@@ -152,7 +152,7 @@ After a valid reply, the reporter receives the final receipt.
 
 ### Email-origin flow
 
-An authorized reporter emails the SecondSignal inbox using the same `/verify <identity>` format. SecondSignal selects the verifier's registered Telegram destination because the originating transport was email. The Telegram verifier responds with the matching token, and the verdict returns to the originating email thread.
+An authorized reporter emails the SecondSignal inbox using the same `/verify <identity>` format. SecondSignal selects the verifier's registered Telegram conversation because the originating transport was email. Telegram Bot API bots cannot cold-start a chat, so the verifier must first message the SecondSignal bot once; the resulting Caspian conversation ID is then stored as the verified route. The Telegram verifier responds with the matching token, and the verdict returns to the originating email thread.
 
 ### Status and cancellation
 
@@ -251,7 +251,7 @@ Combines structured risk signals with the explicit user request. Any `/verify` c
 
 ### Channel independence engine
 
-Selects a registered verification destination whose channel differs from the originating channel. If no independent destination exists, the case resolves as `UNVERIFIED` with reason `NO_INDEPENDENT_ROUTE`.
+Selects a registered verification destination whose channel differs from the originating channel. Email routes contain the recipient address; the runtime binds the active Caspian email connection ID when it calls `client.initiate(...)`. Telegram routes contain a previously established Caspian conversation ID for `client.send_message(...)`; a Telegram bot cannot initiate a new chat from a handle alone. If no independent destination exists, the case resolves as `UNVERIFIED` with reason `NO_INDEPENDENT_ROUTE`.
 
 ### Case service
 
@@ -501,4 +501,3 @@ Implementation follows this strict order:
 7. Freeze features and optimize the live demonstration.
 
 No dashboard enhancement or additional scenario may delay a reliable live cross-channel loop.
-
