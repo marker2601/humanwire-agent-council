@@ -119,7 +119,15 @@ class InterviewCoordinator:
                     "next_action_at": now + timedelta(seconds=self.settings.acknowledgement_seconds),
                 }
             )
-            self._save_assignment_event(updated, saved, "outreach.primary_sent", now, {"attempt": 0})
+            updated_session = self._activate_route(session, route, route.conversation_id, now)
+            self._save_assignment_event(
+                updated,
+                saved,
+                "outreach.primary_sent",
+                now,
+                {"attempt": 0},
+                session=updated_session,
+            )
             return WorkflowResult(
                 deliveries=[
                     self._route_delivery(
@@ -174,7 +182,15 @@ class InterviewCoordinator:
                     "next_action_at": now + timedelta(seconds=self.settings.acknowledgement_seconds),
                 }
             )
-            self._save_assignment_event(updated, saved, "outreach.alternate_sent", now, {"attempt": 2})
+            updated_session = self._activate_route(session, route, route.conversation_id, now)
+            self._save_assignment_event(
+                updated,
+                saved,
+                "outreach.alternate_sent",
+                now,
+                {"attempt": 2},
+                session=updated_session,
+            )
             return WorkflowResult(
                 deliveries=[
                     self._route_delivery(
@@ -226,6 +242,11 @@ class InterviewCoordinator:
         route = self._message_route(message, saved)
         if route is None:
             return WorkflowResult()
+        session = self._session(saved)
+        if not self._is_active_correlation(session, route, message) and not self._contains_token(
+            message.text, self._token(saved)
+        ):
+            return WorkflowResult()
         duplicate_key = f"interview:{saved.assignment_id}:answer:{message.message_id}"
         if any(event.idempotency_key == duplicate_key for event in self.repository.list_events(saved.mandate_id)):
             return WorkflowResult()
@@ -267,6 +288,7 @@ class InterviewCoordinator:
                 "current_question_index": next_index,
                 "current_channel": message.channel,
                 "current_route_id": route.route_id,
+                "current_conversation_id": message.conversation_id,
                 "channel_history": self._channel_history(session, message.channel),
                 "updated_at": now,
                 "completed_at": now if completed else None,
@@ -416,6 +438,7 @@ class InterviewCoordinator:
             update={
                 "current_channel": message.channel,
                 "current_route_id": route.route_id,
+                "current_conversation_id": message.conversation_id,
                 "channel_history": self._channel_history(session, message.channel),
                 "acknowledged_at": now,
                 "updated_at": now,
@@ -527,6 +550,37 @@ class InterviewCoordinator:
             channel,
         ]
 
+    def _activate_route(
+        self,
+        session: InterviewSession,
+        route: ContactRoute,
+        conversation_id: str | None,
+        now: datetime,
+    ) -> InterviewSession:
+        return session.model_copy(
+            update={
+                "current_channel": route.channel,
+                "current_route_id": route.route_id,
+                "current_conversation_id": conversation_id,
+                "channel_history": self._channel_history(session, route.channel),
+                "updated_at": now,
+            }
+        )
+
+    @staticmethod
+    def _is_active_correlation(
+        session: InterviewSession, route: ContactRoute, message: IncomingMessage
+    ) -> bool:
+        return (
+            session.current_route_id == route.route_id
+            and session.current_conversation_id is not None
+            and session.current_conversation_id == message.conversation_id
+        )
+
+    @staticmethod
+    def _contains_token(text: str, token: str) -> bool:
+        return re.search(rf"(?<![A-Z0-9-]){re.escape(token)}(?![A-Z0-9-])", text.upper()) is not None
+
     def _save_assignment_event(
         self,
         updated: StakeholderAssignment,
@@ -534,6 +588,8 @@ class InterviewCoordinator:
         event_type: str,
         now: datetime,
         metadata: dict[str, int | str],
+        *,
+        session: InterviewSession | None = None,
     ) -> None:
         event = self._event(
             event_type,
@@ -545,6 +601,8 @@ class InterviewCoordinator:
         )
         with self.repository.transaction() as unit:
             unit.save_assignment(updated)
+            if session is not None:
+                unit.save_interview(session)
             unit.append_event(updated.mandate_id, event)
 
     def _transition(

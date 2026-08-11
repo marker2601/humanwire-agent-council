@@ -99,6 +99,7 @@ class InterviewSessionRecord(Base):
     current_question_index: Mapped[int] = mapped_column(Integer)
     current_channel: Mapped[str | None] = mapped_column(String(32), nullable=True)
     current_route_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    current_conversation_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     channel_history: Mapped[list[str]] = mapped_column(JSON)
     default_visibility: Mapped[str] = mapped_column(String(32))
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

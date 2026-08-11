@@ -208,6 +208,7 @@ class InterviewSession(BaseModel):
     current_question_index: int = 0
     current_channel: Channel | None = None
     current_route_id: str | None = None
+    current_conversation_id: str | None = None
     channel_history: list[Channel] = Field(default_factory=list)
     default_visibility: EvidenceVisibility = EvidenceVisibility.SHAREABLE
     acknowledged_at: datetime | None = None

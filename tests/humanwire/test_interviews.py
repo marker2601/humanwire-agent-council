@@ -398,6 +398,220 @@ def test_delivery_success_is_idempotent(coordinator, repository, mandate, now) -
     assert [event.event_type for event in events].count("outreach.delivery_confirmed") == 1
 
 
+def test_tokenless_answer_on_active_route_and_conversation_is_accepted(
+    coordinator, repository, mandate, now
+) -> None:
+    repository.add_mandate(mandate)
+    assignment = _assignment(mandate)
+    repository.add_assignment(assignment)
+    coordinator.start_assignment(assignment, ["One?", "Two?"], now)
+    pending = repository.get_assignment(assignment.assignment_id)
+    assert pending is not None
+    coordinator.acknowledge(
+        _message(
+            now,
+            text="ACK HW-2411",
+            channel=Channel.EMAIL,
+            sender="priya@example.test",
+            conversation="mail-priya",
+        ),
+        pending,
+        now,
+    )
+    interviewing = repository.get_assignment(assignment.assignment_id)
+    assert interviewing is not None
+
+    result = coordinator.record_answer(
+        _message(
+            now,
+            text="We need 72 hours notice.",
+            channel=Channel.EMAIL,
+            sender="priya@example.test",
+            conversation="mail-priya",
+        ),
+        interviewing,
+        now,
+    )
+
+    assert "Question 2 of 2" in result.deliveries[0].text
+    assert len(repository.list_evidence(mandate.mandate_id)) == 1
+
+
+def test_tokenless_answer_from_active_route_with_wrong_conversation_is_rejected(
+    coordinator, repository, mandate, now
+) -> None:
+    repository.add_mandate(mandate)
+    assignment = _assignment(mandate)
+    repository.add_assignment(assignment)
+    coordinator.start_assignment(assignment, ["One?", "Two?"], now)
+    pending = repository.get_assignment(assignment.assignment_id)
+    assert pending is not None
+    coordinator.acknowledge(
+        _message(
+            now,
+            text="ACK HW-2411",
+            channel=Channel.EMAIL,
+            sender="priya@example.test",
+            conversation="mail-priya",
+        ),
+        pending,
+        now,
+    )
+    interviewing = repository.get_assignment(assignment.assignment_id)
+    assert interviewing is not None
+
+    result = coordinator.record_answer(
+        _message(
+            now,
+            text="We need 72 hours notice.",
+            channel=Channel.EMAIL,
+            sender="priya@example.test",
+            conversation="old-mail-thread",
+        ),
+        interviewing,
+        now,
+    )
+
+    session = repository.get_interview(interviewing.interview_id)
+    assert result.deliveries == []
+    assert repository.list_evidence(mandate.mandate_id) == []
+    assert session is not None
+    assert session.current_question_index == 0
+
+
+def test_token_correlated_cross_channel_answer_switches_the_active_session(
+    coordinator, repository, mandate, now
+) -> None:
+    repository.add_mandate(mandate)
+    assignment = _assignment(mandate)
+    repository.add_assignment(assignment)
+    coordinator.start_assignment(assignment, ["One?", "Two?"], now)
+    pending = repository.get_assignment(assignment.assignment_id)
+    assert pending is not None
+    coordinator.acknowledge(
+        _message(
+            now,
+            text="ACK HW-2411",
+            channel=Channel.EMAIL,
+            sender="priya@example.test",
+            conversation="mail-priya",
+        ),
+        pending,
+        now,
+    )
+    interviewing = repository.get_assignment(assignment.assignment_id)
+    assert interviewing is not None
+
+    result = coordinator.record_answer(
+        _message(
+            now,
+            text="HW-2411 We need 72 hours notice.",
+            channel=Channel.TELEGRAM,
+            sender="priya-telegram",
+            conversation="tg-priya",
+        ),
+        interviewing,
+        now,
+    )
+
+    session = repository.get_interview(interviewing.interview_id)
+    assert "Question 2 of 2" in result.deliveries[0].text
+    assert session is not None
+    assert session.current_route_id == "telegram-priya"
+    assert session.current_conversation_id == "tg-priya"
+
+
+def test_tokenless_stale_previous_channel_reply_is_rejected(
+    coordinator, repository, mandate, now
+) -> None:
+    repository.add_mandate(mandate)
+    assignment = _assignment(mandate)
+    repository.add_assignment(assignment)
+    coordinator.start_assignment(assignment, ["One?", "Two?", "Three?"], now)
+    pending = repository.get_assignment(assignment.assignment_id)
+    assert pending is not None
+    coordinator.acknowledge(
+        _message(
+            now,
+            text="ACK HW-2411",
+            channel=Channel.EMAIL,
+            sender="priya@example.test",
+            conversation="mail-priya",
+        ),
+        pending,
+        now,
+    )
+    interviewing = repository.get_assignment(assignment.assignment_id)
+    assert interviewing is not None
+    coordinator.record_answer(
+        _message(
+            now,
+            text="HW-2411 Current answer.",
+            channel=Channel.TELEGRAM,
+            sender="priya-telegram",
+            conversation="tg-priya",
+        ),
+        interviewing,
+        now,
+    )
+    switched = repository.get_assignment(assignment.assignment_id)
+    assert switched is not None
+
+    result = coordinator.record_answer(
+        _message(
+            now,
+            text="Stale email answer.",
+            channel=Channel.EMAIL,
+            sender="priya@example.test",
+            conversation="mail-priya",
+        ),
+        switched,
+        now,
+    )
+
+    session = repository.get_interview(switched.interview_id)
+    assert result.deliveries == []
+    assert len(repository.list_evidence(mandate.mandate_id)) == 1
+    assert session is not None
+    assert session.current_question_index == 1
+
+
+def test_alternate_escalation_persists_route_correlation_for_tokenless_continuity(
+    coordinator, repository, mandate, now
+) -> None:
+    repository.add_mandate(mandate)
+    assignment = _assignment(mandate)
+    repository.add_assignment(assignment)
+    coordinator.start_assignment(assignment, ["One?", "Two?"], now)
+    primary = repository.get_assignment(assignment.assignment_id)
+    assert primary is not None
+    coordinator.process_due_assignment(primary, now + timedelta(seconds=60))
+    reminder = repository.get_assignment(assignment.assignment_id)
+    assert reminder is not None
+    coordinator.process_due_assignment(reminder, now + timedelta(seconds=90))
+    alternate = repository.get_assignment(assignment.assignment_id)
+    assert alternate is not None
+
+    session = repository.get_interview(alternate.interview_id)
+    assert session is not None
+    assert session.current_route_id == "telegram-priya"
+    assert session.current_conversation_id == "tg-priya"
+    result = coordinator.record_answer(
+        _message(
+            now,
+            text="We need 72 hours notice.",
+            channel=Channel.TELEGRAM,
+            sender="priya-telegram",
+            conversation="tg-priya",
+        ),
+        alternate,
+        now,
+    )
+
+    assert "Question 2 of 2" in result.deliveries[0].text
+    assert len(repository.list_evidence(mandate.mandate_id)) == 1
+
+
 def test_completed_assignment_never_appears_in_due_work(repository, mandate, now) -> None:
     repository.add_mandate(mandate)
     assignment = _assignment(
