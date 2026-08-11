@@ -2,6 +2,7 @@ import json
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from humanwire.directory import InitiatorPolicy, OrganizationDirectory, OrganizationDocument
 from humanwire.domain import Direction, Person
@@ -9,6 +10,7 @@ from humanwire.model_client import FeatherlessJsonClient, ModelFailure
 from humanwire.planning import (
     FeatherlessMandatePlanner,
     PlanNeedsClarification,
+    PublicMandateProjection,
     RuleBasedMandatePlanner,
 )
 
@@ -103,6 +105,13 @@ def _coerced_model_plan(field: str) -> dict[str, object]:
     return plan
 
 
+def _public_projection(*stakeholders: str) -> PublicMandateProjection:
+    return PublicMandateProjection(
+        objective="Coordinate weekend coverage",
+        stakeholder_references=list(stakeholders),
+    )
+
+
 def _json_client(response_factory) -> FeatherlessJsonClient:
     return FeatherlessJsonClient(
         api_key="test-key",
@@ -184,7 +193,9 @@ def planner(directory: OrganizationDirectory) -> FeatherlessMandatePlanner:
 
 
 def test_valid_model_plan_is_resolved_against_directory(planner, manager) -> None:
-    result = planner.plan("Coordinate weekend coverage", manager)
+    result = planner.plan_public(
+        _public_projection("us-lead", "apac-lead", "vp-people", "vp-support"), manager
+    )
 
     assert [person.person_id for person in result.people] == [
         "us-lead", "apac-lead", "vp-people", "vp-support"
@@ -192,7 +203,30 @@ def test_valid_model_plan_is_resolved_against_directory(planner, manager) -> Non
     assert result.plan.stakeholders[2].direction is Direction.LATERAL
 
 
-def test_private_mandate_content_is_not_sent_to_the_model(directory, manager) -> None:
+def test_raw_mandate_text_never_calls_the_model(directory, manager) -> None:
+    transport_calls: list[httpx.Request] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        transport_calls.append(request)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(_model_plan("us-lead"))}}]},
+        )
+
+    planner = FeatherlessMandatePlanner(
+        _json_client(transport), directory, RuleBasedMandatePlanner(directory)
+    )
+    result = planner.plan(
+        "Interview US Team Lead about weekend coverage. Priya said she cannot work weekends "+
+        "in her interview, and this evidence must remain private.",
+        manager,
+    )
+
+    assert result.planner == "rules"
+    assert transport_calls == []
+
+
+def test_public_projection_sends_only_allowlisted_fields(directory, manager) -> None:
     captured_content: list[str] = []
 
     def transport(request: httpx.Request) -> httpx.Response:
@@ -205,18 +239,47 @@ def test_private_mandate_content_is_not_sent_to_the_model(directory, manager) ->
     planner = FeatherlessMandatePlanner(
         _json_client(transport), directory, RuleBasedMandatePlanner(directory)
     )
-    private_content = "Priya's private interview says she cannot work weekends."
-    private_continuation = "The private interview also contains staffing evidence."
-    result = planner.plan(
-        "Interview US Team Lead about weekend coverage.\n"
-        f"PRIVATE EVIDENCE: {private_content}\n  {private_continuation}",
-        manager,
-    )
+    result = planner.plan_public(_public_projection("us-lead"), manager)
 
     assert result.planner == "featherless"
-    assert private_content not in captured_content[0]
-    assert private_continuation not in captured_content[0]
-    assert "US Team Lead" in captured_content[0]
+    assert captured_content[0].startswith("UNTRUSTED_CONTENT_START\n")
+    assert captured_content[0].endswith("\nUNTRUSTED_CONTENT_END")
+    assert json.loads(
+        captured_content[0]
+        .removeprefix("UNTRUSTED_CONTENT_START\n")
+        .removesuffix("\nUNTRUSTED_CONTENT_END")
+    ) == {
+        "objective": "Coordinate weekend coverage",
+        "stakeholder_references": ["us-lead"],
+        "deadline": None,
+    }
+
+
+@pytest.mark.parametrize("field_name", ["evidence", "private_notes", "unexpected"])
+def test_public_projection_rejects_non_public_fields_before_transport(
+    field_name: str, directory, manager
+) -> None:
+    transport_calls: list[httpx.Request] = []
+    planner = FeatherlessMandatePlanner(
+        _json_client(
+            lambda request: transport_calls.append(request)
+            or httpx.Response(200, json={"choices": []})
+        ),
+        directory,
+        RuleBasedMandatePlanner(directory),
+    )
+    payload = {
+        "objective": "Coordinate weekend coverage",
+        "stakeholder_references": ["us-lead"],
+        field_name: "private interview evidence",
+    }
+
+    with pytest.raises(ValidationError):
+        PublicMandateProjection.model_validate(payload)
+    with pytest.raises(PlanNeedsClarification, match="invalid_public_projection"):
+        planner.plan_public(payload, manager)  # type: ignore[arg-type]
+
+    assert transport_calls == []
 
 
 @pytest.mark.parametrize(
@@ -237,7 +300,7 @@ def test_coerced_model_fields_use_safe_schema_fallback(
     )
     planner = FeatherlessMandatePlanner(client, directory, RuleBasedMandatePlanner(directory))
 
-    result = planner.plan("Interview US Team Lead about weekend coverage.", manager)
+    result = planner.plan_public(_public_projection("us-lead"), manager)
 
     assert result.planner == "rules"
     assert result.fallback_reason == "invalid_schema"
@@ -256,8 +319,8 @@ def failing_client() -> FeatherlessJsonClient:
 
 def test_invalid_model_output_uses_rule_fallback(failing_client, directory, manager) -> None:
     planner = FeatherlessMandatePlanner(failing_client, directory, RuleBasedMandatePlanner(directory))
-    result = planner.plan(
-        "Interview US Team Lead, APAC Team Lead, Priya Raman, and Nora Williams about weekend coverage.",
+    result = planner.plan_public(
+        _public_projection("us-lead", "apac-lead", "vp-people", "vp-support"),
         manager,
     )
 
@@ -275,7 +338,7 @@ def test_unknown_model_person_returns_an_explicit_clarification(directory, manag
     planner = FeatherlessMandatePlanner(client, directory, RuleBasedMandatePlanner(directory))
 
     with pytest.raises(PlanNeedsClarification) as error:
-        planner.plan("Coordinate weekend coverage", manager)
+        planner.plan_public(_public_projection("not-a-person"), manager)
 
     assert error.value.reason == "unknown_person"
     assert "not-a-person" in error.value.references
@@ -305,6 +368,29 @@ def test_fallback_rejects_mixed_known_and_unknown_explicit_stakeholders(director
     assert error.value.references == ["Unlisted Team Lead"]
 
 
+def test_fallback_resolves_every_explicit_stakeholder_clause(directory, manager) -> None:
+    planner = RuleBasedMandatePlanner(directory)
+
+    result = planner.plan(
+        "Interview US Team Lead about coverage. Contact APAC Team Lead regarding coverage.", manager
+    )
+
+    assert [person.person_id for person in result.people] == ["us-lead", "apac-lead"]
+
+
+def test_fallback_rejects_unknown_stakeholder_in_a_later_clause(directory, manager) -> None:
+    planner = RuleBasedMandatePlanner(directory)
+
+    with pytest.raises(PlanNeedsClarification) as error:
+        planner.plan(
+            "Interview US Team Lead about coverage. Contact Unlisted Team Lead regarding coverage.",
+            manager,
+        )
+
+    assert error.value.reason == "unknown_person"
+    assert error.value.references == ["Unlisted Team Lead"]
+
+
 def test_unauthorized_upward_route_returns_an_explicit_clarification(directory, manager) -> None:
     client = _json_client(
         lambda request: httpx.Response(
@@ -315,7 +401,7 @@ def test_unauthorized_upward_route_returns_an_explicit_clarification(directory, 
     planner = FeatherlessMandatePlanner(client, directory, RuleBasedMandatePlanner(directory))
 
     with pytest.raises(PlanNeedsClarification) as error:
-        planner.plan("Coordinate weekend coverage", manager)
+        planner.plan_public(_public_projection("ceo"), manager)
 
     assert error.value.reason == "unauthorized_target"
     assert error.value.candidates == ["Jordan Lee"]
