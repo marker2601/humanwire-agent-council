@@ -181,6 +181,27 @@ def test_converts_caspian_message_and_extracts_sender(gateway):
     assert incoming.received_at == NOW
 
 
+def test_extracts_command_before_gmail_quoted_thread(gateway):
+    message = SimpleNamespace(
+        id="msg_email_reply",
+        conversation_id="conv_email",
+        connection_id="conn_email",
+        channel="email",
+        sender={"address": "asha@example.com", "name": "Asha Rao"},
+        subject="Re: SecondSignal verification",
+        text=(
+            "NO SS-0LTOZL\n\n"
+            "On Tue, Aug 11, 2026 at 3:30 PM SecondSignal wrote:\n"
+            "> SECOND SIGNAL VERIFICATION REQUEST\n"
+            "> Case: SS-0LTOZL"
+        ),
+    )
+
+    incoming = gateway.to_incoming_message(message)
+
+    assert incoming.text == "NO SS-0LTOZL"
+
+
 def test_rejects_unsupported_channel(gateway):
     message = SimpleNamespace(
         id="msg_1",

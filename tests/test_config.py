@@ -8,6 +8,7 @@ from secondsignal.config import Settings
 
 def test_listener_credentials_are_required_only_for_listener() -> None:
     settings = Settings(
+        _env_file=None,
         database_url="sqlite:///data/test.db",
         registry_path=Path("data/test-identities.json"),
     )
@@ -18,6 +19,7 @@ def test_listener_credentials_are_required_only_for_listener() -> None:
 
 def test_listener_credentials_return_plain_values() -> None:
     settings = Settings(
+        _env_file=None,
         caspian_api_key=SecretStr("caspian-key"),
         telegram_bot_token=SecretStr("telegram-token"),
     )

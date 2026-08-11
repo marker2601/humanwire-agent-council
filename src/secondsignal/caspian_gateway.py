@@ -20,6 +20,18 @@ class UnsupportedCaspianChannelError(ValueError):
     """Raised when a message arrives from a channel SecondSignal does not trust."""
 
 
+def _email_visible_reply(text: str) -> str:
+    visible_lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(">"):
+            break
+        if stripped.startswith("On ") and stripped.endswith("wrote:"):
+            break
+        visible_lines.append(line)
+    return "\n".join(visible_lines).strip()
+
+
 @dataclass(frozen=True)
 class ConnectionSummary:
     email_connection_id: str
@@ -114,6 +126,9 @@ class CaspianGateway:
             ) from error
 
         sender = message.sender or {}
+        text = message.text or ""
+        if channel is Channel.EMAIL:
+            text = _email_visible_reply(text)
         return IncomingMessage(
             message_id=str(message.id),
             conversation_id=str(message.conversation_id),
@@ -122,7 +137,7 @@ class CaspianGateway:
             sender_address=str(sender.get("address", "")),
             sender_name=sender.get("name") or sender.get("display_name"),
             subject=message.subject,
-            text=message.text or "",
+            text=text,
             received_at=self.clock(),
         )
 
