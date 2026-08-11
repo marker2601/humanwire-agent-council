@@ -82,6 +82,27 @@ def _model_plan(*stakeholders: str) -> dict[str, object]:
     }
 
 
+def _coerced_model_plan(field: str) -> dict[str, object]:
+    plan = _model_plan("us-lead")
+    stakeholder = plan["stakeholders"][0]
+    assert isinstance(stakeholder, dict)
+    if field == "boolean":
+        stakeholder["required"] = "false"
+    elif field == "list":
+        plan["required_decisions"] = ["Approve coverage plan", 7]
+    elif field == "string":
+        plan["objective"] = 7
+    elif field == "direction":
+        stakeholder["direction"] = 1
+    elif field == "direction-list":
+        stakeholder["direction"] = []
+    elif field == "deadline":
+        plan["deadline"] = 0
+    else:
+        raise AssertionError(f"Unknown coercion field: {field}")
+    return plan
+
+
 def _json_client(response_factory) -> FeatherlessJsonClient:
     return FeatherlessJsonClient(
         api_key="test-key",
@@ -171,6 +192,57 @@ def test_valid_model_plan_is_resolved_against_directory(planner, manager) -> Non
     assert result.plan.stakeholders[2].direction is Direction.LATERAL
 
 
+def test_private_mandate_content_is_not_sent_to_the_model(directory, manager) -> None:
+    captured_content: list[str] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        captured_content.append(json.loads(request.content)["messages"][1]["content"])
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(_model_plan("us-lead"))}}]},
+        )
+
+    planner = FeatherlessMandatePlanner(
+        _json_client(transport), directory, RuleBasedMandatePlanner(directory)
+    )
+    private_content = "Priya's private interview says she cannot work weekends."
+    private_continuation = "The private interview also contains staffing evidence."
+    result = planner.plan(
+        "Interview US Team Lead about weekend coverage.\n"
+        f"PRIVATE EVIDENCE: {private_content}\n  {private_continuation}",
+        manager,
+    )
+
+    assert result.planner == "featherless"
+    assert private_content not in captured_content[0]
+    assert private_continuation not in captured_content[0]
+    assert "US Team Lead" in captured_content[0]
+
+
+@pytest.mark.parametrize(
+    "coerced_field", ["boolean", "list", "string", "direction", "direction-list", "deadline"]
+)
+def test_coerced_model_fields_use_safe_schema_fallback(
+    coerced_field: str, directory, manager
+) -> None:
+    client = _json_client(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": json.dumps(_coerced_model_plan(coerced_field))}}
+                ]
+            },
+        )
+    )
+    planner = FeatherlessMandatePlanner(client, directory, RuleBasedMandatePlanner(directory))
+
+    result = planner.plan("Interview US Team Lead about weekend coverage.", manager)
+
+    assert result.planner == "rules"
+    assert result.fallback_reason == "invalid_schema"
+
+
 @pytest.fixture
 def failing_client() -> FeatherlessJsonClient:
     def transport(request: httpx.Request) -> httpx.Response:
@@ -219,6 +291,18 @@ def test_ambiguous_alias_returns_safe_candidate_names(directory, manager) -> Non
     assert error.value.reason == "ambiguous_person"
     assert error.value.candidates == ["Jordan Lee", "Taylor Kim"]
     assert "@" not in str(error.value)
+
+
+def test_fallback_rejects_mixed_known_and_unknown_explicit_stakeholders(directory, manager) -> None:
+    planner = RuleBasedMandatePlanner(directory)
+
+    with pytest.raises(PlanNeedsClarification) as error:
+        planner.plan(
+            "Interview US Team Lead and Unlisted Team Lead about weekend coverage.", manager
+        )
+
+    assert error.value.reason == "unknown_person"
+    assert error.value.references == ["Unlisted Team Lead"]
 
 
 def test_unauthorized_upward_route_returns_an_explicit_clarification(directory, manager) -> None:
