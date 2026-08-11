@@ -1,7 +1,18 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, create_engine, event
+from sqlalchemy import (
+    JSON,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    create_engine,
+    event,
+    text,
+)
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -66,6 +77,15 @@ class StakeholderAssignmentRecord(Base):
 
 class InterviewSessionRecord(Base):
     __tablename__ = "hw_interviews"
+    __table_args__ = (
+        Index(
+            "uq_hw_active_interview_stakeholder",
+            "mandate_id",
+            "stakeholder_person_id",
+            unique=True,
+            sqlite_where=text("completed_at IS NULL"),
+        ),
+    )
 
     session_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     mandate_id: Mapped[str] = mapped_column(
@@ -74,6 +94,7 @@ class InterviewSessionRecord(Base):
     assignment_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("hw_assignments.assignment_id"), unique=True, index=True
     )
+    stakeholder_person_id: Mapped[str] = mapped_column(String(128), index=True)
     questions: Mapped[list[str]] = mapped_column(JSON)
     current_question_index: Mapped[int] = mapped_column(Integer)
     current_channel: Mapped[str | None] = mapped_column(String(32), nullable=True)

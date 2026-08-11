@@ -3,8 +3,9 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
-from humanwire.database import create_session_factory
+from humanwire.database import InterviewSessionRecord, create_session_factory
 from humanwire.domain import (
     AlignmentIssue,
     AlignmentIssueType,
@@ -185,6 +186,87 @@ def test_rejects_duplicate_active_interview_for_the_same_stakeholder(
         )
 
 
+def test_completed_interview_allows_later_active_interview_for_the_same_stakeholder(
+    repository, sample_mandate, make_assignment, now
+) -> None:
+    repository.add_mandate(sample_mandate)
+    completed_assignment = make_assignment(
+        state=StakeholderState.COMPLETE, completed_at=now, next_action_at=None
+    )
+    next_assignment = make_assignment(assignment_id=uuid4(), next_action_at=None)
+    repository.add_assignment(completed_assignment)
+    repository.add_assignment(next_assignment)
+    repository.add_interview(
+        InterviewSession(
+            session_id=uuid4(),
+            mandate_id=sample_mandate.mandate_id,
+            assignment_id=completed_assignment.assignment_id,
+            questions=["Capacity?"],
+            started_at=now,
+            updated_at=now,
+            completed_at=now,
+        )
+    )
+
+    repository.add_interview(
+        InterviewSession(
+            session_id=uuid4(),
+            mandate_id=sample_mandate.mandate_id,
+            assignment_id=next_assignment.assignment_id,
+            questions=["Capacity?"],
+            started_at=now,
+            updated_at=now,
+        )
+    )
+
+    assert repository.find_active_interview(sample_mandate.mandate_id, "team-lead") is not None
+
+
+def test_active_interview_unique_index_rejects_direct_duplicate_insert(
+    repository, sample_mandate, make_assignment, now
+) -> None:
+    repository.add_mandate(sample_mandate)
+    first_assignment = make_assignment(next_action_at=None)
+    second_assignment = make_assignment(assignment_id=uuid4(), next_action_at=None)
+    repository.add_assignment(first_assignment)
+    repository.add_assignment(second_assignment)
+    first = InterviewSessionRecord(
+        session_id=str(uuid4()),
+        mandate_id=str(sample_mandate.mandate_id),
+        assignment_id=str(first_assignment.assignment_id),
+        stakeholder_person_id="team-lead",
+        questions=["Capacity?"],
+        current_question_index=0,
+        current_channel=None,
+        channel_history=[],
+        default_visibility=EvidenceVisibility.SHAREABLE.value,
+        started_at=now,
+        updated_at=now,
+        completed_at=None,
+    )
+    duplicate = InterviewSessionRecord(
+        session_id=str(uuid4()),
+        mandate_id=str(sample_mandate.mandate_id),
+        assignment_id=str(second_assignment.assignment_id),
+        stakeholder_person_id="team-lead",
+        questions=["Capacity?"],
+        current_question_index=0,
+        current_channel=None,
+        channel_history=[],
+        default_visibility=EvidenceVisibility.SHAREABLE.value,
+        started_at=now,
+        updated_at=now,
+        completed_at=None,
+    )
+    with repository._session_factory() as session:
+        session.add(first)
+        session.commit()
+    with repository._session_factory() as session:
+        session.add(duplicate)
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+
 def test_round_trips_evidence_issue_proposal_response_and_meeting_package(
     repository, sample_mandate, make_assignment, now
 ) -> None:
@@ -322,8 +404,16 @@ def test_event_idempotency_is_unique_and_metadata_rejects_destinations(
         )
 
 
-def test_event_metadata_rejects_nested_conversation_destinations(
-    repository, sample_mandate, now
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"route_id": "private.person@example.test"},
+        {"person_id": "+1 (555) 010-9999"},
+        {"references": [{"route_id": "tg://resolve?domain=private-chat"}]},
+    ],
+)
+def test_event_metadata_rejects_destination_values_under_safe_keys(
+    repository, sample_mandate, now, metadata
 ) -> None:
     repository.add_mandate(sample_mandate)
 
@@ -334,7 +424,7 @@ def test_event_metadata_rejects_nested_conversation_destinations(
                 event_type="outreach.attempted",
                 created_at=now,
                 idempotency_key="event:nested-destination",
-                metadata={"attempts": [{"conversation_id": "private-chat"}]},
+                metadata=metadata,
             ),
         )
 

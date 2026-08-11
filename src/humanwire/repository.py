@@ -1,3 +1,4 @@
+import re
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -159,11 +160,14 @@ def _assignment_value(record: StakeholderAssignmentRecord) -> StakeholderAssignm
     )
 
 
-def _interview_record(value: InterviewSession) -> InterviewSessionRecord:
+def _interview_record(
+    value: InterviewSession, stakeholder_person_id: str
+) -> InterviewSessionRecord:
     return InterviewSessionRecord(
         session_id=str(value.session_id),
         mandate_id=str(value.mandate_id),
         assignment_id=str(value.assignment_id),
+        stakeholder_person_id=stakeholder_person_id,
         questions=value.questions,
         current_question_index=value.current_question_index,
         current_channel=value.current_channel.value if value.current_channel else None,
@@ -351,26 +355,82 @@ def _package_value(record: MeetingPackageRecord) -> MeetingPackage:
     )
 
 
-def _validate_event_metadata(metadata: dict[str, Any]) -> None:
-    forbidden = {
-        "address",
-        "chat",
-        "conversation",
-        "destination",
-        "email",
-        "phone",
-        "recipient",
-        "sender",
+_EVENT_BOOLEAN_KEYS = frozenset({"calendar_written", "fallback", "safe"})
+_EVENT_INTEGER_KEYS = frozenset(
+    {"attempt", "attempt_count", "duration_ms", "question_index", "round_number"}
+)
+_EVENT_IDENTIFIER_KEYS = frozenset(
+    {
+        "actor_id",
+        "analyzer",
+        "assignment_id",
+        "error_code",
+        "evidence_id",
+        "issue_id",
+        "meeting_id",
+        "message_id",
+        "model",
+        "outcome",
+        "person_id",
+        "proposal_id",
+        "reason_code",
+        "route_id",
+        "status",
     }
+)
+_EVENT_IDENTIFIER_LIST_KEYS = frozenset(
+    {"assignment_ids", "evidence_ids", "issue_ids", "person_ids", "route_ids"}
+)
+_EVENT_CONTAINER_KEYS = frozenset({"references"})
+_OPAQUE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_EMAIL_DESTINATION = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+_PHONE_DESTINATION = re.compile(r"(?:\+\d[\d(). -]{6,}\d|\d{3}[(). -]+\d{3}[(). -]+\d{4}|\d{10,})")
+_CHAT_DESTINATION_PREFIXES = ("@", "tg://", "telegram://", "http://t.me/", "https://t.me/")
+
+
+def _validate_opaque_identifier(value: Any) -> None:
+    if not isinstance(value, str) or not _OPAQUE_IDENTIFIER.fullmatch(value):
+        raise ValueError("event metadata must not contain a full destination")
+    lowered = value.lower()
+    if (
+        _EMAIL_DESTINATION.search(value)
+        or _PHONE_DESTINATION.fullmatch(value)
+        or lowered.startswith(_CHAT_DESTINATION_PREFIXES)
+    ):
+        raise ValueError("event metadata must not contain a full destination")
+
+
+def _validate_event_metadata(metadata: dict[str, Any]) -> None:
     for key, value in metadata.items():
-        if any(word in key.lower() for word in forbidden):
-            raise ValueError("event metadata must not contain a full destination")
-        if isinstance(value, dict):
-            _validate_event_metadata(value)
-        elif isinstance(value, list):
+        if key in _EVENT_BOOLEAN_KEYS:
+            if not isinstance(value, bool):
+                raise ValueError("event metadata must contain only approved safe identifiers")
+        elif key in _EVENT_INTEGER_KEYS:
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError("event metadata must contain only approved safe identifiers")
+        elif key in _EVENT_IDENTIFIER_KEYS:
+            _validate_opaque_identifier(value)
+        elif key in _EVENT_IDENTIFIER_LIST_KEYS:
+            if not isinstance(value, list):
+                raise ValueError("event metadata must contain only approved safe identifiers")
             for item in value:
-                if isinstance(item, dict):
+                _validate_opaque_identifier(item)
+        elif key in _EVENT_CONTAINER_KEYS:
+            if isinstance(value, dict):
+                _validate_event_metadata(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if not isinstance(item, dict):
+                        raise TypeError(
+                            "event metadata must contain only approved safe identifiers"
+                        )
                     _validate_event_metadata(item)
+            else:
+                raise ValueError("event metadata must contain only approved safe identifiers")
+        else:
+            raise ValueError(
+                "event metadata must not contain a full destination or unapproved field"
+            )
 
 
 def _event_record(mandate_id: UUID, value: DomainEvent) -> DomainEventRecord:
@@ -433,29 +493,27 @@ class RepositoryUnitOfWork:
 
     def add_interview(self, interview: InterviewSession) -> None:
         assignment = self._session.get(StakeholderAssignmentRecord, str(interview.assignment_id))
-        if assignment is not None:
-            existing = self._session.scalar(
-                select(InterviewSessionRecord)
-                .join(
-                    StakeholderAssignmentRecord,
-                    InterviewSessionRecord.assignment_id
-                    == StakeholderAssignmentRecord.assignment_id,
-                )
-                .where(
-                    InterviewSessionRecord.mandate_id == str(interview.mandate_id),
-                    StakeholderAssignmentRecord.person_id == assignment.person_id,
-                    InterviewSessionRecord.completed_at.is_(None),
-                )
+        if assignment is None:
+            raise KeyError(str(interview.assignment_id))
+        existing = self._session.scalar(
+            select(InterviewSessionRecord).where(
+                InterviewSessionRecord.mandate_id == str(interview.mandate_id),
+                InterviewSessionRecord.stakeholder_person_id == assignment.person_id,
+                InterviewSessionRecord.completed_at.is_(None),
             )
-            if existing is not None:
-                raise ValueError("stakeholder already has an active interview")
-        self._session.add(_interview_record(interview))
+        )
+        if existing is not None:
+            raise ValueError("stakeholder already has an active interview")
+        self._session.add(_interview_record(interview, assignment.person_id))
 
     def save_interview(self, interview: InterviewSession) -> None:
         record = self._session.get(InterviewSessionRecord, str(interview.session_id))
         if record is None:
             raise KeyError(str(interview.session_id))
-        _copy_columns(_interview_record(interview), record, {"session_id"})
+        assignment = self._session.get(StakeholderAssignmentRecord, str(interview.assignment_id))
+        if assignment is None:
+            raise KeyError(str(interview.assignment_id))
+        _copy_columns(_interview_record(interview, assignment.person_id), record, {"session_id"})
 
     def add_evidence(self, evidence: EvidenceItem) -> None:
         self._session.add(_evidence_record(evidence))
@@ -562,10 +620,16 @@ class SqlAlchemyHumanWireRepository:
             return [_assignment_value(record) for record in records]
 
     def add_interview(self, interview: InterviewSession) -> None:
-        self._write(RepositoryUnitOfWork.add_interview, interview)
+        try:
+            self._write(RepositoryUnitOfWork.add_interview, interview)
+        except IntegrityError as error:
+            raise ValueError("stakeholder already has an active interview") from error
 
     def save_interview(self, interview: InterviewSession) -> None:
-        self._write(RepositoryUnitOfWork.save_interview, interview)
+        try:
+            self._write(RepositoryUnitOfWork.save_interview, interview)
+        except IntegrityError as error:
+            raise ValueError("stakeholder already has an active interview") from error
 
     def get_interview(self, session_id: UUID) -> InterviewSession | None:
         with self._session_factory() as session:
