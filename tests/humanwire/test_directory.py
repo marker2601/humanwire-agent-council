@@ -143,3 +143,81 @@ def test_rejects_direction_mismatches_before_authority_checks(directory) -> None
 
     with pytest.raises(UnauthorizedTargetError):
         directory.validate_target("manager", "team-lead", Direction.UPWARD)
+
+
+def test_rejects_target_above_the_allowed_upward_hop_limit(directory) -> None:
+    from humanwire.directory import OrganizationDirectory, UnauthorizedTargetError
+
+    document = directory.document.model_copy(deep=True)
+    document.initiator_policies[0].allowed_departments.add("Executive")
+    limited_directory = OrganizationDirectory(document)
+
+    with pytest.raises(UnauthorizedTargetError):
+        limited_directory.validate_target("manager", "coo", Direction.UPWARD)
+
+
+def test_rejects_initiators_without_a_policy(directory) -> None:
+    from humanwire.directory import OrganizationDirectory, UnauthorizedTargetError
+
+    document = directory.document.model_copy(deep=True)
+    document.initiator_policies = []
+    unapproved_directory = OrganizationDirectory(document)
+
+    with pytest.raises(UnauthorizedTargetError):
+        unapproved_directory.validate_target("manager", "team-lead", Direction.DOWNWARD)
+
+
+def test_excludes_email_routes_without_a_recipient(directory) -> None:
+    person = directory.resolve_person("vp-people")
+    person.routes[1].recipient = None
+
+    assert [route.channel for route in directory.ordered_routes("vp-people")] == [Channel.TELEGRAM]
+
+
+def test_excludes_telegram_routes_without_a_conversation(directory) -> None:
+    person = directory.resolve_person("vp-people")
+    person.routes[0].conversation_id = None
+
+    assert [route.channel for route in directory.ordered_routes("vp-people")] == [Channel.EMAIL]
+
+
+def test_rejects_a_cyclic_reporting_hierarchy(directory) -> None:
+    from humanwire.directory import InvalidOrganizationError, OrganizationDirectory
+
+    document = directory.document.model_copy(deep=True)
+    document.people[0].manager_id = "team-lead"
+
+    with pytest.raises(InvalidOrganizationError, match="cycle"):
+        OrganizationDirectory(document)
+
+
+def test_rejects_a_dangling_manager_reference(directory) -> None:
+    from humanwire.directory import InvalidOrganizationError, OrganizationDirectory
+
+    document = directory.document.model_copy(deep=True)
+    document.people[1].manager_id = "not-in-directory"
+
+    with pytest.raises(InvalidOrganizationError, match="manager"):
+        OrganizationDirectory(document)
+
+
+def test_rejects_duplicate_casefolded_person_ids(directory) -> None:
+    from humanwire.directory import InvalidOrganizationError, OrganizationDirectory
+
+    document = directory.document.model_copy(deep=True)
+    document.people.append(document.people[3].model_copy(update={"person_id": "MANAGER"}))
+
+    with pytest.raises(InvalidOrganizationError, match="person_id"):
+        OrganizationDirectory(document)
+
+
+def test_rejects_duplicate_casefolded_policy_ids(directory) -> None:
+    from humanwire.directory import InvalidOrganizationError, OrganizationDirectory
+
+    document = directory.document.model_copy(deep=True)
+    document.initiator_policies.append(
+        document.initiator_policies[0].model_copy(update={"person_id": "MANAGER"})
+    )
+
+    with pytest.raises(InvalidOrganizationError, match="policy"):
+        OrganizationDirectory(document)

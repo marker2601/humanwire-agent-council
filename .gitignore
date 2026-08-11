@@ -4,6 +4,7 @@
 work/
 data/*.db
 data/identities.json
+data/organization.json
 __pycache__/
 *.py[cod]
 *.egg-info/

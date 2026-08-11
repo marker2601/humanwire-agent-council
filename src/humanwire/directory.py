@@ -20,6 +20,10 @@ class UnauthorizedTargetError(ValueError):
     """Raised when an initiator is not allowed to contact a target."""
 
 
+class InvalidOrganizationError(ValueError):
+    """Raised when a directory document cannot safely define authority."""
+
+
 class InitiatorPolicy(BaseModel):
     person_id: str
     allowed_directions: set[Direction]
@@ -34,6 +38,7 @@ class OrganizationDocument(BaseModel):
 
 class OrganizationDirectory:
     def __init__(self, document: OrganizationDocument) -> None:
+        self._validate_document(document)
         self.document = document
         self._people_by_id = {person.person_id.casefold(): person for person in document.people}
         self._policies_by_person_id = {
@@ -159,3 +164,32 @@ class OrganizationDirectory:
     @staticmethod
     def _unique_people(people: list[Person]) -> list[Person]:
         return list({person.person_id.casefold(): person for person in people}.values())
+
+    @staticmethod
+    def _validate_document(document: OrganizationDocument) -> None:
+        people_by_id: dict[str, Person] = {}
+        for person in document.people:
+            person_key = person.person_id.casefold()
+            if person_key in people_by_id:
+                raise InvalidOrganizationError("Duplicate casefolded person_id")
+            people_by_id[person_key] = person
+
+        policy_ids: set[str] = set()
+        for policy in document.initiator_policies:
+            policy_key = policy.person_id.casefold()
+            if policy_key in policy_ids:
+                raise InvalidOrganizationError("Duplicate casefolded initiator policy")
+            policy_ids.add(policy_key)
+
+        for person in document.people:
+            current = person
+            visited: set[str] = set()
+            while current.manager_id:
+                manager_key = current.manager_id.casefold()
+                if manager_key in visited:
+                    raise InvalidOrganizationError("Reporting hierarchy contains a cycle")
+                manager = people_by_id.get(manager_key)
+                if manager is None:
+                    raise InvalidOrganizationError("Reporting hierarchy has an unknown manager")
+                visited.add(manager_key)
+                current = manager
