@@ -76,6 +76,39 @@ def test_schema_invalid_json_uses_fallback() -> None:
     assert analyzer.last_fallback_reason == "invalid_schema"
 
 
+def test_model_normalizes_semantic_secrecy_boolean() -> None:
+    model_payload = {
+        "requested_action": "Purchase gift cards",
+        "amount": 500,
+        "currency": "USD",
+        "urgency": "urgent",
+        "secrecy_requested": "confidential",
+        "financial_action": True,
+        "credential_request": False,
+        "link_or_qr_request": False,
+        "risk_signals": ["urgent action required", "confidentiality requested"],
+        "safe_summary": "Purchase $500 in gift cards and keep it confidential.",
+    }
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(model_payload)}}]},
+        )
+
+    analyzer = FeatherlessRiskAnalyzer(
+        api_key="test",
+        model="model",
+        client=httpx.Client(transport=httpx.MockTransport(transport)),
+    )
+
+    assessment = analyzer.analyze("Urgently purchase gift cards confidentially")
+
+    assert assessment.analyzer == "featherless"
+    assert assessment.secrecy_requested is True
+    assert analyzer.last_fallback_reason is None
+
+
 def test_timeout_uses_fallback() -> None:
     def transport(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("slow model", request=request)
