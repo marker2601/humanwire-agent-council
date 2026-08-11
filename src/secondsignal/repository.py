@@ -40,7 +40,9 @@ def _record_from_case(case: VerificationCase) -> CaseRecord:
         claimed_identity_id=case.claimed_identity_id,
         claimed_identity_name=case.claimed_identity_name,
         risk=case.risk.model_dump(mode="json"),
-        verification_route=case.verification_route.model_dump(mode="json"),
+        verification_route=(
+            case.verification_route.model_dump(mode="json") if case.verification_route else None
+        ),
         state=case.state.value,
         reason=case.reason,
         created_at=case.created_at,
@@ -62,7 +64,11 @@ def _case_from_record(record: CaseRecord) -> VerificationCase:
         claimed_identity_id=record.claimed_identity_id,
         claimed_identity_name=record.claimed_identity_name,
         risk=RiskAssessment.model_validate(record.risk),
-        verification_route=VerificationRoute.model_validate(record.verification_route),
+        verification_route=(
+            VerificationRoute.model_validate(record.verification_route)
+            if record.verification_route
+            else None
+        ),
         state=CaseState(record.state),
         reason=record.reason,
         created_at=_utc(record.created_at),

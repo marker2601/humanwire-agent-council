@@ -43,10 +43,14 @@ class RuleBasedRiskAnalyzer:
                 "credentials",
             ),
         )
-        urgency = "high" if _contains(
-            lowered,
-            ("urgent", "immediately", "today", "emergency", "now"),
-        ) else "unknown"
+        urgency = (
+            "high"
+            if _contains(
+                lowered,
+                ("urgent", "immediately", "today", "emergency", "now"),
+            )
+            else "unknown"
+        )
         secrecy_requested = _contains(
             lowered,
             ("confidential", "secret", "do not tell", "don't tell", "do not call"),
@@ -143,11 +147,7 @@ class FeatherlessRiskAnalyzer:
                 },
                 {
                     "role": "user",
-                    "content": (
-                        "UNTRUSTED_MESSAGE_START\n"
-                        + text
-                        + "\nUNTRUSTED_MESSAGE_END"
-                    ),
+                    "content": ("UNTRUSTED_MESSAGE_START\n" + text + "\nUNTRUSTED_MESSAGE_END"),
                 },
             ],
         }

@@ -24,7 +24,7 @@ class CaseRecord(Base):
     claimed_identity_id: Mapped[str] = mapped_column(String(100))
     claimed_identity_name: Mapped[str] = mapped_column(String(200))
     risk: Mapped[dict[str, Any]] = mapped_column(JSON)
-    verification_route: Mapped[dict[str, Any]] = mapped_column(JSON)
+    verification_route: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     state: Mapped[str] = mapped_column(String(40), index=True)
     reason: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)

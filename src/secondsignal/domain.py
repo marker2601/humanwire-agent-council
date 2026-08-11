@@ -80,7 +80,7 @@ class VerificationCase(BaseModel):
     claimed_identity_id: str
     claimed_identity_name: str
     risk: RiskAssessment
-    verification_route: VerificationRoute
+    verification_route: VerificationRoute | None
     state: CaseState
     reason: str | None = None
     created_at: datetime

@@ -1,2 +1,1 @@
 """SecondSignal application package."""
-
