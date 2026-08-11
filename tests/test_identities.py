@@ -119,3 +119,24 @@ def test_authorized_reporters_are_compared_after_normalization(
 
 def test_address_normalization_does_not_guess_telegram_identifier_format() -> None:
     assert normalize_address(Channel.TELEGRAM, " @Verifier_Name ") == "@verifier_name"
+
+
+def test_generated_demo_registry_has_two_independent_routes(tmp_path, monkeypatch):
+    from scripts.seed_demo_registry import main
+
+    output = tmp_path / "identities.json"
+    monkeypatch.setenv("DEMO_REGISTRY_OUTPUT", str(output))
+    monkeypatch.setenv("DEMO_REPORTER_TELEGRAM_ADDRESS", "reporter-tg")
+    monkeypatch.setenv("DEMO_REPORTER_EMAIL", "reporter@example.com")
+    monkeypatch.setenv("DEMO_VERIFIER_EMAIL", "asha@example.com")
+    monkeypatch.setenv("DEMO_VERIFIER_TELEGRAM_ADDRESS", "verifier-tg")
+    monkeypatch.setenv("DEMO_VERIFIER_TELEGRAM_CONVERSATION", "conv-verifier")
+
+    main([])
+    registry = IdentityRegistry.load(output)
+
+    identity = registry.resolve("Asha Rao")
+    assert {route.channel for route in identity.routes} == {
+        Channel.EMAIL,
+        Channel.TELEGRAM,
+    }
