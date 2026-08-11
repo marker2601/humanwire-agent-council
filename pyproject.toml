@@ -38,7 +38,8 @@ secondsignal = ["templates/*.html", "static/*.css"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+pythonpath = ["tests"]
+addopts = "-q --import-mode=importlib"
 
 [tool.ruff]
 line-length = 100
