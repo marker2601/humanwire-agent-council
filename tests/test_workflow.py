@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from secondsignal.container import ExpiryWorker
 from secondsignal.domain import CaseState, Channel, DeliveryKind, IncomingMessage
 from secondsignal.identities import IdentityRegistry, RegistryDocument
 from secondsignal.risk import RuleBasedRiskAnalyzer
@@ -299,3 +300,36 @@ def test_delivery_failure_returns_unverified_receipt(
 
     assert "UNVERIFIED" in result.deliveries[0].text
     assert repository.get_by_token("SS-7K4P2M").state is CaseState.DELIVERY_FAILED
+
+
+def test_expiry_worker_delivers_each_expired_case_once(
+    workflow,
+    telegram_report,
+    repository,
+) -> None:
+    class RecordingGateway:
+        def __init__(self) -> None:
+            self.dispatched = []
+
+        def dispatch(self, delivery) -> None:
+            self.dispatched.append(delivery)
+
+    gateway = RecordingGateway()
+    workflow.handle(telegram_report)
+    worker = ExpiryWorker(
+        workflow=workflow,
+        gateway=gateway,
+        repository=repository,
+        poll_seconds=5,
+        clock=lambda: NOW + timedelta(minutes=11),
+    )
+
+    worker.run_once()
+    worker.run_once()
+
+    receipts = [item for item in gateway.dispatched if "UNVERIFIED" in item.text]
+    assert len(receipts) == 1
+    assert repository.get_runtime_status("listener.heartbeat") == (
+        "alive",
+        NOW + timedelta(minutes=11),
+    )
