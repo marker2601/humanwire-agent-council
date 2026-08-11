@@ -1,0 +1,27 @@
+{
+  "authorized_reporters": {
+    "telegram": ["reporter-telegram-address"],
+    "email": ["reporter@example.com"]
+  },
+  "identities": [
+    {
+      "identity_id": "asha-rao",
+      "display_name": "Asha Rao",
+      "aliases": ["Asha", "Asha Rao", "CEO"],
+      "routes": [
+        {
+          "channel": "email",
+          "sender_address": "asha@example.com",
+          "recipient": "asha@example.com",
+          "conversation_id": null
+        },
+        {
+          "channel": "telegram",
+          "sender_address": "verifier-telegram-address",
+          "recipient": null,
+          "conversation_id": "conv_asha_telegram"
+        }
+      ]
+    }
+  ]
+}
