@@ -1,1 +1,11 @@
 .worktrees/
+.venv/
+.env
+data/*.db
+data/identities.json
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
