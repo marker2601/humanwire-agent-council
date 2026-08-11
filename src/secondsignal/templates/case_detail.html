@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}{{ case.token }} · SecondSignal receipt{% endblock %}
+{% block content %}
+  <a class="back-link" href="/">← Back to cases</a>
+  <article class="receipt">
+    <header class="receipt__header">
+      <div>
+        <h1>SECOND SIGNAL RECEIPT</h1>
+        <dl class="identity-path">
+          <div>
+            <dt>Claimed identity</dt>
+            <dd>{{ case.claimed_identity }}</dd>
+          </div>
+          <div>
+            <dt>Channel path</dt>
+            <dd>{{ case.channel_path }}</dd>
+          </div>
+        </dl>
+      </div>
+      <div class="verdict-block">
+        <span>Case token</span>
+        <strong class="case-token">{{ case.token }}</strong>
+        <span>Verdict</span>
+        <strong class="verdict verdict--{{ case.state_class }}">{{ case.state }}</strong>
+      </div>
+    </header>
+
+    <div class="receipt__columns">
+      <section aria-labelledby="request-summary-title">
+        <h2 id="request-summary-title">Request summary</h2>
+        <p class="request-summary">{{ case.safe_summary }}</p>
+        <h2>Risk signals <span>(AI identified)</span></h2>
+        <ul class="risk-list">
+          {% for signal in case.risk_signals %}
+            <li>{{ signal }}</li>
+          {% else %}
+            <li>No rule-based risk signal was identified.</li>
+          {% endfor %}
+        </ul>
+      </section>
+      <section aria-labelledby="human-response-title">
+        <h2 id="human-response-title">Human response</h2>
+        <p class="human-response human-response--{{ case.state_class }}">{{ case.human_response }}</p>
+        <h2>Decision authority</h2>
+        <p>The response was accepted only from the independently registered verification route.</p>
+        <dl class="decision-details">
+          <div><dt>Origin</dt><dd>{{ case.origin_channel }}</dd></div>
+          <div><dt>Verification</dt><dd>{{ case.verification_channel }}</dd></div>
+        </dl>
+      </section>
+    </div>
+
+    <aside class="ai-notice" aria-labelledby="ai-notice-title">
+      <h2 id="ai-notice-title">Responsible AI notice</h2>
+      <p><strong>AI analyzed risk; a human response determined the verdict.</strong></p>
+    </aside>
+
+    <section class="timeline" aria-labelledby="timeline-title">
+      <h2 id="timeline-title">Event timeline</h2>
+      <ol>
+        {% for event in events %}
+          <li>
+            <span class="timeline__marker" aria-hidden="true">{{ loop.index }}</span>
+            <strong>{{ event.label }}</strong>
+            <time datetime="{{ event.created_at.isoformat() }}">{{ event.created_at.strftime('%b %d, %Y · %H:%M UTC') }}</time>
+          </li>
+        {% else %}
+          <li>No audit events recorded.</li>
+        {% endfor %}
+      </ol>
+    </section>
+
+    <p class="receipt__footnote">This is a read-only audit record. Contact details are intentionally omitted.</p>
+  </article>
+{% endblock %}
