@@ -111,6 +111,7 @@ def create_app(
     settings: Settings,
     *,
     clock: Callable[[], datetime] | None = None,
+    demo_mode: bool = False,
 ) -> FastAPI:
     application_clock = clock or (lambda: datetime.now(UTC))
     templates = Jinja2Templates(directory=PACKAGE_DIR / "templates")
@@ -133,6 +134,7 @@ def create_app(
             context={
                 "cases": [_case_view(case, now) for case in cases],
                 "counts": counts,
+                "demo_mode": demo_mode,
             },
         )
 
@@ -155,6 +157,7 @@ def create_app(
             context={
                 "case": _case_view(case, application_clock()),
                 "events": event_views,
+                "demo_mode": demo_mode,
             },
         )
 

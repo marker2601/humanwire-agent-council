@@ -9,5 +9,7 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
+.vercel/
+.env.local
 .coverage
 htmlcov/

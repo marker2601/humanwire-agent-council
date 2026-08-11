@@ -124,6 +124,25 @@ a:focus-visible {
   padding-block: 42px 72px;
 }
 
+.demo-notice {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  margin: -16px 0 30px;
+  padding: 12px 15px;
+  border: 1px solid #a9c6af;
+  border-radius: 7px;
+  background: #edf6ef;
+  color: #315b3a;
+  font-size: 0.82rem;
+}
+
+.demo-notice strong {
+  flex: 0 0 auto;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
 .dashboard-intro {
   max-width: 970px;
   margin-bottom: 36px;
@@ -560,6 +579,12 @@ dd {
 
   .page-shell {
     padding-block: 34px 48px;
+  }
+
+  .demo-notice {
+    display: grid;
+    gap: 4px;
+    margin-top: -12px;
   }
 
   .summary-grid {

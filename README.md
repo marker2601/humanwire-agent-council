@@ -4,6 +4,10 @@
 
 SecondSignal is a cross-channel verification agent built for the Caspian Buildathon. It receives a suspicious request on email or Telegram, extracts risk facts, contacts the claimed sender through a separately registered channel, and returns a deterministic human-confirmed verdict with a read-only evidence receipt.
 
+## Live demo
+
+Open the public, read-only dashboard at **[secondsignal.vercel.app](https://secondsignal.vercel.app)**. It uses clearly labeled synthetic cases and never loads Caspian credentials, private identity mappings, or real messages. The credential-dependent Caspian email and Telegram listener runs separately as described below.
+
 ## The same-channel trust problem
 
 When an email account says “send gift cards now,” replying to that email does not establish who is behind it. The account carrying the request may already be compromised. SecondSignal treats the origin channel as evidence of a claim, never as proof of identity.

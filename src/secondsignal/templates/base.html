@@ -17,6 +17,12 @@
       </div>
     </header>
     <main id="main-content" class="page-shell">
+      {% if demo_mode %}
+        <aside class="demo-notice" aria-label="Demo environment">
+          <strong>Live demo</strong>
+          <span>Safe sample verification data; no private messages or credentials.</span>
+        </aside>
+      {% endif %}
       {% block content %}{% endblock %}
     </main>
     <footer class="site-footer">
