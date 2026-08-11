@@ -217,6 +217,8 @@ class InterviewCoordinator:
         self, message: IncomingMessage, assignment: StakeholderAssignment, now: datetime
     ) -> WorkflowResult:
         """Accept a correlated acknowledgement and resume the existing question on that channel."""
+        if not message.conversation_id.strip():
+            return WorkflowResult()
         parsed = parse_command(message.text)
         if not isinstance(parsed, AcknowledgeCommand) or parsed.token != self._token(assignment):
             return WorkflowResult()
@@ -226,6 +228,8 @@ class InterviewCoordinator:
         self, message: IncomingMessage, assignment: StakeholderAssignment, now: datetime
     ) -> WorkflowResult:
         """Persist only an authenticated answer; an answer can implicitly acknowledge the interview."""
+        if not message.conversation_id.strip():
+            return WorkflowResult()
         decline_match = _DECLINE.fullmatch(message.text.strip())
         if decline_match is not None:
             if decline_match.group(1).upper() != self._token(assignment):
@@ -243,8 +247,11 @@ class InterviewCoordinator:
         if route is None:
             return WorkflowResult()
         session = self._session(saved)
-        if not self._is_active_correlation(session, route, message) and not self._contains_token(
-            message.text, self._token(saved)
+        explicit_token = self._contains_token(message.text, self._token(saved))
+        if (
+            not self._is_active_correlation(session, route, message)
+            and not self._can_bind_initial_conversation(session, saved, route, message)
+            and not explicit_token
         ):
             return WorkflowResult()
         duplicate_key = f"interview:{saved.assignment_id}:answer:{message.message_id}"
@@ -421,6 +428,10 @@ class InterviewCoordinator:
             acknowledged = self._transition(
                 acknowledged, StakeholderState.AWAITING_ACKNOWLEDGEMENT, "alternate_reply", now
             )
+        if acknowledged.state is StakeholderState.DELIVERED:
+            acknowledged = self._transition(
+                acknowledged, StakeholderState.AWAITING_ACKNOWLEDGEMENT, "delivered_reply", now
+            )
         if acknowledged.state is StakeholderState.FOLLOW_UP_DUE:
             acknowledged = self._transition(
                 acknowledged, StakeholderState.AWAITING_ACKNOWLEDGEMENT, "follow_up_reply", now
@@ -575,6 +586,21 @@ class InterviewCoordinator:
             session.current_route_id == route.route_id
             and session.current_conversation_id is not None
             and session.current_conversation_id == message.conversation_id
+        )
+
+    @staticmethod
+    def _can_bind_initial_conversation(
+        session: InterviewSession,
+        assignment: StakeholderAssignment,
+        route: ContactRoute,
+        message: IncomingMessage,
+    ) -> bool:
+        return (
+            assignment.state
+            in {StakeholderState.DELIVERED, StakeholderState.AWAITING_ACKNOWLEDGEMENT}
+            and session.current_route_id == route.route_id
+            and session.current_conversation_id is None
+            and bool(message.conversation_id.strip())
         )
 
     @staticmethod

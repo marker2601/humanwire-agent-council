@@ -612,6 +612,173 @@ def test_alternate_escalation_persists_route_correlation_for_tokenless_continuit
     assert len(repository.list_evidence(mandate.mandate_id)) == 1
 
 
+def test_initial_tokenless_email_answer_binds_conversation_and_implicitly_acknowledges(
+    coordinator, repository, mandate, now
+) -> None:
+    repository.add_mandate(mandate)
+    assignment = _assignment(mandate)
+    repository.add_assignment(assignment)
+    coordinator.start_assignment(assignment, ["One?", "Two?"], now)
+    pending = repository.get_assignment(assignment.assignment_id)
+    assert pending is not None
+
+    result = coordinator.record_answer(
+        _message(
+            now,
+            text="We need 72 hours notice.",
+            channel=Channel.EMAIL,
+            sender="priya@example.test",
+            conversation="mail-priya",
+        ),
+        pending,
+        now,
+    )
+
+    saved = repository.get_assignment(assignment.assignment_id)
+    session = repository.get_interview(saved.interview_id) if saved is not None else None
+    assert "Question 2 of 2" in result.deliveries[0].text
+    assert saved is not None
+    assert saved.state is StakeholderState.INTERVIEWING
+    assert session is not None
+    assert session.current_route_id == "email-priya"
+    assert session.current_conversation_id == "mail-priya"
+    assert session.current_question_index == 1
+    assert len(repository.list_evidence(mandate.mandate_id)) == 1
+
+
+def test_initial_tokenless_reply_with_missing_conversation_is_rejected(
+    coordinator, repository, mandate, now
+) -> None:
+    repository.add_mandate(mandate)
+    assignment = _assignment(mandate)
+    repository.add_assignment(assignment)
+    coordinator.start_assignment(assignment, ["One?", "Two?"], now)
+    pending = repository.get_assignment(assignment.assignment_id)
+    assert pending is not None
+
+    result = coordinator.record_answer(
+        _message(
+            now,
+            text="We need 72 hours notice.",
+            channel=Channel.EMAIL,
+            sender="priya@example.test",
+            conversation="",
+        ),
+        pending,
+        now,
+    )
+
+    session = repository.get_interview(pending.interview_id)
+    assert result.deliveries == []
+    assert repository.list_evidence(mandate.mandate_id) == []
+    assert session is not None
+    assert session.current_conversation_id is None
+    assert session.current_question_index == 0
+
+
+def test_token_correlated_reply_with_missing_conversation_is_rejected(
+    coordinator, repository, mandate, now
+) -> None:
+    repository.add_mandate(mandate)
+    assignment = _assignment(mandate)
+    repository.add_assignment(assignment)
+    coordinator.start_assignment(assignment, ["One?", "Two?"], now)
+    pending = repository.get_assignment(assignment.assignment_id)
+    assert pending is not None
+
+    result = coordinator.record_answer(
+        _message(
+            now,
+            text="HW-2411 We need 72 hours notice.",
+            channel=Channel.TELEGRAM,
+            sender="priya-telegram",
+            conversation="",
+        ),
+        pending,
+        now,
+    )
+
+    session = repository.get_interview(pending.interview_id)
+    assert result.deliveries == []
+    assert repository.list_evidence(mandate.mandate_id) == []
+    assert session is not None
+    assert session.current_route_id == "email-priya"
+    assert session.current_conversation_id is None
+
+
+def test_initial_tokenless_reply_from_different_route_cannot_bind_conversation(
+    coordinator, repository, mandate, now
+) -> None:
+    repository.add_mandate(mandate)
+    assignment = _assignment(mandate)
+    repository.add_assignment(assignment)
+    coordinator.start_assignment(assignment, ["One?", "Two?"], now)
+    pending = repository.get_assignment(assignment.assignment_id)
+    assert pending is not None
+
+    result = coordinator.record_answer(
+        _message(
+            now,
+            text="We need 72 hours notice.",
+            channel=Channel.TELEGRAM,
+            sender="priya-telegram",
+            conversation="tg-priya",
+        ),
+        pending,
+        now,
+    )
+
+    session = repository.get_interview(pending.interview_id)
+    assert result.deliveries == []
+    assert repository.list_evidence(mandate.mandate_id) == []
+    assert session is not None
+    assert session.current_route_id == "email-priya"
+    assert session.current_conversation_id is None
+
+
+def test_second_initial_conversation_cannot_replace_the_bound_conversation(
+    coordinator, repository, mandate, now
+) -> None:
+    repository.add_mandate(mandate)
+    assignment = _assignment(mandate)
+    repository.add_assignment(assignment)
+    coordinator.start_assignment(assignment, ["One?", "Two?", "Three?"], now)
+    pending = repository.get_assignment(assignment.assignment_id)
+    assert pending is not None
+    coordinator.record_answer(
+        _message(
+            now,
+            text="First answer.",
+            channel=Channel.EMAIL,
+            sender="priya@example.test",
+            conversation="mail-priya",
+        ),
+        pending,
+        now,
+    )
+    bound = repository.get_assignment(assignment.assignment_id)
+    assert bound is not None
+
+    result = coordinator.record_answer(
+        _message(
+            now,
+            text="Competing answer.",
+            channel=Channel.EMAIL,
+            sender="priya@example.test",
+            conversation="other-mail-thread",
+        ),
+        bound,
+        now,
+    )
+
+    session = repository.get_interview(bound.interview_id)
+    assert result.deliveries == []
+    assert len(repository.list_evidence(mandate.mandate_id)) == 1
+    assert session is not None
+    assert session.current_conversation_id == "mail-priya"
+    assert session.current_question_index == 1
+
+
 def test_completed_assignment_never_appears_in_due_work(repository, mandate, now) -> None:
     repository.add_mandate(mandate)
     assignment = _assignment(
