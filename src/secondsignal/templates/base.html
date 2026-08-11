@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>{% block title %}SecondSignal{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}?v=20260810b">
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <div class="signal-rail" aria-hidden="true"><span></span></div>
+    <header class="site-header">
+      <div class="site-header__inner">
+        <a class="brand" href="/" aria-label="SecondSignal home">SecondSignal</a>
+        <span class="read-only-label"><i aria-hidden="true"></i> Read-only evidence</span>
+      </div>
+    </header>
+    <main id="main-content" class="page-shell">
+      {% block content %}{% endblock %}
+    </main>
+    <footer class="site-footer">
+      <p>SecondSignal · Cross-channel human verification</p>
+    </footer>
+  </body>
+</html>

@@ -1,6 +1,7 @@
 .worktrees/
 .venv/
 .env
+work/
 data/*.db
 data/identities.json
 __pycache__/

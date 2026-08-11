@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}SecondSignal · Verification evidence{% endblock %}
+{% block content %}
+  <section class="dashboard-intro" aria-labelledby="dashboard-title">
+    <h1 id="dashboard-title">The channel carrying a request should not verify itself.</h1>
+    <p>Independent, human-confirmed evidence for high-risk digital requests.</p>
+  </section>
+
+  <section class="summary-grid" aria-label="Case summary">
+    <article class="summary summary--awaiting">
+      <h2>Awaiting</h2>
+      <strong>{{ counts.awaiting }}</strong>
+      <p>Waiting for a second-channel response</p>
+    </article>
+    <article class="summary summary--verified">
+      <h2>Verified</h2>
+      <strong>{{ counts.verified }}</strong>
+      <p>Confirmed by the registered person</p>
+    </article>
+    <article class="summary summary--denied">
+      <h2>Denied</h2>
+      <strong>{{ counts.denied }}</strong>
+      <p>Rejected by the registered person</p>
+    </article>
+    <article class="summary summary--unverified">
+      <h2>Unverified</h2>
+      <strong>{{ counts.unverified }}</strong>
+      <p>No conclusive independent signal</p>
+    </article>
+  </section>
+
+  <section class="case-list" aria-labelledby="recent-cases-title">
+    <div class="section-heading">
+      <h2 id="recent-cases-title">Recent cases</h2>
+      <span>Latest 30</span>
+    </div>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">Case</th>
+            <th scope="col">Claimed identity</th>
+            <th scope="col">Channel path</th>
+            <th scope="col">State</th>
+            <th scope="col">Age</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for case in cases %}
+            <tr>
+              <td><a class="case-link" href="/cases/{{ case.token }}">{{ case.token }}</a></td>
+              <td>{{ case.claimed_identity }}</td>
+              <td>{{ case.channel_path }}</td>
+              <td><span class="state state--{{ case.state_class }}">{{ case.state }}</span></td>
+              <td>{{ case.age }}</td>
+            </tr>
+          {% else %}
+            <tr>
+              <td class="empty-state" colspan="5">No verification cases yet.</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

@@ -60,7 +60,7 @@ def run_web(settings: Settings) -> None:
     from secondsignal.web import create_app
 
     container = ApplicationContainer.build(settings)
-    app = create_app(container)
+    app = create_app(container.repository, settings)
     uvicorn.run(
         app,
         host=settings.dashboard_host,
