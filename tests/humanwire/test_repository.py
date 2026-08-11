@@ -1,0 +1,371 @@
+from datetime import timedelta
+from types import SimpleNamespace
+from uuid import uuid4
+
+import pytest
+
+from humanwire.database import create_session_factory
+from humanwire.domain import (
+    AlignmentIssue,
+    AlignmentIssueType,
+    Channel,
+    Direction,
+    DomainEvent,
+    EvidenceItem,
+    EvidenceStatus,
+    EvidenceType,
+    EvidenceVisibility,
+    InterviewSession,
+    MandateState,
+    MeetingPackage,
+    Proposal,
+    ProposalResponse,
+    ProposalResponseKind,
+    StakeholderAssignment,
+    StakeholderState,
+)
+from humanwire.repository import DuplicateMandateError, SqlAlchemyHumanWireRepository
+
+
+@pytest.fixture
+def repository() -> SqlAlchemyHumanWireRepository:
+    return SqlAlchemyHumanWireRepository(create_session_factory("sqlite://"))
+
+
+@pytest.fixture
+def make_mandate(now):
+    def factory(**updates):
+        values = {
+            "mandate_id": uuid4(),
+            "token": "HW-7K4P2M",
+            "initiator_id": "manager",
+            "origin_channel": Channel.TELEGRAM,
+            "origin_conversation_id": "manager-conversation",
+            "origin_message_id": "message-1",
+            "redacted_request": "Prepare the staffing proposal",
+            "objective": "Align staffing plan",
+            "plan": {
+                "objective": "Align staffing plan",
+                "required_decisions": ["Approve the plan"],
+                "stakeholders": [
+                    {
+                        "person_ref": "team-lead",
+                        "reason": "Owns delivery",
+                        "direction": Direction.DOWNWARD,
+                        "questions": ["What capacity is available?"],
+                    }
+                ],
+                "completion_conditions": ["All required people respond"],
+            },
+            "state": MandateState.INTERVIEWING,
+            "created_at": now,
+            "updated_at": now,
+            "expires_at": now + timedelta(days=1),
+            "idempotency_key": "mandate:sample",
+        }
+        values.update(updates)
+        from humanwire.domain import Mandate
+
+        return Mandate(**values)
+
+    return factory
+
+
+@pytest.fixture
+def sample_mandate(make_mandate):
+    return make_mandate()
+
+
+@pytest.fixture
+def make_assignment(sample_mandate, now):
+    def factory(**updates):
+        values = {
+            "assignment_id": uuid4(),
+            "mandate_id": sample_mandate.mandate_id,
+            "person_id": "team-lead",
+            "department": "Operations",
+            "direction": Direction.DOWNWARD,
+            "reason": "Owns delivery",
+            "required": True,
+            "state": StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+            "route_ids": ["team-lead-email", "team-lead-telegram"],
+            "next_action_at": now - timedelta(seconds=1),
+        }
+        values.update(updates)
+        return StakeholderAssignment(**values)
+
+    return factory
+
+
+@pytest.fixture
+def due_assignments(repository, sample_mandate, make_assignment, now):
+    repository.add_mandate(sample_mandate)
+    follow_up = make_assignment()
+    complete = make_assignment(
+        assignment_id=uuid4(), state=StakeholderState.COMPLETE, completed_at=now
+    )
+    repository.add_assignment(follow_up)
+    repository.add_assignment(complete)
+    return SimpleNamespace(follow_up=follow_up, complete=complete)
+
+
+def test_round_trips_mandate_and_idempotency_lookup(repository, sample_mandate) -> None:
+    repository.add_mandate(sample_mandate)
+
+    assert repository.get_mandate_by_token(sample_mandate.token) == sample_mandate
+    assert (
+        repository.get_mandate_by_idempotency_key(sample_mandate.idempotency_key) == sample_mandate
+    )
+    assert repository.list_recent_mandates() == [sample_mandate]
+
+
+def test_mandate_idempotency_key_is_unique(repository, sample_mandate, make_mandate) -> None:
+    repository.add_mandate(sample_mandate)
+
+    with pytest.raises(DuplicateMandateError):
+        repository.add_mandate(make_mandate(token="HW-OTHER", idempotency_key="mandate:sample"))
+
+
+def test_round_trips_assignment_and_interview(
+    repository, sample_mandate, make_assignment, now
+) -> None:
+    repository.add_mandate(sample_mandate)
+    assignment = make_assignment(next_action_at=None)
+    interview = InterviewSession(
+        session_id=uuid4(),
+        mandate_id=sample_mandate.mandate_id,
+        assignment_id=assignment.assignment_id,
+        questions=["What capacity is available?"],
+        current_channel=Channel.EMAIL,
+        channel_history=[Channel.EMAIL],
+        started_at=now,
+        updated_at=now,
+    )
+    repository.add_assignment(assignment)
+    repository.add_interview(interview)
+
+    assert repository.get_assignment(assignment.assignment_id) == assignment
+    assert repository.list_assignments(sample_mandate.mandate_id) == [assignment]
+    assert repository.get_interview(interview.session_id) == interview
+    assert (
+        repository.find_active_interview(assignment.mandate_id, assignment.person_id) == interview
+    )
+    assert repository.list_interviews(sample_mandate.mandate_id) == [interview]
+
+
+def test_rejects_duplicate_active_interview_for_the_same_stakeholder(
+    repository, sample_mandate, make_assignment, now
+) -> None:
+    repository.add_mandate(sample_mandate)
+    first_assignment = make_assignment(next_action_at=None)
+    second_assignment = make_assignment(assignment_id=uuid4(), next_action_at=None)
+    repository.add_assignment(first_assignment)
+    repository.add_assignment(second_assignment)
+    repository.add_interview(
+        InterviewSession(
+            session_id=uuid4(),
+            mandate_id=sample_mandate.mandate_id,
+            assignment_id=first_assignment.assignment_id,
+            questions=["Capacity?"],
+            started_at=now,
+            updated_at=now,
+        )
+    )
+
+    with pytest.raises(ValueError, match="active interview"):
+        repository.add_interview(
+            InterviewSession(
+                session_id=uuid4(),
+                mandate_id=sample_mandate.mandate_id,
+                assignment_id=second_assignment.assignment_id,
+                questions=["Capacity?"],
+                started_at=now,
+                updated_at=now,
+            )
+        )
+
+
+def test_round_trips_evidence_issue_proposal_response_and_meeting_package(
+    repository, sample_mandate, make_assignment, now
+) -> None:
+    repository.add_mandate(sample_mandate)
+    assignment = make_assignment(next_action_at=None)
+    repository.add_assignment(assignment)
+    evidence = EvidenceItem(
+        evidence_id=uuid4(),
+        mandate_id=sample_mandate.mandate_id,
+        assignment_id=assignment.assignment_id,
+        stakeholder_id=assignment.person_id,
+        evidence_type=EvidenceType.FACT,
+        statement="Two engineers are available.",
+        visibility=EvidenceVisibility.SHAREABLE,
+        status=EvidenceStatus.CONFIRMED,
+        source_message_id="message-2",
+        channel=Channel.EMAIL,
+        created_at=now,
+    )
+    issue = AlignmentIssue(
+        issue_id=uuid4(),
+        mandate_id=sample_mandate.mandate_id,
+        issue_type=AlignmentIssueType.RESOURCE_CONFLICT,
+        evidence_ids=[evidence.evidence_id],
+        stakeholder_ids=[assignment.person_id],
+        summary="Capacity is limited.",
+        blocking=True,
+    )
+    proposal = Proposal(
+        proposal_id=uuid4(),
+        mandate_id=sample_mandate.mandate_id,
+        round_number=1,
+        text="Move the deadline by one week.",
+        issue_ids=[issue.issue_id],
+        required_respondent_ids=[assignment.person_id],
+        created_at=now,
+        expires_at=now + timedelta(hours=1),
+    )
+    response = ProposalResponse(
+        response_id=uuid4(),
+        proposal_id=proposal.proposal_id,
+        stakeholder_id=assignment.person_id,
+        response=ProposalResponseKind.ACCEPT,
+        source_message_id="message-3",
+        created_at=now,
+        idempotency_key="response:sample",
+    )
+    package = MeetingPackage(
+        meeting_id=uuid4(),
+        mandate_id=sample_mandate.mandate_id,
+        purpose="Resolve staffing",
+        decision_owner_id="manager",
+        required_attendee_ids=[assignment.person_id],
+        agreed_facts=["Capacity is limited."],
+        open_decisions=["Choose a date."],
+        agenda=["Review options"],
+        pre_read_evidence_ids=[evidence.evidence_id],
+        created_at=now,
+    )
+    repository.add_evidence(evidence)
+    repository.add_issue(issue)
+    repository.add_proposal(proposal)
+    repository.add_proposal_response(response)
+    repository.save_meeting_package(package)
+
+    assert repository.list_evidence(sample_mandate.mandate_id) == [evidence]
+    assert repository.list_issues(sample_mandate.mandate_id) == [issue]
+    assert repository.get_active_proposal(sample_mandate.mandate_id) == proposal
+    assert repository.list_proposal_responses(proposal.proposal_id) == [response]
+    assert repository.get_meeting_package(sample_mandate.mandate_id) == package
+
+
+def test_saves_mutable_aggregates(repository, sample_mandate, make_assignment, now) -> None:
+    repository.add_mandate(sample_mandate)
+    planned = sample_mandate.model_copy(update={"state": MandateState.PLANNED, "reason": "planned"})
+    repository.save_mandate(planned)
+    assignment = make_assignment(next_action_at=None)
+    repository.add_assignment(assignment)
+    completed = assignment.model_copy(
+        update={"state": StakeholderState.COMPLETE, "completed_at": now}
+    )
+    repository.save_assignment(completed)
+
+    assert repository.get_mandate_by_token(planned.token) == planned
+    assert repository.get_assignment(completed.assignment_id) == completed
+
+
+def test_event_order_is_stable(repository, sample_mandate, now) -> None:
+    repository.add_mandate(sample_mandate)
+    repository.append_event(
+        sample_mandate.mandate_id,
+        DomainEvent(
+            event_type="mandate.created",
+            created_at=now,
+            idempotency_key="mandate:sample:created",
+            metadata={"safe": True},
+        ),
+    )
+    repository.append_event(
+        sample_mandate.mandate_id,
+        DomainEvent(
+            event_type="mandate.planned",
+            created_at=now,
+            idempotency_key="mandate:sample:planned",
+            metadata={},
+        ),
+    )
+
+    assert [event.event_type for event in repository.list_events(sample_mandate.mandate_id)] == [
+        "mandate.created",
+        "mandate.planned",
+    ]
+
+
+def test_event_idempotency_is_unique_and_metadata_rejects_destinations(
+    repository, sample_mandate, now
+) -> None:
+    repository.add_mandate(sample_mandate)
+    event = DomainEvent(
+        event_type="mandate.created", created_at=now, idempotency_key="event:sample", metadata={}
+    )
+    repository.append_event(sample_mandate.mandate_id, event)
+
+    with pytest.raises(ValueError):
+        repository.append_event(sample_mandate.mandate_id, event)
+    with pytest.raises(ValueError, match="destination"):
+        repository.append_event(
+            sample_mandate.mandate_id,
+            event.model_copy(
+                update={
+                    "idempotency_key": "event:unsafe",
+                    "metadata": {"recipient": "private@example.test"},
+                }
+            ),
+        )
+
+
+def test_event_metadata_rejects_nested_conversation_destinations(
+    repository, sample_mandate, now
+) -> None:
+    repository.add_mandate(sample_mandate)
+
+    with pytest.raises(ValueError, match="destination"):
+        repository.append_event(
+            sample_mandate.mandate_id,
+            DomainEvent(
+                event_type="outreach.attempted",
+                created_at=now,
+                idempotency_key="event:nested-destination",
+                metadata={"attempts": [{"conversation_id": "private-chat"}]},
+            ),
+        )
+
+
+def test_due_assignments_excludes_terminal_states(repository, due_assignments, now) -> None:
+    tokens = {item.assignment_id for item in repository.list_due_assignments(now)}
+    assert due_assignments.follow_up.assignment_id in tokens
+    assert due_assignments.complete.assignment_id not in tokens
+
+
+def test_round_trips_runtime_status(repository, now) -> None:
+    repository.set_runtime_status("channel.email", "ready", now)
+
+    assert repository.get_runtime_status("channel.email") == ("ready", now)
+
+
+def test_transaction_commits_mandate_update_and_event_together(
+    repository, sample_mandate, now
+) -> None:
+    repository.add_mandate(sample_mandate)
+    updated = sample_mandate.model_copy(update={"state": MandateState.PLANNED, "reason": "planned"})
+    event = DomainEvent(
+        event_type="mandate.planned",
+        created_at=now,
+        idempotency_key="event:transaction",
+        metadata={},
+    )
+
+    with repository.transaction() as unit:
+        unit.save_mandate(updated)
+        unit.append_event(updated.mandate_id, event)
+
+    assert repository.get_mandate_by_token(updated.token) == updated
+    assert repository.list_events(updated.mandate_id) == [event]
