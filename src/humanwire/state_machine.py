@@ -89,7 +89,9 @@ ASSIGNMENT_TERMINAL_STATES = frozenset(
     }
 )
 ASSIGNMENT_TRANSITIONS: dict[StakeholderState, frozenset[StakeholderState]] = {
-    StakeholderState.NOT_CONTACTED: frozenset({StakeholderState.CONTACT_QUEUED}),
+    StakeholderState.NOT_CONTACTED: frozenset(
+        {StakeholderState.CONTACT_QUEUED, StakeholderState.DELIVERY_FAILED}
+    ),
     StakeholderState.CONTACT_QUEUED: frozenset(
         {StakeholderState.DELIVERED, StakeholderState.DELIVERY_FAILED}
     ),
@@ -101,6 +103,7 @@ ASSIGNMENT_TRANSITIONS: dict[StakeholderState, frozenset[StakeholderState]] = {
             StakeholderState.ACKNOWLEDGED,
             StakeholderState.FOLLOW_UP_DUE,
             StakeholderState.DECLINED,
+            StakeholderState.DELIVERY_FAILED,
         }
     ),
     StakeholderState.ACKNOWLEDGED: frozenset(
@@ -109,7 +112,14 @@ ASSIGNMENT_TRANSITIONS: dict[StakeholderState, frozenset[StakeholderState]] = {
     StakeholderState.INTERVIEWING: frozenset(
         {StakeholderState.COMPLETE, StakeholderState.DECLINED}
     ),
-    StakeholderState.FOLLOW_UP_DUE: frozenset({StakeholderState.ALTERNATE_CHANNEL}),
+    StakeholderState.FOLLOW_UP_DUE: frozenset(
+        {
+            StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+            StakeholderState.ALTERNATE_CHANNEL,
+            StakeholderState.UNREACHABLE,
+            StakeholderState.DELIVERY_FAILED,
+        }
+    ),
     StakeholderState.ALTERNATE_CHANNEL: frozenset(
         {
             StakeholderState.AWAITING_ACKNOWLEDGEMENT,

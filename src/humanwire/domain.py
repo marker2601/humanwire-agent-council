@@ -207,8 +207,10 @@ class InterviewSession(BaseModel):
     questions: list[str] = Field(min_length=1, max_length=5)
     current_question_index: int = 0
     current_channel: Channel | None = None
+    current_route_id: str | None = None
     channel_history: list[Channel] = Field(default_factory=list)
     default_visibility: EvidenceVisibility = EvidenceVisibility.SHAREABLE
+    acknowledged_at: datetime | None = None
     started_at: datetime
     updated_at: datetime
     completed_at: datetime | None = None
