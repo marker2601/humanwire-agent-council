@@ -1,0 +1,100 @@
+{
+  "people": [
+    {
+      "person_id": "ceo",
+      "display_name": "Jordan Lee",
+      "aliases": ["Jordan", "CEO"],
+      "role": "CEO",
+      "department": "Executive",
+      "timezone": "America/Chicago",
+      "routes": [
+        {"route_id": "ceo-email", "channel": "email", "sender_address": "jordan.lee@example.com", "recipient": "jordan.lee@example.com", "preferred": true},
+        {"route_id": "ceo-telegram", "channel": "telegram", "sender_address": "jordan-telegram", "conversation_id": "tg-jordan"}
+      ]
+    },
+    {
+      "person_id": "coo",
+      "display_name": "Maya Chen",
+      "aliases": ["Maya", "COO"],
+      "role": "COO",
+      "department": "Executive",
+      "timezone": "America/Chicago",
+      "manager_id": "ceo",
+      "routes": [
+        {"route_id": "coo-email", "channel": "email", "sender_address": "maya.chen@example.com", "recipient": "maya.chen@example.com", "preferred": true},
+        {"route_id": "coo-telegram", "channel": "telegram", "sender_address": "maya-telegram", "conversation_id": "tg-maya"}
+      ]
+    },
+    {
+      "person_id": "vp-support",
+      "display_name": "Nora Williams",
+      "aliases": ["Nora", "VP Support"],
+      "role": "VP Support",
+      "department": "Support",
+      "timezone": "America/Chicago",
+      "manager_id": "coo",
+      "routes": [
+        {"route_id": "vp-support-email", "channel": "email", "sender_address": "nora.williams@example.com", "recipient": "nora.williams@example.com", "preferred": true},
+        {"route_id": "vp-support-telegram", "channel": "telegram", "sender_address": "nora-telegram", "conversation_id": "tg-nora"}
+      ]
+    },
+    {
+      "person_id": "support-manager",
+      "display_name": "Arun Patel",
+      "aliases": ["Arun", "Support Manager"],
+      "role": "Support Manager",
+      "department": "Support",
+      "timezone": "America/Chicago",
+      "manager_id": "vp-support",
+      "routes": [
+        {"route_id": "support-manager-email", "channel": "email", "sender_address": "arun.patel@example.com", "recipient": "arun.patel@example.com", "preferred": true},
+        {"route_id": "support-manager-telegram", "channel": "telegram", "sender_address": "arun-telegram", "conversation_id": "tg-arun"}
+      ]
+    },
+    {
+      "person_id": "us-team-lead",
+      "display_name": "US Team Lead",
+      "aliases": ["US Lead", "US Team Lead"],
+      "role": "US Team Lead",
+      "department": "Support",
+      "timezone": "America/Chicago",
+      "manager_id": "support-manager",
+      "routes": [
+        {"route_id": "us-team-lead-email", "channel": "email", "sender_address": "us-team-lead@example.com", "recipient": "us-team-lead@example.com", "preferred": true},
+        {"route_id": "us-team-lead-telegram", "channel": "telegram", "sender_address": "us-team-lead-telegram", "conversation_id": "tg-us-team-lead"}
+      ]
+    },
+    {
+      "person_id": "apac-team-lead",
+      "display_name": "APAC Team Lead",
+      "aliases": ["APAC Lead", "APAC Team Lead"],
+      "role": "APAC Team Lead",
+      "department": "Support",
+      "timezone": "Asia/Singapore",
+      "manager_id": "support-manager",
+      "routes": [
+        {"route_id": "apac-team-lead-email", "channel": "email", "sender_address": "apac-team-lead@example.com", "recipient": "apac-team-lead@example.com", "preferred": true},
+        {"route_id": "apac-team-lead-telegram", "channel": "telegram", "sender_address": "apac-team-lead-telegram", "conversation_id": "tg-apac-team-lead"}
+      ]
+    },
+    {
+      "person_id": "vp-people",
+      "display_name": "Priya Raman",
+      "aliases": ["Priya", "VP People"],
+      "role": "VP People",
+      "department": "People",
+      "timezone": "America/Chicago",
+      "manager_id": "coo",
+      "routes": [
+        {"route_id": "vp-people-email", "channel": "email", "sender_address": "priya.raman@example.com", "recipient": "priya.raman@example.com", "preferred": true},
+        {"route_id": "vp-people-telegram", "channel": "telegram", "sender_address": "priya-telegram", "conversation_id": "tg-priya"}
+      ]
+    }
+  ],
+  "initiator_policies": [
+    {"person_id": "ceo", "allowed_directions": ["downward", "lateral", "upward"], "allowed_departments": ["Executive", "Support", "People"], "max_upward_levels": 0},
+    {"person_id": "coo", "allowed_directions": ["downward", "lateral", "upward"], "allowed_departments": ["Executive", "Support", "People"], "max_upward_levels": 1},
+    {"person_id": "vp-support", "allowed_directions": ["downward", "lateral", "upward"], "allowed_departments": ["Support", "People"], "max_upward_levels": 1},
+    {"person_id": "support-manager", "allowed_directions": ["downward", "lateral", "upward"], "allowed_departments": ["Support", "People"], "max_upward_levels": 1}
+  ]
+}
