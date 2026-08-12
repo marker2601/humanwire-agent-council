@@ -530,6 +530,10 @@ class RepositoryUnitOfWork:
     def add_proposal(self, proposal: Proposal) -> None:
         self._session.add(_proposal_record(proposal))
 
+    def get_proposal(self, proposal_id: UUID) -> Proposal | None:
+        record = self._session.get(ProposalRecord, str(proposal_id))
+        return _proposal_value(record) if record else None
+
     def save_proposal(self, proposal: Proposal) -> None:
         record = self._session.get(ProposalRecord, str(proposal.proposal_id))
         if record is None:
@@ -737,6 +741,11 @@ class SqlAlchemyHumanWireRepository:
 
     def add_proposal(self, proposal: Proposal) -> None:
         self._write(RepositoryUnitOfWork.add_proposal, proposal)
+
+    def get_proposal(self, proposal_id: UUID) -> Proposal | None:
+        with self._session_factory() as session:
+            record = session.get(ProposalRecord, str(proposal_id))
+            return _proposal_value(record) if record else None
 
     def save_proposal(self, proposal: Proposal) -> None:
         self._write(RepositoryUnitOfWork.save_proposal, proposal)

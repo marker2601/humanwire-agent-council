@@ -33,7 +33,17 @@ from humanwire.model_client import JsonModelClient, ModelFailure
 from humanwire.repository import SqlAlchemyHumanWireRepository
 
 _HARD_CONSTRAINT = re.compile(r"\b(?:must|cannot|requires?|blocked)\b", re.IGNORECASE)
-_AUTHORITY_CLAIM = re.compile(r"\b(?:accept(?:ed|ance)?|approv(?:e|ed|al)|aligned)\b", re.IGNORECASE)
+_AUTHORITY_CLAIM = re.compile(
+    r"\b(?:accept(?:ed|ance)?|approv(?:e|ed|al)|align(?:ed|ment)?|agreed?|"
+    r"sign(?:ed)?\s+off|authori[sz](?:e|ed|ation)|consensus|endors(?:e|d|ement)|"
+    r"commit(?:ted|ment)?|confirm(?:ed|ation)?)\b",
+    re.IGNORECASE,
+)
+_DAY = re.compile(
+    r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", re.IGNORECASE
+)
+_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+_NEGATION = re.compile(r"\b(?:not|cannot|can't|never|won't)\b", re.IGNORECASE)
 _NUMBER = re.compile(r"\b(\d+)\b")
 _WHITESPACE = re.compile(r"\s+")
 _MAX_PROPOSAL_TEXT = 600
@@ -94,13 +104,9 @@ class AlignmentEngine:
             stakeholder.person_ref for stakeholder in plan.stakeholders if stakeholder.required
         }
         completed_ids = {
-            assignment.person_id
-            for assignment in required_assignments
-            if assignment.state is StakeholderState.COMPLETE
+            assignment.person_id for assignment in required_assignments if assignment.state is StakeholderState.COMPLETE
         }
-        all_required_complete = bool(planned_required_ids) and planned_required_ids.issubset(
-            completed_ids
-        )
+        all_required_complete = bool(planned_required_ids) and planned_required_ids.issubset(completed_ids)
         agreements = self._agreements(public_evidence, issues)
         return AlignmentReport(
             mandate_id=self.mandate_id,
@@ -122,8 +128,34 @@ class AlignmentEngine:
         required_assignments: list[StakeholderAssignment],
     ) -> list[AlignmentIssue]:
         issues: list[AlignmentIssue] = []
+        planned_required_ids = {
+            stakeholder.person_ref for stakeholder in plan.stakeholders if stakeholder.required
+        }
+        by_person = {assignment.person_id: assignment for assignment in required_assignments}
+        accounted_for: set[str] = set()
+        for person_id in sorted(planned_required_ids):
+            assignment = by_person.get(person_id)
+            accounted_for.add(person_id)
+            if assignment is None:
+                issues.append(
+                    self._issue(
+                        AlignmentIssueType.MISSING_EVIDENCE,
+                        "A required stakeholder has no authenticated assignment.",
+                        stakeholder_ids=[person_id],
+                        blocking=True,
+                    )
+                )
+            elif assignment.state is not StakeholderState.COMPLETE:
+                issues.append(
+                    self._issue(
+                        AlignmentIssueType.MISSING_EVIDENCE,
+                        "A required stakeholder has not completed an authenticated response.",
+                        stakeholder_ids=[assignment.person_id],
+                        blocking=True,
+                    )
+                )
         for assignment in required_assignments:
-            if assignment.state is not StakeholderState.COMPLETE:
+            if assignment.person_id not in accounted_for and assignment.state is not StakeholderState.COMPLETE:
                 issues.append(
                     self._issue(
                         AlignmentIssueType.MISSING_EVIDENCE,
@@ -166,8 +198,7 @@ class AlignmentEngine:
         self, candidates: list[ShareableEvidence], decision: str
     ) -> list[AlignmentIssue]:
         facts = [item for item in candidates if item.evidence_type is EvidenceType.FACT]
-        normalized = {self._normalize(item.statement) for item in facts}
-        if len(facts) > 1 and len(normalized) > 1:
+        if self._facts_have_explicit_conflict(facts):
             return [
                 self._issue(
                     AlignmentIssueType.CONTRADICTION,
@@ -178,6 +209,27 @@ class AlignmentEngine:
                 )
             ]
         return []
+
+    def _facts_have_explicit_conflict(self, facts: list[ShareableEvidence]) -> bool:
+        if len(facts) < 2:
+            return False
+        dates = [self._date_value(item.statement) for item in facts]
+        if all(value is not None for value in dates) and len(set(dates)) > 1:
+            return True
+        quantities = [self._quantity(item) for item in facts]
+        if all(value is not None for value in quantities) and len(set(quantities)) > 1:
+            return True
+        normalized = [self._normalize(_NEGATION.sub("", item.statement)) for item in facts]
+        polarity = [bool(_NEGATION.search(item.statement)) for item in facts]
+        return len(set(normalized)) == 1 and len(set(polarity)) > 1
+
+    @staticmethod
+    def _date_value(statement: str) -> str | None:
+        if match := _DATE.search(statement):
+            return match.group(0)
+        if match := _DAY.search(statement):
+            return match.group(0).casefold()
+        return None
 
     def _deadline_conflicts(
         self, candidates: list[ShareableEvidence], decision: str
@@ -321,15 +373,14 @@ class _ModelIssue(BaseModel):
 class _ModelAlignment(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    agreements: list[str] = Field(default_factory=list, max_length=10)
     issues: list[_ModelIssue] = Field(default_factory=list, max_length=10)
 
 
 class HybridAlignmentEngine(AlignmentEngine):
     """Adds non-authoritative model suggestions to deterministic checks."""
 
-    _SYSTEM_PROMPT = """Summarize only the supplied public evidence. Return exactly:
-{"agreements":[string],"issues":[{"issue_type":string,"summary":string,"related_decision":string|null}]}
+    _SYSTEM_PROMPT = """Identify advisory issues from the supplied public evidence. Return exactly:
+{"issues":[{"issue_type":string,"summary":string,"related_decision":string|null}]}
 Do not infer acceptance, approval, authority, identities, private facts, or state changes.
 Your output is advisory only and cannot resolve any issue."""
 
@@ -352,8 +403,12 @@ Your output is advisory only and cannot resolve any issue."""
         )
         self.last_fallback_reason = None
         try:
-            suggestion = _ModelAlignment.model_validate(
-                self._client.complete_json(self._SYSTEM_PROMPT, self._safe_payload(plan, public_evidence))
+            suggestion = _ModelAlignment.model_validate_json(
+                json.dumps(
+                    self._client.complete_json(
+                        self._SYSTEM_PROMPT, self._safe_payload(plan, public_evidence)
+                    )
+                )
             )
         except ModelFailure as error:
             self.last_fallback_reason = error.reason
@@ -370,16 +425,10 @@ Your output is advisory only and cannot resolve any issue."""
                 blocking=False,
             )
             for issue in suggestion.issues
-            if issue.related_decision is None or issue.related_decision in plan.required_decisions
+            if (issue.related_decision is None or issue.related_decision in plan.required_decisions)
+            and not _AUTHORITY_CLAIM.search(issue.summary)
         ]
-        safe_agreements = [
-            f"Suggested: {text.strip()}"
-            for text in suggestion.agreements
-            if text.strip() and not _AUTHORITY_CLAIM.search(text)
-        ][:10]
-        return report.model_copy(
-            update={"agreements": [*report.agreements, *safe_agreements], "issues": [*report.issues, *safe_issues]}
-        )
+        return report.model_copy(update={"issues": [*report.issues, *safe_issues]})
 
     @staticmethod
     def _safe_payload(plan: MandatePlan, evidence: list[ShareableEvidence]) -> str:
@@ -451,16 +500,27 @@ Do not claim anyone accepted, approved, has authority, or changed system state."
         stakeholder_id: str,
         kind: ProposalResponseKind,
         change_text: str | None,
+        source_message_id: str,
         now: datetime,
     ) -> ProposalResponse:
-        if stakeholder_id not in proposal.required_respondent_ids:
+        persisted = self.repository.get_proposal(proposal.proposal_id)
+        if persisted is None:
+            raise KeyError(str(proposal.proposal_id))
+        if persisted.state is not ProposalState.AWAITING_RESPONSES:
+            raise ValueError("proposal is not awaiting responses")
+        if now >= persisted.expires_at:
+            raise ValueError("proposal has expired")
+        if stakeholder_id not in persisted.required_respondent_ids:
             raise ValueError("stakeholder is not a required proposal respondent")
+        if not source_message_id.strip():
+            raise ValueError("source_message_id is required")
         cleaned_change = change_text.strip() if change_text else None
         if kind is ProposalResponseKind.CHANGE and not cleaned_change:
             raise ValueError("CHANGE requires requested change text")
         if kind is not ProposalResponseKind.CHANGE:
             cleaned_change = None
-        key = self._response_key(proposal.proposal_id, stakeholder_id, kind, cleaned_change)
+        proposal = persisted
+        key = self._response_key(proposal.proposal_id, source_message_id)
         existing = self._response_with_key(proposal.proposal_id, key)
         if existing is not None:
             return existing
@@ -470,12 +530,19 @@ Do not claim anyone accepted, approved, has authority, or changed system state."
             stakeholder_id=stakeholder_id,
             response=kind,
             change_text=cleaned_change,
-            source_message_id=f"proposal-response:{response_key_fragment(key)}",
+            source_message_id=source_message_id,
             created_at=now,
             idempotency_key=key,
         )
         try:
             with self.repository.transaction() as unit:
+                persisted_in_transaction = unit.get_proposal(proposal.proposal_id)
+                if persisted_in_transaction is None:
+                    raise KeyError(str(proposal.proposal_id))
+                if persisted_in_transaction.state is not ProposalState.AWAITING_RESPONSES:
+                    raise ValueError("proposal is not awaiting responses")
+                if now >= persisted_in_transaction.expires_at:
+                    raise ValueError("proposal has expired")
                 existing_in_transaction = unit.list_proposal_responses(proposal.proposal_id)
                 duplicate = next(
                     (item for item in existing_in_transaction if item.idempotency_key == key), None
@@ -492,7 +559,7 @@ Do not claim anyone accepted, approved, has authority, or changed system state."
                         if outcome is NegotiationOutcome.ALIGNED
                         else ProposalState.UNRESOLVED
                     )
-                    unit.save_proposal(proposal.model_copy(update={"state": state}))
+                    unit.save_proposal(persisted_in_transaction.model_copy(update={"state": state}))
                 unit.append_event(
                     proposal.mandate_id,
                     DomainEvent(
@@ -511,13 +578,20 @@ Do not claim anyone accepted, approved, has authority, or changed system state."
         return response
 
     def evaluate_round(self, proposal: Proposal) -> NegotiationOutcome:
-        responses = self.repository.list_proposal_responses(proposal.proposal_id)
-        return self._outcome(proposal, responses)
+        persisted = self.repository.get_proposal(proposal.proposal_id)
+        if persisted is None:
+            raise KeyError(str(proposal.proposal_id))
+        if persisted.state is ProposalState.ALIGNED:
+            return NegotiationOutcome.ALIGNED
+        responses = self.repository.list_proposal_responses(persisted.proposal_id)
+        return self._outcome(persisted, responses)
 
     def open_change_requests(self, proposal: Proposal) -> list[str]:
         return [
             response.change_text
-            for response in self.repository.list_proposal_responses(proposal.proposal_id)
+            for response in self._latest_responses(
+                self.repository.list_proposal_responses(proposal.proposal_id)
+            ).values()
             if response.response is ProposalResponseKind.CHANGE and response.change_text is not None
         ]
 
@@ -548,18 +622,13 @@ Do not claim anyone accepted, approved, has authority, or changed system state."
         return f"{summary} Reply ACCEPT, REJECT, or CHANGE with a requested change."
 
     @staticmethod
-    def _response_key(
-        proposal_id: UUID, stakeholder_id: str, kind: ProposalResponseKind, change_text: str | None
-    ) -> str:
-        value = "|".join([str(proposal_id), stakeholder_id, kind.value, change_text or ""])
+    def _response_key(proposal_id: UUID, source_message_id: str) -> str:
+        value = "|".join([str(proposal_id), source_message_id])
         return f"proposal-response:{hashlib.sha256(value.encode()).hexdigest()[:48]}"
 
     @staticmethod
     def _outcome(proposal: Proposal, responses: list[ProposalResponse]) -> NegotiationOutcome:
-        by_stakeholder = {
-            response.stakeholder_id: response
-            for response in sorted(responses, key=lambda item: (item.created_at, str(item.response_id)))
-        }
+        by_stakeholder = NegotiationCoordinator._latest_responses(responses)
         aligned = (
             set(by_stakeholder) == set(proposal.required_respondent_ids)
             and all(response.response is ProposalResponseKind.ACCEPT for response in by_stakeholder.values())
@@ -570,6 +639,13 @@ Do not claim anyone accepted, approved, has authority, or changed system state."
             return NegotiationOutcome.NEXT_ROUND
         return NegotiationOutcome.MEETING_REQUIRED
 
+    @staticmethod
+    def _latest_responses(responses: list[ProposalResponse]) -> dict[str, ProposalResponse]:
+        return {
+            response.stakeholder_id: response
+            for response in sorted(responses, key=lambda item: (item.created_at, item.source_message_id))
+        }
+
     def _response_with_key(self, proposal_id: UUID, key: str) -> ProposalResponse | None:
         return next(
             (
@@ -579,8 +655,3 @@ Do not claim anyone accepted, approved, has authority, or changed system state."
             ),
             None,
         )
-
-
-def response_key_fragment(key: str) -> str:
-    """Keep source correlation opaque and bounded without repeating content."""
-    return key.rsplit(":", maxsplit=1)[-1]

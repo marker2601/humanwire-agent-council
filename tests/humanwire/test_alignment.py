@@ -183,8 +183,23 @@ def test_missing_required_response_blocks_alignment(
     report = engine.analyze(sample_plan(), [], [unreachable_required_assignment])
 
     assert report.is_aligned is False
-    assert report.blocking_issue_count == 1
-    assert report.issues[0].issue_type == "missing_evidence"
+    assert report.blocking_issue_count == 2
+    assert {issue.stakeholder_ids[0] for issue in report.issues} == {"ops", "people"}
+
+
+def test_missing_planned_assignments_are_blocking_issues(engine) -> None:
+    report = engine.analyze(sample_plan(), [], [])
+
+    assert report.is_aligned is False
+    assert {issue.stakeholder_ids[0] for issue in report.issues} == {"ops", "people"}
+
+
+def test_partial_assignment_collection_identifies_the_unassigned_stakeholder(
+    engine, complete_assignments
+) -> None:
+    report = engine.analyze(sample_plan(), [], complete_assignments[:1])
+
+    assert [issue.stakeholder_ids for issue in report.issues] == [["people"]]
 
 
 def test_conflicting_resource_quantities_exceed_asserted_limit(
@@ -258,11 +273,41 @@ def test_compatible_confirmed_commitments_cover_required_decision(
     assert report.covered_decisions == ["Launch date"]
 
 
+def test_different_but_compatible_facts_are_not_labeled_contradictory(
+    engine, evidence_factory, complete_assignments
+) -> None:
+    evidence = [
+        evidence_factory(EvidenceType.FACT, "The launch team has a checklist"),
+        evidence_factory(
+            EvidenceType.FACT, "The launch team has completed training", stakeholder_id="people"
+        ),
+    ]
+
+    report = engine.analyze(sample_plan(), shareable_evidence(evidence), complete_assignments)
+
+    assert not any(issue.issue_type == "contradiction" for issue in report.issues)
+
+
+def test_explicit_incompatible_fact_dates_are_contradictory(
+    engine, evidence_factory, complete_assignments
+) -> None:
+    evidence = [
+        evidence_factory(EvidenceType.FACT, "Launch starts Friday"),
+        evidence_factory(EvidenceType.FACT, "Launch starts Monday", stakeholder_id="people"),
+    ]
+
+    report = engine.analyze(sample_plan(), shareable_evidence(evidence), complete_assignments)
+
+    assert any(issue.issue_type == "contradiction" and issue.blocking for issue in report.issues)
+
+
 def test_all_required_stakeholders_must_explicitly_accept(
     coordinator, mandate, report, now
 ) -> None:
     proposal = coordinator.create_proposal(mandate, report, round_number=1, now=now)
-    coordinator.record_response(proposal, "ops", ProposalResponseKind.ACCEPT, None, now)
+    coordinator.record_response(
+        proposal, "ops", ProposalResponseKind.ACCEPT, None, "ops-accept-1", now
+    )
 
     assert coordinator.evaluate_round(proposal) is NegotiationOutcome.NEXT_ROUND
 
@@ -270,7 +315,9 @@ def test_all_required_stakeholders_must_explicitly_accept(
 def test_reject_prevents_alignment(coordinator, mandate, report, now) -> None:
     proposal = coordinator.create_proposal(mandate, report, round_number=1, now=now)
     for stakeholder_id, kind in (("ops", ProposalResponseKind.ACCEPT), ("people", ProposalResponseKind.REJECT)):
-        coordinator.record_response(proposal, stakeholder_id, kind, None, now)
+        coordinator.record_response(
+            proposal, stakeholder_id, kind, None, f"{stakeholder_id}-{kind.value}-1", now
+        )
 
     assert coordinator.evaluate_round(proposal) is NegotiationOutcome.NEXT_ROUND
 
@@ -278,7 +325,7 @@ def test_reject_prevents_alignment(coordinator, mandate, report, now) -> None:
 def test_change_creates_open_change_request(coordinator, mandate, report, now) -> None:
     proposal = coordinator.create_proposal(mandate, report, round_number=1, now=now)
     coordinator.record_response(
-        proposal, "ops", ProposalResponseKind.CHANGE, "Start Monday", now
+        proposal, "ops", ProposalResponseKind.CHANGE, "Start Monday", "ops-change-1", now
     )
 
     assert coordinator.open_change_requests(proposal) == ["Start Monday"]
@@ -287,8 +334,12 @@ def test_change_creates_open_change_request(coordinator, mandate, report, now) -
 
 def test_duplicate_response_is_idempotent(coordinator, mandate, report, now) -> None:
     proposal = coordinator.create_proposal(mandate, report, round_number=1, now=now)
-    first = coordinator.record_response(proposal, "ops", ProposalResponseKind.ACCEPT, None, now)
-    second = coordinator.record_response(proposal, "ops", ProposalResponseKind.ACCEPT, None, now)
+    first = coordinator.record_response(
+        proposal, "ops", ProposalResponseKind.ACCEPT, None, "ops-accept-1", now
+    )
+    second = coordinator.record_response(
+        proposal, "ops", ProposalResponseKind.ACCEPT, None, "ops-accept-1", now
+    )
 
     assert second == first
     assert len(coordinator.repository.list_proposal_responses(proposal.proposal_id)) == 1
@@ -296,11 +347,107 @@ def test_duplicate_response_is_idempotent(coordinator, mandate, report, now) -> 
 
 def test_final_acceptance_closes_the_persisted_proposal(coordinator, mandate, report, now) -> None:
     proposal = coordinator.create_proposal(mandate, report, round_number=1, now=now)
-    coordinator.record_response(proposal, "ops", ProposalResponseKind.ACCEPT, None, now)
-    coordinator.record_response(proposal, "people", ProposalResponseKind.ACCEPT, None, now)
+    coordinator.record_response(
+        proposal, "ops", ProposalResponseKind.ACCEPT, None, "ops-accept-1", now
+    )
+    coordinator.record_response(
+        proposal, "people", ProposalResponseKind.ACCEPT, None, "people-accept-1", now
+    )
 
     assert coordinator.evaluate_round(proposal) is NegotiationOutcome.ALIGNED
     assert coordinator.repository.get_active_proposal(mandate.mandate_id) is None
+
+
+def test_same_content_from_a_later_message_is_a_new_response(coordinator, mandate, report, now) -> None:
+    proposal = coordinator.create_proposal(mandate, report, round_number=1, now=now)
+    coordinator.record_response(
+        proposal, "ops", ProposalResponseKind.ACCEPT, None, "ops-accept-1", now
+    )
+    coordinator.record_response(
+        proposal, "ops", ProposalResponseKind.ACCEPT, None, "ops-accept-2", now
+    )
+
+    assert len(coordinator.repository.list_proposal_responses(proposal.proposal_id)) == 2
+
+
+def test_later_accept_closes_an_earlier_change_request(coordinator, mandate, report, now) -> None:
+    proposal = coordinator.create_proposal(mandate, report, round_number=1, now=now)
+    coordinator.record_response(
+        proposal, "ops", ProposalResponseKind.CHANGE, "Start Monday", "ops-01-change", now
+    )
+    coordinator.record_response(
+        proposal, "ops", ProposalResponseKind.ACCEPT, None, "ops-02-accept", now
+    )
+
+    assert coordinator.open_change_requests(proposal) == []
+
+
+def test_latest_response_wins_after_accept_reject_accept(
+    coordinator, mandate, report, now
+) -> None:
+    proposal = coordinator.create_proposal(mandate, report, round_number=1, now=now)
+    coordinator.record_response(
+        proposal, "ops", ProposalResponseKind.ACCEPT, None, "ops-01-accept", now
+    )
+    coordinator.record_response(
+        proposal, "ops", ProposalResponseKind.REJECT, None, "ops-02-reject", now
+    )
+    coordinator.record_response(
+        proposal, "ops", ProposalResponseKind.ACCEPT, None, "ops-03-accept", now
+    )
+    coordinator.record_response(
+        proposal, "people", ProposalResponseKind.ACCEPT, None, "people-01-accept", now
+    )
+
+    assert coordinator.evaluate_round(proposal) is NegotiationOutcome.ALIGNED
+
+
+def test_equal_timestamps_use_source_identity_for_stable_latest_response(
+    coordinator, mandate, report, now
+) -> None:
+    proposal = coordinator.create_proposal(mandate, report, round_number=1, now=now)
+    coordinator.record_response(
+        proposal, "ops", ProposalResponseKind.ACCEPT, None, "ops-01-accept", now
+    )
+    coordinator.record_response(
+        proposal, "ops", ProposalResponseKind.REJECT, None, "ops-02-reject", now
+    )
+    coordinator.record_response(
+        proposal, "people", ProposalResponseKind.ACCEPT, None, "people-01-accept", now
+    )
+
+    assert coordinator.evaluate_round(proposal) is NegotiationOutcome.NEXT_ROUND
+
+
+def test_expired_proposal_rejects_late_response(coordinator, mandate, report, now) -> None:
+    proposal = coordinator.create_proposal(mandate, report, round_number=1, now=now)
+
+    with pytest.raises(ValueError, match="expired"):
+        coordinator.record_response(
+            proposal,
+            "ops",
+            ProposalResponseKind.ACCEPT,
+            None,
+            "ops-late-accept",
+            now + timedelta(days=2),
+        )
+
+    assert coordinator.repository.list_proposal_responses(proposal.proposal_id) == []
+
+
+def test_terminal_proposal_rejects_response(coordinator, mandate, report, now) -> None:
+    proposal = coordinator.create_proposal(mandate, report, round_number=1, now=now)
+    coordinator.record_response(
+        proposal, "ops", ProposalResponseKind.ACCEPT, None, "ops-accept-1", now
+    )
+    coordinator.record_response(
+        proposal, "people", ProposalResponseKind.ACCEPT, None, "people-accept-1", now
+    )
+
+    with pytest.raises(ValueError, match="not awaiting"):
+        coordinator.record_response(
+            proposal, "ops", ProposalResponseKind.REJECT, None, "ops-late-reject", now
+        )
 
 
 def test_third_round_is_forbidden(coordinator, mandate, report, now) -> None:
@@ -321,16 +468,68 @@ def test_model_cannot_turn_unfinished_work_into_agreement(mandate, complete_assi
     assert report.agreements == []
 
 
-def test_model_proposal_cannot_claim_human_acceptance(repository, mandate, report, now) -> None:
+def test_model_issue_cannot_claim_authority(mandate, complete_assignments) -> None:
     class UntrustedClient:
         def complete_json(self, system: str, user: str) -> dict:
-            return {"proposal": "Everyone has accepted this proposal."}
+            return {
+                "issues": [
+                    {
+                        "issue_type": "agreement",
+                        "summary": "Everyone signed off and approved the plan.",
+                        "related_decision": "Launch date",
+                    }
+                ]
+            }
+
+    report = HybridAlignmentEngine(mandate.mandate_id, UntrustedClient()).analyze(
+        sample_plan(), [], complete_assignments
+    )
+
+    assert not any("signed off" in issue.summary for issue in report.issues)
+
+
+def test_model_can_add_nonblocking_advisory_issue(mandate, complete_assignments) -> None:
+    class AdvisoryClient:
+        def complete_json(self, system: str, user: str) -> dict:
+            return {
+                "issues": [
+                    {
+                        "issue_type": "agreement",
+                        "summary": "Clarify the deployment handoff.",
+                        "related_decision": "Launch date",
+                    }
+                ]
+            }
+
+    report = HybridAlignmentEngine(mandate.mandate_id, AdvisoryClient()).analyze(
+        sample_plan(), [], complete_assignments
+    )
+
+    assert any(issue.summary == "Clarify the deployment handoff." for issue in report.issues)
+    assert report.blocking_issue_count == 0
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "Everyone has accepted this proposal.",
+        "The leaders signed off on this plan.",
+        "This is the authorized consensus decision.",
+        "The plan is agreed, endorsed, committed, and confirmed.",
+    ],
+)
+def test_model_proposal_cannot_claim_human_authority(
+    repository, mandate, report, now, claim
+) -> None:
+    class UntrustedClient:
+        def complete_json(self, system: str, user: str) -> dict:
+            return {"proposal": claim}
 
     proposal = NegotiationCoordinator(repository, UntrustedClient()).create_proposal(
         mandate, report, round_number=1, now=now
     )
 
-    assert "Everyone has accepted" not in proposal.text
+    assert claim not in proposal.text
     assert "Reply ACCEPT" in proposal.text
 
 
