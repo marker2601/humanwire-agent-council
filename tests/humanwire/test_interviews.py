@@ -779,6 +779,76 @@ def test_second_initial_conversation_cannot_replace_the_bound_conversation(
     assert session.current_question_index == 1
 
 
+def test_initial_conversation_compare_and_set_allows_only_one_distinct_winner(
+    coordinator, repository, mandate, now
+) -> None:
+    repository.add_mandate(mandate)
+    assignment = _assignment(mandate)
+    repository.add_assignment(assignment)
+    coordinator.start_assignment(assignment, ["One?", "Two?"], now)
+    pending = repository.get_assignment(assignment.assignment_id)
+    assert pending is not None
+    assert pending.interview_id is not None
+
+    first = repository.bind_initial_interview_conversation(
+        pending.assignment_id,
+        pending.interview_id,
+        "email-priya",
+        "mail-priya",
+    )
+    second = repository.bind_initial_interview_conversation(
+        pending.assignment_id,
+        pending.interview_id,
+        "email-priya",
+        "competing-mail-thread",
+    )
+
+    session = repository.get_interview(pending.interview_id)
+    assert first is True
+    assert second is False
+    assert session is not None
+    assert session.current_conversation_id == "mail-priya"
+
+
+def test_losing_initial_conversation_cas_cannot_persist_answer_or_progress(
+    coordinator, repository, mandate, now
+) -> None:
+    repository.add_mandate(mandate)
+    assignment = _assignment(mandate)
+    repository.add_assignment(assignment)
+    coordinator.start_assignment(assignment, ["One?", "Two?"], now)
+    pending = repository.get_assignment(assignment.assignment_id)
+    assert pending is not None
+    assert pending.interview_id is not None
+    assert repository.bind_initial_interview_conversation(
+        pending.assignment_id,
+        pending.interview_id,
+        "email-priya",
+        "mail-priya",
+    )
+
+    result = coordinator.record_answer(
+        _message(
+            now,
+            text="Losing concurrent answer.",
+            channel=Channel.EMAIL,
+            sender="priya@example.test",
+            conversation="competing-mail-thread",
+        ),
+        pending,
+        now,
+    )
+
+    saved = repository.get_assignment(pending.assignment_id)
+    session = repository.get_interview(pending.interview_id)
+    assert result.deliveries == []
+    assert repository.list_evidence(mandate.mandate_id) == []
+    assert saved is not None
+    assert saved.state is StakeholderState.AWAITING_ACKNOWLEDGEMENT
+    assert session is not None
+    assert session.current_question_index == 0
+
+
 def test_completed_assignment_never_appears_in_due_work(repository, mandate, now) -> None:
     repository.add_mandate(mandate)
     assignment = _assignment(

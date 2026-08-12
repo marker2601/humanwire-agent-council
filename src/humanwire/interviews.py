@@ -248,9 +248,26 @@ class InterviewCoordinator:
             return WorkflowResult()
         session = self._session(saved)
         explicit_token = self._contains_token(message.text, self._token(saved))
+        initial_bind = self._can_bind_initial_conversation(session, saved, route, message)
+        if (
+            initial_bind
+            and saved.interview_id is not None
+            and not self.repository.bind_initial_interview_conversation(
+                saved.assignment_id,
+                saved.interview_id,
+                route.route_id,
+                message.conversation_id,
+            )
+        ):
+            saved = self.repository.get_assignment(saved.assignment_id)
+            if saved is None:
+                return WorkflowResult()
+            session = self._session(saved)
+            if not self._is_active_correlation(session, route, message):
+                return WorkflowResult()
         if (
             not self._is_active_correlation(session, route, message)
-            and not self._can_bind_initial_conversation(session, saved, route, message)
+            and not initial_bind
             and not explicit_token
         ):
             return WorkflowResult()

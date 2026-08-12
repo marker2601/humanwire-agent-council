@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -641,6 +641,40 @@ class SqlAlchemyHumanWireRepository:
         with self._session_factory() as session:
             record = session.get(InterviewSessionRecord, str(session_id))
             return _interview_value(record) if record else None
+
+    def bind_initial_interview_conversation(
+        self,
+        assignment_id: UUID,
+        session_id: UUID,
+        route_id: str,
+        conversation_id: str,
+    ) -> bool:
+        """Atomically bind one initial conversation without replacing an existing correlation."""
+        if not conversation_id.strip():
+            return False
+        initial_assignments = select(StakeholderAssignmentRecord.assignment_id).where(
+            StakeholderAssignmentRecord.assignment_id == str(assignment_id),
+            StakeholderAssignmentRecord.state.in_(
+                [
+                    StakeholderState.DELIVERED.value,
+                    StakeholderState.AWAITING_ACKNOWLEDGEMENT.value,
+                ]
+            ),
+        )
+        with self._session_factory() as session:
+            result = session.execute(
+                update(InterviewSessionRecord)
+                .where(
+                    InterviewSessionRecord.session_id == str(session_id),
+                    InterviewSessionRecord.assignment_id == str(assignment_id),
+                    InterviewSessionRecord.current_route_id == route_id,
+                    InterviewSessionRecord.current_conversation_id.is_(None),
+                    InterviewSessionRecord.assignment_id.in_(initial_assignments),
+                )
+                .values(current_conversation_id=conversation_id)
+            )
+            session.commit()
+            return result.rowcount == 1
 
     def find_active_interview(self, mandate_id: UUID, person_id: str) -> InterviewSession | None:
         with self._session_factory() as session:
