@@ -1079,6 +1079,77 @@ def test_mandate_coupled_assignment_cas_rejects_changed_authorization_contract(
     assert repository.get_assignment(assignment.assignment_id) == changed
 
 
+@pytest.mark.parametrize(
+    ("state", "expires_delta", "expected_guarded"),
+    [
+        (MandateState.SCHEDULING, timedelta(seconds=1), True),
+        (MandateState.CANCELLED, timedelta(seconds=1), False),
+        (MandateState.SCHEDULING, timedelta(0), False),
+    ],
+)
+def test_mandate_state_guard_requires_scheduling_and_unexpired_deadline(
+    repository,
+    make_mandate,
+    now,
+    state,
+    expires_delta,
+    expected_guarded,
+) -> None:
+    mandate = make_mandate(state=state, expires_at=now + expires_delta)
+    repository.add_mandate(mandate)
+
+    with repository.transaction() as unit:
+        guarded = unit.guard_mandate_state_if_unexpired(
+            mandate.mandate_id,
+            MandateState.SCHEDULING,
+            now,
+        )
+
+    assert guarded is expected_guarded
+    assert repository.get_mandate_by_token(mandate.token) == mandate
+
+
+@pytest.mark.parametrize("persisted_change", ["cancelled", "expired", "refreshed"])
+def test_mandate_cas_rejects_changed_or_expired_scheduling_snapshot(
+    repository,
+    make_mandate,
+    now,
+    persisted_change,
+) -> None:
+    expected = make_mandate(state=MandateState.SCHEDULING)
+    updated = expected.model_copy(
+        update={
+            "state": MandateState.MEETING_READY,
+            "updated_at": now + timedelta(seconds=2),
+        }
+    )
+    persisted_updates = {
+        "cancelled": {
+            "state": MandateState.CANCELLED,
+            "updated_at": now + timedelta(seconds=1),
+            "completed_at": now + timedelta(seconds=1),
+        },
+        "expired": {
+            "expires_at": now,
+            "updated_at": now + timedelta(seconds=1),
+        },
+        "refreshed": {"updated_at": now + timedelta(seconds=1)},
+    }
+    persisted = expected.model_copy(update=persisted_updates[persisted_change])
+    repository.add_mandate(expected)
+    repository.save_mandate(persisted)
+
+    with repository.transaction() as unit:
+        saved = unit.compare_and_save_mandate_if_unexpired(
+            expected,
+            updated,
+            now,
+        )
+
+    assert saved is False
+    assert repository.get_mandate_by_token(expected.token) == persisted
+
+
 def test_review_append_event_once_treats_exact_duplicate_as_inert(
     tmp_path, sample_mandate, now
 ) -> None:

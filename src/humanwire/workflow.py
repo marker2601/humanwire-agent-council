@@ -475,6 +475,12 @@ class HumanWireWorkflow:
         )
         try:
             with self.repository.transaction() as unit:
+                if not unit.guard_mandate_state_if_unexpired(
+                    mandate.mandate_id,
+                    MandateState.SCHEDULING,
+                    message.received_at,
+                ):
+                    raise ValueError("mandate is no longer schedulable")
                 if not unit.append_event_once(mandate.mandate_id, event):
                     return WorkflowResult()
                 unit.set_runtime_status(
@@ -512,11 +518,19 @@ class HumanWireWorkflow:
             return WorkflowResult()
         package = coordinator.build_package(mandate.plan, report, assignments, mandate.initiator_id, shareable_evidence(self.repository.list_evidence(mandate.mandate_id)), proposed_slot=slot, created_at=now)
         ready = MandateStateMachine().transition(mandate, MandateState.MEETING_READY, "verified_availability", now)
-        with self.repository.transaction() as unit:
-            unit.save_meeting_package(package)
-            unit.save_mandate(ready)
-            unit.append_event(mandate.mandate_id, _event("meeting.package_created", now, f"meeting:{package.meeting_id}", actor_id=mandate.initiator_id, metadata={"meeting_id": str(package.meeting_id)}))
-            unit.append_event(mandate.mandate_id, _event("mandate.meeting_ready", now, f"meeting-ready:{package.meeting_id}", actor_id=mandate.initiator_id, previous_state="scheduling", new_state="meeting_ready"))
+        try:
+            with self.repository.transaction() as unit:
+                if not unit.compare_and_save_mandate_if_unexpired(
+                    mandate,
+                    ready,
+                    now,
+                ):
+                    raise ValueError("mandate scheduling snapshot changed")
+                unit.save_meeting_package(package)
+                unit.append_event(mandate.mandate_id, _event("meeting.package_created", now, f"meeting:{package.meeting_id}", actor_id=mandate.initiator_id, metadata={"meeting_id": str(package.meeting_id)}))
+                unit.append_event(mandate.mandate_id, _event("mandate.meeting_ready", now, f"meeting-ready:{package.meeting_id}", actor_id=mandate.initiator_id, previous_state="scheduling", new_state="meeting_ready"))
+        except ValueError:
+            return WorkflowResult()
         return WorkflowResult(deliveries=self.synthesis._route_deliveries(
             package.required_attendee_ids,
             render_meeting_confirmation(mandate.token, package, coordinator=coordinator),

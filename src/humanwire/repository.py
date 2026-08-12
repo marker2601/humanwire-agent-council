@@ -574,6 +574,57 @@ class RepositoryUnitOfWork:
             raise KeyError(str(mandate.mandate_id))
         _copy_columns(_mandate_record(mandate), record, {"mandate_id"})
 
+    def guard_mandate_state_if_unexpired(
+        self,
+        mandate_id: UUID,
+        expected_state: MandateState,
+        now: datetime,
+    ) -> bool:
+        """Acquire the write turn only while a mandate remains in the expected state."""
+        result = self._session.execute(
+            update(MandateRecord)
+            .where(
+                MandateRecord.mandate_id == str(mandate_id),
+                MandateRecord.state == expected_state.value,
+                MandateRecord.expires_at > now,
+            )
+            .values(state=expected_state.value)
+            .execution_options(synchronize_session=False)
+        )
+        return result.rowcount == 1
+
+    def compare_and_save_mandate_if_unexpired(
+        self,
+        expected: Mandate,
+        updated: Mandate,
+        now: datetime,
+    ) -> bool:
+        """Save one mandate while its persisted lifecycle snapshot is exact and live."""
+        if expected.mandate_id != updated.mandate_id:
+            raise ValueError("mandate compare-and-save requires one mandate")
+        replacement = _mandate_record(updated)
+        values = {
+            column.key: getattr(replacement, column.key)
+            for column in replacement.__table__.columns
+            if column.key != "mandate_id"
+        }
+        result = self._session.execute(
+            update(MandateRecord)
+            .where(
+                MandateRecord.mandate_id == str(expected.mandate_id),
+                MandateRecord.state == expected.state.value,
+                MandateRecord.reason == expected.reason,
+                MandateRecord.next_action_at == expected.next_action_at,
+                MandateRecord.updated_at == expected.updated_at,
+                MandateRecord.expires_at == expected.expires_at,
+                MandateRecord.completed_at == expected.completed_at,
+                MandateRecord.expires_at > now,
+            )
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        return result.rowcount == 1
+
     def add_assignment(self, assignment: StakeholderAssignment) -> None:
         self._session.add(_assignment_record(assignment))
 

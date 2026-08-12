@@ -1704,6 +1704,133 @@ def test_file_scheduling_concurrent_conflicting_replay_preserves_first_windows(
     assert recorded[0].metadata == {"attempt_count": 1}
 
 
+@pytest.mark.parametrize("terminal_state", [MandateState.CANCELLED, MandateState.EXPIRED])
+@pytest.mark.parametrize("boundary", ["before_input", "before_package"])
+def test_file_final_scheduling_availability_cannot_resurrect_terminal_mandate(
+    tmp_path,
+    incoming_message_factory,
+    monkeypatch,
+    terminal_state,
+    boundary,
+) -> None:
+    database_path = tmp_path / f"scheduling-{terminal_state.value}-{boundary}.sqlite3"
+    factory = create_session_factory(f"sqlite:///{database_path.as_posix()}")
+    with factory.kw["bind"].begin() as connection:
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        connection.exec_driver_sql("PRAGMA busy_timeout=5000")
+    repository = SqlAlchemyHumanWireRepository(factory)
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _create_mandate(
+        workflow,
+        incoming_message_factory,
+        message_id=f"scheduling-terminal-{terminal_state.value}-{boundary}-create",
+    )
+    _move_to_scheduling(repository, mandate)
+    window = "2026-08-12T15:00:00+00:00/2026-08-12T16:00:00+00:00"
+    manager_message = _message_for(
+        incoming_message_factory,
+        "manager",
+        f"AVAILABLE {mandate.token} {window}",
+        message_id=f"scheduling-terminal-{terminal_state.value}-{boundary}-manager",
+    )
+    assert workflow.handle(manager_message) == WorkflowResult()
+
+    final_message = _message_for(
+        incoming_message_factory,
+        "team-lead",
+        f"AVAILABLE {mandate.token} {window}",
+        message_id=f"scheduling-terminal-{terminal_state.value}-{boundary}-lead",
+        conversation_id="lead-thread",
+    )
+    original_transaction = repository.transaction
+    response_at_boundary = threading.Event()
+    input_committed = threading.Event()
+    terminal_committed = threading.Event()
+    role = threading.local()
+
+    @contextmanager
+    def terminal_first_transaction():
+        if getattr(role, "name", None) != "response":
+            with original_transaction() as unit:
+                yield unit
+            return
+
+        transaction_number = getattr(role, "transaction_number", 0) + 1
+        role.transaction_number = transaction_number
+        target_transaction = 1 if boundary == "before_input" else 2
+        if transaction_number == target_transaction:
+            if boundary == "before_package":
+                assert input_committed.is_set()
+            response_at_boundary.set()
+            assert terminal_committed.wait(timeout=5)
+        with original_transaction() as unit:
+            yield unit
+        if boundary == "before_package" and transaction_number == 1:
+            input_committed.set()
+
+    monkeypatch.setattr(repository, "transaction", terminal_first_transaction)
+
+    def record_final_availability():
+        role.name = "response"
+        return workflow.handle(final_message)
+
+    def commit_terminal_state():
+        assert response_at_boundary.wait(timeout=5)
+        current = repository.get_mandate_by_token(mandate.token)
+        assert current is not None
+        updates = {
+            "state": terminal_state,
+            "updated_at": final_message.received_at + timedelta(seconds=1),
+            "completed_at": final_message.received_at + timedelta(seconds=1),
+        }
+        if terminal_state is MandateState.EXPIRED:
+            updates["expires_at"] = final_message.received_at
+        with original_transaction() as unit:
+            unit.save_mandate(current.model_copy(update=updates))
+        terminal_committed.set()
+
+    with ThreadPoolExecutor(
+        max_workers=2,
+        thread_name_prefix=f"scheduling-terminal-{boundary}",
+    ) as executor:
+        response_future = executor.submit(record_final_availability)
+        terminal_future = executor.submit(commit_terminal_state)
+        result = response_future.result(timeout=10)
+        terminal_future.result(timeout=10)
+
+    saved = repository.get_mandate_by_token(mandate.token)
+    events = repository.list_events(mandate.mandate_id)
+    lead_input_events = [
+        event
+        for event in events
+        if event.event_type == "availability.recorded"
+        and event.actor_id == "team-lead"
+    ]
+    lead_status = repository.get_runtime_status(
+        f"availability:{mandate.mandate_id}:team-lead"
+    )
+    assert result == WorkflowResult()
+    assert saved is not None and saved.state is terminal_state
+    assert repository.get_meeting_package(mandate.mandate_id) is None
+    assert not {
+        "meeting.package_created",
+        "mandate.meeting_ready",
+    }.intersection(event.event_type for event in events)
+    if boundary == "before_input":
+        assert lead_status is None
+        assert lead_input_events == []
+    else:
+        assert lead_status is not None and lead_status[0] == window
+        assert len(lead_input_events) == 1
+
+    before_replay = _terminal_snapshot(repository, mandate)
+    replay = workflow.handle(final_message)
+
+    assert replay == WorkflowResult()
+    assert repository.get_meeting_package(mandate.mandate_id) is None
+    assert _terminal_snapshot(repository, mandate) == before_replay
+
+
 def test_scheduling_availability_identity_includes_channel_connection_and_message(
     repository, incoming_message_factory
 ) -> None:
