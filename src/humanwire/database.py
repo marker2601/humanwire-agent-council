@@ -165,8 +165,12 @@ class ProposalRecord(Base):
 
 class ProposalResponseRecord(Base):
     __tablename__ = "hw_proposal_responses"
+    __table_args__ = (
+        Index("uq_hw_proposal_response_source", "proposal_id", "source_message_id", unique=True),
+    )
 
-    response_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    receipt_order: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    response_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
     proposal_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("hw_proposals.proposal_id"), index=True
     )

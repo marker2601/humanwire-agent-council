@@ -407,16 +407,61 @@ def test_equal_timestamps_use_source_identity_for_stable_latest_response(
 ) -> None:
     proposal = coordinator.create_proposal(mandate, report, round_number=1, now=now)
     coordinator.record_response(
-        proposal, "ops", ProposalResponseKind.ACCEPT, None, "ops-01-accept", now
+        proposal, "ops", ProposalResponseKind.ACCEPT, None, "z-first-accept", now
     )
     coordinator.record_response(
-        proposal, "ops", ProposalResponseKind.REJECT, None, "ops-02-reject", now
+        proposal, "ops", ProposalResponseKind.REJECT, None, "a-second-reject", now
     )
     coordinator.record_response(
         proposal, "people", ProposalResponseKind.ACCEPT, None, "people-01-accept", now
     )
 
+    assert [
+        response.source_message_id
+        for response in coordinator.repository.list_proposal_responses(proposal.proposal_id)
+    ] == ["z-first-accept", "a-second-reject", "people-01-accept"]
     assert coordinator.evaluate_round(proposal) is NegotiationOutcome.NEXT_ROUND
+
+
+def test_same_source_replay_after_alignment_returns_original_response(
+    coordinator, mandate, report, now
+) -> None:
+    proposal = coordinator.create_proposal(mandate, report, round_number=1, now=now)
+    original = coordinator.record_response(
+        proposal, "ops", ProposalResponseKind.ACCEPT, None, "ops-accept-1", now
+    )
+    coordinator.record_response(
+        proposal, "people", ProposalResponseKind.ACCEPT, None, "people-accept-1", now
+    )
+
+    replay = coordinator.record_response(
+        proposal, "ops", ProposalResponseKind.REJECT, None, "ops-accept-1", now + timedelta(hours=1)
+    )
+
+    assert replay == original
+    assert coordinator.evaluate_round(proposal) is NegotiationOutcome.ALIGNED
+    assert len(coordinator.repository.list_proposal_responses(proposal.proposal_id)) == 2
+
+
+def test_same_source_replay_after_expiry_returns_original_response(
+    coordinator, mandate, report, now
+) -> None:
+    proposal = coordinator.create_proposal(mandate, report, round_number=1, now=now)
+    original = coordinator.record_response(
+        proposal, "ops", ProposalResponseKind.ACCEPT, None, "ops-accept-1", now
+    )
+
+    replay = coordinator.record_response(
+        proposal,
+        "ops",
+        ProposalResponseKind.REJECT,
+        None,
+        "ops-accept-1",
+        now + timedelta(days=2),
+    )
+
+    assert replay == original
+    assert len(coordinator.repository.list_proposal_responses(proposal.proposal_id)) == 1
 
 
 def test_expired_proposal_rejects_late_response(coordinator, mandate, report, now) -> None:
@@ -495,7 +540,6 @@ def test_model_can_add_nonblocking_advisory_issue(mandate, complete_assignments)
                 "issues": [
                     {
                         "issue_type": "agreement",
-                        "summary": "Clarify the deployment handoff.",
                         "related_decision": "Launch date",
                     }
                 ]
@@ -505,7 +549,8 @@ def test_model_can_add_nonblocking_advisory_issue(mandate, complete_assignments)
         sample_plan(), [], complete_assignments
     )
 
-    assert any(issue.summary == "Clarify the deployment handoff." for issue in report.issues)
+    assert all("Clarify the deployment handoff." not in issue.summary for issue in report.issues)
+    assert any(issue.summary == "An advisory human review item was identified." for issue in report.issues)
     assert report.blocking_issue_count == 0
 
 
@@ -516,6 +561,8 @@ def test_model_can_add_nonblocking_advisory_issue(mandate, complete_assignments)
         "The leaders signed off on this plan.",
         "This is the authorized consensus decision.",
         "The plan is agreed, endorsed, committed, and confirmed.",
+        "This received a unanimous green-light and was ratified.",
+        "The unlisted phrase of authority is florp-certified.",
     ],
 )
 def test_model_proposal_cannot_claim_human_authority(

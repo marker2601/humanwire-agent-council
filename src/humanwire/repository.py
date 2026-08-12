@@ -547,7 +547,7 @@ class RepositoryUnitOfWork:
         records = self._session.scalars(
             select(ProposalResponseRecord)
             .where(ProposalResponseRecord.proposal_id == str(proposal_id))
-            .order_by(ProposalResponseRecord.created_at, ProposalResponseRecord.response_id)
+            .order_by(ProposalResponseRecord.receipt_order)
         ).all()
         return [_response_value(record) for record in records]
 
@@ -770,7 +770,7 @@ class SqlAlchemyHumanWireRepository:
             records = session.scalars(
                 select(ProposalResponseRecord)
                 .where(ProposalResponseRecord.proposal_id == str(proposal_id))
-                .order_by(ProposalResponseRecord.created_at, ProposalResponseRecord.response_id)
+                .order_by(ProposalResponseRecord.receipt_order)
             ).all()
             return [_response_value(record) for record in records]
 

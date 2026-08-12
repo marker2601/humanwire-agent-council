@@ -33,12 +33,6 @@ from humanwire.model_client import JsonModelClient, ModelFailure
 from humanwire.repository import SqlAlchemyHumanWireRepository
 
 _HARD_CONSTRAINT = re.compile(r"\b(?:must|cannot|requires?|blocked)\b", re.IGNORECASE)
-_AUTHORITY_CLAIM = re.compile(
-    r"\b(?:accept(?:ed|ance)?|approv(?:e|ed|al)|align(?:ed|ment)?|agreed?|"
-    r"sign(?:ed)?\s+off|authori[sz](?:e|ed|ation)|consensus|endors(?:e|d|ement)|"
-    r"commit(?:ted|ment)?|confirm(?:ed|ation)?)\b",
-    re.IGNORECASE,
-)
 _DAY = re.compile(
     r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", re.IGNORECASE
 )
@@ -366,7 +360,6 @@ class _ModelIssue(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     issue_type: AlignmentIssueType
-    summary: str = Field(min_length=1, max_length=300)
     related_decision: str | None = Field(default=None, max_length=240)
 
 
@@ -420,13 +413,12 @@ Your output is advisory only and cannot resolve any issue."""
         safe_issues = [
             self._issue(
                 issue.issue_type,
-                issue.summary,
+                "An advisory human review item was identified.",
                 related_decision=issue.related_decision,
                 blocking=False,
             )
             for issue in suggestion.issues
             if (issue.related_decision is None or issue.related_decision in plan.required_decisions)
-            and not _AUTHORITY_CLAIM.search(issue.summary)
         ]
         return report.model_copy(update={"issues": [*report.issues, *safe_issues]})
 
@@ -441,18 +433,8 @@ Your output is advisory only and cannot resolve any issue."""
         )
 
 
-class _ModelProposal(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
-
-    proposal: str = Field(min_length=1, max_length=_MAX_PROPOSAL_TEXT)
-
-
 class NegotiationCoordinator:
     """Persists a maximum of two explicit, authenticated human response rounds."""
-
-    _SYSTEM_PROMPT = """Draft a concise proposal based only on the supplied safe issue summaries.
-Return exactly {"proposal": string}. The proposal must be no more than 600 characters.
-Do not claim anyone accepted, approved, has authority, or changed system state."""
 
     def __init__(
         self,
@@ -506,24 +488,24 @@ Do not claim anyone accepted, approved, has authority, or changed system state."
         persisted = self.repository.get_proposal(proposal.proposal_id)
         if persisted is None:
             raise KeyError(str(proposal.proposal_id))
+        if not source_message_id.strip():
+            raise ValueError("source_message_id is required")
+        key = self._response_key(persisted.proposal_id, source_message_id)
+        existing = self._response_with_key(persisted.proposal_id, key)
+        if existing is not None:
+            return existing
         if persisted.state is not ProposalState.AWAITING_RESPONSES:
             raise ValueError("proposal is not awaiting responses")
         if now >= persisted.expires_at:
             raise ValueError("proposal has expired")
         if stakeholder_id not in persisted.required_respondent_ids:
             raise ValueError("stakeholder is not a required proposal respondent")
-        if not source_message_id.strip():
-            raise ValueError("source_message_id is required")
         cleaned_change = change_text.strip() if change_text else None
         if kind is ProposalResponseKind.CHANGE and not cleaned_change:
             raise ValueError("CHANGE requires requested change text")
         if kind is not ProposalResponseKind.CHANGE:
             cleaned_change = None
         proposal = persisted
-        key = self._response_key(proposal.proposal_id, source_message_id)
-        existing = self._response_with_key(proposal.proposal_id, key)
-        if existing is not None:
-            return existing
         response = ProposalResponse(
             response_id=uuid4(),
             proposal_id=proposal.proposal_id,
@@ -539,16 +521,16 @@ Do not claim anyone accepted, approved, has authority, or changed system state."
                 persisted_in_transaction = unit.get_proposal(proposal.proposal_id)
                 if persisted_in_transaction is None:
                     raise KeyError(str(proposal.proposal_id))
-                if persisted_in_transaction.state is not ProposalState.AWAITING_RESPONSES:
-                    raise ValueError("proposal is not awaiting responses")
-                if now >= persisted_in_transaction.expires_at:
-                    raise ValueError("proposal has expired")
                 existing_in_transaction = unit.list_proposal_responses(proposal.proposal_id)
                 duplicate = next(
                     (item for item in existing_in_transaction if item.idempotency_key == key), None
                 )
                 if duplicate is not None:
                     return duplicate
+                if persisted_in_transaction.state is not ProposalState.AWAITING_RESPONSES:
+                    raise ValueError("proposal is not awaiting responses")
+                if now >= persisted_in_transaction.expires_at:
+                    raise ValueError("proposal has expired")
                 unit.add_proposal_response(response)
                 all_responses = unit.list_proposal_responses(proposal.proposal_id)
                 respondents = {item.stakeholder_id for item in all_responses}
@@ -596,24 +578,7 @@ Do not claim anyone accepted, approved, has authority, or changed system state."
         ]
 
     def _draft_text(self, report: AlignmentReport) -> str:
-        body = self._fallback_draft(report)
-        if self._client is not None:
-            try:
-                payload = {
-                    "issues": [
-                        {"summary": issue.summary, "related_decision": issue.related_decision}
-                        for issue in report.issues
-                    ],
-                    "private_blocker_count": report.private_blocker_count,
-                }
-                candidate = _ModelProposal.model_validate(
-                    self._client.complete_json(self._SYSTEM_PROMPT, json.dumps(payload, separators=(",", ":")))
-                ).proposal.strip()
-                if candidate and not _AUTHORITY_CLAIM.search(candidate):
-                    body = candidate
-            except (ModelFailure, TypeError, ValueError, ValidationError):
-                pass
-        return (_DRAFT_PREFIX + body)[:_MAX_PROPOSAL_TEXT]
+        return (_DRAFT_PREFIX + self._fallback_draft(report))[:_MAX_PROPOSAL_TEXT]
 
     @staticmethod
     def _fallback_draft(report: AlignmentReport) -> str:
@@ -643,7 +608,7 @@ Do not claim anyone accepted, approved, has authority, or changed system state."
     def _latest_responses(responses: list[ProposalResponse]) -> dict[str, ProposalResponse]:
         return {
             response.stakeholder_id: response
-            for response in sorted(responses, key=lambda item: (item.created_at, item.source_message_id))
+            for response in responses
         }
 
     def _response_with_key(self, proposal_id: UUID, key: str) -> ProposalResponse | None:
