@@ -411,6 +411,8 @@ Connects email and Telegram once, normalizes messages, invokes the single applic
 
 Deterministically handles `/mandate`, `/status`, `/cancel`, acknowledgement, interview replies, availability replies, and proposal responses before model invocation. It correlates replies using sender metadata, conversation context, and a case token.
 
+Approved correlation amendment (2026-08-11): when a terminal interview and a newer active interview share the same conversation, tokenless free text may advance the newer interview only if that newer interview was already acknowledged on that exact conversation. Otherwise HumanWire must request `ACK <token>` and persist no answer, evidence, event, or state change. Explicit authenticated token selection continues to support cross-channel continuation.
+
 ### Organization directory
 
 Stores people, roles, departments, reporting relationships, aliases, timezones, and registered contact routes. The competition build uses seeded configuration plus persisted route state. The model cannot create destinations.

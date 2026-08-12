@@ -1462,6 +1462,8 @@ If planning needs clarification, reply with safe names and create no mandate. If
 
 Route case commands before free text. For free text, find exactly one active interview for the registered sender and conversation; zero matches returns usage help and more than one match asks for `ACK <token>`. Proposal and availability responses require both token match and assigned person match. Only the original authorized initiator may cancel.
 
+**Approved amendment (2026-08-11):** terminal interview history on the same conversation makes tokenless correlation ambiguous. A newer active interview may accept tokenless free text only after it has been acknowledged on that exact conversation. Until then, return a safe `ACK <token>` selection prompt and make no durable mutation. A valid explicit token may select the intended active interview and preserve authenticated cross-channel continuation.
+
 - [ ] **Step 6: Implement automatic synthesis gates**
 
 After each completed assignment, check whether all required assignments are terminal. Transition to `SYNTHESIZING`, run alignment, and then:
