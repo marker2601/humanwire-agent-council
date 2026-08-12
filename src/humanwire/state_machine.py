@@ -113,6 +113,7 @@ ASSIGNMENT_TRANSITIONS: dict[StakeholderState, frozenset[StakeholderState]] = {
     StakeholderState.DELIVERED: frozenset(
         {
             StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+            StakeholderState.ALTERNATE_CHANNEL,
             StakeholderState.COMPLETE,
             StakeholderState.DELIVERY_FAILED,
         }
@@ -147,6 +148,7 @@ ASSIGNMENT_TRANSITIONS: dict[StakeholderState, frozenset[StakeholderState]] = {
     ),
     StakeholderState.ALTERNATE_CHANNEL: frozenset(
         {
+            StakeholderState.DELIVERED,
             StakeholderState.AWAITING_ACKNOWLEDGEMENT,
             StakeholderState.UNREACHABLE,
             StakeholderState.DELIVERY_FAILED,

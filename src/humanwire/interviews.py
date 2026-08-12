@@ -136,7 +136,13 @@ class InterviewCoordinator:
         )
         delivery = self._route_delivery(
             route,
-            render_interview_intro(token, summary, assignment.reason, len(bounded_questions)),
+            render_interview_intro(
+                token,
+                summary,
+                assignment.reason,
+                len(bounded_questions),
+                assignment.engagement_type,
+            ),
             updated,
         )
         return updated, active_session, event, delivery
@@ -194,7 +200,11 @@ class InterviewCoordinator:
                     self._route_delivery(
                         route,
                         render_interview_intro(
-                            self._token(saved), self._summary(saved), saved.reason, len(session.questions)
+                            self._token(saved),
+                            self._summary(saved),
+                            saved.reason,
+                            len(session.questions),
+                            saved.engagement_type,
                         ),
                         saved,
                     )
@@ -214,7 +224,13 @@ class InterviewCoordinator:
             route = routes[min(saved.active_route_index, len(routes) - 1)]
             self._save_assignment_event(updated, saved, "outreach.reminder_sent", now, {"attempt": 1})
             return WorkflowResult(
-                deliveries=[self._route_delivery(route, render_reminder(self._token(saved)), saved)]
+                deliveries=[
+                    self._route_delivery(
+                        route,
+                        render_reminder(self._token(saved), saved.engagement_type),
+                        saved,
+                    )
+                ]
             )
 
         if saved.attempt_count == 2:
@@ -257,7 +273,11 @@ class InterviewCoordinator:
                     self._route_delivery(
                         route,
                         render_channel_switch(
-                            self._token(saved), self._summary(saved), saved.reason, len(session.questions)
+                            self._token(saved),
+                            self._summary(saved),
+                            saved.reason,
+                            len(session.questions),
+                            saved.engagement_type,
                         ),
                         saved,
                     )
@@ -458,7 +478,9 @@ class InterviewCoordinator:
         assignment = self.repository.get_assignment(assignment_id)
         if assignment is None:
             raise KeyError(str(assignment_id))
-        key = f"delivery:{assignment_id}:success:{delivery_id}"
+        if assignment.state in ASSIGNMENT_TERMINAL_STATES:
+            return
+        key = f"delivery:{assignment_id}:result:{delivery_id}"
         if any(event.idempotency_key == key for event in self.repository.list_events(assignment.mandate_id)):
             return
         event = self._event(
@@ -467,7 +489,7 @@ class InterviewCoordinator:
             assignment,
             now,
             key,
-            {},
+            {"outcome": "success"},
         )
         with self.repository.transaction() as unit:
             unit.append_event(assignment.mandate_id, event)
@@ -479,7 +501,7 @@ class InterviewCoordinator:
         assignment = self.repository.get_assignment(assignment_id)
         if assignment is None:
             raise KeyError(str(assignment_id))
-        key = f"delivery:{assignment_id}:failure:{delivery_id}"
+        key = f"delivery:{assignment_id}:result:{delivery_id}"
         if any(event.idempotency_key == key for event in self.repository.list_events(assignment.mandate_id)):
             return WorkflowResult()
         if assignment.state in ASSIGNMENT_TERMINAL_STATES:
@@ -490,7 +512,7 @@ class InterviewCoordinator:
             assignment,
             now,
             key,
-            {"message_id": delivery_id},
+            {"message_id": delivery_id, "outcome": "failure"},
         )
         routes = self._assignment_routes(assignment)
         next_index = assignment.active_route_index + 1
@@ -532,6 +554,7 @@ class InterviewCoordinator:
                             self._summary(assignment),
                             assignment.reason,
                             len(session.questions),
+                            assignment.engagement_type,
                         ),
                         alternate,
                     )
@@ -699,7 +722,12 @@ class InterviewCoordinator:
         return [
             self._route_delivery(
                 owner_route,
-                render_unreachable_notice(mandate.token, stakeholder.display_name),
+                render_unreachable_notice(
+                    mandate.token,
+                    stakeholder.display_name,
+                    assignment.engagement_type,
+                    delivery_failed=assignment.state is StakeholderState.DELIVERY_FAILED,
+                ),
                 assignment,
             )
         ]

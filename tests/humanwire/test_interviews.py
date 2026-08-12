@@ -10,6 +10,7 @@ from humanwire.domain import (
     Channel,
     ContactRoute,
     Direction,
+    EngagementType,
     IncomingMessage,
     InterviewSession,
     Mandate,
@@ -860,3 +861,25 @@ def test_completed_assignment_never_appears_in_due_work(repository, mandate, now
     repository.add_assignment(assignment)
 
     assert assignment.assignment_id not in {item.assignment_id for item in repository.list_due_assignments(now)}
+
+
+def test_quick_response_engine_copy_never_calls_the_engagement_an_interview(
+    coordinator, repository, mandate, now
+) -> None:
+    repository.add_mandate(mandate)
+    assignment = _assignment(
+        mandate,
+        engagement_type=EngagementType.QUICK_RESPONSE,
+        response_required=True,
+    )
+    repository.add_assignment(assignment)
+
+    intro = coordinator.start_assignment(assignment, ["Committed date?"], now)
+    pending = repository.get_assignment(assignment.assignment_id)
+    assert pending is not None
+    reminder = coordinator.process_due_assignment(pending, now + timedelta(seconds=60))
+
+    assert intro.deliveries[0].text.startswith("HUMANWIRE QUICK RESPONSE")
+    assert reminder.deliveries[0].text.startswith("HUMANWIRE QUICK RESPONSE")
+    assert "interview" not in intro.deliveries[0].text.lower()
+    assert "interview" not in reminder.deliveries[0].text.lower()

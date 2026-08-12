@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from humanwire.domain import MeetingPackage, Proposal
+from humanwire.domain import EngagementType, MeetingPackage, Proposal
 from humanwire.evidence import ShareableEvidence
 from humanwire.redaction import redact_sensitive
 
@@ -14,17 +14,58 @@ if TYPE_CHECKING:
     from humanwire.meetings import MeetingCoordinator
 
 
-def render_interview_intro(
-    token: str, mandate_summary: str, reason: str, question_count: int
-) -> str:
+def render_inform_update(token: str, mandate_summary: str, reason: str) -> str:
     return (
-        f"HUMANWIRE INTERVIEW · {token}\n\n"
+        f"HUMANWIRE UPDATE · {token}\n\n"
         f"Mandate: {mandate_summary}\n"
         f"Why you were contacted: {reason}\n"
-        f"This interview has {question_count} question{'s' if question_count != 1 else ''}.\n\n"
+        "This is a registered update; no response requested."
+    )
+
+
+def render_acknowledgement_intro(token: str, mandate_summary: str, reason: str) -> str:
+    return (
+        f"HUMANWIRE ACKNOWLEDGEMENT · {token}\n\n"
+        f"Mandate: {mandate_summary}\n"
+        f"Why you were contacted: {reason}\n\n"
+        f"Reply ACK {token}."
+    )
+
+
+def render_response_intro(
+    token: str,
+    mandate_summary: str,
+    reason: str,
+    question_count: int,
+    engagement_type: EngagementType,
+) -> str:
+    quick = engagement_type is EngagementType.QUICK_RESPONSE
+    heading = "HUMANWIRE QUICK RESPONSE" if quick else "HUMANWIRE INTERVIEW"
+    label = "quick response" if quick else "interview"
+    return (
+        f"{heading} · {token}\n\n"
+        f"Mandate: {mandate_summary}\n"
+        f"Why you were contacted: {reason}\n"
+        f"This {label} has {question_count} question{'s' if question_count != 1 else ''}.\n\n"
         "Reply normally. Prefix an answer with SHAREABLE, ANONYMOUS, or PRIVATE to choose "
         "how that answer may be used.\n\n"
         f"Reply ACK {token} to begin."
+    )
+
+
+def render_interview_intro(
+    token: str,
+    mandate_summary: str,
+    reason: str,
+    question_count: int,
+    engagement_type: EngagementType = EngagementType.STRUCTURED_INTERVIEW,
+) -> str:
+    return render_response_intro(
+        token,
+        mandate_summary,
+        reason,
+        question_count,
+        engagement_type,
     )
 
 
@@ -32,32 +73,72 @@ def render_question(question: str, index: int, total: int) -> str:
     return f"Question {index} of {total}:\n{question}"
 
 
-def render_reminder(token: str) -> str:
+def render_reminder(
+    token: str,
+    engagement_type: EngagementType = EngagementType.STRUCTURED_INTERVIEW,
+) -> str:
+    if engagement_type is EngagementType.ACKNOWLEDGE:
+        return (
+            f"HUMANWIRE ACKNOWLEDGEMENT · {token}\n\n"
+            f"Please record the required acknowledgement: Reply ACK {token}."
+        )
+    quick = engagement_type is EngagementType.QUICK_RESPONSE
+    heading = "HUMANWIRE QUICK RESPONSE" if quick else "HUMANWIRE INTERVIEW"
+    label = "quick response" if quick else "interview"
     return (
-        f"HUMANWIRE INTERVIEW · {token}\n\n"
-        f"Please acknowledge this interview when ready: ACK {token}."
+        f"{heading} · {token}\n\n"
+        f"Please acknowledge this {label} when ready: ACK {token}."
     )
 
 
-def render_channel_switch(token: str, mandate_summary: str, reason: str, question_count: int) -> str:
+def render_channel_switch(
+    token: str,
+    mandate_summary: str,
+    reason: str,
+    question_count: int,
+    engagement_type: EngagementType = EngagementType.STRUCTURED_INTERVIEW,
+) -> str:
+    del mandate_summary, reason, question_count
+    if engagement_type is EngagementType.INFORM:
+        return (
+            f"HUMANWIRE UPDATE · {token}\n\n"
+            "The prior registered route did not receive confirmed delivery. "
+            "This update is being delivered here; no response requested."
+        )
+    if engagement_type is EngagementType.ACKNOWLEDGE:
+        return (
+            f"HUMANWIRE ACKNOWLEDGEMENT · {token}\n\n"
+            "The prior registered route did not receive the required acknowledgement.\n\n"
+            f"Reply ACK {token}."
+        )
+    quick = engagement_type is EngagementType.QUICK_RESPONSE
+    heading = "HUMANWIRE QUICK RESPONSE" if quick else "HUMANWIRE INTERVIEW"
+    response = "quick response" if quick else "interview response"
     return (
-        f"HUMANWIRE INTERVIEW · {token}\n\n"
-        "The previous channel did not receive an acknowledgement. The same interview will "
-        "continue here.\n\n"
-        f"Mandate: {mandate_summary}\n"
-        f"Why you were contacted: {reason}\n"
-        f"This interview has {question_count} question{'s' if question_count != 1 else ''}.\n\n"
-        "Reply normally. Prefix an answer with SHAREABLE, ANONYMOUS, or PRIVATE to choose "
-        "how that answer may be used.\n\n"
+        f"{heading} · {token}\n\n"
+        f"The prior registered route did not receive the required {response}.\n\n"
         f"Reply ACK {token} to continue."
     )
 
 
-def render_unreachable_notice(token: str, stakeholder_name: str) -> str:
+def render_unreachable_notice(
+    token: str,
+    stakeholder_name: str,
+    engagement_type: EngagementType = EngagementType.STRUCTURED_INTERVIEW,
+    *,
+    delivery_failed: bool = False,
+) -> str:
+    if delivery_failed:
+        detail = f"Delivery could not be confirmed to {stakeholder_name} on the registered routes."
+    elif engagement_type is EngagementType.ACKNOWLEDGE:
+        detail = f"{stakeholder_name} did not provide the required acknowledgement."
+    elif engagement_type is EngagementType.QUICK_RESPONSE:
+        detail = f"{stakeholder_name} did not provide the required quick response."
+    else:
+        detail = f"{stakeholder_name} did not provide the required interview response."
     return (
         f"HUMANWIRE STATUS · {token}\n\n"
-        f"{stakeholder_name} did not acknowledge the registered interview routes. "
-        "No agreement, approval, or interview response was recorded."
+        f"{detail} No required response was recorded, and no agreement or approval was inferred."
     )
 
 
