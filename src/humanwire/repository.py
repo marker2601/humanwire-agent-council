@@ -481,6 +481,10 @@ class RepositoryUnitOfWork:
 
     def add_mandate(self, mandate: Mandate) -> None:
         self._session.add(_mandate_record(mandate))
+        # Other aggregate records use a database foreign key but deliberately
+        # have no ORM relationship.  Flush the parent inside the caller's unit
+        # of work so an event and its state change remain one transaction.
+        self._session.flush()
 
     def save_mandate(self, mandate: Mandate) -> None:
         record = self._session.get(MandateRecord, str(mandate.mandate_id))
