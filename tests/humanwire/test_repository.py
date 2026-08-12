@@ -4,10 +4,15 @@ from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 
 from humanwire import domain
-from humanwire.database import InterviewSessionRecord, create_session_factory
+from humanwire.database import (
+    EngagementDecisionRecord,
+    InterviewSessionRecord,
+    create_session_factory,
+)
 from humanwire.domain import (
     AlignmentIssue,
     AlignmentIssueType,
@@ -27,7 +32,11 @@ from humanwire.domain import (
     StakeholderAssignment,
     StakeholderState,
 )
-from humanwire.repository import DuplicateMandateError, SqlAlchemyHumanWireRepository
+from humanwire.repository import (
+    DuplicateMandateError,
+    RepositoryUnitOfWork,
+    SqlAlchemyHumanWireRepository,
+)
 
 
 @pytest.fixture
@@ -230,6 +239,16 @@ def test_planned_stakeholder_rejects_invalid_engagement_contract(
         )
 
 
+def test_legacy_planned_stakeholder_rejects_zero_questions() -> None:
+    with pytest.raises(ValidationError):
+        domain.PlannedStakeholder(
+            person_ref="team-lead",
+            reason="Needed for the mandate",
+            direction=Direction.DOWNWARD,
+            questions=[],
+        )
+
+
 @pytest.mark.parametrize(
     ("questions", "expected_type"),
     [
@@ -277,7 +296,7 @@ def test_engagement_decision_is_idempotent_and_queryable(
     assert repository.list_engagement_decisions(decision.mandate_id) == [decision]
 
 
-def test_unit_of_work_queries_engagement_decision(
+def test_exact_duplicate_engagement_decision_in_same_unit_of_work_is_inert(
     repository, sample_mandate, make_assignment, now
 ) -> None:
     repository.add_mandate(sample_mandate)
@@ -300,6 +319,174 @@ def test_unit_of_work_queries_engagement_decision(
         unit.add_engagement_decision(decision)
         assert unit.get_engagement_decision(assignment.assignment_id) == decision
         assert unit.list_engagement_decisions(sample_mandate.mandate_id) == [decision]
+
+
+def test_reused_engagement_decision_idempotency_key_with_changed_payload_rejects(
+    repository, sample_mandate, make_assignment, now
+) -> None:
+    repository.add_mandate(sample_mandate)
+    first_assignment = make_assignment()
+    second_assignment = make_assignment(assignment_id=uuid4(), person_id="second")
+    repository.add_assignment(first_assignment)
+    repository.add_assignment(second_assignment)
+    first = domain.EngagementDecision(
+        decision_id=uuid4(),
+        mandate_id=sample_mandate.mandate_id,
+        assignment_id=first_assignment.assignment_id,
+        stakeholder_id=first_assignment.person_id,
+        response=domain.EngagementDecisionKind.APPROVE,
+        source_message_id="message-first",
+        created_at=now,
+        idempotency_key="engagement-decision:reused",
+    )
+    changed = first.model_copy(
+        update={
+            "decision_id": uuid4(),
+            "assignment_id": second_assignment.assignment_id,
+            "stakeholder_id": second_assignment.person_id,
+        }
+    )
+    repository.add_engagement_decision(first)
+
+    with pytest.raises(ValueError, match="idempotency key conflicts"):
+        repository.add_engagement_decision(changed)
+
+    assert repository.get_engagement_decision(first_assignment.assignment_id) == first
+    assert repository.get_engagement_decision(second_assignment.assignment_id) is None
+
+
+def test_engagement_decision_unit_of_work_rolls_back_sibling_writes_on_conflict(
+    repository, sample_mandate, make_assignment, now
+) -> None:
+    repository.add_mandate(sample_mandate)
+    assignment = make_assignment()
+    repository.add_assignment(assignment)
+    first = domain.EngagementDecision(
+        decision_id=uuid4(),
+        mandate_id=sample_mandate.mandate_id,
+        assignment_id=assignment.assignment_id,
+        stakeholder_id=assignment.person_id,
+        response=domain.EngagementDecisionKind.APPROVE,
+        source_message_id="message-first",
+        created_at=now,
+        idempotency_key="engagement-decision:durable",
+    )
+    repository.add_engagement_decision(first)
+    conflicting = first.model_copy(
+        update={
+            "decision_id": uuid4(),
+            "response": domain.EngagementDecisionKind.REJECT,
+            "source_message_id": "message-conflict",
+            "idempotency_key": "engagement-decision:conflict",
+        }
+    )
+
+    with (
+        pytest.raises(ValueError, match="already has a decision"),
+        repository.transaction() as unit,
+    ):
+        unit.set_runtime_status("review.sibling", "must-roll-back", now)
+        unit.add_engagement_decision(conflicting)
+
+    assert repository.get_runtime_status("review.sibling") is None
+    assert repository.get_engagement_decision(assignment.assignment_id) == first
+
+
+def test_engagement_decision_unit_of_work_is_atomic_on_later_failure(
+    repository, sample_mandate, make_assignment, now
+) -> None:
+    repository.add_mandate(sample_mandate)
+    assignment = make_assignment()
+    repository.add_assignment(assignment)
+    decision = domain.EngagementDecision(
+        decision_id=uuid4(),
+        mandate_id=sample_mandate.mandate_id,
+        assignment_id=assignment.assignment_id,
+        stakeholder_id=assignment.person_id,
+        response=domain.EngagementDecisionKind.APPROVE,
+        source_message_id="message-atomic",
+        created_at=now,
+        idempotency_key="engagement-decision:atomic",
+    )
+
+    with (
+        pytest.raises(RuntimeError, match="abort sibling write"),
+        repository.transaction() as unit,
+    ):
+        unit.add_engagement_decision(decision)
+        unit.set_runtime_status("atomic.sibling", "must-roll-back", now)
+        raise RuntimeError("abort sibling write")
+
+    assert repository.get_engagement_decision(assignment.assignment_id) is None
+    assert repository.get_runtime_status("atomic.sibling") is None
+
+
+@pytest.mark.parametrize("entrypoint", ["repository", "unit_of_work"])
+def test_exact_duplicate_decision_race_is_inert_and_session_remains_usable(
+    tmp_path, sample_mandate, make_assignment, now, entrypoint
+) -> None:
+    database_path = tmp_path / f"engagement-race-{entrypoint}.db"
+    factory = create_session_factory(f"sqlite:///{database_path.as_posix()}")
+    with factory.kw["bind"].begin() as connection:
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+    repository = SqlAlchemyHumanWireRepository(factory)
+    repository.add_mandate(sample_mandate)
+    assignment = make_assignment()
+    repository.add_assignment(assignment)
+    decision = domain.EngagementDecision(
+        decision_id=uuid4(),
+        mandate_id=sample_mandate.mandate_id,
+        assignment_id=assignment.assignment_id,
+        stakeholder_id=assignment.person_id,
+        response=domain.EngagementDecisionKind.APPROVE,
+        source_message_id="message-race",
+        created_at=now,
+        idempotency_key="engagement-decision:race",
+    )
+
+    raced = False
+
+    def interleave_exact_winner(session, flush_context, instances) -> None:
+        del flush_context, instances
+        nonlocal raced
+        has_pending_decision = any(
+            isinstance(item, EngagementDecisionRecord) for item in session.new
+        )
+        if has_pending_decision and not raced:
+            raced = True
+            with factory() as winning_session:
+                winning_session.add(
+                    EngagementDecisionRecord(
+                        decision_id=str(decision.decision_id),
+                        mandate_id=str(decision.mandate_id),
+                        assignment_id=str(decision.assignment_id),
+                        stakeholder_id=decision.stakeholder_id,
+                        response=decision.response.value,
+                        change_text=decision.change_text,
+                        source_message_id=decision.source_message_id,
+                        created_at=decision.created_at,
+                        idempotency_key=decision.idempotency_key,
+                    )
+                )
+                winning_session.commit()
+
+    event.listen(factory.class_, "before_flush", interleave_exact_winner)
+    try:
+        if entrypoint == "repository":
+            repository.add_engagement_decision(decision)
+            repository.set_runtime_status("race.session", "usable", now)
+        else:
+            with factory() as losing_session:
+                unit = RepositoryUnitOfWork(losing_session)
+                unit.add_engagement_decision(decision)
+                unit.set_runtime_status("race.session", "usable", now)
+                losing_session.commit()
+    finally:
+        event.remove(factory.class_, "before_flush", interleave_exact_winner)
+
+    assert raced
+    assert repository.get_engagement_decision(assignment.assignment_id) == decision
+    assert repository.get_runtime_status("race.session") == ("usable", now)
 
 
 def test_engagement_decisions_are_ordered_by_created_at_then_decision_id(

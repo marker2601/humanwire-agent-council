@@ -357,6 +357,33 @@ def _engagement_decision_value(record: EngagementDecisionRecord) -> EngagementDe
     )
 
 
+def _engagement_decision_exists_or_conflicts(
+    session: Session, decision: EngagementDecision
+) -> bool:
+    by_assignment = session.scalar(
+        select(EngagementDecisionRecord).where(
+            EngagementDecisionRecord.assignment_id == str(decision.assignment_id)
+        )
+    )
+    by_idempotency_key = session.scalar(
+        select(EngagementDecisionRecord).where(
+            EngagementDecisionRecord.idempotency_key == decision.idempotency_key
+        )
+    )
+    if by_assignment is None and by_idempotency_key is None:
+        return False
+    same_record = (
+        by_assignment is not None
+        and by_idempotency_key is not None
+        and by_assignment.decision_id == by_idempotency_key.decision_id
+    )
+    if same_record and _engagement_decision_value(by_assignment) == decision:
+        return True
+    if by_idempotency_key is not None:
+        raise ValueError("engagement decision idempotency key conflicts")
+    raise ValueError("assignment already has a decision")
+
+
 def _package_record(value: MeetingPackage) -> MeetingPackageRecord:
     return MeetingPackageRecord(
         meeting_id=str(value.meeting_id),
@@ -592,25 +619,16 @@ class RepositoryUnitOfWork:
         return [_response_value(record) for record in records]
 
     def add_engagement_decision(self, decision: EngagementDecision) -> None:
-        existing_key = self._session.scalar(
-            select(EngagementDecisionRecord).where(
-                EngagementDecisionRecord.idempotency_key == decision.idempotency_key
-            )
-        )
-        if existing_key is not None:
-            if _engagement_decision_value(existing_key) == decision:
-                return
-            raise ValueError("engagement decision idempotency key conflicts")
-        existing_assignment = self._session.scalar(
-            select(EngagementDecisionRecord).where(
-                EngagementDecisionRecord.assignment_id == str(decision.assignment_id)
-            )
-        )
-        if existing_assignment is not None:
-            if _engagement_decision_value(existing_assignment) == decision:
-                return
-            raise ValueError("assignment already has a decision")
+        if _engagement_decision_exists_or_conflicts(self._session, decision):
+            return
         self._session.add(_engagement_decision_record(decision))
+        try:
+            self._session.flush()
+        except IntegrityError:
+            self._session.rollback()
+            if _engagement_decision_exists_or_conflicts(self._session, decision):
+                return
+            raise ValueError("engagement decision conflicts") from None
 
     def get_engagement_decision(self, assignment_id: UUID) -> EngagementDecision | None:
         record = self._session.scalar(
@@ -858,7 +876,10 @@ class SqlAlchemyHumanWireRepository:
         try:
             self._write(RepositoryUnitOfWork.add_engagement_decision, decision)
         except IntegrityError as error:
-            raise ValueError("assignment already has a decision") from error
+            with self._session_factory() as session:
+                if _engagement_decision_exists_or_conflicts(session, decision):
+                    return
+            raise ValueError("engagement decision conflicts") from error
 
     def get_engagement_decision(self, assignment_id: UUID) -> EngagementDecision | None:
         with self._session_factory() as session:

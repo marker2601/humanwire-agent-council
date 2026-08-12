@@ -1,10 +1,25 @@
 from datetime import datetime
+from enum import StrEnum
 
-from humanwire.domain import Mandate, MandateState, StakeholderAssignment, StakeholderState
+from humanwire.domain import (
+    EngagementType,
+    Mandate,
+    MandateState,
+    StakeholderAssignment,
+    StakeholderState,
+)
 
 
 class InvalidTransitionError(ValueError):
     """Raised when a HumanWire aggregate attempts an undocumented transition."""
+
+
+class AssignmentCompletionProof(StrEnum):
+    DELIVERY_CONFIRMED = "delivery_confirmed"
+    AUTHENTICATED_ACKNOWLEDGEMENT = "authenticated_acknowledgement"
+    REQUIRED_RESPONSES_COMPLETE = "required_responses_complete"
+    AUTHENTICATED_DECISION = "authenticated_decision"
+    VALID_AVAILABILITY = "valid_availability"
 
 
 MANDATE_TERMINAL_STATES = frozenset(
@@ -139,6 +154,41 @@ ASSIGNMENT_TRANSITIONS: dict[StakeholderState, frozenset[StakeholderState]] = {
     ),
 }
 
+ASSIGNMENT_COMPLETION_CONTRACTS: dict[
+    EngagementType, tuple[bool, StakeholderState, AssignmentCompletionProof]
+] = {
+    EngagementType.INFORM: (
+        False,
+        StakeholderState.DELIVERED,
+        AssignmentCompletionProof.DELIVERY_CONFIRMED,
+    ),
+    EngagementType.ACKNOWLEDGE: (
+        True,
+        StakeholderState.ACKNOWLEDGED,
+        AssignmentCompletionProof.AUTHENTICATED_ACKNOWLEDGEMENT,
+    ),
+    EngagementType.QUICK_RESPONSE: (
+        True,
+        StakeholderState.INTERVIEWING,
+        AssignmentCompletionProof.REQUIRED_RESPONSES_COMPLETE,
+    ),
+    EngagementType.STRUCTURED_INTERVIEW: (
+        True,
+        StakeholderState.INTERVIEWING,
+        AssignmentCompletionProof.REQUIRED_RESPONSES_COMPLETE,
+    ),
+    EngagementType.REVIEW_APPROVAL: (
+        True,
+        StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+        AssignmentCompletionProof.AUTHENTICATED_DECISION,
+    ),
+    EngagementType.AVAILABILITY: (
+        True,
+        StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+        AssignmentCompletionProof.VALID_AVAILABILITY,
+    ),
+}
+
 
 class MandateStateMachine:
     def transition(
@@ -165,9 +215,24 @@ class StakeholderStateMachine:
         target: StakeholderState,
         reason: str,
         now: datetime,
+        *,
+        completion_proof: AssignmentCompletionProof | None = None,
     ) -> StakeholderAssignment:
         if target not in ASSIGNMENT_TRANSITIONS.get(assignment.state, frozenset()):
             raise InvalidTransitionError(f"{assignment.state.value} -> {target.value}")
+        if target is StakeholderState.COMPLETE:
+            response_required, required_source, required_proof = ASSIGNMENT_COMPLETION_CONTRACTS[
+                assignment.engagement_type
+            ]
+            if (
+                assignment.response_required is not response_required
+                or assignment.state is not required_source
+                or completion_proof is not required_proof
+            ):
+                raise InvalidTransitionError(
+                    f"{assignment.engagement_type.value} completion requires "
+                    f"{required_source.value} with {required_proof.value}"
+                )
         terminal = target in ASSIGNMENT_TERMINAL_STATES
         return assignment.model_copy(
             update={

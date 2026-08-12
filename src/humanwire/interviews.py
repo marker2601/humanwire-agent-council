@@ -31,7 +31,11 @@ from humanwire.messages import (
     render_unreachable_notice,
 )
 from humanwire.repository import SqlAlchemyHumanWireRepository
-from humanwire.state_machine import ASSIGNMENT_TERMINAL_STATES, StakeholderStateMachine
+from humanwire.state_machine import (
+    ASSIGNMENT_TERMINAL_STATES,
+    AssignmentCompletionProof,
+    StakeholderStateMachine,
+)
 
 _VISIBILITY_PREFIX = re.compile(r"^(SHAREABLE|ANONYMOUS|PRIVATE)\b[\s:—-]*", re.IGNORECASE)
 _DECLINE = re.compile(r"^DECLINE\s+(HW-[A-Z0-9]{4,8})$", re.IGNORECASE)
@@ -376,7 +380,13 @@ class InterviewCoordinator:
             }
         )
         updated_assignment = (
-            self._transition(saved, StakeholderState.COMPLETE, "interview_complete", now)
+            self._transition(
+                saved,
+                StakeholderState.COMPLETE,
+                "interview_complete",
+                now,
+                completion_proof=AssignmentCompletionProof.REQUIRED_RESPONSES_COMPLETE,
+            )
             if completed
             else saved
         )
@@ -779,9 +789,21 @@ class InterviewCoordinator:
             unit.append_event(updated.mandate_id, event)
 
     def _transition(
-        self, assignment: StakeholderAssignment, target: StakeholderState, reason: str, now: datetime
+        self,
+        assignment: StakeholderAssignment,
+        target: StakeholderState,
+        reason: str,
+        now: datetime,
+        *,
+        completion_proof: AssignmentCompletionProof | None = None,
     ) -> StakeholderAssignment:
-        return self.state_machine.transition(assignment, target, reason, now)
+        return self.state_machine.transition(
+            assignment,
+            target,
+            reason,
+            now,
+            completion_proof=completion_proof,
+        )
 
     @staticmethod
     def _event(

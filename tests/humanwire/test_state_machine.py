@@ -6,12 +6,14 @@ import pytest
 from humanwire.domain import (
     Channel,
     Direction,
+    EngagementType,
     Mandate,
     MandateState,
     StakeholderAssignment,
     StakeholderState,
 )
 from humanwire.state_machine import (
+    AssignmentCompletionProof,
     InvalidTransitionError,
     MandateStateMachine,
     StakeholderStateMachine,
@@ -132,14 +134,10 @@ def test_mandate_invalid_transition_names_source_and_target(make_mandate, now) -
     [
         (StakeholderState.NOT_CONTACTED, StakeholderState.CONTACT_QUEUED),
         (StakeholderState.CONTACT_QUEUED, StakeholderState.DELIVERED),
-        (StakeholderState.DELIVERED, StakeholderState.COMPLETE),
         (StakeholderState.DELIVERED, StakeholderState.AWAITING_ACKNOWLEDGEMENT),
         (StakeholderState.AWAITING_ACKNOWLEDGEMENT, StakeholderState.ACKNOWLEDGED),
-        (StakeholderState.AWAITING_ACKNOWLEDGEMENT, StakeholderState.COMPLETE),
         (StakeholderState.AWAITING_ACKNOWLEDGEMENT, StakeholderState.FOLLOW_UP_DUE),
-        (StakeholderState.ACKNOWLEDGED, StakeholderState.COMPLETE),
         (StakeholderState.ACKNOWLEDGED, StakeholderState.INTERVIEWING),
-        (StakeholderState.INTERVIEWING, StakeholderState.COMPLETE),
         (StakeholderState.FOLLOW_UP_DUE, StakeholderState.ALTERNATE_CHANNEL),
         (StakeholderState.ALTERNATE_CHANNEL, StakeholderState.AWAITING_ACKNOWLEDGEMENT),
     ],
@@ -152,7 +150,136 @@ def test_stakeholder_allows_response_ladder_transition(
     )
 
     assert updated.state is target
-    assert updated.completed_at == (now if target is StakeholderState.COMPLETE else None)
+    assert updated.completed_at is None
+
+
+@pytest.mark.parametrize(
+    ("engagement_type", "source", "proof"),
+    [
+        (
+            EngagementType.INFORM,
+            StakeholderState.DELIVERED,
+            AssignmentCompletionProof.DELIVERY_CONFIRMED,
+        ),
+        (
+            EngagementType.ACKNOWLEDGE,
+            StakeholderState.ACKNOWLEDGED,
+            AssignmentCompletionProof.AUTHENTICATED_ACKNOWLEDGEMENT,
+        ),
+        (
+            EngagementType.QUICK_RESPONSE,
+            StakeholderState.INTERVIEWING,
+            AssignmentCompletionProof.REQUIRED_RESPONSES_COMPLETE,
+        ),
+        (
+            EngagementType.STRUCTURED_INTERVIEW,
+            StakeholderState.INTERVIEWING,
+            AssignmentCompletionProof.REQUIRED_RESPONSES_COMPLETE,
+        ),
+        (
+            EngagementType.REVIEW_APPROVAL,
+            StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+            AssignmentCompletionProof.AUTHENTICATED_DECISION,
+        ),
+        (
+            EngagementType.AVAILABILITY,
+            StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+            AssignmentCompletionProof.VALID_AVAILABILITY,
+        ),
+    ],
+)
+def test_assignment_completion_requires_matching_engagement_source_and_proof(
+    make_assignment, now, engagement_type, source, proof
+) -> None:
+    updated = StakeholderStateMachine().transition(
+        make_assignment(
+            state=source,
+            engagement_type=engagement_type,
+            response_required=engagement_type is not EngagementType.INFORM,
+        ),
+        StakeholderState.COMPLETE,
+        "completion recorded",
+        now,
+        completion_proof=proof,
+    )
+
+    assert updated.state is StakeholderState.COMPLETE
+    assert updated.completed_at == now
+    assert updated.next_action_at is None
+
+
+@pytest.mark.parametrize(
+    ("engagement_type", "source", "proof"),
+    [
+        (EngagementType.REVIEW_APPROVAL, StakeholderState.DELIVERED, None),
+        (
+            EngagementType.STRUCTURED_INTERVIEW,
+            StakeholderState.DELIVERED,
+            AssignmentCompletionProof.DELIVERY_CONFIRMED,
+        ),
+        (
+            EngagementType.REVIEW_APPROVAL,
+            StakeholderState.ACKNOWLEDGED,
+            AssignmentCompletionProof.AUTHENTICATED_ACKNOWLEDGEMENT,
+        ),
+        (
+            EngagementType.AVAILABILITY,
+            StakeholderState.ACKNOWLEDGED,
+            AssignmentCompletionProof.AUTHENTICATED_ACKNOWLEDGEMENT,
+        ),
+        (
+            EngagementType.QUICK_RESPONSE,
+            StakeholderState.INTERVIEWING,
+            AssignmentCompletionProof.AUTHENTICATED_ACKNOWLEDGEMENT,
+        ),
+        (EngagementType.INFORM, StakeholderState.DELIVERED, None),
+    ],
+)
+def test_assignment_completion_rejects_wrong_or_missing_lifecycle_proof(
+    make_assignment, now, engagement_type, source, proof
+) -> None:
+    with pytest.raises(InvalidTransitionError):
+        StakeholderStateMachine().transition(
+            make_assignment(state=source, engagement_type=engagement_type),
+            StakeholderState.COMPLETE,
+            "interview_complete",
+            now,
+            completion_proof=proof,
+        )
+
+
+@pytest.mark.parametrize(
+    ("engagement_type", "response_required", "source", "proof"),
+    [
+        (
+            EngagementType.INFORM,
+            True,
+            StakeholderState.DELIVERED,
+            AssignmentCompletionProof.DELIVERY_CONFIRMED,
+        ),
+        (
+            EngagementType.REVIEW_APPROVAL,
+            False,
+            StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+            AssignmentCompletionProof.AUTHENTICATED_DECISION,
+        ),
+    ],
+)
+def test_assignment_completion_rejects_inconsistent_response_contract(
+    make_assignment, now, engagement_type, response_required, source, proof
+) -> None:
+    with pytest.raises(InvalidTransitionError):
+        StakeholderStateMachine().transition(
+            make_assignment(
+                state=source,
+                engagement_type=engagement_type,
+                response_required=response_required,
+            ),
+            StakeholderState.COMPLETE,
+            "completion recorded",
+            now,
+            completion_proof=proof,
+        )
 
 
 @pytest.mark.parametrize(
@@ -196,6 +323,7 @@ def test_assignment_terminal_transition_sets_completed_at(make_assignment, now) 
         StakeholderState.COMPLETE,
         "interview_complete",
         now,
+        completion_proof=AssignmentCompletionProof.REQUIRED_RESPONSES_COMPLETE,
     )
 
     assert updated.completed_at == now
