@@ -1,5 +1,7 @@
 # HumanWire Implementation Plan
 
+> **Approved adaptive-engagement amendment (2026-08-12):** Before continuing the Decision Room and later phases, execute [2026-08-12-humanwire-adaptive-engagement.md](2026-08-12-humanwire-adaptive-engagement.md). It supersedes universal-interview behavior and public copy while preserving the completed safety, correlation, negotiation, meeting-proof, and gateway foundations.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace SecondSignal with a competition-ready HumanWire product that turns one authorized mandate into live cross-channel stakeholder interviews, evidence-backed alignment or a meeting-ready package, a responsive Decision Room, Propagation Lanes, and analytics-ready event data.
