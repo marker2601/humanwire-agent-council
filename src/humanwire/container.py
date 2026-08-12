@@ -20,6 +20,7 @@ from humanwire.alignment import (
 from humanwire.config import Settings
 from humanwire.database import create_session_factory
 from humanwire.directory import OrganizationDirectory
+from humanwire.engagements import EngagementCoordinator
 from humanwire.evidence import (
     EvidenceExtractor,
     FeatherlessEvidenceExtractor,
@@ -54,6 +55,7 @@ class ApplicationContainer:
     evidence_extractor: EvidenceExtractor
     mandate_state_machine: MandateStateMachine
     stakeholder_state_machine: StakeholderStateMachine
+    engagement_coordinator: EngagementCoordinator
     interview_coordinator: InterviewCoordinator
     synthesis_service: SynthesisService
     negotiation_coordinator: NegotiationCoordinator
@@ -120,6 +122,7 @@ class ApplicationContainer:
             evidence_extractor=evidence_extractor,
             mandate_state_machine=workflow.mandates.state_machine,
             stakeholder_state_machine=workflow.mandates.interviews.state_machine,
+            engagement_coordinator=workflow.engagements,
             interview_coordinator=workflow.mandates.interviews,
             synthesis_service=workflow.synthesis,
             negotiation_coordinator=negotiation_coordinator,

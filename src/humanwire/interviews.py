@@ -164,7 +164,17 @@ class InterviewCoordinator:
             updated_at=now,
         )
         pending = assignment.model_copy(update={"interview_id": session.session_id})
-        queued = self._transition(pending, StakeholderState.CONTACT_QUEUED, "primary_outreach", now)
+        if pending.state is StakeholderState.NOT_CONTACTED:
+            queued = self._transition(
+                pending,
+                StakeholderState.CONTACT_QUEUED,
+                "primary_outreach",
+                now,
+            )
+        elif pending.state is StakeholderState.CONTACT_QUEUED:
+            queued = pending
+        else:
+            raise ValueError("initial interview must be not contacted or contact queued")
         delivered = self._transition(queued, StakeholderState.DELIVERED, "primary_outreach", now)
         updated = self._transition(
             delivered,

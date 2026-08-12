@@ -2055,3 +2055,49 @@ def test_review_explicit_ack_retry_rejects_assignment_changed_to_non_question_ty
     assert session.current_route_id == "email-priya"
     assert session.current_conversation_id == "mail-priya"
     assert [event.event_type for event in events].count("stakeholder.acknowledged") == 0
+
+
+@pytest.mark.parametrize(
+    ("engagement_type", "questions", "expects_interview"),
+    [
+        (EngagementType.INFORM, [], False),
+        (EngagementType.ACKNOWLEDGE, [], False),
+        (EngagementType.QUICK_RESPONSE, ["Fact?"], True),
+        (
+            EngagementType.STRUCTURED_INTERVIEW,
+            ["Fact?", "Constraint?", "Commitment?"],
+            True,
+        ),
+        (EngagementType.REVIEW_APPROVAL, [], False),
+        (EngagementType.AVAILABILITY, [], False),
+    ],
+)
+def test_prepare_start_releases_an_already_queued_preview_assignment(
+    coordinator,
+    mandate,
+    now,
+    engagement_type,
+    questions,
+    expects_interview,
+) -> None:
+    assignment = _assignment(
+        mandate,
+        engagement_type,
+        state=StakeholderState.CONTACT_QUEUED,
+    )
+
+    prepared = coordinator.prepare_start(
+        assignment,
+        questions,
+        mandate.token,
+        mandate.objective,
+        now,
+    )
+
+    assert prepared.assignment.state in {
+        StakeholderState.DELIVERED,
+        StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+    }
+    assert (prepared.interview is not None) is expects_interview
+    assert prepared.assignment.attempt_count == 1
+    assert prepared.assignment.first_contact_at == now

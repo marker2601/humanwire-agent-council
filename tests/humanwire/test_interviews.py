@@ -888,3 +888,28 @@ def test_quick_response_engine_copy_never_calls_the_engagement_an_interview(
     assert reminder.deliveries[0].text.startswith("HUMANWIRE QUICK RESPONSE")
     assert "interview" not in intro.deliveries[0].text.lower()
     assert "interview" not in reminder.deliveries[0].text.lower()
+
+
+def test_prepare_assignment_start_releases_an_already_queued_preview_assignment(
+    coordinator, mandate, now
+) -> None:
+    assignment = _assignment(
+        mandate,
+        state=StakeholderState.CONTACT_QUEUED,
+        engagement_type=EngagementType.QUICK_RESPONSE,
+        response_required=True,
+    )
+
+    updated, session, event, delivery = coordinator.prepare_assignment_start(
+        assignment,
+        ["Committed date?"],
+        mandate.token,
+        mandate.objective,
+        now,
+    )
+
+    assert updated.state is StakeholderState.AWAITING_ACKNOWLEDGEMENT
+    assert updated.attempt_count == 1
+    assert session.assignment_id == assignment.assignment_id
+    assert event.previous_state == StakeholderState.CONTACT_QUEUED.value
+    assert delivery.assignment_id == assignment.assignment_id

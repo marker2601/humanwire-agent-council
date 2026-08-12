@@ -12,8 +12,10 @@ from humanwire.commands import (
     AcknowledgeCommand,
     AvailabilityCommand,
     CancelCommand,
+    EngageCommand,
     EngagementDecisionCommand,
     FreeTextCommand,
+    GoCommand,
     MandateCommand,
     ProposalResponseCommand,
     StatusCommand,
@@ -31,7 +33,6 @@ from humanwire.domain import (
     StakeholderState,
     WorkflowResult,
 )
-from humanwire.engagements import EngagementCoordinator
 from humanwire.evidence import EvidenceExtractor, shareable_evidence
 from humanwire.meetings import MeetingCoordinator
 from humanwire.messages import render_alignment_brief, render_meeting_confirmation, render_proposal
@@ -46,7 +47,6 @@ from humanwire.state_machine import (
     ASSIGNMENT_TERMINAL_STATES,
     MANDATE_TERMINAL_STATES,
     MandateStateMachine,
-    StakeholderStateMachine,
 )
 
 
@@ -56,13 +56,7 @@ class HumanWireWorkflow:
         self.repository = repository
         self.settings = settings
         self.mandates = MandateService(directory, repository, planner, evidence_extractor, settings)
-        self.engagements = EngagementCoordinator(
-            directory,
-            repository,
-            StakeholderStateMachine(),
-            evidence_extractor,
-            settings,
-        )
+        self.engagements = self.mandates.engagements
         self.negotiation_coordinator = negotiation_coordinator or NegotiationCoordinator(repository)
         self.meeting_coordinator_factory = meeting_coordinator_factory or MeetingCoordinator
         self.synthesis = SynthesisService(
@@ -80,6 +74,10 @@ class HumanWireWorkflow:
             return self._status(message, command.token)
         if isinstance(command, CancelCommand):
             return self._cancel(message, command.token)
+        if isinstance(command, GoCommand):
+            return self.mandates.authorized_release(message, command.token)
+        if isinstance(command, EngageCommand):
+            return self.mandates.override(message, command)
         if isinstance(command, EngagementDecisionCommand):
             return self._engagement_decision(message, command)
         if isinstance(command, ProposalResponseCommand):
@@ -93,9 +91,24 @@ class HumanWireWorkflow:
         for mandate in self.repository.list_recent_mandates(1000):
             if mandate.expires_at <= now and mandate.state not in MANDATE_TERMINAL_STATES:
                 expired = MandateStateMachine().transition(mandate, MandateState.EXPIRED, "deadline_elapsed", now)
-                with self.repository.transaction() as unit:
-                    unit.save_mandate(expired)
-                    unit.append_event(mandate.mandate_id, _event("mandate.expired", now, f"expired:{mandate.mandate_id}", actor_id=mandate.initiator_id, previous_state=mandate.state.value, new_state="expired"))
+                try:
+                    with self.repository.transaction() as unit:
+                        if not unit.compare_and_save_mandate(mandate, expired):
+                            raise ValueError("mandate expiration snapshot changed")
+                        if not unit.append_event_once(
+                            mandate.mandate_id,
+                            _event(
+                                "mandate.expired",
+                                now,
+                                f"expired:{mandate.mandate_id}",
+                                actor_id=mandate.initiator_id,
+                                previous_state=mandate.state.value,
+                                new_state="expired",
+                            ),
+                        ):
+                            raise ValueError("mandate expiration already recorded")
+                except ValueError:
+                    continue
                 text = (
                     f"HUMANWIRE EXPIRED · {mandate.token}\n\n"
                     "The mandate deadline elapsed. No agreement or approval was inferred."
@@ -105,6 +118,10 @@ class HumanWireWorkflow:
                         [mandate.initiator_id], text, mandate.token
                     )
                 )
+
+        for mandate in self.repository.list_due_mandates(now):
+            deliveries.extend(self.mandates.release(mandate.token, now).deliveries)
+
         mandate_states = {
             mandate.mandate_id: mandate.state
             for mandate in self.repository.list_recent_mandates(1000)
@@ -112,13 +129,7 @@ class HumanWireWorkflow:
         for assignment in self.repository.list_due_assignments(now):
             if mandate_states.get(assignment.mandate_id) is not MandateState.INTERVIEWING:
                 continue
-            coordinator = (
-                self.engagements
-                if assignment.engagement_type
-                in {EngagementType.REVIEW_APPROVAL, EngagementType.AVAILABILITY}
-                else self.mandates.interviews
-            )
-            result = coordinator.process_due_assignment(assignment, now)
+            result = self.engagements.process_due_assignment(assignment, now)
             deliveries.extend(result.deliveries)
             deliveries.extend(self.synthesis.run(assignment.mandate_id, now).deliveries)
         return WorkflowResult(deliveries=deliveries)
@@ -135,18 +146,12 @@ class HumanWireWorkflow:
             ]
         )
         delivery_id = hashlib.sha256(delivery_source.encode()).hexdigest()[:48]
-        assignment = self.repository.get_assignment(instruction.assignment_id)
-        coordinator = (
-            self.engagements
-            if assignment is not None
-            and assignment.engagement_type
-            in {EngagementType.REVIEW_APPROVAL, EngagementType.AVAILABILITY}
-            else self.mandates.interviews
-        )
         if succeeded:
-            coordinator.mark_delivery_success(instruction.assignment_id, delivery_id, now)
+            self.engagements.mark_delivery_success(
+                instruction.assignment_id, delivery_id, now
+            )
         else:
-            failed = coordinator.mark_delivery_failure(
+            failed = self.engagements.mark_delivery_failure(
                 instruction.assignment_id, delivery_id, now
             )
             assignment = self.repository.get_assignment(instruction.assignment_id)
@@ -189,6 +194,16 @@ class HumanWireWorkflow:
                         terminal_match = True
                         continue
                     candidates.append(assignment)
+            if isinstance(command, AcknowledgeCommand) and mandate.token == command.token:
+                for assignment in self.repository.list_assignments(mandate.mandate_id):
+                    if (
+                        assignment.person_id.casefold() == person.person_id.casefold()
+                        and assignment.engagement_type is EngagementType.ACKNOWLEDGE
+                        and assignment.response_required
+                        and assignment.state not in ASSIGNMENT_TERMINAL_STATES
+                        and self._active_assignment_route_matches(assignment, message)
+                    ):
+                        candidates.append(assignment)
         if isinstance(command, AcknowledgeCommand):
             candidates = [
                 assignment
@@ -207,7 +222,11 @@ class HumanWireWorkflow:
                 return self._reply(message, "This mandate is closed. No response was recorded.")
             return self._reply(message, "Reply ACK <token> to select an active interview." if candidates else "Use /mandate to start a request.")
         assignment = candidates[0]
-        result = self.mandates.interviews.acknowledge(message, assignment, message.received_at) if isinstance(command, AcknowledgeCommand) else self.mandates.interviews.record_answer(message, assignment, message.received_at)
+        result = (
+            self.engagements.acknowledge(message, assignment, message.received_at)
+            if isinstance(command, AcknowledgeCommand)
+            else self.engagements.record_answer(message, assignment, message.received_at)
+        )
         synthesis = self.synthesis.run(assignment.mandate_id, message.received_at)
         return WorkflowResult(deliveries=[*result.deliveries, *synthesis.deliveries])
 
@@ -294,9 +313,24 @@ class HumanWireWorkflow:
         if mandate.state in {MandateState.ALIGNED, MandateState.MEETING_READY, MandateState.PARTIAL, MandateState.CANCELLED, MandateState.EXPIRED}:
             return self._reply(message, f"HumanWire {token}: {mandate.state.value}.")
         cancelled = MandateStateMachine().transition(mandate, MandateState.CANCELLED, "initiator_cancelled", message.received_at)
-        with self.repository.transaction() as unit:
-            unit.save_mandate(cancelled)
-            unit.append_event(mandate.mandate_id, _event("mandate.cancelled", message.received_at, event_key, actor_id=sender.person_id, previous_state=mandate.state.value, new_state="cancelled"))
+        try:
+            with self.repository.transaction() as unit:
+                if not unit.compare_and_save_mandate(mandate, cancelled):
+                    raise ValueError("mandate cancellation snapshot changed")
+                if not unit.append_event_once(
+                    mandate.mandate_id,
+                    _event(
+                        "mandate.cancelled",
+                        message.received_at,
+                        event_key,
+                        actor_id=sender.person_id,
+                        previous_state=mandate.state.value,
+                        new_state="cancelled",
+                    ),
+                ):
+                    raise ValueError("mandate cancellation already recorded")
+        except ValueError:
+            return WorkflowResult()
         return self._reply(message, f"HumanWire {token} is cancelled.")
 
     def _proposal(self, message: IncomingMessage, command: ProposalResponseCommand) -> WorkflowResult:
@@ -582,7 +616,11 @@ class HumanWireWorkflow:
             if any(
                 assignment.person_id.casefold() == person_id.casefold()
                 and assignment.engagement_type
-                in {EngagementType.REVIEW_APPROVAL, EngagementType.AVAILABILITY}
+                in {
+                    EngagementType.ACKNOWLEDGE,
+                    EngagementType.REVIEW_APPROVAL,
+                    EngagementType.AVAILABILITY,
+                }
                 and assignment.state not in ASSIGNMENT_TERMINAL_STATES
                 and self._active_assignment_route_matches(assignment, message)
                 for assignment in self.repository.list_assignments(mandate.mandate_id)

@@ -5,6 +5,7 @@ from datetime import datetime
 from humanwire.domain import (
     AvailabilityWindow,
     EngagementDecisionKind,
+    EngagementType,
     ProposalResponseKind,
 )
 
@@ -29,6 +30,14 @@ AVAILABILITY = re.compile(
 )
 STATUS = re.compile(rf"^/status[ \t]+(?P<token>{TOKEN})$", ASCII_CASE_INSENSITIVE)
 CANCEL = re.compile(rf"^/cancel[ \t]+(?P<token>{TOKEN})$", ASCII_CASE_INSENSITIVE)
+GO = re.compile(rf"^GO[ \t]+(?P<token>{TOKEN})$", ASCII_CASE_INSENSITIVE)
+ENGAGE = re.compile(
+    rf"^ENGAGE[ \t]+(?P<token>{TOKEN})[ \t]+"
+    r"(?P<person_id>[A-Z0-9][A-Z0-9._:-]{0,127})[ \t]+"
+    r"(?P<engagement_type>INFORM|ACKNOWLEDGE|QUICK_RESPONSE|"
+    r"STRUCTURED_INTERVIEW|REVIEW_APPROVAL|AVAILABILITY)$",
+    ASCII_CASE_INSENSITIVE,
+)
 MANDATE = re.compile(
     r"^/mandate[ \t]*\r?\n(?P<body>[\s\S]+)$", ASCII_CASE_INSENSITIVE
 )
@@ -52,6 +61,18 @@ class CancelCommand:
 @dataclass(frozen=True)
 class AcknowledgeCommand:
     token: str
+
+
+@dataclass(frozen=True)
+class GoCommand:
+    token: str
+
+
+@dataclass(frozen=True)
+class EngageCommand:
+    token: str
+    person_id: str
+    engagement_type: EngagementType
 
 
 @dataclass(frozen=True)
@@ -84,6 +105,8 @@ type ParsedCommand = (
     | StatusCommand
     | CancelCommand
     | AcknowledgeCommand
+    | GoCommand
+    | EngageCommand
     | ProposalResponseCommand
     | EngagementDecisionCommand
     | AvailabilityCommand
@@ -103,6 +126,14 @@ def parse_command(text: str) -> ParsedCommand:
         )
     if match := ACKNOWLEDGEMENT.fullmatch(source):
         return AcknowledgeCommand(token=match.group("token").upper())
+    if single_line and (match := GO.fullmatch(source)):
+        return GoCommand(token=match.group("token").upper())
+    if single_line and (match := ENGAGE.fullmatch(source)):
+        return EngageCommand(
+            token=match.group("token").upper(),
+            person_id=match.group("person_id"),
+            engagement_type=EngagementType(match.group("engagement_type").lower()),
+        )
     if single_line and (match := ENGAGEMENT_DECISION.fullmatch(source)):
         response = EngagementDecisionKind(match.group("answer").lower())
         change_text = match.group("change")

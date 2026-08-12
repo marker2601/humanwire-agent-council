@@ -457,6 +457,8 @@ _EVENT_IDENTIFIER_KEYS = frozenset(
         "meeting_id",
         "message_id",
         "model",
+        "new_engagement_type",
+        "old_engagement_type",
         "outcome",
         "person_id",
         "proposal_id",
@@ -599,7 +601,35 @@ class RepositoryUnitOfWork:
         updated: Mandate,
         now: datetime,
     ) -> bool:
-        """Save one mandate while its persisted lifecycle snapshot is exact and live."""
+        """Save one mandate while its persisted aggregate snapshot is exact and live."""
+        return self._compare_and_save_mandate(
+            expected,
+            updated,
+            now=now,
+            require_unexpired=True,
+        )
+
+    def compare_and_save_mandate(
+        self,
+        expected: Mandate,
+        updated: Mandate,
+    ) -> bool:
+        """Save one mandate only while its complete mutable snapshot remains exact."""
+        return self._compare_and_save_mandate(
+            expected,
+            updated,
+            now=None,
+            require_unexpired=False,
+        )
+
+    def _compare_and_save_mandate(
+        self,
+        expected: Mandate,
+        updated: Mandate,
+        *,
+        now: datetime | None,
+        require_unexpired: bool,
+    ) -> bool:
         if expected.mandate_id != updated.mandate_id:
             raise ValueError("mandate compare-and-save requires one mandate")
         replacement = _mandate_record(updated)
@@ -608,18 +638,28 @@ class RepositoryUnitOfWork:
             for column in replacement.__table__.columns
             if column.key != "mandate_id"
         }
+        predicates = [
+            MandateRecord.mandate_id == str(expected.mandate_id),
+            MandateRecord.token == expected.token,
+            MandateRecord.initiator_id == expected.initiator_id,
+            MandateRecord.origin_channel == expected.origin_channel.value,
+            MandateRecord.origin_conversation_id == expected.origin_conversation_id,
+            MandateRecord.origin_message_id == expected.origin_message_id,
+            MandateRecord.objective == expected.objective,
+            MandateRecord.plan == _json(expected.plan),
+            MandateRecord.state == expected.state.value,
+            MandateRecord.reason == expected.reason,
+            MandateRecord.next_action_at == expected.next_action_at,
+            MandateRecord.updated_at == expected.updated_at,
+            MandateRecord.expires_at == expected.expires_at,
+            MandateRecord.completed_at == expected.completed_at,
+        ]
+        if require_unexpired:
+            assert now is not None
+            predicates.append(MandateRecord.expires_at > now)
         result = self._session.execute(
             update(MandateRecord)
-            .where(
-                MandateRecord.mandate_id == str(expected.mandate_id),
-                MandateRecord.state == expected.state.value,
-                MandateRecord.reason == expected.reason,
-                MandateRecord.next_action_at == expected.next_action_at,
-                MandateRecord.updated_at == expected.updated_at,
-                MandateRecord.expires_at == expected.expires_at,
-                MandateRecord.completed_at == expected.completed_at,
-                MandateRecord.expires_at > now,
-            )
+            .where(*predicates)
             .values(**values)
             .execution_options(synchronize_session=False)
         )
@@ -652,12 +692,32 @@ class RepositoryUnitOfWork:
             update(StakeholderAssignmentRecord)
             .where(
                 StakeholderAssignmentRecord.assignment_id == str(expected.assignment_id),
+                StakeholderAssignmentRecord.mandate_id == str(expected.mandate_id),
+                StakeholderAssignmentRecord.person_id == expected.person_id,
+                StakeholderAssignmentRecord.department == expected.department,
+                StakeholderAssignmentRecord.direction == expected.direction.value,
+                StakeholderAssignmentRecord.reason == expected.reason,
+                StakeholderAssignmentRecord.required == expected.required,
+                StakeholderAssignmentRecord.engagement_type
+                == expected.engagement_type.value,
+                StakeholderAssignmentRecord.response_required
+                == expected.response_required,
                 StakeholderAssignmentRecord.state == expected.state.value,
+                StakeholderAssignmentRecord.route_ids == expected.route_ids,
                 StakeholderAssignmentRecord.attempt_count == expected.attempt_count,
                 StakeholderAssignmentRecord.active_route_index
                 == expected.active_route_index,
                 StakeholderAssignmentRecord.interview_id
                 == (str(expected.interview_id) if expected.interview_id else None),
+                StakeholderAssignmentRecord.first_contact_at
+                == expected.first_contact_at,
+                StakeholderAssignmentRecord.last_delivery_at
+                == expected.last_delivery_at,
+                StakeholderAssignmentRecord.next_action_at == expected.next_action_at,
+                StakeholderAssignmentRecord.acknowledged_at
+                == expected.acknowledged_at,
+                StakeholderAssignmentRecord.completed_at == expected.completed_at,
+                StakeholderAssignmentRecord.failure_reason == expected.failure_reason,
             )
             .values(**values)
             .execution_options(synchronize_session=False)
@@ -1133,6 +1193,20 @@ class SqlAlchemyHumanWireRepository:
                 )
             ).all()
             return [_assignment_value(record) for record in records]
+
+    def list_due_mandates(self, now: datetime) -> list[Mandate]:
+        with self._session_factory() as session:
+            records = session.scalars(
+                select(MandateRecord)
+                .where(
+                    MandateRecord.state == MandateState.PLANNED.value,
+                    MandateRecord.next_action_at.is_not(None),
+                    MandateRecord.next_action_at <= now,
+                    MandateRecord.expires_at > now,
+                )
+                .order_by(MandateRecord.next_action_at, MandateRecord.mandate_id)
+            ).all()
+            return [_mandate_value(record) for record in records]
 
     def set_runtime_status(self, key: str, value: str, updated_at: datetime) -> None:
         self._write(RepositoryUnitOfWork.set_runtime_status, key, value, updated_at)

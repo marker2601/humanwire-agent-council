@@ -23,6 +23,8 @@ def test_demo_is_deterministic_isolated_and_ready_without_local_configuration(
         "ACKNOWLEDGEMENT_SECONDS": "901",
         "REMINDER_SECONDS": "902",
         "MANDATE_TIMEOUT_SECONDS": "903",
+        "ENGAGEMENT_PREVIEW_SECONDS": "905",
+        "ENGAGEMENT_REQUIRE_GO": "true",
         "DUE_ACTION_POLL_SECONDS": "904",
         "DASHBOARD_HOST": "198.51.100.44",
         "DASHBOARD_PORT": "9999",
@@ -65,6 +67,8 @@ def test_demo_is_deterministic_isolated_and_ready_without_local_configuration(
     assert first_app.state.settings.acknowledgement_seconds == 300
     assert first_app.state.settings.reminder_seconds == 300
     assert first_app.state.settings.mandate_timeout_seconds == 86_400
+    assert first_app.state.settings.engagement_preview_seconds == 15
+    assert first_app.state.settings.engagement_require_go is False
     assert first_app.state.settings.due_action_poll_seconds == 5
     assert first_app.state.settings.dashboard_host == "127.0.0.1"
     assert first_app.state.settings.dashboard_port == 8000

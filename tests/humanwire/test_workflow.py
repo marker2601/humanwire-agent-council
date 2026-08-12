@@ -5,16 +5,9 @@ from datetime import timedelta
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import func, select
 
 from humanwire.config import Settings
-from humanwire.database import (
-    DomainEventRecord,
-    InterviewSessionRecord,
-    MandateRecord,
-    StakeholderAssignmentRecord,
-    create_session_factory,
-)
+from humanwire.database import create_session_factory
 from humanwire.directory import InitiatorPolicy, OrganizationDirectory, OrganizationDocument
 from humanwire.domain import (
     AlignmentIssue,
@@ -83,6 +76,192 @@ class DeterministicPlanner:
             planner="rules" if self.fallback_reason else "deterministic",
             fallback_reason=self.fallback_reason,
         )
+
+
+class MixedEngagementPlanner:
+    SPECS = (
+        (
+            "inform-person",
+            "Awareness update for launch observers.",
+            Direction.DOWNWARD,
+            False,
+            EngagementType.INFORM,
+            [],
+        ),
+        (
+            "ack-person",
+            "Acknowledge executive sponsorship receipt.",
+            Direction.UPWARD,
+            True,
+            EngagementType.ACKNOWLEDGE,
+            [],
+        ),
+        (
+            "quick-person",
+            "Provide one focused launch fact.",
+            Direction.DOWNWARD,
+            True,
+            EngagementType.QUICK_RESPONSE,
+            ["Which date is viable?"],
+        ),
+        (
+            "structured-person",
+            "Gather related policy facts and constraints.",
+            Direction.LATERAL,
+            True,
+            EngagementType.STRUCTURED_INTERVIEW,
+            ["Which rule applies?", "What blocks launch?", "What can you commit?"],
+        ),
+        (
+            "approval-person",
+            "Approve the registered launch decision.",
+            Direction.UPWARD,
+            True,
+            EngagementType.REVIEW_APPROVAL,
+            [],
+        ),
+        (
+            "availability-person",
+            "Provide meeting availability.",
+            Direction.LATERAL,
+            True,
+            EngagementType.AVAILABILITY,
+            [],
+        ),
+    )
+
+    def __init__(self, people: list[Person]) -> None:
+        self.people = people
+
+    def plan(self, text: str, initiator: Person) -> ResolvedPlan:
+        del text, initiator
+        people_by_id = {person.person_id: person for person in self.people}
+        return ResolvedPlan(
+            plan=MandatePlan(
+                objective="Coordinate adaptive launch coverage",
+                required_decisions=["Complete the registered launch mandate"],
+                stakeholders=[
+                    PlannedStakeholder(
+                        person_ref=person_id,
+                        reason=reason,
+                        direction=direction,
+                        required=required,
+                        engagement_type=engagement_type,
+                        response_required=engagement_type is not EngagementType.INFORM,
+                        questions=questions,
+                    )
+                    for (
+                        person_id,
+                        reason,
+                        direction,
+                        required,
+                        engagement_type,
+                        questions,
+                    ) in self.SPECS
+                ],
+                completion_conditions=["Every required contribution is recorded"],
+            ),
+            people=[people_by_id[spec[0]] for spec in self.SPECS],
+            planner="deterministic",
+        )
+
+
+def _mixed_directory(*, missing_routes: set[str] | None = None) -> tuple[OrganizationDirectory, list[Person]]:
+    missing_routes = missing_routes or set()
+    manager = Person(
+        person_id="manager",
+        display_name="Morgan Lee",
+        role="Operations Manager",
+        department="Operations",
+        timezone="UTC",
+        routes=[
+            ContactRoute(
+                route_id="manager-tg",
+                channel=Channel.TELEGRAM,
+                sender_address="manager-chat",
+                conversation_id="manager-conversation",
+                preferred=True,
+            )
+        ],
+    )
+    rows = (
+        ("inform-person", "Inez Ward", "Observers"),
+        ("ack-person", "Noah Price", "Leadership"),
+        ("quick-person", "Quinn Stone", "Delivery"),
+        ("structured-person", "Priya Raman", "People"),
+        ("approval-person", "Maya Brooks", "Executive"),
+        ("availability-person", "Ari Lane", "Operations"),
+    )
+    people = []
+    for person_id, display_name, department in rows:
+        routes = []
+        if person_id not in missing_routes:
+            routes = [
+                ContactRoute(
+                    route_id=f"{person_id}-email-route",
+                    channel=Channel.EMAIL,
+                    sender_address=f"{person_id}@private.example.test",
+                    recipient=f"{person_id}@private.example.test",
+                    preferred=True,
+                ),
+                ContactRoute(
+                    route_id=f"{person_id}-telegram-route",
+                    channel=Channel.TELEGRAM,
+                    sender_address=f"{person_id}-private-chat",
+                    conversation_id=f"{person_id}-private-conversation",
+                ),
+            ]
+        people.append(
+            Person(
+                person_id=person_id,
+                display_name=display_name,
+                role=f"{department} owner",
+                department=department,
+                timezone="UTC",
+                routes=routes,
+            )
+        )
+    return (
+        OrganizationDirectory(
+            OrganizationDocument(
+                people=[manager, *people],
+                initiator_policies=[
+                    InitiatorPolicy(
+                        person_id="manager",
+                        allowed_directions={
+                            Direction.DOWNWARD,
+                            Direction.LATERAL,
+                            Direction.UPWARD,
+                        },
+                        allowed_departments={department for _, _, department in rows},
+                    )
+                ],
+            )
+        ),
+        people,
+    )
+
+
+def _build_mixed_workflow(
+    repository: SqlAlchemyHumanWireRepository,
+    *,
+    settings: Settings | None = None,
+    missing_routes: set[str] | None = None,
+) -> HumanWireWorkflow:
+    directory, people = _mixed_directory(missing_routes=missing_routes)
+    return HumanWireWorkflow(
+        directory,
+        repository,
+        MixedEngagementPlanner(people),
+        RuleBasedEvidenceExtractor(),
+        settings
+        or Settings(
+            _env_file=None,
+            engagement_preview_seconds=15,
+            acknowledgement_seconds=60,
+            reminder_seconds=30,
+        ),
+    )
 
 
 def _people(
@@ -277,13 +456,21 @@ def _message_for(
 
 
 def _create_mandate(workflow, incoming_message_factory, *, message_id: str = "create-1"):
-    result = workflow.handle(
-        incoming_message_factory(
-            text="/mandate\nCoordinate launch coverage",
-            message_id=message_id,
+    message = incoming_message_factory(
+        text="/mandate\nCoordinate launch coverage",
+        message_id=message_id,
+    )
+    workflow.handle(message)
+    mandate = workflow.repository.list_recent_mandates(1)[0]
+    released = workflow.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": f"{message_id}-go",
+            }
         )
     )
-    return workflow.repository.list_recent_mandates(1)[0], result
+    return workflow.repository.get_mandate_by_token(mandate.token), released
 
 
 def _convert_assignment_to_engagement(
@@ -496,18 +683,1185 @@ def telegram_mandate(incoming_message_factory):
     return incoming_message_factory(text="/mandate\nCoordinate launch coverage with Riley, Avery, Casey, and Jordan")
 
 
+def _mixed_preview(
+    workflow: HumanWireWorkflow,
+    incoming_message_factory,
+    *,
+    message_id: str = "mixed-preview-create",
+    received_at=None,
+):
+    updates = {}
+    if received_at is not None:
+        updates["received_at"] = received_at
+    message = incoming_message_factory(
+        text=(
+            "/mandate\nCoordinate adaptive launch coverage. "
+            "PRIVATE-REQUEST-SENTINEL provider-body-sentinel"
+        ),
+        message_id=message_id,
+        **updates,
+    )
+    result = workflow.handle(message)
+    mandate = workflow.repository.list_recent_mandates(1)[0]
+    return message, mandate, result
+
+
+def test_mandate_previews_mixed_engagements_before_release_without_outreach(
+    repository, incoming_message_factory, now
+) -> None:
+    workflow = _build_mixed_workflow(repository)
+
+    message, mandate, result = _mixed_preview(
+        workflow, incoming_message_factory, received_at=now
+    )
+
+    assignments = repository.list_assignments(mandate.mandate_id)
+    by_person = {assignment.person_id: assignment for assignment in assignments}
+    events = repository.list_events(mandate.mandate_id)
+    assert mandate.state is MandateState.PLANNED
+    assert mandate.next_action_at == now + timedelta(seconds=15)
+    assert len(result.deliveries) == 1
+    preview = result.deliveries[0]
+    assert preview.kind is DeliveryKind.REPLY_TO_MESSAGE
+    assert preview.message_id == message.message_id
+    assert preview.conversation_id == message.conversation_id
+    assert preview.assignment_id is None
+    assert {assignment.state for assignment in assignments} == {
+        StakeholderState.CONTACT_QUEUED
+    }
+    assert all(assignment.attempt_count == 0 for assignment in assignments)
+    assert all(assignment.first_contact_at is None for assignment in assignments)
+    assert all(assignment.last_delivery_at is None for assignment in assignments)
+    assert all(assignment.next_action_at is None for assignment in assignments)
+    assert all(assignment.interview_id is None for assignment in assignments)
+    assert repository.list_interviews(mandate.mandate_id) == []
+    assert repository.list_evidence(mandate.mandate_id) == []
+    assert repository.list_engagement_decisions(mandate.mandate_id) == []
+    assert [event.event_type for event in events] == [
+        "mandate.received",
+        "mandate.planned",
+        "engagement.plan_previewed",
+    ]
+    assert [by_person[person_id].engagement_type for person_id, *_ in MixedEngagementPlanner.SPECS] == [
+        EngagementType.INFORM,
+        EngagementType.ACKNOWLEDGE,
+        EngagementType.QUICK_RESPONSE,
+        EngagementType.STRUCTURED_INTERVIEW,
+        EngagementType.REVIEW_APPROVAL,
+        EngagementType.AVAILABILITY,
+    ]
+    assert by_person["inform-person"].response_required is False
+    assert all(
+        by_person[person_id].response_required
+        for person_id in by_person
+        if person_id != "inform-person"
+    )
+
+    text = preview.text
+    for expected in (
+        "HUMANWIRE ENGAGEMENT PLAN",
+        mandate.token,
+        "Inez Ward",
+        "Observers",
+        "Downward",
+        "Awareness update for launch observers.",
+        "Inform",
+        "Response required: No",
+        "Noah Price",
+        "Acknowledgement",
+        "Quinn Stone",
+        "Quick response",
+        "Questions: 1",
+        "Priya Raman",
+        "Structured interview",
+        "Questions: 3",
+        "Maya Brooks",
+        "Approval review",
+        "Ari Lane",
+        "Availability",
+        "Primary Email",
+        "Alternate Telegram",
+        "15-second preview",
+        f"GO {mandate.token}",
+        f"ENGAGE {mandate.token} <person_id> <type>",
+    ):
+        assert expected in text
+    assert text.count("Questions:") == 2
+    for forbidden in (
+        "PRIVATE-REQUEST-SENTINEL",
+        "provider-body-sentinel",
+        "@private.example.test",
+        "private-conversation",
+        "private-chat",
+        "-email-route",
+        "-telegram-route",
+        "connection-1",
+        "manager-chat",
+    ):
+        assert forbidden not in text
+        assert forbidden not in "\n".join(event.model_dump_json() for event in events)
+
+
+def test_require_go_preview_has_no_deadline_and_never_auto_releases(
+    repository, incoming_message_factory, now
+) -> None:
+    workflow = _build_mixed_workflow(
+        repository,
+        settings=Settings(
+            _env_file=None,
+            engagement_preview_seconds=0,
+            engagement_require_go=True,
+        ),
+    )
+    _, mandate, created = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id="strict-require-go-preview",
+        received_at=now,
+    )
+
+    due = workflow.process_due(now + timedelta(hours=1))
+
+    saved = repository.get_mandate_by_token(mandate.token)
+    assert saved is not None and saved.state is MandateState.PLANNED
+    assert saved.next_action_at is None
+    assert "Explicit GO is required before outreach" in created.deliveries[0].text
+    assert due.deliveries == []
+    assert repository.list_interviews(mandate.mandate_id) == []
+    assert not any(
+        event.event_type == "engagement.plan_released"
+        for event in repository.list_events(mandate.mandate_id)
+    )
+
+
+def test_due_release_starts_all_six_engagement_types_once_and_not_before_deadline(
+    repository, incoming_message_factory, now
+) -> None:
+    workflow = _build_mixed_workflow(repository)
+    _, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id="due-release-preview",
+        received_at=now,
+    )
+
+    before = workflow.process_due(now + timedelta(seconds=14, microseconds=999999))
+    released = workflow.process_due(now + timedelta(seconds=15))
+    replay = workflow.process_due(now + timedelta(seconds=15))
+
+    saved = repository.get_mandate_by_token(mandate.token)
+    assignments = repository.list_assignments(mandate.mandate_id)
+    by_type = {assignment.engagement_type: assignment for assignment in assignments}
+    interviews = repository.list_interviews(mandate.mandate_id)
+    events = repository.list_events(mandate.mandate_id)
+    assert before.deliveries == []
+    assert saved is not None and saved.state is MandateState.INTERVIEWING
+    assert saved.next_action_at is None
+    assert len(released.deliveries) == 6
+    assert replay.deliveries == []
+    assert by_type[EngagementType.INFORM].state is StakeholderState.DELIVERED
+    assert by_type[EngagementType.INFORM].next_action_at is None
+    for engagement_type in EngagementType:
+        assignment = by_type[engagement_type]
+        assert assignment.attempt_count == 1
+        assert assignment.first_contact_at == now + timedelta(seconds=15)
+        assert assignment.last_delivery_at == now + timedelta(seconds=15)
+        if engagement_type is not EngagementType.INFORM:
+            assert assignment.state is StakeholderState.AWAITING_ACKNOWLEDGEMENT
+    assert {interview.assignment_id for interview in interviews} == {
+        by_type[EngagementType.QUICK_RESPONSE].assignment_id,
+        by_type[EngagementType.STRUCTURED_INTERVIEW].assignment_id,
+    }
+    assert len(interviews) == 2
+    assert [event.event_type for event in events].count("outreach.primary_sent") == 6
+    assert [event.event_type for event in events].count("engagement.plan_released") == 1
+    assert [event.event_type for event in events].count("mandate.interviewing") == 1
+
+
+def test_authorized_go_releases_strict_preview_early_once(
+    repository, incoming_message_factory, now
+) -> None:
+    workflow = _build_mixed_workflow(
+        repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    _, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id="go-release-preview",
+        received_at=now,
+    )
+    go = incoming_message_factory(
+        text=f"GO {mandate.token}",
+        message_id="go-release-command",
+        received_at=now + timedelta(seconds=1),
+    )
+
+    first = workflow.handle(go)
+    replay = workflow.handle(go)
+
+    saved = repository.get_mandate_by_token(mandate.token)
+    assert saved is not None and saved.state is MandateState.INTERVIEWING
+    assert len(first.deliveries) == 6
+    assert replay.deliveries == []
+    assert len(repository.list_interviews(mandate.mandate_id)) == 2
+    assert sum(
+        event.event_type == "engagement.plan_released"
+        for event in repository.list_events(mandate.mandate_id)
+    ) == 1
+
+
+@pytest.mark.parametrize(
+    ("sender", "channel", "conversation", "token"),
+    [
+        ("unknown-chat", Channel.TELEGRAM, "manager-conversation", None),
+        ("manager-chat", Channel.TELEGRAM, "wrong-conversation", None),
+        ("manager-chat", Channel.EMAIL, "manager-conversation", None),
+        ("manager-chat", Channel.TELEGRAM, "manager-conversation", "HW-NONE"),
+    ],
+    ids=["unknown-sender", "wrong-thread", "wrong-channel", "wrong-token"],
+)
+def test_go_release_requires_exact_initiator_origin_and_token_without_oracle(
+    repository,
+    incoming_message_factory,
+    now,
+    sender,
+    channel,
+    conversation,
+    token,
+) -> None:
+    workflow = _build_mixed_workflow(
+        repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    _, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id=f"go-auth-preview-{sender}-{conversation}",
+        received_at=now,
+    )
+    before = _terminal_snapshot(repository, mandate)
+
+    result = workflow.handle(
+        incoming_message_factory(
+            text=f"GO {token or mandate.token}",
+            sender_address=sender,
+            channel=channel,
+            conversation_id=conversation,
+            message_id=f"go-auth-command-{sender}-{conversation}",
+            received_at=now + timedelta(seconds=1),
+        )
+    )
+
+    assert result == WorkflowResult()
+    assert _terminal_snapshot(repository, mandate) == before
+
+
+def test_authorized_engage_updates_plan_assignment_and_safe_event_atomically(
+    repository, incoming_message_factory, now
+) -> None:
+    workflow = _build_mixed_workflow(
+        repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    _, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id="engage-preview-create",
+        received_at=now,
+    )
+    command = incoming_message_factory(
+        text=f"ENGAGE {mandate.token} inform-person ACKNOWLEDGE",
+        message_id="engage-safe-command",
+        received_at=now + timedelta(seconds=1),
+    )
+
+    result = workflow.handle(command)
+
+    saved = repository.get_mandate_by_token(mandate.token)
+    assignment = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.person_id == "inform-person"
+    )
+    stakeholder = next(
+        item for item in saved.plan.stakeholders if item.person_ref == "inform-person"
+    )
+    events = [
+        event
+        for event in repository.list_events(mandate.mandate_id)
+        if event.event_type == "engagement.override_recorded"
+    ]
+    assert saved is not None and saved.state is MandateState.PLANNED
+    assert assignment.engagement_type is EngagementType.ACKNOWLEDGE
+    assert assignment.response_required is True
+    assert assignment.state is StakeholderState.CONTACT_QUEUED
+    assert stakeholder.engagement_type is EngagementType.ACKNOWLEDGE
+    assert stakeholder.response_required is True
+    assert len(events) == 1
+    assert events[0].person_id == "inform-person"
+    assert events[0].metadata == {
+        "old_engagement_type": "inform",
+        "new_engagement_type": "acknowledge",
+    }
+    assert len(result.deliveries) == 1
+    assert result.deliveries[0].kind is DeliveryKind.REPLY_TO_MESSAGE
+    assert "Acknowledgement" in result.deliveries[0].text
+    assert "@private.example.test" not in result.deliveries[0].text
+
+    before_replay = _terminal_snapshot(repository, mandate)
+    replay = workflow.handle(command)
+    assert replay == WorkflowResult()
+    assert _terminal_snapshot(repository, mandate) == before_replay
+
+    reverse = workflow.handle(
+        command.model_copy(
+            update={
+                "message_id": "engage-safe-sequential",
+                "text": f"ENGAGE {mandate.token} inform-person INFORM",
+                "received_at": now + timedelta(seconds=2),
+            }
+        )
+    )
+    assert len(reverse.deliveries) == 1
+    assert sum(
+        event.event_type == "engagement.override_recorded"
+        for event in repository.list_events(mandate.mandate_id)
+    ) == 2
+
+
+@pytest.mark.parametrize(
+    ("person_id", "requested_type", "sender", "channel", "conversation"),
+    [
+        ("approval-person", "inform", "manager-chat", Channel.TELEGRAM, "manager-conversation"),
+        ("quick-person", "structured_interview", "manager-chat", Channel.TELEGRAM, "manager-conversation"),
+        ("unknown-person", "inform", "manager-chat", Channel.TELEGRAM, "manager-conversation"),
+        ("inform-person", "acknowledge", "unknown-chat", Channel.TELEGRAM, "manager-conversation"),
+        ("inform-person", "acknowledge", "manager-chat", Channel.TELEGRAM, "wrong-thread"),
+        ("inform-person", "acknowledge", "manager-chat", Channel.EMAIL, "manager-conversation"),
+    ],
+    ids=[
+        "unsafe-authority-downgrade",
+        "invalid-question-contract",
+        "unknown-person",
+        "wrong-initiator",
+        "wrong-thread",
+        "wrong-channel",
+    ],
+)
+def test_engage_rejects_unsafe_or_unauthorized_override_without_mutation(
+    repository,
+    incoming_message_factory,
+    now,
+    person_id,
+    requested_type,
+    sender,
+    channel,
+    conversation,
+) -> None:
+    workflow = _build_mixed_workflow(
+        repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    _, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id=f"engage-denied-preview-{person_id}-{requested_type}",
+        received_at=now,
+    )
+    before = _terminal_snapshot(repository, mandate)
+
+    result = workflow.handle(
+        incoming_message_factory(
+            text=f"ENGAGE {mandate.token} {person_id} {requested_type}",
+            sender_address=sender,
+            channel=channel,
+            conversation_id=conversation,
+            message_id=f"engage-denied-{person_id}-{requested_type}",
+            received_at=now + timedelta(seconds=1),
+        )
+    )
+
+    assert result == WorkflowResult()
+    assert _terminal_snapshot(repository, mandate) == before
+
+
+def test_engage_is_inert_after_release_cancel_or_expiry(
+    repository, incoming_message_factory, now
+) -> None:
+    workflow = _build_mixed_workflow(
+        repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    _, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id="engage-late-preview",
+        received_at=now,
+    )
+    workflow.handle(
+        incoming_message_factory(
+            text=f"GO {mandate.token}",
+            message_id="engage-late-go",
+            received_at=now + timedelta(seconds=1),
+        )
+    )
+    before = _terminal_snapshot(repository, mandate)
+
+    late = workflow.handle(
+        incoming_message_factory(
+            text=f"ENGAGE {mandate.token} inform-person ACKNOWLEDGE",
+            message_id="engage-late-command",
+            received_at=now + timedelta(seconds=2),
+        )
+    )
+
+    assert late == WorkflowResult()
+    assert _terminal_snapshot(repository, mandate) == before
+
+
+def test_required_missing_route_is_truthful_partial_and_never_releases_other_assignments(
+    repository, incoming_message_factory, now
+) -> None:
+    workflow = _build_mixed_workflow(
+        repository,
+        missing_routes={"quick-person"},
+    )
+
+    _, mandate, result = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id="required-missing-route-preview",
+        received_at=now,
+    )
+    due = workflow.process_due(now + timedelta(days=1))
+
+    saved = repository.get_mandate_by_token(mandate.token)
+    assignments = repository.list_assignments(mandate.mandate_id)
+    missing = next(item for item in assignments if item.person_id == "quick-person")
+    assert saved is not None and saved.state is MandateState.PARTIAL
+    assert saved.next_action_at is None
+    assert missing.state is StakeholderState.DELIVERY_FAILED
+    assert missing.failure_reason == "no_registered_route"
+    assert len(result.deliveries) == 1
+    assert result.deliveries[0].kind is DeliveryKind.REPLY_TO_MESSAGE
+    assert "Quinn Stone" in result.deliveries[0].text
+    assert "No registered delivery route" in result.deliveries[0].text
+    assert due.deliveries == []
+    assert repository.list_interviews(mandate.mandate_id) == []
+    assert all(item.attempt_count == 0 for item in assignments)
+    assert not any(
+        event.event_type == "engagement.plan_released"
+        for event in repository.list_events(mandate.mandate_id)
+    )
+
+
+def test_optional_missing_route_is_explicit_and_does_not_block_valid_release(
+    repository, incoming_message_factory, now
+) -> None:
+    workflow = _build_mixed_workflow(
+        repository,
+        missing_routes={"inform-person"},
+    )
+    _, mandate, result = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id="optional-missing-route-preview",
+        received_at=now,
+    )
+
+    released = workflow.process_due(now + timedelta(seconds=15))
+
+    saved = repository.get_mandate_by_token(mandate.token)
+    assignments = repository.list_assignments(mandate.mandate_id)
+    missing = next(item for item in assignments if item.person_id == "inform-person")
+    assert saved is not None and saved.state is MandateState.INTERVIEWING
+    assert missing.state is StakeholderState.DELIVERY_FAILED
+    assert "Routes: Unavailable" in result.deliveries[0].text
+    assert len(released.deliveries) == 5
+    assert all(delivery.assignment_id != missing.assignment_id for delivery in released.deliveries)
+
+
+def test_file_restart_releases_persisted_preview_at_due_time(
+    tmp_path, incoming_message_factory, now
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'preview-restart.sqlite3').as_posix()}"
+    repository = SqlAlchemyHumanWireRepository(create_session_factory(database_url))
+    first = _build_mixed_workflow(repository)
+    _, mandate, _ = _mixed_preview(
+        first,
+        incoming_message_factory,
+        message_id="preview-restart-create",
+        received_at=now,
+    )
+
+    restarted_repository = SqlAlchemyHumanWireRepository(
+        create_session_factory(database_url)
+    )
+    restarted = _build_mixed_workflow(restarted_repository)
+    released = restarted.process_due(now + timedelta(seconds=15))
+    replay = restarted.process_due(now + timedelta(seconds=15))
+
+    saved = restarted_repository.get_mandate_by_token(mandate.token)
+    assert saved is not None and saved.state is MandateState.INTERVIEWING
+    assert len(released.deliveries) == 6
+    assert replay.deliveries == []
+    assert len(restarted_repository.list_interviews(mandate.mandate_id)) == 2
+
+
+@pytest.mark.parametrize(
+    ("failure_point", "assignment_loss_index"),
+    [
+        ("mandate_cas", None),
+        ("assignment_cas", 0),
+        ("assignment_cas", 2),
+        ("assignment_cas", 5),
+        ("interview_insert", None),
+        ("event_append", None),
+    ],
+)
+def test_release_failure_rolls_back_the_complete_batch_without_delivery(
+    repository,
+    incoming_message_factory,
+    now,
+    monkeypatch,
+    failure_point,
+    assignment_loss_index,
+) -> None:
+    workflow = _build_mixed_workflow(
+        repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    _, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id=f"release-rollback-{failure_point}-{assignment_loss_index}",
+        received_at=now,
+    )
+    before = _terminal_snapshot(repository, mandate)
+
+    if failure_point == "mandate_cas":
+        monkeypatch.setattr(
+            RepositoryUnitOfWork,
+            "compare_and_save_mandate_if_unexpired",
+            lambda self, expected, updated, at: False,
+        )
+    elif failure_point == "assignment_cas":
+        original = RepositoryUnitOfWork.compare_and_save_assignment
+        calls = 0
+
+        def lose_selected_assignment(self, expected, updated):
+            nonlocal calls
+            index = calls
+            calls += 1
+            if index == assignment_loss_index:
+                return False
+            return original(self, expected, updated)
+
+        monkeypatch.setattr(
+            RepositoryUnitOfWork,
+            "compare_and_save_assignment",
+            lose_selected_assignment,
+        )
+    elif failure_point == "interview_insert":
+        original = RepositoryUnitOfWork.add_interview
+
+        def fail_interview(self, interview):
+            original(self, interview)
+            raise RuntimeError("injected release interview failure")
+
+        monkeypatch.setattr(RepositoryUnitOfWork, "add_interview", fail_interview)
+    else:
+        original = RepositoryUnitOfWork.append_event_once
+
+        def fail_release_event(self, mandate_id, event):
+            if event.event_type == "engagement.plan_released":
+                raise RuntimeError("injected release event failure")
+            return original(self, mandate_id, event)
+
+        monkeypatch.setattr(RepositoryUnitOfWork, "append_event_once", fail_release_event)
+
+    released = workflow.handle(
+        incoming_message_factory(
+            text=f"GO {mandate.token}",
+            message_id=f"release-rollback-go-{failure_point}-{assignment_loss_index}",
+            received_at=now + timedelta(seconds=1),
+        )
+    )
+
+    assert released == WorkflowResult()
+    assert _terminal_snapshot(repository, mandate) == before
+
+
+def test_release_rejects_an_assignment_roster_that_no_longer_matches_the_plan(
+    repository, incoming_message_factory, now
+) -> None:
+    workflow = _build_mixed_workflow(
+        repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    _, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id="release-roster-mismatch-create",
+        received_at=now,
+    )
+    assignment = repository.list_assignments(mandate.mandate_id)[0]
+    repository.add_assignment(
+        assignment.model_copy(
+            update={
+                "assignment_id": uuid4(),
+                "person_id": "unexpected-person",
+            }
+        )
+    )
+    before = _terminal_snapshot(repository, mandate)
+
+    released = workflow.handle(
+        incoming_message_factory(
+            text=f"GO {mandate.token}",
+            message_id="release-roster-mismatch-go",
+            received_at=now + timedelta(seconds=1),
+        )
+    )
+
+    assert released == WorkflowResult()
+    assert _terminal_snapshot(repository, mandate) == before
+
+
+def test_expiration_is_processed_before_a_due_preview_release(
+    repository, incoming_message_factory, now
+) -> None:
+    workflow = _build_mixed_workflow(
+        repository,
+        settings=Settings(
+            _env_file=None,
+            engagement_preview_seconds=15,
+            mandate_timeout_seconds=10,
+        ),
+    )
+    _, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id="expire-before-release-preview",
+        received_at=now,
+    )
+
+    result = workflow.process_due(now + timedelta(seconds=15))
+
+    saved = repository.get_mandate_by_token(mandate.token)
+    assert saved is not None and saved.state is MandateState.EXPIRED
+    assert len(result.deliveries) == 1
+    assert "EXPIRED" in result.deliveries[0].text
+    assert repository.list_interviews(mandate.mandate_id) == []
+    assert not any(
+        event.event_type == "engagement.plan_released"
+        for event in repository.list_events(mandate.mandate_id)
+    )
+
+
+def _file_mixed_race_workflow(tmp_path, name: str, settings: Settings):
+    database_path = tmp_path / f"{name}.sqlite3"
+    factory = create_session_factory(f"sqlite:///{database_path.as_posix()}")
+    with factory.kw["bind"].begin() as connection:
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        connection.exec_driver_sql("PRAGMA busy_timeout=5000")
+    repository = SqlAlchemyHumanWireRepository(factory)
+    return repository, _build_mixed_workflow(repository, settings=settings)
+
+
+def _order_stale_transaction_race(
+    repository,
+    monkeypatch,
+    *,
+    winner: str,
+    participant_count: int = 2,
+):
+    """Hold every loser after its aggregate read, then commit one named winner."""
+    original_transaction = repository.transaction
+    role = threading.local()
+    condition = threading.Condition()
+    losers_ready = 0
+    winner_done = threading.Event()
+
+    @contextmanager
+    def ordered_transaction():
+        nonlocal losers_ready
+        name = getattr(role, "name", None)
+        if name == winner:
+            with condition:
+                assert condition.wait_for(
+                    lambda: losers_ready == participant_count - 1,
+                    timeout=5,
+                )
+        else:
+            with condition:
+                losers_ready += 1
+                condition.notify_all()
+            assert winner_done.wait(timeout=5)
+        try:
+            with original_transaction() as unit:
+                yield unit
+        finally:
+            if name == winner:
+                winner_done.set()
+
+    monkeypatch.setattr(repository, "transaction", ordered_transaction)
+    return role
+
+
+@pytest.mark.parametrize("iteration", range(2))
+@pytest.mark.parametrize("winner", ["go", "due"])
+def test_file_go_and_due_release_race_has_one_complete_winner(
+    tmp_path, incoming_message_factory, now, monkeypatch, iteration, winner
+) -> None:
+    repository, workflow = _file_mixed_race_workflow(
+        tmp_path,
+        f"go-due-{winner}-{iteration}",
+        Settings(_env_file=None, engagement_preview_seconds=15),
+    )
+    message, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id=f"go-due-create-{winner}-{iteration}",
+        received_at=now,
+    )
+    role = _order_stale_transaction_race(
+        repository,
+        monkeypatch,
+        winner=winner,
+    )
+
+    def run_go():
+        role.name = "go"
+        return workflow.handle(
+            message.model_copy(
+                update={
+                    "text": f"GO {mandate.token}",
+                    "message_id": f"go-due-go-{winner}-{iteration}",
+                    "received_at": now + timedelta(seconds=1),
+                }
+            )
+        )
+
+    def run_due():
+        role.name = "due"
+        return workflow.process_due(now + timedelta(seconds=15))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        go_result = executor.submit(run_go)
+        due_result = executor.submit(run_due)
+        results = (go_result.result(timeout=10), due_result.result(timeout=10))
+
+    assert sorted(len(result.deliveries) for result in results) == [0, 6]
+    assert repository.get_mandate_by_token(mandate.token).state is MandateState.INTERVIEWING
+    assert len(repository.list_interviews(mandate.mandate_id)) == 2
+    assert sum(
+        event.event_type == "engagement.plan_released"
+        for event in repository.list_events(mandate.mandate_id)
+    ) == 1
+
+
+@pytest.mark.parametrize("iteration", range(2))
+@pytest.mark.parametrize("winner", ["go", "cancel"])
+def test_file_go_and_cancel_race_never_releases_a_cancelled_plan(
+    tmp_path, incoming_message_factory, now, monkeypatch, iteration, winner
+) -> None:
+    repository, workflow = _file_mixed_race_workflow(
+        tmp_path,
+        f"go-cancel-{winner}-{iteration}",
+        Settings(_env_file=None, engagement_require_go=True),
+    )
+    message, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id=f"go-cancel-create-{winner}-{iteration}",
+        received_at=now,
+    )
+    role = _order_stale_transaction_race(
+        repository,
+        monkeypatch,
+        winner=winner,
+    )
+
+    def run_go():
+        role.name = "go"
+        return workflow.handle(
+            message.model_copy(
+                update={
+                    "text": f"GO {mandate.token}",
+                    "message_id": f"go-cancel-go-{winner}-{iteration}",
+                }
+            )
+        )
+
+    def run_cancel():
+        role.name = "cancel"
+        return workflow.handle(
+            message.model_copy(
+                update={
+                    "text": f"/cancel {mandate.token}",
+                    "message_id": f"go-cancel-cancel-{winner}-{iteration}",
+                }
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        go_result = executor.submit(run_go)
+        cancel_result = executor.submit(run_cancel)
+        results = (go_result.result(timeout=10), cancel_result.result(timeout=10))
+
+    saved = repository.get_mandate_by_token(mandate.token)
+    events = repository.list_events(mandate.mandate_id)
+    if winner == "go":
+        assert saved.state is MandateState.INTERVIEWING
+        assert sorted(len(result.deliveries) for result in results) == [0, 6]
+        assert len(repository.list_interviews(mandate.mandate_id)) == 2
+        assert not any(event.event_type == "mandate.cancelled" for event in events)
+    else:
+        assert saved.state is MandateState.CANCELLED
+        assert sorted(len(result.deliveries) for result in results) == [0, 1]
+        assert repository.list_interviews(mandate.mandate_id) == []
+        assert not any(event.event_type == "engagement.plan_released" for event in events)
+
+
+@pytest.mark.parametrize("iteration", range(2))
+@pytest.mark.parametrize("winner", ["release", "expiry"])
+def test_file_release_and_expiry_race_preserves_one_whole_aggregate(
+    tmp_path, incoming_message_factory, now, monkeypatch, iteration, winner
+) -> None:
+    repository, workflow = _file_mixed_race_workflow(
+        tmp_path,
+        f"release-expiry-{winner}-{iteration}",
+        Settings(
+            _env_file=None,
+            engagement_require_go=True,
+            mandate_timeout_seconds=30,
+        ),
+    )
+    message, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id=f"release-expiry-create-{winner}-{iteration}",
+        received_at=now,
+    )
+    role = _order_stale_transaction_race(
+        repository,
+        monkeypatch,
+        winner=winner,
+    )
+
+    def run_release():
+        role.name = "release"
+        return workflow.handle(
+            message.model_copy(
+                update={
+                    "text": f"GO {mandate.token}",
+                    "message_id": f"release-expiry-go-{winner}-{iteration}",
+                    "received_at": mandate.expires_at - timedelta(seconds=1),
+                }
+            )
+        )
+
+    def run_expiry():
+        role.name = "expiry"
+        return workflow.process_due(mandate.expires_at)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        release_result = executor.submit(run_release)
+        expiry_result = executor.submit(run_expiry)
+        results = (release_result.result(timeout=10), expiry_result.result(timeout=10))
+
+    saved = repository.get_mandate_by_token(mandate.token)
+    events = repository.list_events(mandate.mandate_id)
+    if winner == "release":
+        assert saved.state is MandateState.INTERVIEWING
+        assert sorted(len(result.deliveries) for result in results) == [0, 6]
+        assert len(repository.list_interviews(mandate.mandate_id)) == 2
+        assert not any(event.event_type == "mandate.expired" for event in events)
+    else:
+        assert saved.state is MandateState.EXPIRED
+        assert sorted(len(result.deliveries) for result in results) == [0, 1]
+        assert repository.list_interviews(mandate.mandate_id) == []
+        assert not any(event.event_type == "engagement.plan_released" for event in events)
+
+
+@pytest.mark.parametrize("iteration", range(2))
+@pytest.mark.parametrize("winner", ["override", "release"])
+def test_file_override_and_release_race_never_exposes_a_half_updated_plan(
+    tmp_path, incoming_message_factory, now, monkeypatch, iteration, winner
+) -> None:
+    repository, workflow = _file_mixed_race_workflow(
+        tmp_path,
+        f"override-release-{winner}-{iteration}",
+        Settings(_env_file=None, engagement_require_go=True),
+    )
+    message, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id=f"override-release-create-{winner}-{iteration}",
+        received_at=now,
+    )
+    role = _order_stale_transaction_race(
+        repository,
+        monkeypatch,
+        winner=winner,
+    )
+
+    def run_override():
+        role.name = "override"
+        return workflow.handle(
+            message.model_copy(
+                update={
+                    "text": f"ENGAGE {mandate.token} inform-person ACKNOWLEDGE",
+                    "message_id": f"override-release-engage-{winner}-{iteration}",
+                }
+            )
+        )
+
+    def run_release():
+        role.name = "release"
+        return workflow.handle(
+            message.model_copy(
+                update={
+                    "text": f"GO {mandate.token}",
+                    "message_id": f"override-release-go-{winner}-{iteration}",
+                }
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        override_result = executor.submit(run_override)
+        release_result = executor.submit(run_release)
+        results = (override_result.result(timeout=10), release_result.result(timeout=10))
+
+    saved = repository.get_mandate_by_token(mandate.token)
+    assignment = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.person_id == "inform-person"
+    )
+    planned = next(
+        item
+        for item in saved.plan.stakeholders
+        if item.person_ref == "inform-person"
+    )
+    events = repository.list_events(mandate.mandate_id)
+    assert assignment.engagement_type is planned.engagement_type
+    assert assignment.response_required is planned.response_required
+    if winner == "override":
+        assert saved.state is MandateState.PLANNED
+        assert assignment.engagement_type is EngagementType.ACKNOWLEDGE
+        assert sorted(len(result.deliveries) for result in results) == [0, 1]
+        assert repository.list_interviews(mandate.mandate_id) == []
+        assert not any(event.event_type == "engagement.plan_released" for event in events)
+    else:
+        assert saved.state is MandateState.INTERVIEWING
+        assert assignment.engagement_type is EngagementType.INFORM
+        assert sorted(len(result.deliveries) for result in results) == [0, 6]
+        assert not any(event.event_type == "engagement.override_recorded" for event in events)
+
+
+@pytest.mark.parametrize("iteration", range(2))
+def test_file_two_override_race_records_exactly_one_safe_change(
+    tmp_path, incoming_message_factory, now, monkeypatch, iteration
+) -> None:
+    repository, workflow = _file_mixed_race_workflow(
+        tmp_path,
+        f"two-overrides-{iteration}",
+        Settings(_env_file=None, engagement_require_go=True),
+    )
+    message, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id=f"two-overrides-create-{iteration}",
+        received_at=now,
+    )
+    role = _order_stale_transaction_race(
+        repository,
+        monkeypatch,
+        winner="first",
+    )
+
+    def run_override(name: str):
+        role.name = name
+        return workflow.handle(
+            message.model_copy(
+                update={
+                    "text": f"ENGAGE {mandate.token} inform-person ACKNOWLEDGE",
+                    "message_id": f"two-overrides-{name}-{iteration}",
+                }
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(run_override, "first")
+        second = executor.submit(run_override, "second")
+        results = (first.result(timeout=10), second.result(timeout=10))
+
+    saved = repository.get_mandate_by_token(mandate.token)
+    assignment = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.person_id == "inform-person"
+    )
+    override_events = [
+        event
+        for event in repository.list_events(mandate.mandate_id)
+        if event.event_type == "engagement.override_recorded"
+    ]
+    assert saved.state is MandateState.PLANNED
+    assert assignment.engagement_type is EngagementType.ACKNOWLEDGE
+    assert sorted(len(result.deliveries) for result in results) == [0, 1]
+    assert len(override_events) == 1
+    assert override_events[0].metadata == {
+        "old_engagement_type": "inform",
+        "new_engagement_type": "acknowledge",
+    }
+
+
+@pytest.mark.parametrize("iteration", range(2))
+def test_file_repeated_due_scan_race_releases_once(
+    tmp_path, incoming_message_factory, now, monkeypatch, iteration
+) -> None:
+    repository, workflow = _file_mixed_race_workflow(
+        tmp_path,
+        f"repeated-due-{iteration}",
+        Settings(_env_file=None, engagement_preview_seconds=0),
+    )
+    _, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id=f"repeated-due-create-{iteration}",
+        received_at=now,
+    )
+    role = _order_stale_transaction_race(
+        repository,
+        monkeypatch,
+        winner="due-0",
+        participant_count=4,
+    )
+
+    def run_due(index: int):
+        role.name = f"due-{index}"
+        return workflow.process_due(now)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(run_due, index) for index in range(4)]
+        results = [future.result(timeout=10) for future in futures]
+
+    assert sorted(len(result.deliveries) for result in results) == [0, 0, 0, 6]
+    assert repository.get_mandate_by_token(mandate.token).state is MandateState.INTERVIEWING
+    assert len(repository.list_interviews(mandate.mandate_id)) == 2
+    assert sum(
+        event.event_type == "engagement.plan_released"
+        for event in repository.list_events(mandate.mandate_id)
+    ) == 1
+
+
+def test_process_due_delegates_all_six_types_to_the_shared_coordinator(
+    repository, incoming_message_factory, now, monkeypatch
+) -> None:
+    workflow = _build_mixed_workflow(
+        repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    message, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id="shared-due-create",
+        received_at=now,
+    )
+    workflow.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": "shared-due-go",
+            }
+        )
+    )
+    assignments = repository.list_assignments(mandate.mandate_id)
+    for assignment in assignments:
+        repository.save_assignment(
+            assignment.model_copy(update={"next_action_at": now})
+        )
+    delegated = []
+
+    def capture_due(assignment, at):
+        delegated.append((assignment.assignment_id, assignment.engagement_type, at))
+        return WorkflowResult()
+
+    monkeypatch.setattr(workflow.engagements, "process_due_assignment", capture_due)
+
+    workflow.process_due(now)
+
+    assert {item[0] for item in delegated} == {
+        assignment.assignment_id for assignment in assignments
+    }
+    assert {item[1] for item in delegated} == set(EngagementType)
+    assert {item[2] for item in delegated} == {now}
+
+
+def test_delivery_callbacks_for_all_six_types_use_the_shared_coordinator(
+    repository, incoming_message_factory, now, monkeypatch
+) -> None:
+    workflow = _build_mixed_workflow(
+        repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    message, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id="shared-callback-create",
+        received_at=now,
+    )
+    released = workflow.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": "shared-callback-go",
+            }
+        )
+    )
+    delegated = []
+
+    def capture_success(assignment_id, delivery_id, at):
+        delegated.append((assignment_id, delivery_id, at))
+
+    monkeypatch.setattr(workflow.engagements, "mark_delivery_success", capture_success)
+
+    for delivery in released.deliveries:
+        workflow.mark_delivery_result(delivery, succeeded=True, now=now)
+
+    assignments = repository.list_assignments(mandate.mandate_id)
+    assert {item[0] for item in delegated} == {
+        assignment.assignment_id for assignment in assignments
+    }
+    assert all(item[1] for item in delegated)
+    assert {item[2] for item in delegated} == {now}
+
+
 def test_manager_mandate_creates_three_routes_and_real_deliveries(
     workflow, telegram_mandate, repository
 ) -> None:
     """Break caught: creation skips a direction, atomic state transition, or outreach."""
-    result = workflow.handle(telegram_mandate)
+    preview = workflow.handle(telegram_mandate)
     mandate = repository.list_recent_mandates(1)[0]
+    released = workflow.handle(
+        telegram_mandate.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": "manager-mandate-go",
+            }
+        )
+    )
     assignments = repository.list_assignments(mandate.mandate_id)
 
-    assert mandate.state is MandateState.INTERVIEWING
+    assert repository.get_mandate_by_token(mandate.token).state is MandateState.INTERVIEWING
     assert {item.direction for item in assignments} == {Direction.DOWNWARD, Direction.LATERAL, Direction.UPWARD}
-    assert len(result.deliveries) == 5
-    assert {delivery.kind for delivery in result.deliveries[1:]} == {DeliveryKind.INITIATE_EMAIL}
+    assert len(preview.deliveries) == 1
+    assert len(released.deliveries) == 4
+    assert {delivery.kind for delivery in released.deliveries} == {DeliveryKind.INITIATE_EMAIL}
     assert {event.new_state for event in repository.list_events(mandate.mandate_id)} >= {"received", "planned", "interviewing"}
 
 
@@ -519,7 +1873,7 @@ def test_duplicate_incoming_mandate_returns_existing_state_without_second_outrea
     second = workflow.handle(telegram_mandate)
 
     assert len(repository.list_recent_mandates()) == 1
-    assert len(first.deliveries) == 5
+    assert len(first.deliveries) == 1
     assert second.deliveries == []
 
 
@@ -567,7 +1921,7 @@ def test_required_stakeholder_without_route_is_atomically_partial_and_explained_
     }
     assert any(event.new_state == StakeholderState.DELIVERY_FAILED.value for event in events)
     assert len(first.deliveries) == 1
-    assert first.deliveries[0].kind is DeliveryKind.SEND_TO_CONVERSATION
+    assert first.deliveries[0].kind is DeliveryKind.REPLY_TO_MESSAGE
     assert first.deliveries[0].conversation_id == "manager-conversation"
     assert "Riley Chen" in first.deliveries[0].text
     assert "Launch Lead" in first.deliveries[0].text
@@ -603,7 +1957,7 @@ def test_model_planning_failure_uses_persisted_fallback_and_duplicate_is_inert(
     fallback = next(event for event in events_before if event.event_type == "model.fallback")
     assert mandate.objective == "Coordinate launch coverage"
     assert fallback.metadata == {"reason_code": "provider_timeout"}
-    assert len(first.deliveries) == 2
+    assert len(first.deliveries) == 1
     assert duplicate.deliveries == []
     assert len(repository.list_recent_mandates()) == 1
     assert repository.list_events(mandate.mandate_id) == events_before
@@ -2107,11 +3461,18 @@ def test_process_due_merges_ladder_and_synthesis_deliveries_at_workflow_boundary
     )
 
 
-def test_creation_transaction_rolls_back_every_row_when_event_persistence_fails(
+def test_release_transaction_rolls_back_every_row_when_interview_persistence_fails(
     repository, incoming_message_factory, monkeypatch
 ) -> None:
-    """Break caught: a failed creation event leaves an orphan mandate or assignment."""
+    """Break caught: a failed interview insert leaks part of a release batch."""
     workflow = _build_workflow(repository)
+    message = incoming_message_factory(
+        text="/mandate\nCoordinate launch coverage",
+        message_id="rollback-create",
+    )
+    workflow.handle(message)
+    mandate = repository.list_recent_mandates(1)[0]
+    before = _terminal_snapshot(repository, mandate)
     original = RepositoryUnitOfWork.add_interview
 
     def fail_after_interview_is_staged(self, interview):
@@ -2119,19 +3480,17 @@ def test_creation_transaction_rolls_back_every_row_when_event_persistence_fails(
         raise RuntimeError("injected interview persistence failure")
 
     monkeypatch.setattr(RepositoryUnitOfWork, "add_interview", fail_after_interview_is_staged)
-    with pytest.raises(RuntimeError, match="injected interview persistence failure"):
-        workflow.handle(
-            incoming_message_factory(
-                text="/mandate\nCoordinate launch coverage",
-                message_id="rollback-create",
-            )
+    released = workflow.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": "rollback-release",
+            }
         )
+    )
 
-    with repository._session_factory() as session:
-        assert session.scalar(select(func.count()).select_from(MandateRecord)) == 0
-        assert session.scalar(select(func.count()).select_from(StakeholderAssignmentRecord)) == 0
-        assert session.scalar(select(func.count()).select_from(InterviewSessionRecord)) == 0
-        assert session.scalar(select(func.count()).select_from(DomainEventRecord)) == 0
+    assert released == WorkflowResult()
+    assert _terminal_snapshot(repository, mandate) == before
 
 
 def test_initiator_can_request_status(workflow, telegram_mandate, incoming_message_factory, repository) -> None:
@@ -2151,7 +3510,7 @@ def test_initiator_can_request_status(workflow, telegram_mandate, incoming_messa
     assert result.deliveries[0].kind is DeliveryKind.REPLY_TO_MESSAGE
     assert result.deliveries[0].conversation_id == "manager-conversation"
     assert mandate.token in result.deliveries[0].text
-    assert MandateState.INTERVIEWING.value in result.deliveries[0].text
+    assert MandateState.PLANNED.value in result.deliveries[0].text
     assert repository.list_events(mandate.mandate_id) == events
 
 
@@ -2330,6 +3689,14 @@ def test_aligned_synthesis_persists_public_brief_and_routes_it_to_required_peopl
     """Break caught: an aligned result is hidden or sent to an unrouted destination."""
     workflow.handle(telegram_mandate)
     mandate = repository.list_recent_mandates(1)[0]
+    workflow.handle(
+        telegram_mandate.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": "aligned-synthesis-go",
+            }
+        )
+    )
     assignments = repository.list_assignments(mandate.mandate_id)
     with repository.transaction() as unit:
         for assignment in assignments:
@@ -2388,7 +3755,16 @@ def test_primary_delivery_failure_immediately_uses_the_next_registered_route(
     workflow, telegram_mandate, repository, now
 ) -> None:
     """Break caught: a failed primary delivery produces a reminder on that same route."""
-    created = workflow.handle(telegram_mandate)
+    workflow.handle(telegram_mandate)
+    mandate = repository.list_recent_mandates(1)[0]
+    created = workflow.handle(
+        telegram_mandate.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": "primary-failure-go",
+            }
+        )
+    )
     primary = next(item for item in created.deliveries if item.assignment_id is not None and item.recipient == "lead@example.test")
 
     retry = workflow.mark_delivery_result(primary, succeeded=False, now=now)
@@ -2407,14 +3783,22 @@ def test_final_delivery_failure_synthesizes_required_mandate_and_replay_is_inert
     workflow, telegram_mandate, repository, now
 ) -> None:
     """Break caught: exhaustion passes an assignment UUID to mandate synthesis."""
-    created = workflow.handle(telegram_mandate)
+    workflow.handle(telegram_mandate)
+    mandate = repository.list_recent_mandates(1)[0]
+    created = workflow.handle(
+        telegram_mandate.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": "final-failure-go",
+            }
+        )
+    )
     primary = next(
         item
         for item in created.deliveries
         if item.assignment_id is not None and item.recipient == "lead@example.test"
     )
     alternate = workflow.mark_delivery_result(primary, succeeded=False, now=now).deliveries[0]
-    mandate = repository.list_recent_mandates(1)[0]
     with repository.transaction() as unit:
         for assignment in repository.list_assignments(mandate.mandate_id):
             if assignment.assignment_id != primary.assignment_id:

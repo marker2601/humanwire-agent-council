@@ -3,15 +3,92 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from humanwire.domain import EngagementType, MeetingPackage, Proposal
+from humanwire.domain import Channel, Direction, EngagementType, MeetingPackage, Proposal
 from humanwire.evidence import ShareableEvidence
 from humanwire.redaction import redact_sensitive
 
 if TYPE_CHECKING:
     from humanwire.meetings import MeetingCoordinator
+
+
+@dataclass(frozen=True)
+class EngagementPreviewRow:
+    person_id: str
+    display_name: str
+    department: str
+    direction: Direction
+    reason: str
+    engagement_type: EngagementType
+    response_required: bool
+    question_count: int
+    route_channels: tuple[Channel, ...]
+
+
+_ENGAGEMENT_LABELS = {
+    EngagementType.INFORM: "Inform",
+    EngagementType.ACKNOWLEDGE: "Acknowledgement",
+    EngagementType.QUICK_RESPONSE: "Quick response",
+    EngagementType.STRUCTURED_INTERVIEW: "Structured interview",
+    EngagementType.REVIEW_APPROVAL: "Approval review",
+    EngagementType.AVAILABILITY: "Availability",
+}
+
+
+def render_engagement_plan_preview(
+    token: str,
+    rows: Iterable[EngagementPreviewRow],
+    *,
+    release_at: datetime | None,
+    preview_seconds: int,
+    require_go: bool,
+) -> str:
+    lines = [
+        f"HUMANWIRE ENGAGEMENT PLAN \u00b7 {token}",
+        "",
+    ]
+    for index, row in enumerate(rows, start=1):
+        route_labels = []
+        for route_index, channel in enumerate(row.route_channels[:2]):
+            position = "Primary" if route_index == 0 else "Alternate"
+            route_labels.append(f"{position} {channel.value.title()}")
+        routes = " \u00b7 ".join(route_labels) if route_labels else "Unavailable"
+        lines.extend(
+            [
+                (
+                    f"{index}. {row.display_name} [{row.person_id}] \u00b7 "
+                    f"{row.department} \u00b7 {row.direction.value.title()}"
+                ),
+                f"   Reason: {row.reason}",
+                f"   Engagement: {_ENGAGEMENT_LABELS[row.engagement_type]}",
+                f"   Response required: {'Yes' if row.response_required else 'No'}",
+            ]
+        )
+        if row.engagement_type in {
+            EngagementType.QUICK_RESPONSE,
+            EngagementType.STRUCTURED_INTERVIEW,
+        }:
+            lines.append(f"   Questions: {row.question_count}")
+        lines.append(f"   Routes: {routes}")
+    lines.append("")
+    if require_go:
+        lines.append("Explicit GO is required before outreach.")
+    else:
+        if release_at is None:
+            raise ValueError("automatic preview requires a release timestamp")
+        lines.append(
+            f"Auto-release: {release_at.isoformat()} ({preview_seconds}-second preview)."
+        )
+    lines.extend(
+        [
+            f"Send GO {token} to release now.",
+            f"Send ENGAGE {token} <person_id> <type> before release to change a safe engagement.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def render_inform_update(token: str, mandate_summary: str, reason: str) -> str:

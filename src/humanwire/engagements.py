@@ -126,12 +126,17 @@ class EngagementCoordinator:
         if not routes:
             raise ValueError("assignment has no registered route")
         route = routes[0]
-        queued = self._transition(
-            assignment,
-            StakeholderState.CONTACT_QUEUED,
-            "primary_outreach",
-            now,
-        )
+        if assignment.state is StakeholderState.NOT_CONTACTED:
+            queued = self._transition(
+                assignment,
+                StakeholderState.CONTACT_QUEUED,
+                "primary_outreach",
+                now,
+            )
+        elif assignment.state is StakeholderState.CONTACT_QUEUED:
+            queued = assignment
+        else:
+            raise ValueError("initial engagement must be not contacted or contact queued")
         delivered = self._transition(
             queued,
             StakeholderState.DELIVERED,

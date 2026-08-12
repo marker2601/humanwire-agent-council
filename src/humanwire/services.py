@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 from humanwire.alignment import AlignmentEngine, NegotiationCoordinator
-from humanwire.commands import MandateCommand
+from humanwire.commands import EngageCommand, MandateCommand
 from humanwire.config import Settings
 from humanwire.directory import (
     AmbiguousPersonError,
@@ -20,16 +20,24 @@ from humanwire.domain import (
     DeliveryInstruction,
     DeliveryKind,
     DomainEvent,
+    EngagementType,
     IncomingMessage,
     Mandate,
     MandateState,
+    PlannedStakeholder,
     StakeholderAssignment,
     StakeholderState,
     WorkflowResult,
 )
+from humanwire.engagement_policy import EngagementPolicy, EngagementPolicyError
+from humanwire.engagements import EngagementCoordinator, PreparedEngagement
 from humanwire.evidence import EvidenceExtractor, private_blocker_count, shareable_evidence
-from humanwire.interviews import InterviewCoordinator
-from humanwire.messages import render_alignment_brief, render_proposal
+from humanwire.messages import (
+    EngagementPreviewRow,
+    render_alignment_brief,
+    render_engagement_plan_preview,
+    render_proposal,
+)
 from humanwire.planning import MandatePlanner, PlanNeedsClarification
 from humanwire.repository import SqlAlchemyHumanWireRepository
 from humanwire.state_machine import MandateStateMachine, StakeholderStateMachine
@@ -65,7 +73,7 @@ def _event(
 
 
 class MandateService:
-    """Creates a complete, persisted mandate before any delivery is attempted."""
+    """Persist, preview, safely override, and release one engagement aggregate."""
 
     def __init__(
         self,
@@ -80,9 +88,11 @@ class MandateService:
         self.planner = planner
         self.settings = settings
         self.state_machine = MandateStateMachine()
-        self.interviews = InterviewCoordinator(
+        self.engagement_policy = EngagementPolicy()
+        self.engagements = EngagementCoordinator(
             directory, repository, StakeholderStateMachine(), evidence_extractor, settings
         )
+        self.interviews = self.engagements.interviews
 
     def create(self, message: IncomingMessage, command: MandateCommand) -> WorkflowResult:
         key = incoming_idempotency_key(message)
@@ -113,50 +123,60 @@ class MandateService:
             expires_at=now + timedelta(seconds=self.settings.mandate_timeout_seconds),
             idempotency_key=key,
         )
-        planned = self.state_machine.transition(mandate, MandateState.PLANNED, "plan_validated", now)
-        interviewing = self.state_machine.transition(planned, MandateState.INTERVIEWING, "interviews_created", now)
+        planned = self.state_machine.transition(
+            mandate,
+            MandateState.PLANNED,
+            "plan_validated",
+            now,
+        ).model_copy(
+            update={
+                "next_action_at": (
+                    None
+                    if self.settings.engagement_require_go
+                    else now + timedelta(seconds=self.settings.engagement_preview_seconds)
+                )
+            }
+        )
         assignments: list[StakeholderAssignment] = []
-        unavailable_required = False
         missing_required_people = []
         for stakeholder, person in zip(resolved.plan.stakeholders, resolved.people, strict=True):
             routes = self.directory.ordered_routes(person.person_id)
-            state = StakeholderState.NOT_CONTACTED if routes else StakeholderState.DELIVERY_FAILED
-            unavailable_required = unavailable_required or (stakeholder.required and not routes)
             if stakeholder.required and not routes:
                 missing_required_people.append(person)
             assignments.append(
                 StakeholderAssignment(
                     assignment_id=uuid4(), mandate_id=mandate.mandate_id, person_id=person.person_id,
                     department=person.department, direction=stakeholder.direction, reason=stakeholder.reason,
-                    required=stakeholder.required, state=state, route_ids=[route.route_id for route in routes],
+                    required=stakeholder.required,
+                    engagement_type=stakeholder.engagement_type,
+                    response_required=stakeholder.response_required,
+                    state=(
+                        StakeholderState.CONTACT_QUEUED
+                        if routes
+                        else StakeholderState.DELIVERY_FAILED
+                    ),
+                    route_ids=[route.route_id for route in routes],
                     failure_reason="no_registered_route" if not routes else None,
                 )
             )
-        final_mandate = interviewing
-        if unavailable_required:
-            final_mandate = self.state_machine.transition(
-                interviewing, MandateState.PARTIAL, "required_stakeholder_unreachable", now
+        final_mandate = planned
+        if missing_required_people:
+            coordinating = self.state_machine.transition(
+                planned,
+                MandateState.INTERVIEWING,
+                "required_stakeholder_unreachable",
+                now,
             )
-        prepared_outreach = []
-        if not unavailable_required:
-            prepared_outreach = [
-                self.interviews.prepare_assignment_start(
-                    assignment,
-                    stakeholder.questions,
-                    token,
-                    mandate.objective,
-                    now,
-                )
-                for assignment, stakeholder in zip(
-                    assignments, resolved.plan.stakeholders, strict=True
-                )
-            ]
-            assignments = [item[0] for item in prepared_outreach]
+            final_mandate = self.state_machine.transition(
+                coordinating,
+                MandateState.PARTIAL,
+                "required_stakeholder_unreachable",
+                now,
+            )
         with self.repository.transaction() as unit:
             unit.add_mandate(final_mandate)
             unit.append_event(mandate.mandate_id, _event("mandate.received", now, f"{key}:received", actor_id=initiator.person_id, new_state="received", channel=message.channel))
             unit.append_event(mandate.mandate_id, _event("mandate.planned", now, f"{key}:planned", actor_id=initiator.person_id, previous_state="received", new_state="planned"))
-            unit.append_event(mandate.mandate_id, _event("mandate.interviewing", now, f"{key}:interviewing", actor_id=initiator.person_id, previous_state="planned", new_state="interviewing"))
             if resolved.fallback_reason:
                 unit.append_event(mandate.mandate_id, _event("model.fallback", now, f"{key}:fallback", actor_id=initiator.person_id, metadata={"reason_code": resolved.fallback_reason}))
             for assignment in assignments:
@@ -179,13 +199,22 @@ class MandateService:
                             metadata={"reason_code": "no_registered_route"},
                         ),
                     )
-            for _, interview, event, _ in prepared_outreach:
-                unit.add_interview(interview)
-                unit.append_event(mandate.mandate_id, event)
-            if unavailable_required:
-                unit.append_event(mandate.mandate_id, _event("mandate.partial", now, f"{key}:partial", actor_id=initiator.person_id, previous_state="interviewing", new_state="partial", metadata={"reason_code": "required_stakeholder_unreachable"}))
+            if missing_required_people:
+                unit.append_event(mandate.mandate_id, _event("mandate.partial", now, f"{key}:partial", actor_id=initiator.person_id, previous_state="planned", new_state="partial", metadata={"reason_code": "required_stakeholder_unreachable"}))
+            else:
+                unit.append_event(
+                    mandate.mandate_id,
+                    _event(
+                        "engagement.plan_previewed",
+                        now,
+                        f"{key}:engagement-plan-previewed",
+                        actor_id=initiator.person_id,
+                        previous_state="planned",
+                        new_state="planned",
+                    ),
+                )
 
-        if unavailable_required:
+        if missing_required_people:
             missing = ", ".join(
                 f"{person.display_name} ({person.role})" for person in missing_required_people
             )
@@ -194,11 +223,315 @@ class MandateService:
                 f"Required response missing from: {missing}. "
                 "No registered delivery route is available, so no agreement or approval was inferred."
             )
-            deliveries = self._route_deliveries([initiator.person_id], text, token)
-        else:
-            deliveries = self._reply(message, f"HumanWire mandate {token} is recorded.").deliveries
-        deliveries.extend(item[3] for item in prepared_outreach)
-        return WorkflowResult(deliveries=deliveries)
+            return self._reply(message, text)
+        return self._preview(message, planned, assignments)
+
+    def release(self, token: str, now: datetime) -> WorkflowResult:
+        """Atomically release the latest planned aggregate and emit only committed work."""
+        mandate = self.repository.get_mandate_by_token(token)
+        if (
+            mandate is None
+            or mandate.state is not MandateState.PLANNED
+            or mandate.expires_at <= now
+        ):
+            return WorkflowResult()
+        assignments = self.repository.list_assignments(mandate.mandate_id)
+        assignments_by_person = {item.person_id: item for item in assignments}
+        if (
+            len(assignments_by_person) != len(assignments)
+            or len(assignments) != len(mandate.plan.stakeholders)
+        ):
+            return WorkflowResult()
+
+        prepared: list[tuple[StakeholderAssignment, PreparedEngagement]] = []
+        try:
+            for stakeholder in mandate.plan.stakeholders:
+                assignment = assignments_by_person.get(stakeholder.person_ref)
+                if assignment is None:
+                    return WorkflowResult()
+                if assignment.state is StakeholderState.DELIVERY_FAILED:
+                    if assignment.required:
+                        return WorkflowResult()
+                    continue
+                if (
+                    assignment.state is not StakeholderState.CONTACT_QUEUED
+                    or not assignment.route_ids
+                    or not self._assignment_matches_stakeholder(
+                        assignment,
+                        stakeholder,
+                    )
+                ):
+                    return WorkflowResult()
+                prepared.append(
+                    (
+                        assignment,
+                        self.engagements.prepare_start(
+                            assignment,
+                            stakeholder.questions,
+                            mandate.token,
+                            mandate.objective,
+                            now,
+                        ),
+                    )
+                )
+        except (KeyError, ValueError):
+            return WorkflowResult()
+
+        released = self.state_machine.transition(
+            mandate,
+            MandateState.INTERVIEWING,
+            "engagement_plan_released",
+            now,
+        ).model_copy(update={"next_action_at": None})
+        release_event = _event(
+            "engagement.plan_released",
+            now,
+            f"engagement-release:{mandate.mandate_id}",
+            actor_id=mandate.initiator_id,
+            previous_state=MandateState.PLANNED.value,
+            new_state=MandateState.INTERVIEWING.value,
+        )
+        coordinating_event = _event(
+            "mandate.interviewing",
+            now,
+            f"mandate-coordinating:{mandate.mandate_id}",
+            actor_id=mandate.initiator_id,
+            previous_state=MandateState.PLANNED.value,
+            new_state=MandateState.INTERVIEWING.value,
+        )
+        try:
+            with self.repository.transaction() as unit:
+                if not unit.compare_and_save_mandate_if_unexpired(
+                    mandate,
+                    released,
+                    now,
+                ):
+                    raise ValueError("planned mandate snapshot changed")
+                for expected, item in prepared:
+                    if not unit.compare_and_save_assignment(
+                        expected,
+                        item.assignment,
+                    ):
+                        raise ValueError("planned assignment snapshot changed")
+                    if item.interview is not None:
+                        unit.add_interview(item.interview)
+                    for event in item.events:
+                        if not unit.append_event_once(mandate.mandate_id, event):
+                            raise ValueError("prepared outreach already exists")
+                if not unit.append_event_once(mandate.mandate_id, release_event):
+                    raise ValueError("engagement plan was already released")
+                if not unit.append_event_once(mandate.mandate_id, coordinating_event):
+                    raise ValueError("coordination state already exists")
+        except Exception:  # noqa: BLE001 - never leak a partially staged delivery batch
+            return WorkflowResult()
+        return WorkflowResult(deliveries=[item.delivery for _, item in prepared])
+
+    def authorized_release(
+        self,
+        message: IncomingMessage,
+        token: str,
+    ) -> WorkflowResult:
+        now = message.received_at.astimezone(UTC)
+        mandate = self.repository.get_mandate_by_token(token)
+        if not self._authorized_origin(message, mandate, now):
+            return WorkflowResult()
+        return self.release(token, now)
+
+    def override(
+        self,
+        message: IncomingMessage,
+        command: EngageCommand,
+    ) -> WorkflowResult:
+        now = message.received_at.astimezone(UTC)
+        mandate = self.repository.get_mandate_by_token(command.token)
+        if not self._authorized_origin(message, mandate, now):
+            return WorkflowResult()
+        assert mandate is not None
+        assignments = self.repository.list_assignments(mandate.mandate_id)
+        if (
+            len(assignments) != len(mandate.plan.stakeholders)
+            or len({item.person_id for item in assignments}) != len(assignments)
+        ):
+            return WorkflowResult()
+        candidates = [
+            item for item in assignments if item.person_id == command.person_id
+        ]
+        stakeholder_indexes = [
+            index
+            for index, stakeholder in enumerate(mandate.plan.stakeholders)
+            if stakeholder.person_ref == command.person_id
+        ]
+        if len(candidates) != 1 or len(stakeholder_indexes) != 1:
+            return WorkflowResult()
+        assignment = candidates[0]
+        stakeholder_index = stakeholder_indexes[0]
+        stakeholder = mandate.plan.stakeholders[stakeholder_index]
+        if (
+            assignment.state is not StakeholderState.CONTACT_QUEUED
+            or not self._assignment_matches_stakeholder(assignment, stakeholder)
+        ):
+            return WorkflowResult()
+        try:
+            requested = self.engagement_policy.validate_override(
+                stakeholder,
+                command.engagement_type,
+            )
+        except EngagementPolicyError:
+            return WorkflowResult()
+        if requested is stakeholder.engagement_type:
+            return WorkflowResult()
+
+        response_required = requested is not EngagementType.INFORM
+        try:
+            updated_stakeholder = PlannedStakeholder.model_validate(
+                stakeholder.model_dump()
+                | {
+                    "engagement_type": requested,
+                    "response_required": response_required,
+                }
+            )
+        except ValueError:
+            return WorkflowResult()
+        stakeholders = list(mandate.plan.stakeholders)
+        stakeholders[stakeholder_index] = updated_stakeholder
+        updated_mandate = mandate.model_copy(
+            update={
+                "plan": mandate.plan.model_copy(
+                    update={"stakeholders": stakeholders}
+                ),
+                "updated_at": now,
+            }
+        )
+        updated_assignment = assignment.model_copy(
+            update={
+                "engagement_type": requested,
+                "response_required": response_required,
+            }
+        )
+        event = DomainEvent(
+            event_type="engagement.override_recorded",
+            created_at=now,
+            idempotency_key=f"{incoming_idempotency_key(message)}:engagement-override",
+            actor_id=mandate.initiator_id,
+            assignment_id=assignment.assignment_id,
+            person_id=assignment.person_id,
+            department=assignment.department,
+            direction=assignment.direction,
+            channel=message.channel,
+            previous_state=assignment.engagement_type.value,
+            new_state=requested.value,
+            metadata={
+                "old_engagement_type": assignment.engagement_type.value,
+                "new_engagement_type": requested.value,
+            },
+        )
+        try:
+            with self.repository.transaction() as unit:
+                if not unit.compare_and_save_mandate_if_unexpired(
+                    mandate,
+                    updated_mandate,
+                    now,
+                ):
+                    raise ValueError("planned mandate snapshot changed")
+                if not unit.compare_and_save_assignment(
+                    assignment,
+                    updated_assignment,
+                ):
+                    raise ValueError("planned assignment snapshot changed")
+                if not unit.append_event_once(mandate.mandate_id, event):
+                    raise ValueError("engagement override was already recorded")
+        except ValueError:
+            return WorkflowResult()
+        updated_assignments = [
+            updated_assignment
+            if item.assignment_id == assignment.assignment_id
+            else item
+            for item in assignments
+        ]
+        return self._preview(message, updated_mandate, updated_assignments)
+
+    def _preview(
+        self,
+        message: IncomingMessage,
+        mandate: Mandate,
+        assignments: list[StakeholderAssignment],
+    ) -> WorkflowResult:
+        assignments_by_person = {item.person_id: item for item in assignments}
+        rows = []
+        for stakeholder in mandate.plan.stakeholders:
+            assignment = assignments_by_person[stakeholder.person_ref]
+            person = self.directory.resolve_person(stakeholder.person_ref)
+            allowed_routes = set(assignment.route_ids)
+            channels = tuple(
+                route.channel
+                for route in self.directory.ordered_routes(person.person_id)
+                if route.route_id in allowed_routes
+            )
+            rows.append(
+                EngagementPreviewRow(
+                    person_id=person.person_id,
+                    display_name=person.display_name,
+                    department=person.department,
+                    direction=stakeholder.direction,
+                    reason=stakeholder.reason,
+                    engagement_type=stakeholder.engagement_type,
+                    response_required=stakeholder.response_required,
+                    question_count=len(stakeholder.questions),
+                    route_channels=channels,
+                )
+            )
+        text = render_engagement_plan_preview(
+            mandate.token,
+            rows,
+            release_at=mandate.next_action_at,
+            preview_seconds=self.settings.engagement_preview_seconds,
+            require_go=self.settings.engagement_require_go,
+        )
+        return self._reply(message, text)
+
+    def _authorized_origin(
+        self,
+        message: IncomingMessage,
+        mandate: Mandate | None,
+        now: datetime,
+    ) -> bool:
+        if (
+            mandate is None
+            or mandate.state is not MandateState.PLANNED
+            or mandate.expires_at <= now
+            or message.channel is not mandate.origin_channel
+            or message.conversation_id != mandate.origin_conversation_id
+        ):
+            return False
+        try:
+            sender = self.directory.person_for_sender(message)
+        except (UnknownPersonError, AmbiguousPersonError):
+            return False
+        if sender.person_id != mandate.initiator_id:
+            return False
+        return any(
+            route.channel is message.channel
+            and route.sender_address.casefold() == message.sender_address.casefold()
+            and (
+                route.conversation_id is None
+                or route.conversation_id == message.conversation_id
+            )
+            for route in self.directory.ordered_routes(sender.person_id)
+        )
+
+    @staticmethod
+    def _assignment_matches_stakeholder(
+        assignment: StakeholderAssignment,
+        stakeholder: PlannedStakeholder,
+    ) -> bool:
+        return (
+            assignment.person_id == stakeholder.person_ref
+            and assignment.direction is stakeholder.direction
+            and assignment.reason == stakeholder.reason
+            and assignment.required is stakeholder.required
+            and assignment.engagement_type is stakeholder.engagement_type
+            and assignment.response_required is stakeholder.response_required
+        )
 
     def _route_deliveries(
         self, person_ids: list[str], text: str, token: str

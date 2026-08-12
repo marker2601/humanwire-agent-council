@@ -1171,3 +1171,123 @@ def test_review_append_event_once_treats_exact_duplicate_as_inert(
         assert unit.append_event_once(sample_mandate.mandate_id, event) is False
 
     assert repository.list_events(sample_mandate.mandate_id) == [event]
+
+
+def test_due_mandates_returns_only_live_planned_preview_deadlines(
+    repository, make_mandate, now
+) -> None:
+    due = make_mandate(
+        token="HW-DUE1",
+        idempotency_key="mandate:due-1",
+        state=MandateState.PLANNED,
+        next_action_at=now,
+    )
+    future = make_mandate(
+        token="HW-DUE2",
+        idempotency_key="mandate:due-2",
+        state=MandateState.PLANNED,
+        next_action_at=now + timedelta(seconds=1),
+    )
+    strict_go = make_mandate(
+        token="HW-DUE3",
+        idempotency_key="mandate:due-3",
+        state=MandateState.PLANNED,
+        next_action_at=None,
+    )
+    released = make_mandate(
+        token="HW-DUE4",
+        idempotency_key="mandate:due-4",
+        state=MandateState.INTERVIEWING,
+        next_action_at=now,
+    )
+    expired = make_mandate(
+        token="HW-DUE5",
+        idempotency_key="mandate:due-5",
+        state=MandateState.PLANNED,
+        next_action_at=now,
+        expires_at=now,
+    )
+    for mandate in (due, future, strict_go, released, expired):
+        repository.add_mandate(mandate)
+
+    assert repository.list_due_mandates(now) == [due]
+
+
+def test_mandate_release_cas_binds_the_saved_plan_snapshot(
+    repository, make_mandate, now
+) -> None:
+    expected = make_mandate(
+        state=MandateState.PLANNED,
+        next_action_at=now + timedelta(seconds=15),
+    )
+    changed_stakeholder = expected.plan.stakeholders[0].model_copy(
+        update={"reason": "A concurrently saved safe override"}
+    )
+    changed = expected.model_copy(
+        update={
+            "plan": expected.plan.model_copy(update={"stakeholders": [changed_stakeholder]}),
+        }
+    )
+    released = expected.model_copy(
+        update={
+            "state": MandateState.INTERVIEWING,
+            "next_action_at": None,
+            "updated_at": now + timedelta(seconds=1),
+        }
+    )
+    repository.add_mandate(expected)
+    repository.save_mandate(changed)
+
+    with repository.transaction() as unit:
+        saved = unit.compare_and_save_mandate_if_unexpired(expected, released, now)
+
+    assert saved is False
+    assert repository.get_mandate_by_token(expected.token) == changed
+
+
+@pytest.mark.parametrize(
+    ("field", "changed_value"),
+    [
+        ("engagement_type", domain.EngagementType.ACKNOWLEDGE),
+        ("response_required", False),
+        ("person_id", "replacement-person"),
+        ("route_ids", ["replacement-route"]),
+        ("reason", "Concurrent reason"),
+        ("required", False),
+        ("next_action_at", None),
+    ],
+)
+def test_assignment_release_cas_rejects_any_changed_preview_snapshot(
+    repository,
+    sample_mandate,
+    make_assignment,
+    now,
+    field,
+    changed_value,
+) -> None:
+    if field == "next_action_at":
+        changed_value = now + timedelta(seconds=1)
+    expected = make_assignment(
+        state=StakeholderState.CONTACT_QUEUED,
+        engagement_type=domain.EngagementType.QUICK_RESPONSE,
+        response_required=True,
+        next_action_at=None,
+    )
+    changed = expected.model_copy(update={field: changed_value})
+    released = expected.model_copy(
+        update={
+            "state": StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+            "attempt_count": 1,
+            "first_contact_at": now,
+            "last_delivery_at": now,
+        }
+    )
+    repository.add_mandate(sample_mandate)
+    repository.add_assignment(expected)
+    repository.save_assignment(changed)
+
+    with repository.transaction() as unit:
+        saved = unit.compare_and_save_assignment(expected, released)
+
+    assert saved is False
+    assert repository.get_assignment(expected.assignment_id) == changed

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pydantic import SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     acknowledgement_seconds: int = 300
     reminder_seconds: int = 300
     mandate_timeout_seconds: int = 86_400
+    engagement_preview_seconds: int = Field(default=15, ge=0, le=3_600)
+    engagement_require_go: bool = False
     due_action_poll_seconds: int = 5
     dashboard_host: str = "127.0.0.1"
     dashboard_port: int = 8000

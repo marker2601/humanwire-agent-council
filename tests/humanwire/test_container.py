@@ -25,6 +25,7 @@ from humanwire.domain import (
     StakeholderState,
     WorkflowResult,
 )
+from humanwire.engagements import EngagementCoordinator
 from humanwire.evidence import FeatherlessEvidenceExtractor, RuleBasedEvidenceExtractor
 from humanwire.model_client import FeatherlessJsonClient
 from humanwire.planning import FeatherlessMandatePlanner, RuleBasedMandatePlanner
@@ -161,6 +162,16 @@ def test_container_builds_offline_rule_fallbacks_without_creating_comm_client(
     assert isinstance(container.evidence_extractor, RuleBasedEvidenceExtractor)
     assert container.model_client is None
     assert container.repository.list_recent_mandates() == []
+
+
+def test_container_exposes_one_shared_engagement_coordinator(tmp_path) -> None:
+    container = ApplicationContainer.build(make_settings(tmp_path))
+
+    assert isinstance(container.engagement_coordinator, EngagementCoordinator)
+    assert container.workflow.engagements is container.engagement_coordinator
+    assert container.workflow.mandates.engagements is container.engagement_coordinator
+    assert container.workflow.mandates.interviews is container.interview_coordinator
+    assert container.engagement_coordinator.interviews is container.interview_coordinator
 
 
 def test_configured_featherless_selects_real_json_adapters_without_opening_channels(
