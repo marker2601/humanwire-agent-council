@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import exists, insert, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -48,7 +48,7 @@ from humanwire.domain import (
     StakeholderAssignment,
     StakeholderState,
 )
-from humanwire.state_machine import ASSIGNMENT_TERMINAL_STATES
+from humanwire.state_machine import ASSIGNMENT_TERMINAL_STATES, MANDATE_TERMINAL_STATES
 
 
 class DuplicateMandateError(ValueError):
@@ -607,6 +607,51 @@ class RepositoryUnitOfWork:
                 == expected.active_route_index,
                 StakeholderAssignmentRecord.interview_id
                 == (str(expected.interview_id) if expected.interview_id else None),
+            )
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        return result.rowcount == 1
+
+    def compare_and_save_assignment_if_mandate_active(
+        self,
+        expected: StakeholderAssignment,
+        updated: StakeholderAssignment,
+        now: datetime,
+    ) -> bool:
+        """Save one assignment only while its mandate is active and unexpired."""
+        if (
+            expected.assignment_id != updated.assignment_id
+            or expected.mandate_id != updated.mandate_id
+        ):
+            raise ValueError("mandate-coupled compare-and-save requires one assignment")
+        replacement = _assignment_record(updated)
+        values = {
+            column.key: getattr(replacement, column.key)
+            for column in replacement.__table__.columns
+            if column.key != "assignment_id"
+        }
+        active_mandate = exists().where(
+            MandateRecord.mandate_id == StakeholderAssignmentRecord.mandate_id,
+            MandateRecord.mandate_id == str(expected.mandate_id),
+            MandateRecord.state.not_in(
+                [state.value for state in MANDATE_TERMINAL_STATES]
+            ),
+            MandateRecord.expires_at > now,
+        )
+        result = self._session.execute(
+            update(StakeholderAssignmentRecord)
+            .where(
+                StakeholderAssignmentRecord.assignment_id
+                == str(expected.assignment_id),
+                StakeholderAssignmentRecord.mandate_id == str(expected.mandate_id),
+                StakeholderAssignmentRecord.state == expected.state.value,
+                StakeholderAssignmentRecord.attempt_count == expected.attempt_count,
+                StakeholderAssignmentRecord.active_route_index
+                == expected.active_route_index,
+                StakeholderAssignmentRecord.interview_id
+                == (str(expected.interview_id) if expected.interview_id else None),
+                active_mandate,
             )
             .values(**values)
             .execution_options(synchronize_session=False)

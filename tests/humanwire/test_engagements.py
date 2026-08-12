@@ -1111,6 +1111,108 @@ def test_threaded_exact_decision_duplicate_records_one_atomic_result(
     ) == 1
 
 
+@pytest.mark.parametrize(
+    "terminal_state",
+    [MandateState.CANCELLED, MandateState.EXPIRED],
+)
+@pytest.mark.parametrize(
+    "response_kind",
+    [EngagementType.REVIEW_APPROVAL, EngagementType.AVAILABILITY],
+)
+def test_terminal_mandate_commit_wins_before_explicit_response_uow(
+    directory,
+    mandate,
+    now,
+    tmp_path,
+    monkeypatch,
+    terminal_state,
+    response_kind,
+) -> None:
+    repository = _file_repository(tmp_path)
+    coordinator = _file_coordinator(directory, repository)
+    assignment = _assignment(mandate, response_kind)
+    _prepare(coordinator, repository, mandate, assignment, [], now)
+    before_assignment = repository.get_assignment(assignment.assignment_id)
+    before_events = repository.list_events(mandate.mandate_id)
+    before_evidence = repository.list_evidence(mandate.mandate_id)
+    original_transaction = repository.transaction
+    response_validated = threading.Event()
+    terminal_committed = threading.Event()
+    role = threading.local()
+
+    @contextmanager
+    def terminal_first_transaction():
+        if getattr(role, "name", None) == "response":
+            response_validated.set()
+            assert terminal_committed.wait(timeout=5)
+        with original_transaction() as unit:
+            yield unit
+
+    monkeypatch.setattr(repository, "transaction", terminal_first_transaction)
+
+    def respond():
+        role.name = "response"
+        if response_kind is EngagementType.REVIEW_APPROVAL:
+            message = _message(
+                now,
+                message_id=f"terminal-race-{terminal_state.value}-decision",
+                text="DECIDE HW-2411 APPROVE",
+            )
+            return coordinator.record_decision(
+                message,
+                assignment,
+                _decision(message.text),
+                now,
+            )
+        windows = _availability_windows()
+        text = "AVAILABLE HW-2411 " + " ".join(
+            f"{window.start.isoformat()}/{window.end.isoformat()}"
+            for window in windows
+        )
+        return coordinator.record_availability(
+            _message(
+                now,
+                message_id=f"terminal-race-{terminal_state.value}-availability",
+                text=text,
+            ),
+            assignment,
+            windows,
+            now,
+        )
+
+    def terminate() -> None:
+        assert response_validated.wait(timeout=5)
+        current = repository.get_mandate_by_token(mandate.token)
+        assert current is not None
+        updates = {
+            "state": terminal_state,
+            "updated_at": now,
+            "completed_at": now,
+        }
+        if terminal_state is MandateState.EXPIRED:
+            updates["expires_at"] = now
+        with original_transaction() as unit:
+            unit.save_mandate(current.model_copy(update=updates))
+        terminal_committed.set()
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="terminal-response") as executor:
+        response_future = executor.submit(respond)
+        terminal_future = executor.submit(terminate)
+        result = response_future.result(timeout=10)
+        terminal_future.result(timeout=10)
+
+    saved_mandate = repository.get_mandate_by_token(mandate.token)
+    assert result.deliveries == []
+    assert saved_mandate is not None and saved_mandate.state is terminal_state
+    assert repository.get_assignment(assignment.assignment_id) == before_assignment
+    assert repository.list_engagement_decisions(mandate.mandate_id) == []
+    assert repository.list_evidence(mandate.mandate_id) == before_evidence
+    assert repository.list_events(mandate.mandate_id) == before_events
+    assert repository.get_runtime_status(
+        f"availability:{mandate.mandate_id}:priya"
+    ) is None
+
+
 def test_authenticated_availability_persists_compatible_windows_and_typed_completion(
     coordinator, repository, mandate, now
 ) -> None:

@@ -989,6 +989,50 @@ def test_review_assignment_compare_and_save_rejects_a_stale_expected_snapshot(
     assert repository.get_assignment(assignment.assignment_id) == acknowledged
 
 
+@pytest.mark.parametrize(
+    ("state", "expires_delta", "expected_saved"),
+    [
+        (MandateState.INTERVIEWING, timedelta(seconds=1), True),
+        (MandateState.CANCELLED, timedelta(seconds=1), False),
+        (MandateState.EXPIRED, timedelta(seconds=1), False),
+        (MandateState.INTERVIEWING, timedelta(0), False),
+        (MandateState.INTERVIEWING, timedelta(seconds=-1), False),
+    ],
+)
+def test_mandate_coupled_assignment_cas_requires_active_unexpired_mandate(
+    repository,
+    make_mandate,
+    make_assignment,
+    now,
+    state,
+    expires_delta,
+    expected_saved,
+) -> None:
+    mandate = make_mandate(state=state, expires_at=now + expires_delta)
+    assignment = make_assignment(mandate_id=mandate.mandate_id)
+    completed = assignment.model_copy(
+        update={
+            "state": StakeholderState.COMPLETE,
+            "completed_at": now,
+            "next_action_at": None,
+        }
+    )
+    repository.add_mandate(mandate)
+    repository.add_assignment(assignment)
+
+    with repository.transaction() as unit:
+        saved = unit.compare_and_save_assignment_if_mandate_active(
+            assignment,
+            completed,
+            now,
+        )
+
+    assert saved is expected_saved
+    assert repository.get_assignment(assignment.assignment_id) == (
+        completed if expected_saved else assignment
+    )
+
+
 def test_review_append_event_once_treats_exact_duplicate_as_inert(
     tmp_path, sample_mandate, now
 ) -> None:

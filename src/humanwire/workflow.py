@@ -424,13 +424,11 @@ class HumanWireWorkflow:
     def _availability(self, message: IncomingMessage, command: AvailabilityCommand) -> WorkflowResult:
         mandate = self.repository.get_mandate_by_token(command.token)
         if mandate is None:
-            return self._reply(message, "There is no active availability request for that token.")
+            return WorkflowResult()
         try:
             person = self.directory.person_for_sender(message)
         except (UnknownPersonError, AmbiguousPersonError):
-            if mandate.state is not MandateState.SCHEDULING:
-                return WorkflowResult()
-            return self._reply(message, "Availability must come from a registered attendee.")
+            return WorkflowResult()
         if mandate.state not in MANDATE_TERMINAL_STATES:
             candidates = self._engagement_candidates(
                 mandate.mandate_id,
@@ -462,26 +460,27 @@ class HumanWireWorkflow:
                     )
                 return result
         if mandate.state is not MandateState.SCHEDULING:
-            return self._reply(message, "There is no active availability request for that token.")
+            return WorkflowResult()
         if person.person_id not in self._meeting_attendees(mandate) or not self._registered_route_matches(
             person.person_id, message
         ):
-            return self._reply(message, "Availability must come from a requested registered attendee.")
-        self.repository.set_runtime_status(
-            f"availability:{mandate.mandate_id}:{person.person_id}",
-            json_windows(command),
+            return WorkflowResult()
+        event = _event(
+            "availability.recorded",
             message.received_at,
+            f"{incoming_idempotency_key(message)}:availability",
+            actor_id=person.person_id,
+            channel=message.channel,
+            metadata={"attempt_count": len(command.windows)},
         )
-        self.repository.append_event(
-            mandate.mandate_id,
-            _event(
-                "availability.recorded",
+        with self.repository.transaction() as unit:
+            if not unit.append_event_once(mandate.mandate_id, event):
+                return WorkflowResult()
+            unit.set_runtime_status(
+                f"availability:{mandate.mandate_id}:{person.person_id}",
+                json_windows(command),
                 message.received_at,
-                f"availability:{mandate.mandate_id}:{person.person_id}:{message.message_id}",
-                actor_id=person.person_id,
-                channel=message.channel,
-            ),
-        )
+            )
         return self._try_schedule(mandate, message.received_at)
 
     def _try_schedule(self, mandate, now: datetime) -> WorkflowResult:

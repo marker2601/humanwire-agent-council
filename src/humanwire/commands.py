@@ -9,24 +9,29 @@ from humanwire.domain import (
 )
 
 TOKEN = r"HW-[A-Z0-9]{4,8}"
+ASCII_CASE_INSENSITIVE = re.IGNORECASE | re.ASCII
 PROPOSAL = re.compile(
     r"^(?P<answer>ACCEPT|REJECT|CHANGE)[ \t]+(?P<token>HW-[A-Z0-9]{4,8})"
     r"(?:[ \t]+(?P<change>[^\r\n].*))?$",
-    re.IGNORECASE,
+    ASCII_CASE_INSENSITIVE,
 )
-ACKNOWLEDGEMENT = re.compile(rf"^ACK[ \t]+(?P<token>{TOKEN})$", re.IGNORECASE)
+ACKNOWLEDGEMENT = re.compile(
+    rf"^ACK[ \t]+(?P<token>{TOKEN})$", ASCII_CASE_INSENSITIVE
+)
 ENGAGEMENT_DECISION = re.compile(
     rf"^DECIDE[ \t]+(?P<token>{TOKEN})[ \t]+"
     r"(?P<answer>APPROVE|REJECT|CHANGE)(?:[ \t]+(?P<change>[^\r\n].*))?$",
-    re.IGNORECASE,
+    ASCII_CASE_INSENSITIVE,
 )
 AVAILABILITY = re.compile(
     rf"^AVAILABLE[ \t]+(?P<token>{TOKEN})[ \t]+(?P<windows>[^\r\n]+)$",
-    re.IGNORECASE,
+    ASCII_CASE_INSENSITIVE,
 )
-STATUS = re.compile(rf"^/status[ \t]+(?P<token>{TOKEN})$", re.IGNORECASE)
-CANCEL = re.compile(rf"^/cancel[ \t]+(?P<token>{TOKEN})$", re.IGNORECASE)
-MANDATE = re.compile(r"^/mandate[ \t]*\r?\n(?P<body>[\s\S]+)$", re.IGNORECASE)
+STATUS = re.compile(rf"^/status[ \t]+(?P<token>{TOKEN})$", ASCII_CASE_INSENSITIVE)
+CANCEL = re.compile(rf"^/cancel[ \t]+(?P<token>{TOKEN})$", ASCII_CASE_INSENSITIVE)
+MANDATE = re.compile(
+    r"^/mandate[ \t]*\r?\n(?P<body>[\s\S]+)$", ASCII_CASE_INSENSITIVE
+)
 
 
 @dataclass(frozen=True)

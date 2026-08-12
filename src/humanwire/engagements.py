@@ -490,7 +490,11 @@ class EngagementCoordinator:
             )
             try:
                 with self.repository.transaction() as unit:
-                    if not unit.compare_and_save_assignment(saved, completed):
+                    if not unit.compare_and_save_assignment_if_mandate_active(
+                        saved,
+                        completed,
+                        now,
+                    ):
                         continue
                     unit.add_engagement_decision(decision)
                     unit.add_evidence(evidence)
@@ -563,7 +567,11 @@ class EngagementCoordinator:
             )
             try:
                 with self.repository.transaction() as unit:
-                    if not unit.compare_and_save_assignment(saved, completed):
+                    if not unit.compare_and_save_assignment_if_mandate_active(
+                        saved,
+                        completed,
+                        now,
+                    ):
                         continue
                     unit.set_runtime_status(
                         f"availability:{saved.mandate_id}:{saved.person_id}",

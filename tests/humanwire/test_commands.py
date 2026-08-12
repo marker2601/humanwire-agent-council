@@ -110,6 +110,22 @@ def test_malformed_decision_commands_remain_free_text() -> None:
         assert parse_command(text) == FreeTextCommand(text=text)
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "DECİDE HW-2411 APPROVE",
+        "AVAİLABLE HW-2411 2026-08-14T15:00:00-05:00/2026-08-14T16:00:00-05:00",
+        "DECIDE HW-24İ1 APPROVE",
+        "ACCEPT HW-24ı1",
+        "ACK HW-2411",
+        "/ſtatus HW-2411",
+        "/cancel HW-24K1",
+    ],
+)
+def test_ascii_commands_reject_unicode_casefold_lookalikes(text: str) -> None:
+    assert parse_command(text) == FreeTextCommand(text=text)
+
+
 def test_unstructured_reply_remains_free_text() -> None:
     assert parse_command("We need 72 hours of notice.") == FreeTextCommand(
         text="We need 72 hours of notice."

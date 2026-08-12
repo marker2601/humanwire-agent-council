@@ -14,6 +14,8 @@ from humanwire.database import (
 )
 from humanwire.directory import InitiatorPolicy, OrganizationDirectory, OrganizationDocument
 from humanwire.domain import (
+    AlignmentIssue,
+    AlignmentIssueType,
     Channel,
     ContactRoute,
     DeliveryKind,
@@ -31,6 +33,7 @@ from humanwire.domain import (
     PlannedStakeholder,
     StakeholderAssignment,
     StakeholderState,
+    WorkflowResult,
 )
 from humanwire.evidence import RuleBasedEvidenceExtractor
 from humanwire.planning import ResolvedPlan
@@ -302,6 +305,23 @@ def _convert_assignment_to_engagement(
     )
     repository.save_assignment(converted)
     return converted
+
+
+def _move_to_scheduling(repository, mandate) -> None:
+    with repository.transaction() as unit:
+        unit.save_mandate(
+            mandate.model_copy(update={"state": MandateState.SCHEDULING})
+        )
+        unit.add_issue(
+            AlignmentIssue(
+                issue_id=uuid4(),
+                mandate_id=mandate.mandate_id,
+                issue_type=AlignmentIssueType.HARD_CONSTRAINT,
+                stakeholder_ids=["team-lead"],
+                summary="A required stakeholder must join the meeting.",
+                blocking=True,
+            )
+        )
 
 
 def _complete_interview(
@@ -1379,6 +1399,206 @@ def test_workflow_ambiguous_engagement_availability_cannot_replace_windows(
     )
 
 
+def test_availability_tokens_are_not_an_oracle_for_unauthorized_senders(
+    repository, incoming_message_factory
+) -> None:
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _create_mandate(
+        workflow, incoming_message_factory, message_id="availability-oracle-create"
+    )
+    _convert_assignment_to_engagement(
+        repository, mandate, EngagementType.AVAILABILITY
+    )
+    ambiguous_peer = Person(
+        person_id="ambiguous-peer",
+        display_name="Ambiguous Peer",
+        role="Peer",
+        department="Support",
+        timezone="UTC",
+        routes=[
+            ContactRoute(
+                route_id="ambiguous-email",
+                channel=Channel.EMAIL,
+                sender_address="people@example.test",
+                recipient="ambiguous@example.test",
+            )
+        ],
+    )
+    ambiguous_directory = OrganizationDirectory(
+        workflow.directory.document.model_copy(
+            update={"people": [*workflow.directory.document.people, ambiguous_peer]}
+        )
+    )
+    workflow.directory = ambiguous_directory
+    workflow.engagements.directory = ambiguous_directory
+    window = "2026-08-12T15:00:00+00:00/2026-08-12T16:00:00+00:00"
+    senders = [
+        incoming_message_factory(
+            text="placeholder",
+            channel=Channel.EMAIL,
+            sender_address="unknown@example.test",
+            conversation_id="unknown-thread",
+            message_id="oracle-unknown",
+        ),
+        _message_for(
+            incoming_message_factory,
+            "vp-people",
+            "placeholder",
+            message_id="oracle-ambiguous",
+        ),
+        incoming_message_factory(
+            text="placeholder",
+            channel=Channel.EMAIL,
+            sender_address="support@example.test",
+            conversation_id="support-thread",
+            message_id="oracle-unrelated",
+        ),
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            "placeholder",
+            message_id="oracle-wrong-route",
+            conversation_id="wrong-thread",
+        ),
+    ]
+
+    for label, token, state in (
+        ("missing", "HW-NONE", MandateState.INTERVIEWING),
+        ("active", mandate.token, MandateState.INTERVIEWING),
+        ("scheduling", mandate.token, MandateState.SCHEDULING),
+        ("terminal", mandate.token, MandateState.CANCELLED),
+    ):
+        current = repository.get_mandate_by_token(mandate.token)
+        assert current is not None
+        repository.save_mandate(current.model_copy(update={"state": state}))
+        before = _terminal_snapshot(repository, mandate)
+        outcomes = []
+        for index, sender in enumerate(senders):
+            incoming = sender.model_copy(
+                update={
+                    "text": f"AVAILABLE {token} {window}",
+                    "message_id": f"{sender.message_id}-{label}-{index}",
+                }
+            )
+            outcomes.append(workflow.handle(incoming))
+        assert outcomes == [WorkflowResult()] * len(senders)
+        assert _terminal_snapshot(repository, mandate) == before
+
+
+def test_scheduling_availability_exact_duplicate_is_inert(
+    repository, incoming_message_factory
+) -> None:
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _create_mandate(
+        workflow, incoming_message_factory, message_id="schedule-exact-create"
+    )
+    _move_to_scheduling(repository, mandate)
+    window = "2026-08-12T15:00:00+00:00/2026-08-12T16:00:00+00:00"
+    message = _message_for(
+        incoming_message_factory,
+        "team-lead",
+        f"AVAILABLE {mandate.token} {window}",
+        message_id="schedule-exact-availability",
+        conversation_id="lead-thread",
+    )
+
+    first = workflow.handle(message)
+    before = _terminal_snapshot(repository, mandate)
+    duplicate = workflow.handle(message)
+
+    recorded = [
+        event
+        for event in repository.list_events(mandate.mandate_id)
+        if event.event_type == "availability.recorded"
+    ]
+    assert first.deliveries == []
+    assert duplicate.deliveries == []
+    assert _terminal_snapshot(repository, mandate) == before
+    assert len(recorded) == 1
+    assert recorded[0].metadata == {"attempt_count": 1}
+
+
+def test_scheduling_availability_same_count_conflicting_replay_is_inert(
+    repository, incoming_message_factory
+) -> None:
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _create_mandate(
+        workflow, incoming_message_factory, message_id="schedule-conflict-create"
+    )
+    _move_to_scheduling(repository, mandate)
+    first_window = "2026-08-12T15:00:00+00:00/2026-08-12T16:00:00+00:00"
+    message = _message_for(
+        incoming_message_factory,
+        "team-lead",
+        f"AVAILABLE {mandate.token} {first_window}",
+        message_id="schedule-conflicting-availability",
+        conversation_id="lead-thread",
+    )
+    workflow.handle(message)
+    before = _terminal_snapshot(repository, mandate)
+    conflicting = message.model_copy(
+        update={
+            "text": (
+                f"AVAILABLE {mandate.token} "
+                "2026-08-13T15:00:00+00:00/2026-08-13T16:00:00+00:00"
+            )
+        }
+    )
+
+    result = workflow.handle(conflicting)
+
+    assert result.deliveries == []
+    assert _terminal_snapshot(repository, mandate) == before
+
+
+def test_scheduling_availability_identity_includes_channel_connection_and_message(
+    repository, incoming_message_factory
+) -> None:
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _create_mandate(
+        workflow, incoming_message_factory, message_id="schedule-identity-create"
+    )
+    _move_to_scheduling(repository, mandate)
+    message_id = "provider-message-reused-across-connections"
+    email = incoming_message_factory(
+        text=(
+            f"AVAILABLE {mandate.token} "
+            "2026-08-12T15:00:00+00:00/2026-08-12T16:00:00+00:00"
+        ),
+        channel=Channel.EMAIL,
+        sender_address="lead@example.test",
+        conversation_id="lead-thread",
+        connection_id="email-connection",
+        message_id=message_id,
+    )
+    telegram = incoming_message_factory(
+        text=(
+            f"AVAILABLE {mandate.token} "
+            "2026-08-13T15:00:00+00:00/2026-08-13T16:00:00+00:00"
+        ),
+        channel=Channel.TELEGRAM,
+        sender_address="lead-chat",
+        conversation_id="lead-conversation",
+        connection_id="telegram-connection",
+        message_id=message_id,
+    )
+
+    workflow.handle(email)
+    workflow.handle(telegram)
+
+    recorded = [
+        event
+        for event in repository.list_events(mandate.mandate_id)
+        if event.event_type == "availability.recorded"
+    ]
+    stored = repository.get_runtime_status(
+        f"availability:{mandate.mandate_id}:team-lead"
+    )
+    assert len(recorded) == 2
+    assert len({event.idempotency_key for event in recorded}) == 2
+    assert stored is not None and stored[0].startswith("2026-08-13T15:00:00+00:00")
+
+
 def test_availability_email_and_telegram_routes_survive_workflow_restart(
     tmp_path, incoming_message_factory
 ) -> None:
@@ -1483,7 +1703,7 @@ def test_availability_email_and_telegram_routes_survive_workflow_restart(
     )
 
     assert all(
-        result.deliveries[0].kind is DeliveryKind.REPLY_TO_MESSAGE
+        result == WorkflowResult()
         for result in (wrong_email, missing_email, wrong_telegram)
     )
     assert repository.list_events(mandate.mandate_id) == events_before
@@ -1814,10 +2034,13 @@ def test_terminal_mandates_reject_late_inputs_without_mutation(
     result = workflow.handle(late_message)
 
     assert repository.get_mandate_by_token(mandate.token).state is expected_state
-    assert len(result.deliveries) == 1
-    assert result.deliveries[0].kind is DeliveryKind.REPLY_TO_MESSAGE
-    assert "PRIVATE-LATE-SENTINEL" not in result.deliveries[0].text
-    assert "@example.test" not in result.deliveries[0].text
+    if input_kind == "availability":
+        assert result == WorkflowResult()
+    else:
+        assert len(result.deliveries) == 1
+        assert result.deliveries[0].kind is DeliveryKind.REPLY_TO_MESSAGE
+        assert "PRIVATE-LATE-SENTINEL" not in result.deliveries[0].text
+        assert "@example.test" not in result.deliveries[0].text
     assert _terminal_snapshot(repository, mandate) == before
 
 
