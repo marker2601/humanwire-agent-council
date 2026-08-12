@@ -76,7 +76,11 @@ class DeterministicPlanner:
         )
 
 
-def _people(*, lead_email_thread: str | None = None) -> tuple[Person, list[Person]]:
+def _people(
+    *,
+    lead_email_thread: str | None = None,
+    lead_secondary_email_thread: str | None = None,
+) -> tuple[Person, list[Person]]:
     manager = Person(
         person_id="manager",
         display_name="Morgan Lee",
@@ -167,11 +171,35 @@ def _people(*, lead_email_thread: str | None = None) -> tuple[Person, list[Perso
             ],
         ),
     ]
+    if lead_secondary_email_thread is not None:
+        lead = people[0]
+        people[0] = lead.model_copy(
+            update={
+                "routes": [
+                    lead.routes[0],
+                    ContactRoute(
+                        route_id="lead-email-secondary",
+                        channel=Channel.EMAIL,
+                        sender_address="lead-secondary@example.test",
+                        recipient="lead-secondary@example.test",
+                        conversation_id=lead_secondary_email_thread,
+                    ),
+                    *lead.routes[1:],
+                ]
+            }
+        )
     return manager, people
 
 
-def _directory(*, lead_email_thread: str | None = None) -> tuple[OrganizationDirectory, list[Person]]:
-    manager, people = _people(lead_email_thread=lead_email_thread)
+def _directory(
+    *,
+    lead_email_thread: str | None = None,
+    lead_secondary_email_thread: str | None = None,
+) -> tuple[OrganizationDirectory, list[Person]]:
+    manager, people = _people(
+        lead_email_thread=lead_email_thread,
+        lead_secondary_email_thread=lead_secondary_email_thread,
+    )
     directory = OrganizationDirectory(
         OrganizationDocument(
             people=[manager, *people],
@@ -195,8 +223,12 @@ def _build_workflow(
     optional_people: set[str] | None = None,
     fallback_reason: str | None = None,
     lead_email_thread: str | None = None,
+    lead_secondary_email_thread: str | None = None,
 ) -> HumanWireWorkflow:
-    directory, all_people = _directory(lead_email_thread=lead_email_thread)
+    directory, all_people = _directory(
+        lead_email_thread=lead_email_thread,
+        lead_secondary_email_thread=lead_secondary_email_thread,
+    )
     selected = [person for person in all_people if person.person_id in person_ids]
     return HumanWireWorkflow(
         directory,
@@ -603,7 +635,11 @@ def test_terminal_thread_requires_newer_interview_ack_before_tokenless_answer(
     repository, incoming_message_factory
 ) -> None:
     """Break caught: terminal thread history implicitly selects one newer unacknowledged interview."""
-    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    workflow = _build_workflow(
+        repository,
+        lead_email_thread="lead-thread",
+        lead_secondary_email_thread="lead-thread",
+    )
     terminal, _ = _create_mandate(
         workflow, incoming_message_factory, message_id="terminal-thread-create"
     )
@@ -706,6 +742,92 @@ def test_explicit_ack_selects_newer_interview_across_registered_channels(
     assert repository.list_assignments(newer.mandate_id)[0].state is StakeholderState.COMPLETE
     assert len(repository.list_evidence(newer.mandate_id)) == 1
     assert continued.deliveries
+
+
+@pytest.mark.parametrize(
+    ("channel", "sender_address", "conversation_id"),
+    [
+        (Channel.EMAIL, "lead@example.test", "wrong-email-thread"),
+        (Channel.EMAIL, "lead@example.test", ""),
+        (Channel.TELEGRAM, "lead-chat", "wrong-telegram-group"),
+        (Channel.TELEGRAM, "lead-chat", ""),
+    ],
+    ids=[
+        "wrong-configured-email-thread",
+        "missing-configured-email-thread",
+        "wrong-configured-telegram-group",
+        "missing-configured-telegram-group",
+    ],
+)
+def test_configured_route_ack_requires_exact_conversation_without_mutation(
+    repository,
+    incoming_message_factory,
+    channel: Channel,
+    sender_address: str,
+    conversation_id: str,
+) -> None:
+    """Break caught: valid sender/token binds and discloses into an unregistered conversation."""
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _create_mandate(
+        workflow, incoming_message_factory, message_id=f"configured-route-{channel.value}-create"
+    )
+    before = _correlation_snapshot(repository, (mandate,))
+
+    result = workflow.handle(
+        incoming_message_factory(
+            text=f"ACK {mandate.token}",
+            channel=channel,
+            sender_address=sender_address,
+            conversation_id=conversation_id,
+            message_id=f"configured-route-{channel.value}-{conversation_id or 'missing'}-ack",
+        )
+    )
+
+    assert result.deliveries == []
+    assert _correlation_snapshot(repository, (mandate,)) == before
+
+
+def test_terminal_history_on_another_registered_route_does_not_block_first_reply(
+    repository, incoming_message_factory
+) -> None:
+    """Break caught: another registered address sharing a conversation overblocks correlation."""
+    workflow = _build_workflow(
+        repository,
+        lead_email_thread="shared-thread",
+        lead_secondary_email_thread="shared-thread",
+    )
+    terminal, _ = _create_mandate(
+        workflow, incoming_message_factory, message_id="other-route-terminal-create"
+    )
+    workflow.handle(
+        incoming_message_factory(
+            text=f"/cancel {terminal.token}",
+            message_id="other-route-terminal-cancel",
+        )
+    )
+    newer, created = _create_mandate(
+        workflow, incoming_message_factory, message_id="other-route-newer-create"
+    )
+    primary = next(delivery for delivery in created.deliveries if delivery.assignment_id)
+    alternate = workflow.mark_delivery_result(primary, False, newer.created_at)
+    assert alternate.deliveries[0].recipient == "lead-secondary@example.test"
+    assert repository.list_interviews(newer.mandate_id)[0].current_route_id == (
+        "lead-email-secondary"
+    )
+
+    result = workflow.handle(
+        incoming_message_factory(
+            text="The secondary registered route may bind its own first reply.",
+            channel=Channel.EMAIL,
+            sender_address="lead-secondary@example.test",
+            conversation_id="shared-thread",
+            message_id="other-route-newer-answer",
+        )
+    )
+
+    assert "ACK <token>" not in [delivery.text for delivery in result.deliveries]
+    assert repository.list_assignments(newer.mandate_id)[0].state is StakeholderState.COMPLETE
+    assert len(repository.list_evidence(newer.mandate_id)) == 1
 
 
 def test_multiple_active_interviews_require_token_and_correct_ack_disambiguates(

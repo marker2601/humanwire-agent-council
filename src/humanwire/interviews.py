@@ -640,7 +640,14 @@ class InterviewCoordinator:
         if person.person_id.casefold() != assignment.person_id.casefold():
             return None
         for route in self._assignment_routes(assignment):
-            if route.channel is message.channel and route.sender_address.casefold() == message.sender_address.casefold():
+            if (
+                route.channel is message.channel
+                and route.sender_address.casefold() == message.sender_address.casefold()
+                and (
+                    route.conversation_id is None
+                    or route.conversation_id == message.conversation_id
+                )
+            ):
                 return route
         return None
 

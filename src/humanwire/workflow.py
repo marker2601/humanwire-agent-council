@@ -165,12 +165,30 @@ class HumanWireWorkflow:
         self, person_id: str, message: IncomingMessage
     ) -> bool:
         completed_match = False
+        inbound_route_ids = {
+            route.route_id
+            for route in self.directory.ordered_routes(person_id)
+            if route.channel is message.channel
+            and route.sender_address.casefold() == message.sender_address.casefold()
+            and (
+                route.conversation_id is None
+                or route.conversation_id == message.conversation_id
+            )
+        }
         for mandate in self.repository.list_recent_mandates(1000):
             for interview in self.repository.list_interviews(mandate.mandate_id):
                 assignment = self.repository.get_assignment(interview.assignment_id)
+                current_route_id = interview.current_route_id
+                if (
+                    current_route_id is None
+                    and assignment is not None
+                    and assignment.active_route_index < len(assignment.route_ids)
+                ):
+                    current_route_id = assignment.route_ids[assignment.active_route_index]
                 if (
                     assignment is not None
                     and assignment.person_id == person_id
+                    and current_route_id in inbound_route_ids
                     and interview.current_channel is message.channel
                     and interview.current_conversation_id == message.conversation_id
                 ):
