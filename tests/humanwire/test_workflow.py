@@ -180,3 +180,35 @@ def test_primary_delivery_failure_immediately_uses_the_next_registered_route(
     assignment = repository.get_assignment(primary.assignment_id)
     assert assignment is not None
     assert assignment.active_route_index == 1
+
+
+def test_final_delivery_failure_synthesizes_required_mandate_and_replay_is_inert(
+    workflow, telegram_mandate, repository, now
+) -> None:
+    """Break caught: exhaustion passes an assignment UUID to mandate synthesis."""
+    created = workflow.handle(telegram_mandate)
+    primary = next(
+        item
+        for item in created.deliveries
+        if item.assignment_id is not None and item.recipient == "lead@example.test"
+    )
+    alternate = workflow.mark_delivery_result(primary, succeeded=False, now=now).deliveries[0]
+    mandate = repository.list_recent_mandates(1)[0]
+    with repository.transaction() as unit:
+        for assignment in repository.list_assignments(mandate.mandate_id):
+            if assignment.assignment_id != primary.assignment_id:
+                unit.save_assignment(
+                    assignment.model_copy(update={"state": StakeholderState.COMPLETE})
+                )
+
+    exhausted = workflow.mark_delivery_result(alternate, succeeded=False, now=now)
+    assignment = repository.get_assignment(primary.assignment_id)
+    events = repository.list_events(mandate.mandate_id)
+    replay = workflow.mark_delivery_result(alternate, succeeded=False, now=now)
+
+    assert assignment is not None and assignment.state is StakeholderState.DELIVERY_FAILED
+    assert repository.get_mandate_by_token(mandate.token).state is MandateState.PARTIAL
+    assert any(event.event_type == "mandate.partial" for event in events)
+    assert exhausted.deliveries
+    assert replay.deliveries == []
+    assert repository.list_events(mandate.mandate_id) == events

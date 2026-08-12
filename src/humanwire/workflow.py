@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime
 
 from humanwire.commands import (
@@ -70,14 +71,27 @@ class HumanWireWorkflow:
     def mark_delivery_result(self, instruction: DeliveryInstruction, succeeded: bool, now: datetime) -> WorkflowResult:
         if instruction.assignment_id is None:
             return WorkflowResult()
-        delivery_id = instruction.message_id or f"instruction:{instruction.assignment_id}"
+        delivery_source = instruction.message_id or "|".join(
+            [
+                instruction.kind.value,
+                instruction.recipient or "",
+                instruction.conversation_id or "",
+                str(instruction.assignment_id),
+            ]
+        )
+        delivery_id = hashlib.sha256(delivery_source.encode()).hexdigest()[:48]
         if succeeded:
             self.mandates.interviews.mark_delivery_success(instruction.assignment_id, delivery_id, now)
         else:
             failed = self.mandates.interviews.mark_delivery_failure(
                 instruction.assignment_id, delivery_id, now
             )
-            synthesis = self.synthesis.run(instruction.assignment_id, now)
+            assignment = self.repository.get_assignment(instruction.assignment_id)
+            synthesis = (
+                self.synthesis.run(assignment.mandate_id, now)
+                if assignment is not None
+                else WorkflowResult()
+            )
             return WorkflowResult(deliveries=[*failed.deliveries, *synthesis.deliveries])
         return WorkflowResult()
 
