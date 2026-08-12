@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, update
 
+import humanwire.web as web_projection
 from humanwire.config import Settings
 from humanwire.database import (
     DomainEventRecord,
@@ -518,6 +519,34 @@ def test_private_token_and_meeting_id_are_removed_at_final_html_header_and_ics_b
     assert "BEGIN:VCALENDAR" in ics_response.text
     assert "DTSTART:20260814T200000Z" in ics_response.text
     assert "SUMMARY:Resolve the launch approval decision" in ics_response.text
+    assert (
+        "UID:bc963698fd096d377e6d10d7c586c77676fd30634cd9875f3b619e5f2835fa19"
+        "@humanwire.local\r\n"
+    ) in ics_response.text
+
+
+def test_denied_meeting_ids_have_stable_distinct_pseudonymous_calendar_uids() -> None:
+    first_id = "11111111-1111-4111-8111-111111111111"
+    second_id = "22222222-2222-4222-8222-222222222222"
+    first = web_projection._public_calendar_uid(first_id, frozenset({first_id}))
+    repeated = web_projection._public_calendar_uid(first_id, frozenset({first_id}))
+    second = web_projection._public_calendar_uid(second_id, frozenset({second_id}))
+
+    assert first == (
+        "60fa6dcb8d6f91c0f0f975dd59e51543f41470fa1cb5d271bff54654a26f2cdf"
+        "@humanwire.local"
+    )
+    assert repeated == first
+    assert second == (
+        "2879b44a3d7f4f154d42049e727fa6b8744426ab3ec37bf34a78577eeb2c9e9f"
+        "@humanwire.local"
+    )
+    assert second != first
+    assert first_id not in first
+    assert second_id not in second
+    assert all(character.isascii() for character in first + second)
+    assert "\r" not in first + second
+    assert "\n" not in first + second
 
 
 def test_private_corpus_cannot_replace_ics_structure_or_property_names(demo_app) -> None:

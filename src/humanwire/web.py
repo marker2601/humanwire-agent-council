@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import html
 import json
@@ -68,6 +69,7 @@ _ENUM_FIELDS = {
     "new_state": {item.value for item in MandateState} | {item.value for item in StakeholderState},
 }
 _PRIVATE_MARKER = "[PRIVATE]"
+_CALENDAR_UID_NAMESPACE = b"humanwire:calendar:uid:v1:"
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -118,6 +120,14 @@ def _private_deny_values(repository: Any, mandate: Mandate) -> frozenset[str]:
             if value
         )
     return frozenset(denied)
+
+
+def _public_calendar_uid(meeting_id: str, denied_values: frozenset[str]) -> str:
+    public_uid = f"{meeting_id}@humanwire.local"
+    if _scrub_known_private(public_uid, denied_values) == public_uid:
+        return public_uid
+    digest = hashlib.sha256(_CALENDAR_UID_NAMESPACE + meeting_id.encode("ascii")).hexdigest()
+    return f"{digest}@humanwire.local"
 
 
 def _public_projection(
@@ -419,10 +429,7 @@ def _verified_calendar(repository: Any, mandate: Mandate, current_time: datetime
             proposed_slot=slot,
             created_at=creation_event.created_at,
         )
-    public_uid = _scrub_known_private(
-        f"{rebuilt.meeting_id}@humanwire.local",
-        denied_values,
-    )
+    public_uid = _public_calendar_uid(str(rebuilt.meeting_id), denied_values)
     public_summary = _scrub_known_private(rebuilt.purpose, denied_values)
     return render_ics(
         rebuilt,
