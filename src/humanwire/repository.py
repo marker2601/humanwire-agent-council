@@ -539,6 +539,14 @@ class RepositoryUnitOfWork:
     def add_proposal_response(self, response: ProposalResponse) -> None:
         self._session.add(_response_record(response))
 
+    def list_proposal_responses(self, proposal_id: UUID) -> list[ProposalResponse]:
+        records = self._session.scalars(
+            select(ProposalResponseRecord)
+            .where(ProposalResponseRecord.proposal_id == str(proposal_id))
+            .order_by(ProposalResponseRecord.created_at, ProposalResponseRecord.response_id)
+        ).all()
+        return [_response_value(record) for record in records]
+
     def save_meeting_package(self, package: MeetingPackage) -> None:
         record = self._session.get(MeetingPackageRecord, str(package.meeting_id))
         replacement = _package_record(package)
