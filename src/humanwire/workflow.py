@@ -122,6 +122,11 @@ class HumanWireWorkflow:
         for mandate in self.repository.list_due_mandates(now):
             deliveries.extend(self.mandates.release(mandate.token, now).deliveries)
 
+        # Initial outreach owns an assignment until its exact provider callback
+        # completes.  Recover it before considering any response ladder so a long
+        # restart cannot turn a never-sent primary into a misleading reminder.
+        deliveries.extend(self.mandates.recover_release_outbox(now).deliveries)
+
         mandate_states = {
             mandate.mandate_id: mandate.state
             for mandate in self.repository.list_recent_mandates(1000)
@@ -129,10 +134,29 @@ class HumanWireWorkflow:
         for assignment in self.repository.list_due_assignments(now):
             if mandate_states.get(assignment.mandate_id) is not MandateState.INTERVIEWING:
                 continue
+            if self.repository.has_open_release_outbox(assignment.assignment_id):
+                continue
             result = self.engagements.process_due_assignment(assignment, now)
             deliveries.extend(result.deliveries)
             deliveries.extend(self.synthesis.run(assignment.mandate_id, now).deliveries)
         return WorkflowResult(deliveries=deliveries)
+
+    def renew_delivery_claim(
+        self,
+        instruction: DeliveryInstruction,
+        now: datetime,
+    ) -> bool:
+        """Fence durable release dispatch immediately before and during provider I/O."""
+        if instruction.dispatch_claim_id is None:
+            return True
+        if instruction.assignment_id is None or instruction.message_id is None:
+            return False
+        return self.repository.renew_release_outbox_claim(
+            instruction.message_id,
+            instruction.assignment_id,
+            instruction.dispatch_claim_id,
+            now,
+        )
 
     def mark_delivery_result(self, instruction: DeliveryInstruction, succeeded: bool, now: datetime) -> WorkflowResult:
         if instruction.assignment_id is None:
@@ -148,11 +172,17 @@ class HumanWireWorkflow:
         delivery_id = hashlib.sha256(delivery_source.encode()).hexdigest()[:48]
         if succeeded:
             self.engagements.mark_delivery_success(
-                instruction.assignment_id, delivery_id, now
+                instruction.assignment_id,
+                delivery_id,
+                now,
+                claim_owner=instruction.dispatch_claim_id,
             )
         else:
             failed = self.engagements.mark_delivery_failure(
-                instruction.assignment_id, delivery_id, now
+                instruction.assignment_id,
+                delivery_id,
+                now,
+                claim_owner=instruction.dispatch_claim_id,
             )
             assignment = self.repository.get_assignment(instruction.assignment_id)
             synthesis = (

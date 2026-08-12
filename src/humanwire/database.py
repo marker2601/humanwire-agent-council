@@ -88,6 +88,42 @@ class StakeholderAssignmentRecord(Base):
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class ReleaseOutboxRecord(Base):
+    """Safe durable ownership of one initial release delivery attempt.
+
+    The row deliberately stores no address, conversation, subject, provider body, or
+    mandate text.  The trusted directory and persisted aggregate reconstruct those
+    values only after an atomic claim.
+    """
+
+    __tablename__ = "hw_release_outbox"
+    __table_args__ = (
+        Index("ix_hw_release_outbox_claim", "state", "claimed_at", "created_at"),
+    )
+
+    outbox_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    mandate_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("hw_mandates.mandate_id"), index=True
+    )
+    assignment_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("hw_assignments.assignment_id"),
+        index=True,
+    )
+    delivery_id: Mapped[str] = mapped_column(String(48), unique=True, index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer)
+    route_index: Mapped[int] = mapped_column(Integer)
+    state: Mapped[str] = mapped_column(String(16), index=True)
+    claim_owner: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class InterviewSessionRecord(Base):
     __tablename__ = "hw_interviews"
     __table_args__ = (

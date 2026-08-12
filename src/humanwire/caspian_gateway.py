@@ -76,6 +76,8 @@ class ConnectionSummary:
 
 
 class CaspianGateway:
+    _delivery_claim_heartbeat_seconds = 10.0
+
     def __init__(
         self,
         settings: Settings,
@@ -216,6 +218,54 @@ class CaspianGateway:
         if self.client is None:
             raise RuntimeError("Caspian gateway is not connected")
 
+        claim_stop: threading.Event | None = None
+        claim_thread: threading.Thread | None = None
+        if delivery.dispatch_claim_id is not None:
+            if not _complete(self.workflow.renew_delivery_claim(delivery, self.clock())):
+                return
+            claim_stop = threading.Event()
+
+            def renew_claim() -> None:
+                assert claim_stop is not None
+                while not claim_stop.wait(self._delivery_claim_heartbeat_seconds):
+                    try:
+                        if not _complete(
+                            self.workflow.renew_delivery_claim(delivery, self.clock())
+                        ):
+                            logger.warning(
+                                "delivery_claim_lost",
+                                extra={
+                                    "mandate_token": delivery.mandate_token,
+                                    "event_type": "delivery.claim_lost",
+                                    "channel": self._delivery_channel(delivery),
+                                    "reason": "dispatch_fence_rejected",
+                                },
+                            )
+                            return
+                    except Exception:  # noqa: BLE001 - retry remains lease bounded
+                        logger.warning(
+                            "delivery_claim_renewal_failed",
+                            extra={
+                                "mandate_token": delivery.mandate_token,
+                                "event_type": "delivery.claim_renewal_failed",
+                                "channel": self._delivery_channel(delivery),
+                                "reason": "claim_store_error",
+                            },
+                        )
+
+            claim_thread = threading.Thread(
+                target=renew_claim,
+                name="humanwire-delivery-claim",
+                daemon=True,
+            )
+            claim_thread.start()
+
+        def stop_claim_heartbeat() -> None:
+            if claim_stop is not None:
+                claim_stop.set()
+            if claim_thread is not None:
+                claim_thread.join()
+
         try:
             if delivery.kind is DeliveryKind.REPLY_TO_MESSAGE:
                 if not delivery.message_id:
@@ -252,14 +302,25 @@ class CaspianGateway:
                 },
             )
             if _allow_failure_callback:
-                recovery = _complete(
-                    self.workflow.mark_delivery_result(delivery, False, self.clock())
-                )
+                try:
+                    recovery = _complete(
+                        self.workflow.mark_delivery_result(delivery, False, self.clock())
+                    )
+                finally:
+                    stop_claim_heartbeat()
                 for instruction in recovery.deliveries:
                     self.dispatch(instruction, _allow_failure_callback=False)
+            else:
+                stop_claim_heartbeat()
             return
+        except BaseException:
+            stop_claim_heartbeat()
+            raise
 
-        _complete(self.workflow.mark_delivery_result(delivery, True, self.clock()))
+        try:
+            _complete(self.workflow.mark_delivery_result(delivery, True, self.clock()))
+        finally:
+            stop_claim_heartbeat()
 
     @staticmethod
     def _delivery_channel(delivery: DeliveryInstruction) -> str:

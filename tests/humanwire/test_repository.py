@@ -166,6 +166,74 @@ def test_round_trips_assignment_and_interview(
     assert repository.list_interviews(sample_mandate.mandate_id) == [interview]
 
 
+@pytest.mark.parametrize(
+    ("field", "changed_value"),
+    [
+        ("questions", ["Changed?", "Second?"]),
+        ("current_question_index", 1),
+        ("current_channel", Channel.TELEGRAM),
+        ("current_route_id", "changed-route"),
+        ("current_conversation_id", "changed-conversation"),
+        ("channel_history", [Channel.EMAIL, Channel.TELEGRAM]),
+        ("default_visibility", EvidenceVisibility.PRIVATE),
+        ("acknowledged_at", "timestamp"),
+        ("started_at", "timestamp"),
+        ("updated_at", "timestamp"),
+        ("completed_at", "timestamp"),
+    ],
+)
+def test_interview_cas_binds_every_persisted_session_field_and_live_mandate(
+    repository,
+    sample_mandate,
+    make_assignment,
+    now,
+    field,
+    changed_value,
+) -> None:
+    assignment = make_assignment(
+        state=StakeholderState.INTERVIEWING,
+        next_action_at=None,
+    )
+    session_id = uuid4()
+    assignment = assignment.model_copy(update={"interview_id": session_id})
+    expected = InterviewSession(
+        session_id=session_id,
+        mandate_id=sample_mandate.mandate_id,
+        assignment_id=assignment.assignment_id,
+        questions=["First?", "Second?"],
+        current_channel=Channel.EMAIL,
+        current_route_id="team-lead-email",
+        current_conversation_id="team-lead-thread",
+        channel_history=[Channel.EMAIL],
+        acknowledged_at=now,
+        started_at=now,
+        updated_at=now,
+    )
+    if changed_value == "timestamp":
+        changed_value = now + timedelta(seconds=1)
+    changed = expected.model_copy(update={field: changed_value})
+    advanced = expected.model_copy(
+        update={
+            "current_question_index": 1,
+            "updated_at": now + timedelta(seconds=2),
+        }
+    )
+    repository.add_mandate(sample_mandate)
+    repository.add_assignment(assignment)
+    repository.add_interview(expected)
+    repository.save_interview(changed)
+
+    with repository.transaction() as unit:
+        saved = unit.compare_and_save_interview_if_mandate_active(
+            expected,
+            advanced,
+            now,
+        )
+
+    assert saved is False
+    assert repository.get_interview(session_id) == changed
+
+
 def test_assignment_round_trip_preserves_engagement_contract(
     repository, sample_mandate, make_assignment
 ) -> None:
@@ -1228,6 +1296,45 @@ def test_mandate_release_cas_binds_the_saved_plan_snapshot(
             "plan": expected.plan.model_copy(update={"stakeholders": [changed_stakeholder]}),
         }
     )
+    released = expected.model_copy(
+        update={
+            "state": MandateState.INTERVIEWING,
+            "next_action_at": None,
+            "updated_at": now + timedelta(seconds=1),
+        }
+    )
+    repository.add_mandate(expected)
+    repository.save_mandate(changed)
+
+    with repository.transaction() as unit:
+        saved = unit.compare_and_save_mandate_if_unexpired(expected, released, now)
+
+    assert saved is False
+    assert repository.get_mandate_by_token(expected.token) == changed
+
+
+@pytest.mark.parametrize(
+    ("field", "changed_value"),
+    [
+        ("redacted_request", "A concurrently changed persisted request"),
+        ("created_at", None),
+        ("idempotency_key", "mandate:concurrently-changed-idempotency"),
+    ],
+)
+def test_mandate_release_cas_binds_every_previously_omitted_persisted_field(
+    repository,
+    make_mandate,
+    now,
+    field,
+    changed_value,
+) -> None:
+    expected = make_mandate(
+        state=MandateState.PLANNED,
+        next_action_at=now + timedelta(seconds=15),
+    )
+    if field == "created_at":
+        changed_value = expected.created_at - timedelta(seconds=1)
+    changed = expected.model_copy(update={field: changed_value})
     released = expected.model_copy(
         update={
             "state": MandateState.INTERVIEWING,

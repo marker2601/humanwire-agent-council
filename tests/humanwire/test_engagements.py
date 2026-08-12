@@ -334,10 +334,16 @@ def test_inform_provider_failure_advances_once_then_success_is_replay_safe(
 
     alternate_delivery_id = _provider_delivery_id(first.deliveries[0])
     coordinator.mark_delivery_success(
-        assignment.assignment_id, alternate_delivery_id, now
+        assignment.assignment_id,
+        alternate_delivery_id,
+        now,
+        claim_owner=first.deliveries[0].dispatch_claim_id,
     )
     coordinator.mark_delivery_success(
-        assignment.assignment_id, alternate_delivery_id, now
+        assignment.assignment_id,
+        alternate_delivery_id,
+        now,
+        claim_owner=first.deliveries[0].dispatch_claim_id,
     )
 
     saved = repository.get_assignment(assignment.assignment_id)

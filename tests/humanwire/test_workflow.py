@@ -1,3 +1,4 @@
+import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -7,6 +8,7 @@ from uuid import uuid4
 import pytest
 
 from humanwire.config import Settings
+from humanwire.container import DueActionWorker
 from humanwire.database import create_session_factory
 from humanwire.directory import InitiatorPolicy, OrganizationDirectory, OrganizationDocument
 from humanwire.domain import (
@@ -563,6 +565,7 @@ def _terminal_snapshot(repository, mandate):
             f"availability:{mandate.mandate_id}:team-lead"
         ),
         "events": repository.list_events(mandate.mandate_id),
+        "release_outbox": repository.list_release_outbox(mandate.mandate_id),
     }
 
 
@@ -1182,6 +1185,98 @@ def test_optional_missing_route_is_explicit_and_does_not_block_valid_release(
     assert all(delivery.assignment_id != missing.assignment_id for delivery in released.deliveries)
 
 
+@pytest.mark.parametrize(
+    ("field", "changed_value"),
+    [
+        ("person_id", "concurrent-person"),
+        ("department", "Concurrent Department"),
+        ("direction", Direction.EXTERNAL),
+        ("reason", "Concurrent reason"),
+        ("required", True),
+        ("engagement_type", EngagementType.ACKNOWLEDGE),
+        ("response_required", True),
+        ("state", StakeholderState.NOT_CONTACTED),
+        ("route_ids", ["concurrent-route"]),
+        ("active_route_index", 1),
+        ("attempt_count", 1),
+        ("interview_id", "uuid"),
+        ("first_contact_at", "timestamp"),
+        ("last_delivery_at", "timestamp"),
+        ("next_action_at", "timestamp"),
+        ("acknowledged_at", "timestamp"),
+        ("completed_at", "timestamp"),
+        ("failure_reason", "concurrent_failure"),
+    ],
+)
+def test_release_cas_guards_every_optional_failed_assignment_field(
+    tmp_path,
+    incoming_message_factory,
+    now,
+    monkeypatch,
+    field,
+    changed_value,
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / f'optional-failed-{field}.db').as_posix()}"
+    repository = SqlAlchemyHumanWireRepository(create_session_factory(database_url))
+    workflow = _build_mixed_workflow(
+        repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+        missing_routes={"inform-person"},
+    )
+    message, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id=f"optional-failed-{field}-create",
+        received_at=now,
+    )
+    expected = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.person_id == "inform-person"
+    )
+    if changed_value == "timestamp":
+        changed_value = now + timedelta(seconds=1)
+    elif changed_value == "uuid":
+        changed_value = uuid4()
+    changed = expected.model_copy(update={field: changed_value})
+    original_transaction = repository.transaction
+    raced = False
+
+    @contextmanager
+    def mutate_skipped_assignment_before_release():
+        nonlocal raced
+        if not raced:
+            raced = True
+            concurrent = SqlAlchemyHumanWireRepository(
+                create_session_factory(database_url)
+            )
+            concurrent.save_assignment(changed)
+        with original_transaction() as unit:
+            yield unit
+
+    monkeypatch.setattr(repository, "transaction", mutate_skipped_assignment_before_release)
+
+    result = workflow.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": f"optional-failed-{field}-go",
+                "received_at": now + timedelta(seconds=2),
+            }
+        )
+    )
+
+    assert raced
+    assert result == WorkflowResult()
+    assert repository.get_mandate_by_token(mandate.token).state is MandateState.PLANNED
+    assert repository.get_assignment(expected.assignment_id) == changed
+    assert repository.list_interviews(mandate.mandate_id) == []
+    assert not any(
+        event.event_type == "engagement.plan_released"
+        for event in repository.list_events(mandate.mandate_id)
+    )
+
+
 def test_file_restart_releases_persisted_preview_at_due_time(
     tmp_path, incoming_message_factory, now
 ) -> None:
@@ -1209,6 +1304,750 @@ def test_file_restart_releases_persisted_preview_at_due_time(
     assert len(restarted_repository.list_interviews(mandate.mandate_id)) == 2
 
 
+def test_release_atomically_persists_safe_claimed_initial_outbox_rows(
+    repository, incoming_message_factory, now
+) -> None:
+    workflow = _build_mixed_workflow(
+        repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    message, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id="release-outbox-safe-create",
+        received_at=now,
+    )
+
+    released = workflow.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": "release-outbox-safe-go",
+                "received_at": now + timedelta(seconds=1),
+            }
+        )
+    )
+
+    rows = repository.list_release_outbox(mandate.mandate_id)
+    assert len(rows) == 6
+    assert {row.assignment_id for row in rows} == {
+        delivery.assignment_id for delivery in released.deliveries
+    }
+    assert {row.state for row in rows} == {"claimed"}
+    assert {row.attempt_count for row in rows} == {1}
+    assert {row.route_index for row in rows} == {0}
+    assert {row.delivery_id for row in rows} == {
+        hashlib.sha256(delivery.message_id.encode()).hexdigest()[:48]
+        for delivery in released.deliveries
+    }
+    serialized = "\n".join(repr(row) for row in rows)
+    for forbidden in (
+        "@private.example.test",
+        "private-conversation",
+        "PRIVATE-REQUEST-SENTINEL",
+        "provider-body-sentinel",
+        "Awareness update for launch observers",
+    ):
+        assert forbidden not in serialized
+
+
+def test_restart_recovers_release_commit_after_crash_before_any_dispatch(
+    tmp_path, incoming_message_factory, now
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'release-outbox-crash.db').as_posix()}"
+    repository = SqlAlchemyHumanWireRepository(create_session_factory(database_url))
+    first = _build_mixed_workflow(
+        repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    message, mandate, _ = _mixed_preview(
+        first,
+        incoming_message_factory,
+        message_id="release-outbox-crash-create",
+        received_at=now,
+    )
+    initially_claimed = first.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": "release-outbox-crash-go",
+                "received_at": now + timedelta(seconds=1),
+            }
+        )
+    )
+    initial_ids = {delivery.message_id for delivery in initially_claimed.deliveries}
+
+    restarted_repository = SqlAlchemyHumanWireRepository(
+        create_session_factory(database_url)
+    )
+    restarted = _build_mixed_workflow(
+        restarted_repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    before_lease = restarted.process_due(now + timedelta(seconds=30))
+    recovered = restarted.process_due(now + timedelta(seconds=32))
+
+    assert before_lease == WorkflowResult()
+    assert len(recovered.deliveries) == 6
+    assert {delivery.message_id for delivery in recovered.deliveries} == initial_ids
+    for delivery in recovered.deliveries:
+        restarted.mark_delivery_result(
+            delivery,
+            succeeded=True,
+            now=now + timedelta(seconds=33),
+        )
+    assert restarted.process_due(now + timedelta(seconds=64)) == WorkflowResult()
+    assert {
+        row.state
+        for row in restarted_repository.list_release_outbox(mandate.mandate_id)
+    } == {"completed"}
+
+
+def test_restart_after_ack_deadline_recovers_primary_before_any_response_ladder(
+    tmp_path, incoming_message_factory, now
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'release-outbox-before-ladder.db').as_posix()}"
+    settings = Settings(
+        _env_file=None,
+        engagement_require_go=True,
+        acknowledgement_seconds=10,
+        reminder_seconds=10,
+    )
+    repository = SqlAlchemyHumanWireRepository(create_session_factory(database_url))
+    first = _build_mixed_workflow(repository, settings=settings)
+    message, mandate, _ = _mixed_preview(
+        first,
+        incoming_message_factory,
+        message_id="release-outbox-before-ladder-create",
+        received_at=now,
+    )
+    initially_claimed = first.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": "release-outbox-before-ladder-go",
+                "received_at": now + timedelta(seconds=1),
+            }
+        )
+    )
+
+    restarted_repository = SqlAlchemyHumanWireRepository(
+        create_session_factory(database_url)
+    )
+    restarted = _build_mixed_workflow(restarted_repository, settings=settings)
+    recovered = restarted.process_due(now + timedelta(seconds=32))
+
+    assert len(recovered.deliveries) == 6
+    assert {delivery.message_id for delivery in recovered.deliveries} == {
+        delivery.message_id for delivery in initially_claimed.deliveries
+    }
+    assert not any(
+        event.event_type in {"outreach.reminder_sent", "outreach.alternate_sent"}
+        for event in restarted_repository.list_events(mandate.mandate_id)
+    )
+
+
+@pytest.mark.parametrize(
+    ("person_id", "response"),
+    [
+        ("ack-person", "ack"),
+        ("quick-person", "answer"),
+        ("structured-person", "answer"),
+        ("approval-person", "decision"),
+        ("availability-person", "availability"),
+    ],
+)
+def test_authenticated_inbound_retires_initial_claim_when_provider_callback_was_lost(
+    tmp_path,
+    incoming_message_factory,
+    now,
+    person_id,
+    response,
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / f'inbound-retires-{person_id}.db').as_posix()}"
+    repository = SqlAlchemyHumanWireRepository(create_session_factory(database_url))
+    workflow = _build_mixed_workflow(
+        repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    message, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id=f"inbound-retires-{person_id}-create",
+        received_at=now,
+    )
+    released = workflow.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": f"inbound-retires-{person_id}-go",
+                "received_at": now + timedelta(seconds=1),
+            }
+        )
+    )
+    selected = next(
+        delivery
+        for delivery in released.deliveries
+        if repository.get_assignment(delivery.assignment_id).person_id == person_id
+    )
+    for delivery in released.deliveries:
+        if delivery.assignment_id != selected.assignment_id:
+            workflow.mark_delivery_result(
+                delivery,
+                succeeded=True,
+                now=now + timedelta(seconds=2),
+            )
+    inbound_text = {
+        "ack": f"ACK {mandate.token}",
+        "answer": "A correlated human answer after the provider callback was lost.",
+        "decision": f"DECIDE {mandate.token} APPROVE",
+        "availability": (
+            f"AVAILABLE {mandate.token} "
+            "2026-08-11T13:00:00+00:00/2026-08-11T14:00:00+00:00"
+        ),
+    }[response]
+
+    workflow.handle(
+        incoming_message_factory(
+            text=inbound_text,
+            channel=Channel.EMAIL,
+            sender_address=f"{person_id}@private.example.test",
+            conversation_id=f"{person_id}-reply-thread",
+            message_id=f"inbound-retires-{person_id}-response",
+            received_at=now + timedelta(seconds=3),
+        )
+    )
+
+    row = next(
+        item
+        for item in repository.list_release_outbox(mandate.mandate_id)
+        if item.assignment_id == selected.assignment_id and item.attempt_count == 1
+    )
+    assert row.state == "completed"
+    assert workflow.process_due(now + timedelta(seconds=35)) == WorkflowResult()
+
+
+def test_restart_recovers_only_uncompleted_release_entries_after_mid_batch_crash(
+    tmp_path, incoming_message_factory, now
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'release-outbox-mid-batch.db').as_posix()}"
+    repository = SqlAlchemyHumanWireRepository(create_session_factory(database_url))
+    first = _build_mixed_workflow(
+        repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    message, mandate, _ = _mixed_preview(
+        first,
+        incoming_message_factory,
+        message_id="release-outbox-mid-batch-create",
+        received_at=now,
+    )
+    released = first.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": "release-outbox-mid-batch-go",
+                "received_at": now + timedelta(seconds=1),
+            }
+        )
+    )
+    completed_ids = {delivery.message_id for delivery in released.deliveries[:2]}
+    for delivery in released.deliveries[:2]:
+        first.mark_delivery_result(
+            delivery,
+            succeeded=True,
+            now=now + timedelta(seconds=2),
+        )
+
+    restarted_repository = SqlAlchemyHumanWireRepository(
+        create_session_factory(database_url)
+    )
+    restarted = _build_mixed_workflow(
+        restarted_repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    recovered = restarted.process_due(now + timedelta(seconds=32))
+
+    assert len(recovered.deliveries) == 4
+    assert completed_ids.isdisjoint(
+        {delivery.message_id for delivery in recovered.deliveries}
+    )
+    assert sorted(
+        row.state
+        for row in restarted_repository.list_release_outbox(mandate.mandate_id)
+    ) == ["claimed"] * 4 + ["completed"] * 2
+
+
+def test_failed_initial_provider_attempt_completes_outbox_and_never_replays_primary(
+    tmp_path, incoming_message_factory, now
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'release-outbox-failure.db').as_posix()}"
+    repository = SqlAlchemyHumanWireRepository(create_session_factory(database_url))
+    workflow = _build_mixed_workflow(
+        repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    message, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id="release-outbox-failure-create",
+        received_at=now,
+    )
+    released = workflow.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": "release-outbox-failure-go",
+                "received_at": now + timedelta(seconds=1),
+            }
+        )
+    )
+    failed = released.deliveries[0]
+    for delivery in released.deliveries[1:]:
+        workflow.mark_delivery_result(
+            delivery,
+            succeeded=True,
+            now=now + timedelta(seconds=2),
+        )
+
+    alternate = workflow.mark_delivery_result(
+        failed,
+        succeeded=False,
+        now=now + timedelta(seconds=2),
+    )
+    replay = workflow.process_due(now + timedelta(seconds=32))
+
+    assert len(alternate.deliveries) == 1
+    assert alternate.deliveries[0].message_id != failed.message_id
+    assert replay == WorkflowResult()
+    row = next(
+        item
+        for item in repository.list_release_outbox(mandate.mandate_id)
+        if item.assignment_id == failed.assignment_id
+    )
+    assert row.state == "completed"
+
+
+def test_failed_primary_alternate_is_recovered_after_callback_dispatch_crash(
+    tmp_path, incoming_message_factory, now
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'release-outbox-alternate-crash.db').as_posix()}"
+    repository = SqlAlchemyHumanWireRepository(create_session_factory(database_url))
+    workflow = _build_mixed_workflow(
+        repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    message, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id="release-outbox-alternate-crash-create",
+        received_at=now,
+    )
+    released = workflow.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": "release-outbox-alternate-crash-go",
+                "received_at": now + timedelta(seconds=1),
+            }
+        )
+    )
+    failed = next(
+        delivery
+        for delivery in released.deliveries
+        if repository.get_assignment(delivery.assignment_id).person_id
+        == "structured-person"
+    )
+    for delivery in released.deliveries:
+        if delivery.assignment_id != failed.assignment_id:
+            workflow.mark_delivery_result(
+                delivery,
+                succeeded=True,
+                now=now + timedelta(seconds=2),
+            )
+    alternate = workflow.mark_delivery_result(
+        failed,
+        succeeded=False,
+        now=now + timedelta(seconds=2),
+    )
+    assert len(alternate.deliveries) == 1
+
+    restarted = _build_mixed_workflow(
+        SqlAlchemyHumanWireRepository(create_session_factory(database_url)),
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    assert restarted.process_due(now + timedelta(seconds=32)) == WorkflowResult()
+    recovered = restarted.process_due(now + timedelta(seconds=34))
+
+    assert len(recovered.deliveries) == 1
+    assert recovered.deliveries[0].message_id == alternate.deliveries[0].message_id
+    restarted.mark_delivery_result(
+        recovered.deliveries[0],
+        succeeded=True,
+        now=now + timedelta(seconds=35),
+    )
+    assert restarted.process_due(now + timedelta(seconds=66)) == WorkflowResult()
+    assert {
+        row.state
+        for row in repository.list_release_outbox(mandate.mandate_id)
+        if row.assignment_id == failed.assignment_id
+    } == {"completed"}
+
+
+def test_concurrent_restart_drains_claim_each_initial_release_entry_once(
+    tmp_path, incoming_message_factory, now
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'release-outbox-claims.db').as_posix()}"
+    repository = SqlAlchemyHumanWireRepository(create_session_factory(database_url))
+    first = _build_mixed_workflow(
+        repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    message, mandate, _ = _mixed_preview(
+        first,
+        incoming_message_factory,
+        message_id="release-outbox-claims-create",
+        received_at=now,
+    )
+    first.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": "release-outbox-claims-go",
+                "received_at": now + timedelta(seconds=1),
+            }
+        )
+    )
+    workflows = [
+        _build_mixed_workflow(
+            SqlAlchemyHumanWireRepository(create_session_factory(database_url)),
+            settings=Settings(_env_file=None, engagement_require_go=True),
+        )
+        for _ in range(4)
+    ]
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [
+            executor.submit(workflow.process_due, now + timedelta(seconds=32))
+            for workflow in workflows
+        ]
+        results = [future.result(timeout=10) for future in futures]
+
+    deliveries = [delivery for result in results for delivery in result.deliveries]
+    assert len(deliveries) == 6
+    assert len({delivery.message_id for delivery in deliveries}) == 6
+    assert {
+        row.state for row in repository.list_release_outbox(mandate.mandate_id)
+    } == {"claimed"}
+
+
+def test_reclaimed_later_batch_entry_fences_the_original_dispatch_owner(
+    tmp_path, incoming_message_factory, now
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'release-outbox-batch-fence.db').as_posix()}"
+    repository = SqlAlchemyHumanWireRepository(create_session_factory(database_url))
+    first = _build_mixed_workflow(
+        repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    message, mandate, _ = _mixed_preview(
+        first,
+        incoming_message_factory,
+        message_id="release-outbox-batch-fence-create",
+        received_at=now,
+    )
+    released = first.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": "release-outbox-batch-fence-go",
+                "received_at": now + timedelta(seconds=1),
+            }
+        )
+    )
+    original_later = released.deliveries[-1]
+
+    restarted = _build_mixed_workflow(
+        SqlAlchemyHumanWireRepository(create_session_factory(database_url)),
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    recovered = restarted.process_due(now + timedelta(seconds=32))
+    reclaimed_later = next(
+        item
+        for item in recovered.deliveries
+        if item.assignment_id == original_later.assignment_id
+    )
+
+    assert original_later.dispatch_claim_id != reclaimed_later.dispatch_claim_id
+    assert not first.renew_delivery_claim(
+        original_later,
+        now + timedelta(seconds=33),
+    )
+    assert restarted.renew_delivery_claim(
+        reclaimed_later,
+        now + timedelta(seconds=33),
+    )
+
+
+@pytest.mark.parametrize(
+    ("person_id", "succeeded"),
+    [
+        ("inform-person", True),
+        ("inform-person", False),
+        ("quick-person", True),
+        ("quick-person", False),
+    ],
+)
+def test_stale_release_owner_callback_is_inert_after_reclaim(
+    tmp_path,
+    incoming_message_factory,
+    now,
+    person_id,
+    succeeded,
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / f'release-outbox-stale-{person_id}-{succeeded}.db').as_posix()}"
+    first_repository = SqlAlchemyHumanWireRepository(
+        create_session_factory(database_url)
+    )
+    first = _build_mixed_workflow(
+        first_repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    message, mandate, _ = _mixed_preview(
+        first,
+        incoming_message_factory,
+        message_id=f"release-outbox-stale-{person_id}-{succeeded}-create",
+        received_at=now,
+    )
+    released = first.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": f"release-outbox-stale-{person_id}-{succeeded}-go",
+                "received_at": now + timedelta(seconds=1),
+            }
+        )
+    )
+    stale = next(
+        item
+        for item in released.deliveries
+        if first_repository.get_assignment(item.assignment_id).person_id == person_id
+    )
+
+    winner_repository = SqlAlchemyHumanWireRepository(
+        create_session_factory(database_url)
+    )
+    winner = _build_mixed_workflow(
+        winner_repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    reclaimed = winner.process_due(now + timedelta(seconds=32))
+    current = next(
+        item
+        for item in reclaimed.deliveries
+        if item.assignment_id == stale.assignment_id
+    )
+    before_assignment = winner_repository.get_assignment(stale.assignment_id)
+    assert before_assignment is not None
+    before_session = (
+        winner_repository.get_interview(before_assignment.interview_id)
+        if before_assignment.interview_id is not None
+        else None
+    )
+    before_events = winner_repository.list_events(mandate.mandate_id)
+
+    stale_result = first.mark_delivery_result(
+        stale,
+        succeeded=succeeded,
+        now=now + timedelta(seconds=33),
+    )
+
+    assert stale_result == WorkflowResult()
+    assert winner_repository.get_assignment(stale.assignment_id) == before_assignment
+    if before_session is not None:
+        assert winner_repository.get_interview(before_session.session_id) == before_session
+    assert winner_repository.list_events(mandate.mandate_id) == before_events
+    open_row = next(
+        row
+        for row in winner_repository.list_release_outbox(mandate.mandate_id)
+        if row.assignment_id == stale.assignment_id
+    )
+    assert open_row.state == "claimed"
+    assert open_row.claim_owner == current.dispatch_claim_id
+
+    winner_result = winner.mark_delivery_result(
+        current,
+        succeeded=succeeded,
+        now=now + timedelta(seconds=34),
+    )
+
+    completed_row = next(
+        row
+        for row in winner_repository.list_release_outbox(mandate.mandate_id)
+        if row.assignment_id == stale.assignment_id
+    )
+    assert completed_row.state == "completed"
+    assert len(winner_repository.list_events(mandate.mandate_id)) > len(before_events)
+    if succeeded:
+        assert winner_result == WorkflowResult()
+    else:
+        assert len(winner_result.deliveries) == 1
+
+
+@pytest.mark.parametrize(
+    ("person_id", "succeeded"),
+    [
+        ("inform-person", True),
+        ("inform-person", False),
+        ("quick-person", True),
+        ("quick-person", False),
+    ],
+)
+def test_durable_release_callback_without_claim_owner_is_inert(
+    tmp_path,
+    incoming_message_factory,
+    now,
+    person_id,
+    succeeded,
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / f'release-outbox-owner-required-{person_id}-{succeeded}.db').as_posix()}"
+    repository = SqlAlchemyHumanWireRepository(create_session_factory(database_url))
+    workflow = _build_mixed_workflow(
+        repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    message, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id=f"release-outbox-owner-required-{person_id}-{succeeded}-create",
+        received_at=now,
+    )
+    released = workflow.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": f"release-outbox-owner-required-{person_id}-{succeeded}-go",
+                "received_at": now + timedelta(seconds=1),
+            }
+        )
+    )
+    current = next(
+        item
+        for item in released.deliveries
+        if repository.get_assignment(item.assignment_id).person_id == person_id
+    )
+    without_owner = current.model_copy(update={"dispatch_claim_id": None})
+    before_assignment = repository.get_assignment(current.assignment_id)
+    assert before_assignment is not None
+    before_session = (
+        repository.get_interview(before_assignment.interview_id)
+        if before_assignment.interview_id is not None
+        else None
+    )
+    before_events = repository.list_events(mandate.mandate_id)
+
+    missing_owner_result = workflow.mark_delivery_result(
+        without_owner,
+        succeeded=succeeded,
+        now=now + timedelta(seconds=2),
+    )
+
+    assert missing_owner_result == WorkflowResult()
+    assert repository.get_assignment(current.assignment_id) == before_assignment
+    if before_session is not None:
+        assert repository.get_interview(before_session.session_id) == before_session
+    assert repository.list_events(mandate.mandate_id) == before_events
+    open_row = next(
+        row
+        for row in repository.list_release_outbox(mandate.mandate_id)
+        if row.assignment_id == current.assignment_id
+    )
+    assert open_row.state == "claimed"
+    assert open_row.claim_owner == current.dispatch_claim_id
+
+    owner_result = workflow.mark_delivery_result(
+        current,
+        succeeded=succeeded,
+        now=now + timedelta(seconds=3),
+    )
+
+    completed_row = next(
+        row
+        for row in repository.list_release_outbox(mandate.mandate_id)
+        if row.assignment_id == current.assignment_id
+    )
+    assert completed_row.state == "completed"
+    assert len(repository.list_events(mandate.mandate_id)) > len(before_events)
+    if succeeded:
+        assert owner_result == WorkflowResult()
+    else:
+        assert len(owner_result.deliveries) == 1
+
+
+def test_due_worker_drains_recovered_release_outbox_and_callbacks_stop_replay(
+    tmp_path, incoming_message_factory, now
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'release-outbox-worker.db').as_posix()}"
+    repository = SqlAlchemyHumanWireRepository(create_session_factory(database_url))
+    first = _build_mixed_workflow(
+        repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    message, mandate, _ = _mixed_preview(
+        first,
+        incoming_message_factory,
+        message_id="release-outbox-worker-create",
+        received_at=now,
+    )
+    first.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": "release-outbox-worker-go",
+                "received_at": now + timedelta(seconds=1),
+            }
+        )
+    )
+    restarted_repository = SqlAlchemyHumanWireRepository(
+        create_session_factory(database_url)
+    )
+    restarted = _build_mixed_workflow(
+        restarted_repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+
+    class CallbackGateway:
+        def __init__(self):
+            self.deliveries = []
+
+        def dispatch(self, delivery):
+            self.deliveries.append(delivery)
+            restarted.mark_delivery_result(
+                delivery,
+                succeeded=True,
+                now=now + timedelta(seconds=32),
+            )
+
+    gateway = CallbackGateway()
+    worker = DueActionWorker(
+        restarted,
+        gateway,
+        restarted_repository,
+        poll_seconds=60,
+        clock=lambda: now + timedelta(seconds=32),
+    )
+
+    worker.run_once()
+    worker.run_once()
+
+    assert len(gateway.deliveries) == 6
+    assert len({delivery.message_id for delivery in gateway.deliveries}) == 6
+    assert {
+        row.state
+        for row in restarted_repository.list_release_outbox(mandate.mandate_id)
+    } == {"completed"}
+
+
 @pytest.mark.parametrize(
     ("failure_point", "assignment_loss_index"),
     [
@@ -1217,6 +2056,7 @@ def test_file_restart_releases_persisted_preview_at_due_time(
         ("assignment_cas", 2),
         ("assignment_cas", 5),
         ("interview_insert", None),
+        ("outbox_insert", None),
         ("event_append", None),
     ],
 )
@@ -1271,6 +2111,14 @@ def test_release_failure_rolls_back_the_complete_batch_without_delivery(
             raise RuntimeError("injected release interview failure")
 
         monkeypatch.setattr(RepositoryUnitOfWork, "add_interview", fail_interview)
+    elif failure_point == "outbox_insert":
+        original = RepositoryUnitOfWork.add_release_outbox
+
+        def fail_outbox(self, entry):
+            original(self, entry)
+            raise RuntimeError("injected release outbox failure")
+
+        monkeypatch.setattr(RepositoryUnitOfWork, "add_release_outbox", fail_outbox)
     else:
         original = RepositoryUnitOfWork.append_event_once
 
@@ -1408,6 +2256,315 @@ def _order_stale_transaction_race(
 
     monkeypatch.setattr(repository, "transaction", ordered_transaction)
     return role
+
+
+def _terminal_wins_before_next_transaction(
+    repository,
+    monkeypatch,
+    mandate_id,
+    terminal_state: MandateState,
+    at,
+):
+    original_transaction = repository.transaction
+    raced = False
+
+    @contextmanager
+    def terminal_first_transaction():
+        nonlocal raced
+        if not raced:
+            raced = True
+            concurrent = SqlAlchemyHumanWireRepository(repository._session_factory)
+            current = next(
+                item
+                for item in concurrent.list_recent_mandates(1000)
+                if item.mandate_id == mandate_id
+            )
+            concurrent.save_mandate(
+                current.model_copy(
+                    update={
+                        "state": terminal_state,
+                        "next_action_at": None,
+                        "updated_at": at,
+                        "completed_at": at,
+                    }
+                )
+            )
+        with original_transaction() as unit:
+            yield unit
+
+    monkeypatch.setattr(repository, "transaction", terminal_first_transaction)
+    return lambda: raced
+
+
+@pytest.mark.parametrize(
+    "engagement_type",
+    [
+        EngagementType.ACKNOWLEDGE,
+        EngagementType.QUICK_RESPONSE,
+        EngagementType.STRUCTURED_INTERVIEW,
+        EngagementType.REVIEW_APPROVAL,
+        EngagementType.AVAILABILITY,
+    ],
+)
+@pytest.mark.parametrize("stage", ["reminder", "alternate", "unreachable"])
+@pytest.mark.parametrize(
+    "terminal_state", [MandateState.CANCELLED, MandateState.EXPIRED]
+)
+def test_terminal_first_due_ladder_race_is_inert_for_every_engagement_family(
+    tmp_path,
+    incoming_message_factory,
+    now,
+    monkeypatch,
+    engagement_type,
+    stage,
+    terminal_state,
+) -> None:
+    repository, workflow = _file_mixed_race_workflow(
+        tmp_path,
+        f"due-terminal-{terminal_state.value}-{engagement_type.value}-{stage}",
+        Settings(_env_file=None, engagement_require_go=True),
+    )
+    message, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id=f"due-terminal-{terminal_state.value}-{engagement_type.value}-{stage}",
+        received_at=now,
+    )
+    workflow.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": f"due-terminal-go-{engagement_type.value}-{stage}",
+                "received_at": now + timedelta(seconds=1),
+            }
+        )
+    )
+    terminal_at = (
+        mandate.expires_at
+        if terminal_state is MandateState.EXPIRED
+        else now + timedelta(seconds=2)
+    )
+    assignment = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.engagement_type is engagement_type
+    )
+    stage_update = {
+        "reminder": {
+            "state": StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+            "attempt_count": 1,
+            "active_route_index": 0,
+        },
+        "alternate": {
+            "state": StakeholderState.FOLLOW_UP_DUE,
+            "attempt_count": 2,
+            "active_route_index": 0,
+        },
+        "unreachable": {
+            "state": StakeholderState.ALTERNATE_CHANNEL,
+            "attempt_count": 3,
+            "active_route_index": 1,
+        },
+    }[stage]
+    due_assignment = assignment.model_copy(
+        update=stage_update
+        | {
+            "last_delivery_at": terminal_at,
+            "next_action_at": terminal_at,
+        }
+    )
+    repository.save_assignment(due_assignment)
+    events_before = repository.list_events(mandate.mandate_id)
+    interviews_before = repository.list_interviews(mandate.mandate_id)
+    raced = _terminal_wins_before_next_transaction(
+        repository,
+        monkeypatch,
+        mandate.mandate_id,
+        terminal_state,
+        terminal_at,
+    )
+
+    result = workflow.engagements.process_due_assignment(due_assignment, terminal_at)
+
+    assert raced()
+    assert result == WorkflowResult()
+    assert repository.get_mandate_by_token(mandate.token).state is terminal_state
+    assert repository.get_assignment(due_assignment.assignment_id) == due_assignment
+    assert repository.list_events(mandate.mandate_id) == events_before
+    assert repository.list_interviews(mandate.mandate_id) == interviews_before
+
+
+@pytest.mark.parametrize("engagement_type", list(EngagementType))
+@pytest.mark.parametrize("succeeded", [True, False], ids=["success", "failure"])
+@pytest.mark.parametrize(
+    "terminal_state", [MandateState.CANCELLED, MandateState.EXPIRED]
+)
+def test_terminal_first_delivery_callback_race_is_inert_for_every_engagement_type(
+    tmp_path,
+    incoming_message_factory,
+    now,
+    monkeypatch,
+    engagement_type,
+    succeeded,
+    terminal_state,
+) -> None:
+    repository, workflow = _file_mixed_race_workflow(
+        tmp_path,
+        f"callback-terminal-{terminal_state.value}-{engagement_type.value}-{succeeded}",
+        Settings(_env_file=None, engagement_require_go=True),
+    )
+    message, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id=f"callback-terminal-create-{engagement_type.value}-{succeeded}",
+        received_at=now,
+    )
+    released = workflow.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": f"callback-terminal-go-{engagement_type.value}-{succeeded}",
+                "received_at": now + timedelta(seconds=1),
+            }
+        )
+    )
+    assignment = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.engagement_type is engagement_type
+    )
+    delivery = next(
+        item for item in released.deliveries if item.assignment_id == assignment.assignment_id
+    )
+    terminal_at = (
+        mandate.expires_at
+        if terminal_state is MandateState.EXPIRED
+        else now + timedelta(seconds=2)
+    )
+    assignment_before = repository.get_assignment(assignment.assignment_id)
+    events_before = repository.list_events(mandate.mandate_id)
+    interviews_before = repository.list_interviews(mandate.mandate_id)
+    raced = _terminal_wins_before_next_transaction(
+        repository,
+        monkeypatch,
+        mandate.mandate_id,
+        terminal_state,
+        terminal_at,
+    )
+
+    result = workflow.mark_delivery_result(delivery, succeeded, terminal_at)
+
+    assert raced()
+    assert result == WorkflowResult()
+    assert repository.get_mandate_by_token(mandate.token).state is terminal_state
+    assert repository.get_assignment(assignment.assignment_id) == assignment_before
+    assert repository.list_events(mandate.mandate_id) == events_before
+    assert repository.list_interviews(mandate.mandate_id) == interviews_before
+
+
+@pytest.mark.parametrize(
+    ("engagement_type", "operation"),
+    [
+        (EngagementType.ACKNOWLEDGE, "ack"),
+        (EngagementType.QUICK_RESPONSE, "ack"),
+        (EngagementType.STRUCTURED_INTERVIEW, "ack"),
+        (EngagementType.QUICK_RESPONSE, "answer"),
+        (EngagementType.STRUCTURED_INTERVIEW, "answer"),
+        (EngagementType.STRUCTURED_INTERVIEW, "decline"),
+    ],
+)
+@pytest.mark.parametrize(
+    "terminal_state", [MandateState.CANCELLED, MandateState.EXPIRED]
+)
+def test_terminal_first_authenticated_engagement_race_is_inert(
+    tmp_path,
+    incoming_message_factory,
+    now,
+    monkeypatch,
+    engagement_type,
+    operation,
+    terminal_state,
+) -> None:
+    repository, workflow = _file_mixed_race_workflow(
+        tmp_path,
+        f"inbound-terminal-{terminal_state.value}-{engagement_type.value}-{operation}",
+        Settings(_env_file=None, engagement_require_go=True),
+    )
+    message, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id=f"inbound-terminal-create-{engagement_type.value}-{operation}",
+        received_at=now,
+    )
+    workflow.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": f"inbound-terminal-go-{engagement_type.value}-{operation}",
+                "received_at": now + timedelta(seconds=1),
+            }
+        )
+    )
+    assignment = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.engagement_type is engagement_type
+    )
+
+    def stakeholder_message(text, message_id, received_at):
+        return incoming_message_factory(
+            text=text,
+            channel=Channel.EMAIL,
+            sender_address=f"{assignment.person_id}@private.example.test",
+            conversation_id=f"{assignment.person_id}-reply-thread",
+            message_id=message_id,
+            received_at=received_at,
+        )
+
+    if operation == "answer":
+        workflow.handle(
+            stakeholder_message(
+                f"ACK {mandate.token}",
+                f"inbound-terminal-setup-ack-{engagement_type.value}",
+                now + timedelta(seconds=2),
+            )
+        )
+    terminal_at = (
+        mandate.expires_at
+        if terminal_state is MandateState.EXPIRED
+        else now + timedelta(seconds=3)
+    )
+    text = {
+        "ack": f"ACK {mandate.token}",
+        "answer": "A correlated answer that must lose to terminal state.",
+        "decline": f"DECLINE {mandate.token}",
+    }[operation]
+    inbound = stakeholder_message(
+        text,
+        f"inbound-terminal-{operation}-{engagement_type.value}-{terminal_state.value}",
+        terminal_at,
+    )
+    assignment_before = repository.get_assignment(assignment.assignment_id)
+    events_before = repository.list_events(mandate.mandate_id)
+    interviews_before = repository.list_interviews(mandate.mandate_id)
+    evidence_before = repository.list_evidence(mandate.mandate_id)
+    raced = _terminal_wins_before_next_transaction(
+        repository,
+        monkeypatch,
+        mandate.mandate_id,
+        terminal_state,
+        terminal_at,
+    )
+
+    result = workflow.handle(inbound)
+
+    assert raced()
+    assert result == WorkflowResult()
+    assert repository.get_mandate_by_token(mandate.token).state is terminal_state
+    assert repository.get_assignment(assignment.assignment_id) == assignment_before
+    assert repository.list_events(mandate.mandate_id) == events_before
+    assert repository.list_interviews(mandate.mandate_id) == interviews_before
+    assert repository.list_evidence(mandate.mandate_id) == evidence_before
 
 
 @pytest.mark.parametrize("iteration", range(2))
@@ -1772,7 +2929,7 @@ def test_process_due_delegates_all_six_types_to_the_shared_coordinator(
         message_id="shared-due-create",
         received_at=now,
     )
-    workflow.handle(
+    released = workflow.handle(
         message.model_copy(
             update={
                 "text": f"GO {mandate.token}",
@@ -1780,6 +2937,15 @@ def test_process_due_delegates_all_six_types_to_the_shared_coordinator(
             }
         )
     )
+    for delivery in released.deliveries:
+        delivery_id = hashlib.sha256(delivery.message_id.encode()).hexdigest()[:48]
+        with repository.transaction() as unit:
+            assert unit.complete_release_outbox(
+                delivery.assignment_id,
+                delivery_id,
+                now,
+                claim_owner=delivery.dispatch_claim_id,
+            )
     assignments = repository.list_assignments(mandate.mandate_id)
     for assignment in assignments:
         repository.save_assignment(
@@ -1825,8 +2991,8 @@ def test_delivery_callbacks_for_all_six_types_use_the_shared_coordinator(
     )
     delegated = []
 
-    def capture_success(assignment_id, delivery_id, at):
-        delegated.append((assignment_id, delivery_id, at))
+    def capture_success(assignment_id, delivery_id, at, *, claim_owner=None):
+        delegated.append((assignment_id, delivery_id, at, claim_owner))
 
     monkeypatch.setattr(workflow.engagements, "mark_delivery_success", capture_success)
 
@@ -1839,6 +3005,9 @@ def test_delivery_callbacks_for_all_six_types_use_the_shared_coordinator(
     }
     assert all(item[1] for item in delegated)
     assert {item[2] for item in delegated} == {now}
+    assert {item[3] for item in delegated} == {
+        delivery.dispatch_claim_id for delivery in released.deliveries
+    }
 
 
 def test_manager_mandate_creates_three_routes_and_real_deliveries(
@@ -3410,7 +4579,9 @@ def test_process_due_merges_ladder_and_synthesis_deliveries_at_workflow_boundary
         person_ids=("team-lead", "vp-people"),
         optional_people={"vp-people"},
     )
-    mandate, _ = _create_mandate(workflow, incoming_message_factory)
+    mandate, released = _create_mandate(workflow, incoming_message_factory)
+    for delivery in released.deliveries:
+        workflow.mark_delivery_result(delivery, succeeded=True, now=now)
     assignments = {
         assignment.person_id: assignment
         for assignment in repository.list_assignments(mandate.mandate_id)

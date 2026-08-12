@@ -1,4 +1,5 @@
-from datetime import UTC, datetime
+import threading
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
@@ -31,6 +32,9 @@ class FakeWorkflow:
         self.result = WorkflowResult()
         self.delivery_results: list[tuple[DeliveryInstruction, bool, datetime]] = []
         self.failure_result = WorkflowResult()
+        self.claim_renewals: list[tuple[DeliveryInstruction, datetime]] = []
+        self.claim_renewed = threading.Event()
+        self.allow_claim_renewal = True
 
     def handle(self, message):
         self.calls.append(message)
@@ -41,6 +45,16 @@ class FakeWorkflow:
     ) -> WorkflowResult:
         self.delivery_results.append((instruction, succeeded, now))
         return WorkflowResult() if succeeded else self.failure_result
+
+    def renew_delivery_claim(
+        self,
+        instruction: DeliveryInstruction,
+        now: datetime,
+    ) -> bool:
+        self.claim_renewals.append((instruction, now))
+        if len(self.claim_renewals) >= 2:
+            self.claim_renewed.set()
+        return self.allow_claim_renewal
 
 
 class FakeClient:
@@ -319,6 +333,123 @@ def test_dispatch_uses_only_instruction_destination_and_marks_success(
     gateway.dispatch(delivery)
 
     assert getattr(fake_client, recording_attribute) == expected
+    assert workflow.delivery_results == [(delivery, True, NOW)]
+
+
+def test_dispatch_fences_a_stale_durable_claim_before_provider_io(
+    gateway, fake_client, workflow
+) -> None:
+    workflow.allow_claim_renewal = False
+    delivery = assigned_delivery(
+        DeliveryKind.INITIATE_EMAIL,
+        recipient="directory-recipient@example.test",
+        message_id="durable-attempt",
+        dispatch_claim_id="stale-owner",
+    )
+    gateway.connect()
+
+    gateway.dispatch(delivery)
+
+    assert len(workflow.claim_renewals) == 1
+    assert fake_client.initiated == []
+    assert workflow.delivery_results == []
+
+
+def test_dispatch_heartbeats_claim_while_provider_call_is_in_flight(
+    settings, repository, workflow
+) -> None:
+    entered_provider = threading.Event()
+    release_provider = threading.Event()
+    clock = [NOW]
+
+    class BlockingClient(FakeClient):
+        def initiate(self, connection_id: str, *, recipient: str, text: str):
+            entered_provider.set()
+            release_provider.wait(timeout=2)
+            return super().initiate(connection_id, recipient=recipient, text=text)
+
+    client = BlockingClient()
+    gateway = CaspianGateway(
+        settings=settings,
+        workflow=workflow,
+        repository=repository,
+        client=client,
+        clock=lambda: clock[0],
+    )
+    gateway._delivery_claim_heartbeat_seconds = 0.01
+    delivery = assigned_delivery(
+        DeliveryKind.INITIATE_EMAIL,
+        recipient="directory-recipient@example.test",
+        message_id="durable-in-flight",
+        dispatch_claim_id="live-owner",
+    )
+    gateway.connect()
+
+    dispatcher = threading.Thread(target=gateway.dispatch, args=(delivery,))
+    dispatcher.start()
+    assert entered_provider.wait(timeout=1)
+    clock[0] = NOW + timedelta(seconds=40)
+    assert workflow.claim_renewed.wait(timeout=1)
+    release_provider.set()
+    dispatcher.join(timeout=1)
+
+    assert not dispatcher.is_alive()
+    assert workflow.claim_renewals[0] == (delivery, NOW)
+    assert any(at == NOW + timedelta(seconds=40) for _, at in workflow.claim_renewals)
+    assert client.initiated == [
+        (
+            "email-connection-exact",
+            "directory-recipient@example.test",
+            "Transport body that must not become a destination",
+        )
+    ]
+
+
+def test_dispatch_heartbeats_claim_until_local_callback_finishes(
+    settings, repository
+) -> None:
+    entered_callback = threading.Event()
+    release_callback = threading.Event()
+    clock = [NOW]
+
+    class BlockingCallbackWorkflow(FakeWorkflow):
+        def mark_delivery_result(
+            self,
+            instruction: DeliveryInstruction,
+            succeeded: bool,
+            now: datetime,
+        ) -> WorkflowResult:
+            entered_callback.set()
+            release_callback.wait(timeout=2)
+            return super().mark_delivery_result(instruction, succeeded, now)
+
+    workflow = BlockingCallbackWorkflow()
+    client = FakeClient()
+    gateway = CaspianGateway(
+        settings=settings,
+        workflow=workflow,
+        repository=repository,
+        client=client,
+        clock=lambda: clock[0],
+    )
+    gateway._delivery_claim_heartbeat_seconds = 0.01
+    delivery = assigned_delivery(
+        DeliveryKind.INITIATE_EMAIL,
+        recipient="directory-recipient@example.test",
+        message_id="durable-callback",
+        dispatch_claim_id="callback-owner",
+    )
+    gateway.connect()
+
+    dispatcher = threading.Thread(target=gateway.dispatch, args=(delivery,))
+    dispatcher.start()
+    assert entered_callback.wait(timeout=1)
+    clock[0] = NOW + timedelta(seconds=40)
+    assert workflow.claim_renewed.wait(timeout=1)
+    release_callback.set()
+    dispatcher.join(timeout=1)
+
+    assert not dispatcher.is_alive()
     assert workflow.delivery_results == [(delivery, True, NOW)]
 
 

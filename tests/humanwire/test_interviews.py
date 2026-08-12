@@ -1,3 +1,6 @@
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import timedelta
 from uuid import uuid4
 
@@ -21,7 +24,7 @@ from humanwire.domain import (
 )
 from humanwire.evidence import RuleBasedEvidenceExtractor
 from humanwire.interviews import InterviewCoordinator
-from humanwire.repository import SqlAlchemyHumanWireRepository
+from humanwire.repository import RepositoryUnitOfWork, SqlAlchemyHumanWireRepository
 from humanwire.state_machine import StakeholderStateMachine
 
 
@@ -108,7 +111,7 @@ def mandate(now) -> Mandate:
             ],
             "completion_conditions": ["Interview complete"],
         },
-        state=MandateState.PLANNED,
+        state=MandateState.INTERVIEWING,
         created_at=now,
         updated_at=now,
         expires_at=now + timedelta(days=1),
@@ -402,6 +405,153 @@ def test_delivery_success_is_idempotent(coordinator, repository, mandate, now) -
 
     events = repository.list_events(mandate.mandate_id)
     assert [event.event_type for event in events].count("outreach.delivery_confirmed") == 1
+
+
+def test_final_answer_session_cas_loss_rolls_back_assignment_and_evidence(
+    coordinator, repository, mandate, now, monkeypatch
+) -> None:
+    repository.add_mandate(mandate)
+    assignment = _assignment(mandate)
+    repository.add_assignment(assignment)
+    coordinator.start_assignment(assignment, ["One?"], now)
+    pending = repository.get_assignment(assignment.assignment_id)
+    assert pending is not None
+    coordinator.acknowledge(
+        _message(
+            now,
+            text="ACK HW-2411",
+            channel=Channel.EMAIL,
+            sender="priya@example.test",
+            conversation="mail-priya",
+        ),
+        pending,
+        now,
+    )
+    before_assignment = repository.get_assignment(assignment.assignment_id)
+    assert before_assignment is not None
+    before_session = repository.get_interview(before_assignment.interview_id)
+    assert before_session is not None
+    before_events = repository.list_events(mandate.mandate_id)
+    monkeypatch.setattr(
+        RepositoryUnitOfWork,
+        "compare_and_save_interview_if_mandate_active",
+        lambda *args, **kwargs: False,
+    )
+
+    result = coordinator.record_answer(
+        _message(
+            now,
+            text="The final answer is confirmed.",
+            channel=Channel.EMAIL,
+            sender="priya@example.test",
+            conversation="mail-priya",
+        ),
+        before_assignment,
+        now,
+    )
+
+    assert result.deliveries == []
+    assert repository.get_assignment(assignment.assignment_id) == before_assignment
+    assert repository.get_interview(before_session.session_id) == before_session
+    assert repository.list_evidence(mandate.mandate_id) == []
+    assert repository.list_events(mandate.mandate_id) == before_events
+
+
+def test_acknowledgement_session_cas_loss_rolls_back_assignment(
+    coordinator, repository, mandate, now, monkeypatch
+) -> None:
+    repository.add_mandate(mandate)
+    assignment = _assignment(mandate)
+    repository.add_assignment(assignment)
+    coordinator.start_assignment(assignment, ["One?"], now)
+    before_assignment = repository.get_assignment(assignment.assignment_id)
+    assert before_assignment is not None
+    before_session = repository.get_interview(before_assignment.interview_id)
+    assert before_session is not None
+    before_events = repository.list_events(mandate.mandate_id)
+    monkeypatch.setattr(
+        RepositoryUnitOfWork,
+        "compare_and_save_interview_if_mandate_active",
+        lambda *args, **kwargs: False,
+    )
+
+    result = coordinator.acknowledge(
+        _message(
+            now,
+            text="ACK HW-2411",
+            channel=Channel.EMAIL,
+            sender="priya@example.test",
+            conversation="mail-priya",
+        ),
+        before_assignment,
+        now,
+    )
+
+    assert result.deliveries == []
+    assert repository.get_assignment(assignment.assignment_id) == before_assignment
+    assert repository.get_interview(before_session.session_id) == before_session
+    assert repository.list_events(mandate.mandate_id) == before_events
+
+
+def test_delivery_failure_session_cas_loss_rolls_back_alternate(
+    coordinator, repository, mandate, now, monkeypatch
+) -> None:
+    repository.add_mandate(mandate)
+    assignment = _assignment(mandate)
+    repository.add_assignment(assignment)
+    coordinator.start_assignment(assignment, ["One?"], now)
+    before_assignment = repository.get_assignment(assignment.assignment_id)
+    assert before_assignment is not None
+    before_session = repository.get_interview(before_assignment.interview_id)
+    assert before_session is not None
+    before_events = repository.list_events(mandate.mandate_id)
+    delivery_id = next(
+        event.metadata["delivery_id"]
+        for event in before_events
+        if event.event_type == "outreach.primary_sent"
+    )
+    monkeypatch.setattr(
+        RepositoryUnitOfWork,
+        "compare_and_save_interview_if_mandate_active",
+        lambda *args, **kwargs: False,
+    )
+
+    result = coordinator.mark_delivery_failure(
+        assignment.assignment_id,
+        delivery_id,
+        now,
+    )
+
+    assert result.deliveries == []
+    assert repository.get_assignment(assignment.assignment_id) == before_assignment
+    assert repository.get_interview(before_session.session_id) == before_session
+    assert repository.list_events(mandate.mandate_id) == before_events
+
+
+def test_due_route_session_cas_loss_rolls_back_assignment(
+    coordinator, repository, mandate, now, monkeypatch
+) -> None:
+    repository.add_mandate(mandate)
+    assignment = _assignment(
+        mandate,
+        state=StakeholderState.FOLLOW_UP_DUE,
+        attempt_count=2,
+    )
+    assignment = _add_session(repository, assignment, now)
+    before_session = repository.get_interview(assignment.interview_id)
+    assert before_session is not None
+    monkeypatch.setattr(
+        RepositoryUnitOfWork,
+        "compare_and_save_interview_if_mandate_active",
+        lambda *args, **kwargs: False,
+    )
+
+    result = coordinator.process_due_assignment(assignment, now)
+
+    assert result.deliveries == []
+    assert repository.get_assignment(assignment.assignment_id) == assignment
+    assert repository.get_interview(before_session.session_id) == before_session
+    assert repository.list_events(mandate.mandate_id) == []
 
 
 def test_tokenless_answer_on_active_route_and_conversation_is_accepted(
@@ -801,12 +951,14 @@ def test_initial_conversation_compare_and_set_allows_only_one_distinct_winner(
         pending.interview_id,
         "email-priya",
         "mail-priya",
+        now,
     )
     second = repository.bind_initial_interview_conversation(
         pending.assignment_id,
         pending.interview_id,
         "email-priya",
         "competing-mail-thread",
+        now,
     )
 
     session = repository.get_interview(pending.interview_id)
@@ -831,6 +983,7 @@ def test_losing_initial_conversation_cas_cannot_persist_answer_or_progress(
         pending.interview_id,
         "email-priya",
         "mail-priya",
+        now,
     )
 
     result = coordinator.record_answer(
@@ -853,6 +1006,100 @@ def test_losing_initial_conversation_cas_cannot_persist_answer_or_progress(
     assert saved.state is StakeholderState.AWAITING_ACKNOWLEDGEMENT
     assert session is not None
     assert session.current_question_index == 0
+
+
+def test_file_concurrent_same_question_answers_have_one_session_cas_winner(
+    tmp_path, directory, mandate, now, monkeypatch
+) -> None:
+    database_path = tmp_path / "same-question-session-cas.sqlite3"
+    factory = create_session_factory(f"sqlite:///{database_path.as_posix()}")
+    with factory.kw["bind"].begin() as connection:
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        connection.exec_driver_sql("PRAGMA busy_timeout=5000")
+    repository = SqlAlchemyHumanWireRepository(factory)
+    coordinator = InterviewCoordinator(
+        directory,
+        repository,
+        StakeholderStateMachine(),
+        RuleBasedEvidenceExtractor(),
+        Settings(acknowledgement_seconds=60, reminder_seconds=30),
+    )
+    repository.add_mandate(mandate)
+    session_id = uuid4()
+    assignment = _assignment(
+        mandate,
+        state=StakeholderState.INTERVIEWING,
+        attempt_count=1,
+        interview_id=session_id,
+        first_contact_at=now,
+        last_delivery_at=now,
+        next_action_at=None,
+        acknowledged_at=now,
+    )
+    repository.add_assignment(assignment)
+    repository.add_interview(
+        InterviewSession(
+            session_id=session_id,
+            mandate_id=mandate.mandate_id,
+            assignment_id=assignment.assignment_id,
+            questions=["First?", "Second?"],
+            current_channel=Channel.EMAIL,
+            current_route_id="email-priya",
+            current_conversation_id="mail-priya",
+            channel_history=[Channel.EMAIL],
+            acknowledged_at=now,
+            started_at=now,
+            updated_at=now,
+        )
+    )
+    original_transaction = repository.transaction
+    role = threading.local()
+    loser_ready = threading.Event()
+    winner_done = threading.Event()
+
+    @contextmanager
+    def ordered_transaction():
+        if role.name == "winner":
+            assert loser_ready.wait(timeout=5)
+        else:
+            loser_ready.set()
+            assert winner_done.wait(timeout=5)
+        try:
+            with original_transaction() as unit:
+                yield unit
+        finally:
+            if role.name == "winner":
+                winner_done.set()
+
+    monkeypatch.setattr(repository, "transaction", ordered_transaction)
+
+    def answer(name: str):
+        role.name = name
+        return coordinator.record_answer(
+            _message(
+                now,
+                text=f"{name} answer to the same question.",
+                channel=Channel.EMAIL,
+                sender="priya@example.test",
+                conversation="mail-priya",
+            ).model_copy(update={"message_id": f"same-question-{name}"}),
+            assignment,
+            now,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        winner = executor.submit(answer, "winner")
+        loser = executor.submit(answer, "loser")
+        results = (winner.result(timeout=10), loser.result(timeout=10))
+
+    session = repository.get_interview(session_id)
+    assert session is not None and session.current_question_index == 1
+    assert len(repository.list_evidence(mandate.mandate_id)) == 1
+    assert sum(
+        event.event_type == "interview.answer_recorded"
+        for event in repository.list_events(mandate.mandate_id)
+    ) == 1
+    assert sorted(len(result.deliveries) for result in results) == [0, 1]
 
 
 def test_completed_assignment_never_appears_in_due_work(repository, mandate, now) -> None:

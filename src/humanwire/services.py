@@ -39,7 +39,7 @@ from humanwire.messages import (
     render_proposal,
 )
 from humanwire.planning import MandatePlanner, PlanNeedsClarification
-from humanwire.repository import SqlAlchemyHumanWireRepository
+from humanwire.repository import ReleaseOutboxEntry, SqlAlchemyHumanWireRepository
 from humanwire.state_machine import MandateStateMachine, StakeholderStateMachine
 
 
@@ -244,14 +244,16 @@ class MandateService:
             return WorkflowResult()
 
         prepared: list[tuple[StakeholderAssignment, PreparedEngagement]] = []
+        guarded_failed: list[StakeholderAssignment] = []
         try:
             for stakeholder in mandate.plan.stakeholders:
                 assignment = assignments_by_person.get(stakeholder.person_ref)
                 if assignment is None:
                     return WorkflowResult()
                 if assignment.state is StakeholderState.DELIVERY_FAILED:
-                    if assignment.required:
+                    if not self._truthful_optional_no_route(assignment, stakeholder):
                         return WorkflowResult()
+                    guarded_failed.append(assignment)
                     continue
                 if (
                     assignment.state is not StakeholderState.CONTACT_QUEUED
@@ -299,6 +301,9 @@ class MandateService:
             previous_state=MandateState.PLANNED.value,
             new_state=MandateState.INTERVIEWING.value,
         )
+        claim_owners = {
+            item.assignment.assignment_id: str(uuid4()) for _, item in prepared
+        }
         try:
             with self.repository.transaction() as unit:
                 if not unit.compare_and_save_mandate_if_unexpired(
@@ -318,13 +323,52 @@ class MandateService:
                     for event in item.events:
                         if not unit.append_event_once(mandate.mandate_id, event):
                             raise ValueError("prepared outreach already exists")
+                    message_id = item.delivery.message_id
+                    if message_id is None:
+                        raise ValueError("prepared release delivery has no stable identity")
+                    unit.add_release_outbox(
+                        ReleaseOutboxEntry(
+                            outbox_id=message_id,
+                            mandate_id=mandate.mandate_id,
+                            assignment_id=item.assignment.assignment_id,
+                            delivery_id=hashlib.sha256(message_id.encode()).hexdigest()[:48],
+                            attempt_count=item.assignment.attempt_count,
+                            route_index=item.assignment.active_route_index,
+                            state="claimed",
+                            claim_owner=claim_owners[item.assignment.assignment_id],
+                            claimed_at=now,
+                            created_at=now,
+                            completed_at=None,
+                        )
+                    )
+                for failed in guarded_failed:
+                    if not unit.compare_and_save_assignment(failed, failed):
+                        raise ValueError("failed assignment snapshot changed")
                 if not unit.append_event_once(mandate.mandate_id, release_event):
                     raise ValueError("engagement plan was already released")
                 if not unit.append_event_once(mandate.mandate_id, coordinating_event):
                     raise ValueError("coordination state already exists")
         except Exception:  # noqa: BLE001 - never leak a partially staged delivery batch
             return WorkflowResult()
-        return WorkflowResult(deliveries=[item.delivery for _, item in prepared])
+        return WorkflowResult(
+            deliveries=[
+                item.delivery.model_copy(
+                    update={
+                        "dispatch_claim_id": claim_owners[item.assignment.assignment_id]
+                    }
+                )
+                for _, item in prepared
+            ]
+        )
+
+    def recover_release_outbox(self, now: datetime) -> WorkflowResult:
+        """Claim and reconstruct durable initial outreach after a worker restart."""
+        deliveries = []
+        for entry in self.repository.claim_release_outbox(now):
+            delivery = self.engagements.reconstruct_initial_delivery(entry, now)
+            if delivery is not None:
+                deliveries.append(delivery)
+        return WorkflowResult(deliveries=deliveries)
 
     def authorized_release(
         self,
@@ -531,6 +575,28 @@ class MandateService:
             and assignment.required is stakeholder.required
             and assignment.engagement_type is stakeholder.engagement_type
             and assignment.response_required is stakeholder.response_required
+        )
+
+    def _truthful_optional_no_route(
+        self,
+        assignment: StakeholderAssignment,
+        stakeholder: PlannedStakeholder,
+    ) -> bool:
+        return (
+            not assignment.required
+            and self._assignment_matches_stakeholder(assignment, stakeholder)
+            and assignment.state is StakeholderState.DELIVERY_FAILED
+            and assignment.route_ids == []
+            and assignment.active_route_index == 0
+            and assignment.attempt_count == 0
+            and assignment.interview_id is None
+            and assignment.first_contact_at is None
+            and assignment.last_delivery_at is None
+            and assignment.next_action_at is None
+            and assignment.acknowledged_at is None
+            and assignment.completed_at is None
+            and assignment.failure_reason == "no_registered_route"
+            and not self.directory.ordered_routes(assignment.person_id)
         )
 
     def _route_deliveries(

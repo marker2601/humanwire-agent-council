@@ -1,9 +1,10 @@
 import re
 from collections.abc import Generator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import exists, insert, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -20,6 +21,7 @@ from humanwire.database import (
     MeetingPackageRecord,
     ProposalRecord,
     ProposalResponseRecord,
+    ReleaseOutboxRecord,
     RuntimeStatusRecord,
     StakeholderAssignmentRecord,
 )
@@ -48,11 +50,28 @@ from humanwire.domain import (
     StakeholderAssignment,
     StakeholderState,
 )
-from humanwire.state_machine import ASSIGNMENT_TERMINAL_STATES, MANDATE_TERMINAL_STATES
+from humanwire.state_machine import ASSIGNMENT_TERMINAL_STATES
 
 
 class DuplicateMandateError(ValueError):
     """Raised when a mandate token or idempotency key already exists."""
+
+
+@dataclass(frozen=True)
+class ReleaseOutboxEntry:
+    """Privacy-safe durable identity for one initial release delivery."""
+
+    outbox_id: str
+    mandate_id: UUID
+    assignment_id: UUID
+    delivery_id: str
+    attempt_count: int
+    route_index: int
+    state: str
+    claim_owner: str | None
+    claimed_at: datetime | None
+    created_at: datetime
+    completed_at: datetime | None
 
 
 def _utc(value: datetime | None) -> datetime | None:
@@ -166,6 +185,38 @@ def _assignment_value(record: StakeholderAssignmentRecord) -> StakeholderAssignm
         acknowledged_at=_utc(record.acknowledged_at),
         completed_at=_utc(record.completed_at),
         failure_reason=record.failure_reason,
+    )
+
+
+def _release_outbox_record(value: ReleaseOutboxEntry) -> ReleaseOutboxRecord:
+    return ReleaseOutboxRecord(
+        outbox_id=value.outbox_id,
+        mandate_id=str(value.mandate_id),
+        assignment_id=str(value.assignment_id),
+        delivery_id=value.delivery_id,
+        attempt_count=value.attempt_count,
+        route_index=value.route_index,
+        state=value.state,
+        claim_owner=value.claim_owner,
+        claimed_at=value.claimed_at,
+        created_at=value.created_at,
+        completed_at=value.completed_at,
+    )
+
+
+def _release_outbox_value(record: ReleaseOutboxRecord) -> ReleaseOutboxEntry:
+    return ReleaseOutboxEntry(
+        outbox_id=record.outbox_id,
+        mandate_id=UUID(record.mandate_id),
+        assignment_id=UUID(record.assignment_id),
+        delivery_id=record.delivery_id,
+        attempt_count=record.attempt_count,
+        route_index=record.route_index,
+        state=record.state,
+        claim_owner=record.claim_owner,
+        claimed_at=_utc(record.claimed_at),
+        created_at=_utc(record.created_at),
+        completed_at=_utc(record.completed_at),
     )
 
 
@@ -645,14 +696,17 @@ class RepositoryUnitOfWork:
             MandateRecord.origin_channel == expected.origin_channel.value,
             MandateRecord.origin_conversation_id == expected.origin_conversation_id,
             MandateRecord.origin_message_id == expected.origin_message_id,
+            MandateRecord.redacted_request == expected.redacted_request,
             MandateRecord.objective == expected.objective,
             MandateRecord.plan == _json(expected.plan),
             MandateRecord.state == expected.state.value,
             MandateRecord.reason == expected.reason,
             MandateRecord.next_action_at == expected.next_action_at,
+            MandateRecord.created_at == expected.created_at,
             MandateRecord.updated_at == expected.updated_at,
             MandateRecord.expires_at == expected.expires_at,
             MandateRecord.completed_at == expected.completed_at,
+            MandateRecord.idempotency_key == expected.idempotency_key,
         ]
         if require_unexpired:
             assert now is not None
@@ -730,7 +784,7 @@ class RepositoryUnitOfWork:
         updated: StakeholderAssignment,
         now: datetime,
     ) -> bool:
-        """Save one assignment only while its mandate is active and unexpired."""
+        """Save an exact assignment only while its mandate is coordinating and live."""
         if (
             expected.assignment_id != updated.assignment_id
             or expected.mandate_id != updated.mandate_id
@@ -745,9 +799,7 @@ class RepositoryUnitOfWork:
         active_mandate = exists().where(
             MandateRecord.mandate_id == StakeholderAssignmentRecord.mandate_id,
             MandateRecord.mandate_id == str(expected.mandate_id),
-            MandateRecord.state.not_in(
-                [state.value for state in MANDATE_TERMINAL_STATES]
-            ),
+            MandateRecord.state == MandateState.INTERVIEWING.value,
             MandateRecord.expires_at > now,
         )
         result = self._session.execute(
@@ -756,11 +808,15 @@ class RepositoryUnitOfWork:
                 StakeholderAssignmentRecord.assignment_id
                 == str(expected.assignment_id),
                 StakeholderAssignmentRecord.mandate_id == str(expected.mandate_id),
+                StakeholderAssignmentRecord.person_id == expected.person_id,
+                StakeholderAssignmentRecord.department == expected.department,
+                StakeholderAssignmentRecord.direction == expected.direction.value,
+                StakeholderAssignmentRecord.reason == expected.reason,
+                StakeholderAssignmentRecord.required == expected.required,
                 StakeholderAssignmentRecord.engagement_type
                 == expected.engagement_type.value,
                 StakeholderAssignmentRecord.response_required
                 == expected.response_required,
-                StakeholderAssignmentRecord.person_id == expected.person_id,
                 StakeholderAssignmentRecord.route_ids == expected.route_ids,
                 StakeholderAssignmentRecord.state == expected.state.value,
                 StakeholderAssignmentRecord.attempt_count == expected.attempt_count,
@@ -768,9 +824,181 @@ class RepositoryUnitOfWork:
                 == expected.active_route_index,
                 StakeholderAssignmentRecord.interview_id
                 == (str(expected.interview_id) if expected.interview_id else None),
+                StakeholderAssignmentRecord.first_contact_at
+                == expected.first_contact_at,
+                StakeholderAssignmentRecord.last_delivery_at
+                == expected.last_delivery_at,
+                StakeholderAssignmentRecord.next_action_at
+                == expected.next_action_at,
+                StakeholderAssignmentRecord.acknowledged_at
+                == expected.acknowledged_at,
+                StakeholderAssignmentRecord.completed_at == expected.completed_at,
+                StakeholderAssignmentRecord.failure_reason == expected.failure_reason,
                 active_mandate,
             )
             .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        return result.rowcount == 1
+
+    def add_release_outbox(self, entry: ReleaseOutboxEntry) -> None:
+        """Stage one safe initial-delivery claim inside the release transaction."""
+        if (
+            entry.state != "claimed"
+            or entry.claimed_at is None
+            or entry.claim_owner is None
+        ):
+            raise ValueError("released delivery must enter the outbox as an owned claim")
+        self._session.add(_release_outbox_record(entry))
+
+    def complete_release_outbox(
+        self,
+        assignment_id: UUID,
+        delivery_id: str,
+        now: datetime,
+        *,
+        claim_owner: str | None = None,
+    ) -> bool:
+        """Fence a durable callback, while allowing attempts with no durable row."""
+        if claim_owner is not None:
+            result = self._session.execute(
+                update(ReleaseOutboxRecord)
+                .where(
+                    ReleaseOutboxRecord.assignment_id == str(assignment_id),
+                    ReleaseOutboxRecord.delivery_id == delivery_id,
+                    ReleaseOutboxRecord.state == "claimed",
+                    ReleaseOutboxRecord.claim_owner == claim_owner,
+                )
+                .values(state="completed", completed_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount == 1:
+                return True
+        durable_row_exists = self._session.scalar(
+            select(ReleaseOutboxRecord.outbox_id).where(
+                ReleaseOutboxRecord.assignment_id == str(assignment_id),
+                ReleaseOutboxRecord.delivery_id == delivery_id,
+            )
+        )
+        return durable_row_exists is None
+
+    def complete_current_release_outbox(
+        self,
+        assignment: StakeholderAssignment,
+        now: datetime,
+    ) -> bool:
+        """Retire the open attempt proven delivered by authenticated inbound work."""
+        result = self._session.execute(
+            update(ReleaseOutboxRecord)
+            .where(
+                ReleaseOutboxRecord.mandate_id == str(assignment.mandate_id),
+                ReleaseOutboxRecord.assignment_id == str(assignment.assignment_id),
+                ReleaseOutboxRecord.attempt_count == assignment.attempt_count,
+                ReleaseOutboxRecord.route_index == assignment.active_route_index,
+                ReleaseOutboxRecord.state.in_(["pending", "claimed"]),
+            )
+            .values(state="completed", completed_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        return result.rowcount > 0
+
+    def claim_release_outbox(
+        self,
+        now: datetime,
+        *,
+        claim_owner: str,
+        lease_seconds: int,
+        limit: int,
+    ) -> list[ReleaseOutboxEntry]:
+        """Atomically claim eligible initial attempts, including expired leases."""
+        lease_cutoff = now - timedelta(seconds=lease_seconds)
+        terminal_assignments = [
+            state.value for state in ASSIGNMENT_TERMINAL_STATES
+        ]
+        eligible_ids = (
+            select(ReleaseOutboxRecord.outbox_id)
+            .join(
+                StakeholderAssignmentRecord,
+                ReleaseOutboxRecord.assignment_id
+                == StakeholderAssignmentRecord.assignment_id,
+            )
+            .join(
+                MandateRecord,
+                ReleaseOutboxRecord.mandate_id == MandateRecord.mandate_id,
+            )
+            .where(
+                (
+                    (ReleaseOutboxRecord.state == "pending")
+                    | (
+                        (ReleaseOutboxRecord.state == "claimed")
+                        & (ReleaseOutboxRecord.claimed_at < lease_cutoff)
+                    )
+                ),
+                MandateRecord.state == MandateState.INTERVIEWING.value,
+                MandateRecord.expires_at > now,
+                StakeholderAssignmentRecord.mandate_id
+                == ReleaseOutboxRecord.mandate_id,
+                StakeholderAssignmentRecord.attempt_count
+                == ReleaseOutboxRecord.attempt_count,
+                StakeholderAssignmentRecord.active_route_index
+                == ReleaseOutboxRecord.route_index,
+                StakeholderAssignmentRecord.state.not_in(terminal_assignments),
+            )
+            .order_by(
+                ReleaseOutboxRecord.created_at,
+                ReleaseOutboxRecord.outbox_id,
+            )
+            .limit(limit)
+        )
+        statement = (
+            update(ReleaseOutboxRecord)
+            .where(ReleaseOutboxRecord.outbox_id.in_(eligible_ids))
+            .values(state="claimed", claim_owner=claim_owner, claimed_at=now)
+            .returning(ReleaseOutboxRecord)
+            .execution_options(synchronize_session=False)
+        )
+        records = self._session.scalars(statement).all()
+        return sorted(
+            (_release_outbox_value(record) for record in records),
+            key=lambda item: (item.created_at, item.outbox_id),
+        )
+
+    def renew_release_outbox_claim(
+        self,
+        outbox_id: str,
+        assignment_id: UUID,
+        claim_owner: str,
+        now: datetime,
+    ) -> bool:
+        """Renew one exact dispatch fence only while its aggregate remains live."""
+        eligible = exists().where(
+            StakeholderAssignmentRecord.assignment_id == str(assignment_id),
+            StakeholderAssignmentRecord.assignment_id
+            == ReleaseOutboxRecord.assignment_id,
+            StakeholderAssignmentRecord.mandate_id == ReleaseOutboxRecord.mandate_id,
+            StakeholderAssignmentRecord.attempt_count
+            == ReleaseOutboxRecord.attempt_count,
+            StakeholderAssignmentRecord.active_route_index
+            == ReleaseOutboxRecord.route_index,
+            StakeholderAssignmentRecord.state.not_in(
+                [state.value for state in ASSIGNMENT_TERMINAL_STATES]
+            ),
+            exists().where(
+                MandateRecord.mandate_id == ReleaseOutboxRecord.mandate_id,
+                MandateRecord.state == MandateState.INTERVIEWING.value,
+                MandateRecord.expires_at > now,
+            ),
+        )
+        result = self._session.execute(
+            update(ReleaseOutboxRecord)
+            .where(
+                ReleaseOutboxRecord.outbox_id == outbox_id,
+                ReleaseOutboxRecord.assignment_id == str(assignment_id),
+                ReleaseOutboxRecord.state == "claimed",
+                ReleaseOutboxRecord.claim_owner == claim_owner,
+                eligible,
+            )
+            .values(claimed_at=now)
             .execution_options(synchronize_session=False)
         )
         return result.rowcount == 1
@@ -798,6 +1026,71 @@ class RepositoryUnitOfWork:
         if assignment is None:
             raise KeyError(str(interview.assignment_id))
         _copy_columns(_interview_record(interview, assignment.person_id), record, {"session_id"})
+
+    def compare_and_save_interview_if_mandate_active(
+        self,
+        expected: InterviewSession,
+        updated: InterviewSession,
+        now: datetime,
+    ) -> bool:
+        """Save one exact session only while its mandate is coordinating and live."""
+        if (
+            expected.session_id != updated.session_id
+            or expected.mandate_id != updated.mandate_id
+            or expected.assignment_id != updated.assignment_id
+        ):
+            raise ValueError("mandate-coupled interview CAS requires one session")
+        assignment = self._session.get(
+            StakeholderAssignmentRecord,
+            str(expected.assignment_id),
+        )
+        if assignment is None or assignment.mandate_id != str(expected.mandate_id):
+            return False
+        replacement = _interview_record(updated, assignment.person_id)
+        values = {
+            column.key: getattr(replacement, column.key)
+            for column in replacement.__table__.columns
+            if column.key != "session_id"
+        }
+        active_mandate = exists().where(
+            MandateRecord.mandate_id == InterviewSessionRecord.mandate_id,
+            MandateRecord.mandate_id == str(expected.mandate_id),
+            MandateRecord.state == MandateState.INTERVIEWING.value,
+            MandateRecord.expires_at > now,
+        )
+        result = self._session.execute(
+            update(InterviewSessionRecord)
+            .where(
+                InterviewSessionRecord.session_id == str(expected.session_id),
+                InterviewSessionRecord.mandate_id == str(expected.mandate_id),
+                InterviewSessionRecord.assignment_id == str(expected.assignment_id),
+                InterviewSessionRecord.stakeholder_person_id == assignment.person_id,
+                InterviewSessionRecord.questions == expected.questions,
+                InterviewSessionRecord.current_question_index
+                == expected.current_question_index,
+                InterviewSessionRecord.current_channel
+                == (
+                    expected.current_channel.value
+                    if expected.current_channel is not None
+                    else None
+                ),
+                InterviewSessionRecord.current_route_id == expected.current_route_id,
+                InterviewSessionRecord.current_conversation_id
+                == expected.current_conversation_id,
+                InterviewSessionRecord.channel_history
+                == [channel.value for channel in expected.channel_history],
+                InterviewSessionRecord.default_visibility
+                == expected.default_visibility.value,
+                InterviewSessionRecord.acknowledged_at == expected.acknowledged_at,
+                InterviewSessionRecord.started_at == expected.started_at,
+                InterviewSessionRecord.updated_at == expected.updated_at,
+                InterviewSessionRecord.completed_at == expected.completed_at,
+                active_mandate,
+            )
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        return result.rowcount == 1
 
     def add_evidence(self, evidence: EvidenceItem) -> None:
         self._session.add(_evidence_record(evidence))
@@ -962,6 +1255,11 @@ class SqlAlchemyHumanWireRepository:
             record = session.scalar(select(MandateRecord).where(MandateRecord.token == token))
             return _mandate_value(record) if record else None
 
+    def get_mandate(self, mandate_id: UUID) -> Mandate | None:
+        with self._session_factory() as session:
+            record = session.get(MandateRecord, str(mandate_id))
+            return _mandate_value(record) if record else None
+
     def get_mandate_by_idempotency_key(self, key: str) -> Mandate | None:
         with self._session_factory() as session:
             record = session.scalar(
@@ -1019,18 +1317,29 @@ class SqlAlchemyHumanWireRepository:
         session_id: UUID,
         route_id: str,
         conversation_id: str,
+        now: datetime | None = None,
     ) -> bool:
         """Atomically bind one initial conversation without replacing an existing correlation."""
         if not conversation_id.strip():
             return False
-        initial_assignments = select(StakeholderAssignmentRecord.assignment_id).where(
-            StakeholderAssignmentRecord.assignment_id == str(assignment_id),
-            StakeholderAssignmentRecord.state.in_(
-                [
-                    StakeholderState.DELIVERED.value,
-                    StakeholderState.AWAITING_ACKNOWLEDGEMENT.value,
-                ]
-            ),
+        at = now or datetime.now(UTC)
+        initial_assignments = (
+            select(StakeholderAssignmentRecord.assignment_id)
+            .join(
+                MandateRecord,
+                StakeholderAssignmentRecord.mandate_id == MandateRecord.mandate_id,
+            )
+            .where(
+                StakeholderAssignmentRecord.assignment_id == str(assignment_id),
+                StakeholderAssignmentRecord.state.in_(
+                    [
+                        StakeholderState.DELIVERED.value,
+                        StakeholderState.AWAITING_ACKNOWLEDGEMENT.value,
+                    ]
+                ),
+                MandateRecord.state == MandateState.INTERVIEWING.value,
+                MandateRecord.expires_at > at,
+            )
         )
         with self._session_factory() as session:
             result = session.execute(
@@ -1207,6 +1516,61 @@ class SqlAlchemyHumanWireRepository:
                 .order_by(MandateRecord.next_action_at, MandateRecord.mandate_id)
             ).all()
             return [_mandate_value(record) for record in records]
+
+    def list_release_outbox(self, mandate_id: UUID) -> list[ReleaseOutboxEntry]:
+        with self._session_factory() as session:
+            records = session.scalars(
+                select(ReleaseOutboxRecord)
+                .where(ReleaseOutboxRecord.mandate_id == str(mandate_id))
+                .order_by(
+                    ReleaseOutboxRecord.created_at,
+                    ReleaseOutboxRecord.outbox_id,
+                )
+            ).all()
+            return [_release_outbox_value(record) for record in records]
+
+    def claim_release_outbox(
+        self,
+        now: datetime,
+        *,
+        lease_seconds: int = 30,
+        limit: int = 1000,
+    ) -> list[ReleaseOutboxEntry]:
+        claim_owner = str(uuid4())
+        with self.transaction() as unit:
+            return unit.claim_release_outbox(
+                now,
+                claim_owner=claim_owner,
+                lease_seconds=lease_seconds,
+                limit=limit,
+            )
+
+    def renew_release_outbox_claim(
+        self,
+        outbox_id: str,
+        assignment_id: UUID,
+        claim_owner: str,
+        now: datetime,
+    ) -> bool:
+        with self.transaction() as unit:
+            return unit.renew_release_outbox_claim(
+                outbox_id,
+                assignment_id,
+                claim_owner,
+                now,
+            )
+
+    def has_open_release_outbox(self, assignment_id: UUID) -> bool:
+        with self._session_factory() as session:
+            return (
+                session.scalar(
+                    select(ReleaseOutboxRecord.outbox_id).where(
+                        ReleaseOutboxRecord.assignment_id == str(assignment_id),
+                        ReleaseOutboxRecord.state.in_(["pending", "claimed"]),
+                    )
+                )
+                is not None
+            )
 
     def set_runtime_status(self, key: str, value: str, updated_at: datetime) -> None:
         self._write(RepositoryUnitOfWork.set_runtime_status, key, value, updated_at)

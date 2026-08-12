@@ -32,7 +32,7 @@ from humanwire.messages import (
     render_reminder,
     render_unreachable_notice,
 )
-from humanwire.repository import SqlAlchemyHumanWireRepository
+from humanwire.repository import ReleaseOutboxEntry, SqlAlchemyHumanWireRepository
 from humanwire.state_machine import (
     ASSIGNMENT_TERMINAL_STATES,
     AssignmentCompletionProof,
@@ -45,6 +45,10 @@ _OUTREACH_SENT_EVENTS = frozenset(
     {"outreach.primary_sent", "outreach.reminder_sent", "outreach.alternate_sent"}
 )
 _AUTHENTICATED_INBOUND_CAS_ATTEMPTS = 3
+
+
+class _InterviewSnapshotChanged(ValueError):
+    """Force the current UOW to roll back before a caller retries or returns."""
 
 
 def _route_fingerprint(route: ContactRoute) -> str:
@@ -136,7 +140,10 @@ class InterviewCoordinator:
             updated = saved.model_copy(update={"interview_id": session.session_id})
             with self.repository.transaction() as unit:
                 unit.add_interview(session)
-                unit.save_assignment(updated)
+                if not unit.compare_and_save_assignment_if_mandate_active(
+                    saved, updated, now
+                ):
+                    raise ValueError("mandate stopped coordinating")
             saved = updated
         return self.process_due_assignment(saved, now)
 
@@ -442,22 +449,6 @@ class InterviewCoordinator:
         explicit_token = self._contains_token(message.text, self._token(saved))
         initial_bind = self._can_bind_initial_conversation(session, saved, route, message)
         if (
-            initial_bind
-            and saved.interview_id is not None
-            and not self.repository.bind_initial_interview_conversation(
-                saved.assignment_id,
-                saved.interview_id,
-                route.route_id,
-                message.conversation_id,
-            )
-        ):
-            saved = self.repository.get_assignment(saved.assignment_id)
-            if saved is None:
-                return WorkflowResult()
-            session = self._session(saved)
-            if not self._is_active_correlation(session, route, message):
-                return WorkflowResult()
-        if (
             not self._is_active_correlation(session, route, message)
             and not initial_bind
             and not explicit_token
@@ -488,6 +479,11 @@ class InterviewCoordinator:
         if not answer:
             return WorkflowResult()
         session = self._session(saved)
+        if (
+            not self._is_active_correlation(session, route, message)
+            and not explicit_token
+        ):
+            return WorkflowResult()
         if session.current_question_index >= len(session.questions):
             return WorkflowResult()
         evidence = confirm_drafts(
@@ -536,12 +532,23 @@ class InterviewCoordinator:
             {"question_index": session.current_question_index},
             channel=message.channel,
         )
-        with self.repository.transaction() as unit:
-            unit.save_interview(updated_session)
-            unit.save_assignment(updated_assignment)
-            for item in evidence:
-                unit.add_evidence(item)
-            unit.append_event(updated_assignment.mandate_id, event)
+        try:
+            with self.repository.transaction() as unit:
+                if not unit.compare_and_save_assignment_if_mandate_active(
+                    saved, updated_assignment, now
+                ):
+                    return WorkflowResult()
+                if not unit.compare_and_save_interview_if_mandate_active(
+                    session, updated_session, now
+                ):
+                    raise _InterviewSnapshotChanged("interview answer snapshot changed")
+                unit.complete_current_release_outbox(saved, now)
+                for item in evidence:
+                    unit.add_evidence(item)
+                if not unit.append_event_once(updated_assignment.mandate_id, event):
+                    raise ValueError("concurrent exact answer already won")
+        except ValueError:
+            return WorkflowResult()
         if completed:
             return WorkflowResult()
         return WorkflowResult(
@@ -585,12 +592,27 @@ class InterviewCoordinator:
             {"reason_code": "explicit_decline"},
             channel=message.channel,
         )
-        with self.repository.transaction() as unit:
-            unit.save_assignment(declined)
-            unit.append_event(declined.mandate_id, event)
+        try:
+            with self.repository.transaction() as unit:
+                if not unit.compare_and_save_assignment_if_mandate_active(
+                    saved, declined, now
+                ):
+                    return WorkflowResult()
+                if not unit.append_event_once(declined.mandate_id, event):
+                    raise ValueError("concurrent exact decline already won")
+                unit.complete_current_release_outbox(saved, now)
+        except ValueError:
+            return WorkflowResult()
         return WorkflowResult()
 
-    def mark_delivery_success(self, assignment_id: UUID, delivery_id: str, now: datetime) -> None:
+    def mark_delivery_success(
+        self,
+        assignment_id: UUID,
+        delivery_id: str,
+        now: datetime,
+        *,
+        claim_owner: str | None = None,
+    ) -> None:
         """Record a gateway-confirmed delivery without treating it as a human response."""
         assignment = self.repository.get_assignment(assignment_id)
         if assignment is None:
@@ -620,15 +642,30 @@ class InterviewCoordinator:
         )
         try:
             with self.repository.transaction() as unit:
-                if not unit.compare_and_save_assignment(assignment, assignment):
+                if not unit.compare_and_save_assignment_if_mandate_active(
+                    assignment, assignment, now
+                ):
                     return
                 if not unit.append_event_once(assignment.mandate_id, event):
                     raise ValueError("concurrent exact delivery result already won")
+                completed = unit.complete_release_outbox(
+                    assignment_id,
+                    delivery_id,
+                    now,
+                    claim_owner=claim_owner,
+                )
+                if not completed:
+                    raise ValueError("durable delivery claim was superseded")
         except ValueError:
             return
 
     def mark_delivery_failure(
-        self, assignment_id: UUID, delivery_id: str, now: datetime
+        self,
+        assignment_id: UUID,
+        delivery_id: str,
+        now: datetime,
+        *,
+        claim_owner: str | None = None,
     ) -> WorkflowResult:
         """Advance one persisted retry-ladder step; gateway failure never implies silence."""
         assignment = self.repository.get_assignment(assignment_id)
@@ -659,6 +696,7 @@ class InterviewCoordinator:
         )
         next_index = assignment.active_route_index + 1
         if next_index < len(routes):
+            alternate_claim_owner = str(uuid4())
             route = routes[next_index]
             session = self._session(assignment)
             alternate = self._transition(
@@ -688,13 +726,45 @@ class InterviewCoordinator:
             )
             try:
                 with self.repository.transaction() as unit:
-                    if not unit.compare_and_save_assignment(assignment, alternate):
+                    if not unit.compare_and_save_assignment_if_mandate_active(
+                        assignment, alternate, now
+                    ):
                         return WorkflowResult()
-                    unit.save_interview(updated_session)
+                    if not unit.compare_and_save_interview_if_mandate_active(
+                        session, updated_session, now
+                    ):
+                        raise _InterviewSnapshotChanged(
+                            "interview delivery snapshot changed"
+                        )
                     if not unit.append_event_once(alternate.mandate_id, event):
                         raise ValueError("concurrent exact delivery result already won")
                     if not unit.append_event_once(alternate.mandate_id, alternate_event):
                         raise ValueError("concurrent alternate outreach already won")
+                    completed = unit.complete_release_outbox(
+                        assignment_id,
+                        delivery_id,
+                        now,
+                        claim_owner=claim_owner,
+                    )
+                    if not completed:
+                        raise ValueError("durable delivery claim was superseded")
+                    unit.add_release_outbox(
+                        ReleaseOutboxEntry(
+                            outbox_id=delivery_source,
+                            mandate_id=alternate.mandate_id,
+                            assignment_id=alternate.assignment_id,
+                            delivery_id=hashlib.sha256(
+                                delivery_source.encode()
+                            ).hexdigest()[:48],
+                            attempt_count=alternate.attempt_count,
+                            route_index=alternate.active_route_index,
+                            state="claimed",
+                            claim_owner=alternate_claim_owner,
+                            claimed_at=now,
+                            created_at=now,
+                            completed_at=None,
+                        )
+                    )
             except ValueError:
                 return WorkflowResult()
             return WorkflowResult(
@@ -710,7 +780,7 @@ class InterviewCoordinator:
                         ),
                         alternate,
                         message_id=delivery_source,
-                    )
+                    ).model_copy(update={"dispatch_claim_id": alternate_claim_owner})
                 ]
             )
         failed = self._transition(
@@ -726,12 +796,22 @@ class InterviewCoordinator:
         )
         try:
             with self.repository.transaction() as unit:
-                if not unit.compare_and_save_assignment(assignment, failed):
+                if not unit.compare_and_save_assignment_if_mandate_active(
+                    assignment, failed, now
+                ):
                     return WorkflowResult()
                 if not unit.append_event_once(failed.mandate_id, event):
                     raise ValueError("concurrent exact delivery result already won")
                 if not unit.append_event_once(failed.mandate_id, terminal_event):
                     raise ValueError("concurrent terminal delivery result already won")
+                completed = unit.complete_release_outbox(
+                    assignment_id,
+                    delivery_id,
+                    now,
+                    claim_owner=claim_owner,
+                )
+                if not completed:
+                    raise ValueError("durable delivery claim was superseded")
         except ValueError:
             return WorkflowResult()
         return WorkflowResult(deliveries=self._owner_notice(failed))
@@ -841,12 +921,24 @@ class InterviewCoordinator:
             )
             try:
                 with self.repository.transaction() as unit:
-                    if not unit.compare_and_save_assignment(saved, interviewing):
-                        retrying_after_cas_loss = True
-                        continue
-                    unit.save_interview(updated_session)
+                    if not unit.compare_and_save_assignment_if_mandate_active(
+                        saved, interviewing, now
+                    ):
+                        raise _InterviewSnapshotChanged(
+                            "acknowledgement assignment snapshot changed"
+                        )
+                    if not unit.compare_and_save_interview_if_mandate_active(
+                        session, updated_session, now
+                    ):
+                        raise _InterviewSnapshotChanged(
+                            "acknowledgement interview snapshot changed"
+                        )
+                    unit.complete_current_release_outbox(saved, now)
                     if not unit.append_event_once(interviewing.mandate_id, event):
                         raise ValueError("concurrent exact acknowledgement already won")
+            except _InterviewSnapshotChanged:
+                retrying_after_cas_loss = True
+                continue
             except ValueError:
                 return WorkflowResult()
             if not send_question:
@@ -1011,6 +1103,13 @@ class InterviewCoordinator:
         *,
         session: InterviewSession | None = None,
     ) -> bool:
+        expected_session = (
+            self.repository.get_interview(session.session_id)
+            if session is not None
+            else None
+        )
+        if session is not None and expected_session is None:
+            return False
         event = self._event(
             event_type,
             updated,
@@ -1021,10 +1120,18 @@ class InterviewCoordinator:
         )
         try:
             with self.repository.transaction() as unit:
-                if not unit.compare_and_save_assignment(previous, updated):
+                if not unit.compare_and_save_assignment_if_mandate_active(
+                    previous, updated, now
+                ):
                     return False
                 if session is not None:
-                    unit.save_interview(session)
+                    assert expected_session is not None
+                    if not unit.compare_and_save_interview_if_mandate_active(
+                        expected_session, session, now
+                    ):
+                        raise _InterviewSnapshotChanged(
+                            "due interview snapshot changed"
+                        )
                 if not unit.append_event_once(updated.mandate_id, event):
                     raise ValueError("concurrent exact assignment event already won")
         except ValueError:

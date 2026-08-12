@@ -390,6 +390,7 @@ class DeliveryInstruction(BaseModel):
     mandate_token: str | None = None
     assignment_id: UUID | None = None
     message_id: str | None = None
+    dispatch_claim_id: str | None = None
     conversation_id: str | None = None
     recipient: str | None = None
 

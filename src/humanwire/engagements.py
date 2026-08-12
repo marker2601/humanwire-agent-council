@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from humanwire.commands import (
     AcknowledgeCommand,
@@ -32,6 +32,7 @@ from humanwire.domain import (
     IncomingMessage,
     InterviewSession,
     Mandate,
+    MandateState,
     StakeholderAssignment,
     StakeholderState,
     WorkflowResult,
@@ -48,10 +49,11 @@ from humanwire.messages import (
     render_channel_switch,
     render_engagement_availability_request,
     render_inform_update,
+    render_interview_intro,
     render_reminder,
     render_unreachable_notice,
 )
-from humanwire.repository import SqlAlchemyHumanWireRepository
+from humanwire.repository import ReleaseOutboxEntry, SqlAlchemyHumanWireRepository
 from humanwire.state_machine import (
     ASSIGNMENT_TERMINAL_STATES,
     MANDATE_TERMINAL_STATES,
@@ -199,12 +201,89 @@ class EngagementCoordinator:
 
     def persist_prepared(self, prepared: PreparedEngagement) -> None:
         """Persist a prepared assignment, optional session, and events as one unit."""
+        expected = self.repository.get_assignment(prepared.assignment.assignment_id)
+        now = prepared.assignment.first_contact_at or prepared.assignment.last_delivery_at
+        if expected is None or now is None:
+            raise ValueError("prepared engagement has no live assignment snapshot")
         with self.repository.transaction() as unit:
-            unit.save_assignment(prepared.assignment)
+            if not unit.compare_and_save_assignment_if_mandate_active(
+                expected, prepared.assignment, now
+            ):
+                raise ValueError("mandate stopped coordinating")
             if prepared.interview is not None:
                 unit.add_interview(prepared.interview)
             for event in prepared.events:
                 unit.append_event(prepared.assignment.mandate_id, event)
+
+    def reconstruct_initial_delivery(
+        self,
+        entry: ReleaseOutboxEntry,
+        now: datetime,
+    ) -> DeliveryInstruction | None:
+        """Rebuild one claimed initial attempt from trusted persisted state."""
+        mandate = self.repository.get_mandate(entry.mandate_id)
+        assignment = self.repository.get_assignment(entry.assignment_id)
+        if (
+            mandate is None
+            or assignment is None
+            or mandate.state is not MandateState.INTERVIEWING
+            or mandate.expires_at <= now
+            or assignment.mandate_id != mandate.mandate_id
+            or assignment.state in ASSIGNMENT_TERMINAL_STATES
+            or assignment.attempt_count != entry.attempt_count
+            or assignment.active_route_index != entry.route_index
+        ):
+            return None
+        routes = self._assignment_routes(assignment)
+        if not routes:
+            return None
+        route = routes[entry.route_index]
+        session = None
+        if assignment.engagement_type in {
+            EngagementType.QUICK_RESPONSE,
+            EngagementType.STRUCTURED_INTERVIEW,
+        }:
+            if assignment.interview_id is None:
+                return None
+            session = self.repository.get_interview(assignment.interview_id)
+            if session is None or session.assignment_id != assignment.assignment_id:
+                return None
+        if entry.attempt_count > 1:
+            text = render_channel_switch(
+                mandate.token,
+                mandate.objective if session is not None else "",
+                assignment.reason if session is not None else "",
+                len(session.questions) if session is not None else 0,
+                assignment.engagement_type,
+            )
+        elif session is not None:
+            text = render_interview_intro(
+                mandate.token,
+                mandate.objective,
+                assignment.reason,
+                len(session.questions),
+                assignment.engagement_type,
+            )
+        elif assignment.engagement_type is EngagementType.INFORM:
+            text = render_inform_update(
+                mandate.token, mandate.objective, assignment.reason
+            )
+        elif assignment.engagement_type is EngagementType.ACKNOWLEDGE:
+            text = render_acknowledgement_intro(
+                mandate.token, mandate.objective, assignment.reason
+            )
+        elif assignment.engagement_type is EngagementType.REVIEW_APPROVAL:
+            text = render_approval_request(mandate.token)
+        elif assignment.engagement_type is EngagementType.AVAILABILITY:
+            text = render_engagement_availability_request(mandate.token)
+        else:
+            return None
+        return self._route_delivery(
+            route,
+            text,
+            assignment,
+            message_id=entry.outbox_id,
+        ).model_copy(update={"dispatch_claim_id": entry.claim_owner})
 
     def process_due_assignment(
         self, assignment: StakeholderAssignment, now: datetime
@@ -254,7 +333,9 @@ class EngagementCoordinator:
                 delivery_metadata,
                 channel=route.channel,
             )
-            if not self._save_assignment_events(saved, reminder, (reminder_event,)):
+            if not self._save_assignment_events(
+                saved, reminder, (reminder_event,), now
+            ):
                 return WorkflowResult()
             return WorkflowResult(
                 deliveries=[
@@ -305,7 +386,9 @@ class EngagementCoordinator:
                 delivery_metadata,
                 channel=route.channel,
             )
-            if not self._save_assignment_events(saved, alternate, (alternate_event,)):
+            if not self._save_assignment_events(
+                saved, alternate, (alternate_event,), now
+            ):
                 return WorkflowResult()
             return WorkflowResult(
                 deliveries=[
@@ -397,10 +480,13 @@ class EngagementCoordinator:
             )
             try:
                 with self.repository.transaction() as unit:
-                    if not unit.compare_and_save_assignment(saved, completed):
+                    if not unit.compare_and_save_assignment_if_mandate_active(
+                        saved, completed, now
+                    ):
                         continue
                     if not unit.append_event_once(completed.mandate_id, event):
                         raise ValueError("concurrent exact acknowledgement already won")
+                    unit.complete_current_release_outbox(saved, now)
             except ValueError:
                 return WorkflowResult()
             return WorkflowResult()
@@ -503,6 +589,7 @@ class EngagementCoordinator:
                         continue
                     unit.add_engagement_decision(decision)
                     unit.add_evidence(evidence)
+                    unit.complete_current_release_outbox(saved, now)
                     if not unit.append_event_once(completed.mandate_id, event):
                         raise ValueError("concurrent exact decision already won")
             except ValueError:
@@ -583,6 +670,7 @@ class EngagementCoordinator:
                         serialized,
                         now,
                     )
+                    unit.complete_current_release_outbox(saved, now)
                     if not unit.append_event_once(completed.mandate_id, event):
                         raise ValueError("concurrent exact availability already won")
             except ValueError:
@@ -605,7 +693,12 @@ class EngagementCoordinator:
         return self.interviews.record_answer(message, saved, now)
 
     def mark_delivery_success(
-        self, assignment_id: UUID, delivery_id: str, now: datetime
+        self,
+        assignment_id: UUID,
+        delivery_id: str,
+        now: datetime,
+        *,
+        claim_owner: str | None = None,
     ) -> None:
         assignment = self.repository.get_assignment(assignment_id)
         if assignment is None:
@@ -614,7 +707,12 @@ class EngagementCoordinator:
             EngagementType.QUICK_RESPONSE,
             EngagementType.STRUCTURED_INTERVIEW,
         }:
-            self.interviews.mark_delivery_success(assignment_id, delivery_id, now)
+            self.interviews.mark_delivery_success(
+                assignment_id,
+                delivery_id,
+                now,
+                claim_owner=claim_owner,
+            )
             return
         if assignment.state in ASSIGNMENT_TERMINAL_STATES:
             return
@@ -668,10 +766,22 @@ class EngagementCoordinator:
             key,
             {"delivery_id": delivery_id, "outcome": "success"},
         )
-        self._save_assignment_events(assignment, updated, (event,))
+        self._save_assignment_events(
+            assignment,
+            updated,
+            (event,),
+            now,
+            completed_delivery_id=delivery_id,
+            completed_delivery_claim_owner=claim_owner,
+        )
 
     def mark_delivery_failure(
-        self, assignment_id: UUID, delivery_id: str, now: datetime
+        self,
+        assignment_id: UUID,
+        delivery_id: str,
+        now: datetime,
+        *,
+        claim_owner: str | None = None,
     ) -> WorkflowResult:
         assignment = self.repository.get_assignment(assignment_id)
         if assignment is None:
@@ -680,7 +790,12 @@ class EngagementCoordinator:
             EngagementType.QUICK_RESPONSE,
             EngagementType.STRUCTURED_INTERVIEW,
         }:
-            return self.interviews.mark_delivery_failure(assignment_id, delivery_id, now)
+            return self.interviews.mark_delivery_failure(
+                assignment_id,
+                delivery_id,
+                now,
+                claim_owner=claim_owner,
+            )
         if assignment.state in ASSIGNMENT_TERMINAL_STATES:
             return WorkflowResult()
         allowed_states = (
@@ -716,6 +831,7 @@ class EngagementCoordinator:
             {"delivery_id": delivery_id, "outcome": "failure"},
         )
         if next_index < len(routes):
+            alternate_claim_owner = str(uuid4())
             route = routes[next_index]
             alternate_source = assignment
             if alternate_source.state is StakeholderState.ALTERNATE_CHANNEL:
@@ -764,6 +880,11 @@ class EngagementCoordinator:
                 assignment,
                 alternate,
                 (failed_event, alternate_event),
+                now,
+                completed_delivery_id=delivery_id,
+                completed_delivery_claim_owner=claim_owner,
+                enqueue_message_id=delivery_source,
+                enqueue_claim_owner=alternate_claim_owner,
             ):
                 return WorkflowResult()
             return WorkflowResult(
@@ -779,7 +900,7 @@ class EngagementCoordinator:
                         ),
                         alternate,
                         message_id=delivery_source,
-                    )
+                    ).model_copy(update={"dispatch_claim_id": alternate_claim_owner})
                 ]
             )
 
@@ -801,6 +922,9 @@ class EngagementCoordinator:
             assignment,
             failed,
             (failed_event, terminal_event),
+            now,
+            completed_delivery_id=delivery_id,
+            completed_delivery_claim_owner=claim_owner,
         ):
             return WorkflowResult()
         return WorkflowResult(deliveries=self._owner_notice(failed, delivery_failed=True))
@@ -839,7 +963,7 @@ class EngagementCoordinator:
             f"engagement:{assignment.assignment_id}:{event_type}:{assignment.attempt_count}",
             {"reason_code": reason},
         )
-        if not self._save_assignment_events(assignment, updated, (event,)):
+        if not self._save_assignment_events(assignment, updated, (event,), now):
             return WorkflowResult()
         return WorkflowResult(deliveries=self._owner_notice(updated, delivery_failed=delivery))
 
@@ -848,14 +972,51 @@ class EngagementCoordinator:
         expected: StakeholderAssignment,
         updated: StakeholderAssignment,
         events: tuple[DomainEvent, ...],
+        now: datetime,
+        *,
+        completed_delivery_id: str | None = None,
+        completed_delivery_claim_owner: str | None = None,
+        enqueue_message_id: str | None = None,
+        enqueue_claim_owner: str | None = None,
     ) -> bool:
         try:
             with self.repository.transaction() as unit:
-                if not unit.compare_and_save_assignment(expected, updated):
+                if not unit.compare_and_save_assignment_if_mandate_active(
+                    expected, updated, now
+                ):
                     return False
                 for event in events:
                     if not unit.append_event_once(updated.mandate_id, event):
                         raise ValueError("concurrent exact event already won")
+                if completed_delivery_id is not None:
+                    completed = unit.complete_release_outbox(
+                        updated.assignment_id,
+                        completed_delivery_id,
+                        now,
+                        claim_owner=completed_delivery_claim_owner,
+                    )
+                    if not completed:
+                        raise ValueError("durable delivery claim was superseded")
+                if enqueue_message_id is not None:
+                    if enqueue_claim_owner is None:
+                        raise ValueError("durable alternate has no dispatch claim")
+                    unit.add_release_outbox(
+                        ReleaseOutboxEntry(
+                            outbox_id=enqueue_message_id,
+                            mandate_id=updated.mandate_id,
+                            assignment_id=updated.assignment_id,
+                            delivery_id=hashlib.sha256(
+                                enqueue_message_id.encode()
+                            ).hexdigest()[:48],
+                            attempt_count=updated.attempt_count,
+                            route_index=updated.active_route_index,
+                            state="claimed",
+                            claim_owner=enqueue_claim_owner,
+                            claimed_at=now,
+                            created_at=now,
+                            completed_at=None,
+                        )
+                    )
         except ValueError:
             return False
         return True

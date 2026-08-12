@@ -167,3 +167,26 @@ def test_parses_exact_go_and_engage_commands_with_ascii_case_folding() -> None:
 )
 def test_malformed_or_unicode_go_and_engage_commands_remain_free_text(text: str) -> None:
     assert parse_command(text) == FreeTextCommand(text=text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "\u00a0GO HW-2411",
+        "GO HW-2411\u00a0",
+        "\u2003GO HW-2411",
+        "GO HW-2411\u2003",
+        "GO\u00a0HW-2411",
+        "GO\u2003HW-2411",
+        "\u00a0ENGAGE HW-2411 team-lead inform",
+        "ENGAGE HW-2411 team-lead inform\u2003",
+        "ENGAGE\u00a0HW-2411 team-lead inform",
+        "ENGAGE HW-2411\u2003team-lead inform",
+        "ENGAGE HW-2411 team-lead\u00a0inform",
+        "ENGAGE HW-2411 t\u00e9am-lead inform",
+    ],
+)
+def test_go_and_engage_reject_every_non_ascii_wrapper_separator_or_letter(
+    text: str,
+) -> None:
+    assert parse_command(text) == FreeTextCommand(text=text)

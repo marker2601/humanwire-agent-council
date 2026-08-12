@@ -117,6 +117,8 @@ type ParsedCommand = (
 def parse_command(text: str) -> ParsedCommand:
     source = text.strip()
     single_line = "\r" not in text and "\n" not in text
+    ascii_command_source = text.strip(" \t")
+    strict_ascii_command = single_line and text.isascii()
 
     if match := PROPOSAL.fullmatch(source):
         return ProposalResponseCommand(
@@ -126,9 +128,9 @@ def parse_command(text: str) -> ParsedCommand:
         )
     if match := ACKNOWLEDGEMENT.fullmatch(source):
         return AcknowledgeCommand(token=match.group("token").upper())
-    if single_line and (match := GO.fullmatch(source)):
+    if strict_ascii_command and (match := GO.fullmatch(ascii_command_source)):
         return GoCommand(token=match.group("token").upper())
-    if single_line and (match := ENGAGE.fullmatch(source)):
+    if strict_ascii_command and (match := ENGAGE.fullmatch(ascii_command_source)):
         return EngageCommand(
             token=match.group("token").upper(),
             person_id=match.group("person_id"),
