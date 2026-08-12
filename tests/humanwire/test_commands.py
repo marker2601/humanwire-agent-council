@@ -1,15 +1,18 @@
+import pytest
+
 import humanwire
 from humanwire.commands import (
     AcknowledgeCommand,
     AvailabilityCommand,
     CancelCommand,
+    EngagementDecisionCommand,
     FreeTextCommand,
     MandateCommand,
     ProposalResponseCommand,
     StatusCommand,
     parse_command,
 )
-from humanwire.domain import ProposalResponseKind
+from humanwire.domain import EngagementDecisionKind, ProposalResponseKind
 
 
 def test_imports_the_initialized_production_package() -> None:
@@ -50,6 +53,57 @@ def test_invalid_availability_remains_free_text() -> None:
         "AVAILABLE HW-2411 not-a-timestamp/2026-08-14T16:00:00-05:00",
         "AVAILABLE HW-2411 2026-08-14T15:00:00/2026-08-14T16:00:00",
         "AVAILABLE HW-2411 2026-08-14T16:00:00-05:00/2026-08-14T15:00:00-05:00",
+        "\nAVAILABLE HW-2411 2026-08-14T15:00:00-05:00/2026-08-14T16:00:00-05:00",
+        "AVAILABLE HW-2411 2026-08-14T15:00:00-05:00/2026-08-14T16:00:00-05:00\n",
+    ]
+
+    for text in invalid_commands:
+        assert parse_command(text) == FreeTextCommand(text=text)
+
+
+@pytest.mark.parametrize(
+    ("text", "response", "change_text"),
+    [
+        ("DECIDE HW-2411 APPROVE", EngagementDecisionKind.APPROVE, None),
+        ("decide hw-2411 reject", EngagementDecisionKind.REJECT, None),
+        (
+            "DECIDE HW-2411 REJECT Missing authority",
+            EngagementDecisionKind.REJECT,
+            "Missing authority",
+        ),
+        (
+            "DECIDE HW-2411 CHANGE Add a security review",
+            EngagementDecisionKind.CHANGE,
+            "Add a security review",
+        ),
+    ],
+)
+def test_parses_exact_engagement_decisions_case_insensitively(
+    text: str,
+    response: EngagementDecisionKind,
+    change_text: str | None,
+) -> None:
+    assert parse_command(text) == EngagementDecisionCommand(
+        token="HW-2411",
+        response=response,
+        change_text=change_text,
+    )
+
+
+def test_malformed_decision_commands_remain_free_text() -> None:
+    overlong = "x" * 401
+    invalid_commands = [
+        "DECIDE HW-2411 APPROVE because yes",
+        "DECIDE HW-2411 CHANGE",
+        "DECIDE HW-2411 CHANGE   ",
+        "DECIDE HW-2411 MAYBE",
+        "DECISION HW-2411 APPROVE",
+        "DECIDE HW-12 APPROVE",
+        "\nDECIDE HW-2411 APPROVE",
+        "DECIDE HW-2411 APPROVE\n",
+        "DECIDE HW-2411 APPROVE\nDECIDE HW-2411 REJECT",
+        f"DECIDE HW-2411 REJECT {overlong}",
+        f"DECIDE HW-2411 CHANGE {overlong}",
     ]
 
     for text in invalid_commands:

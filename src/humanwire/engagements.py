@@ -2,22 +2,36 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
-from humanwire.commands import AcknowledgeCommand, parse_command
+from humanwire.commands import (
+    AcknowledgeCommand,
+    AvailabilityCommand,
+    EngagementDecisionCommand,
+    parse_command,
+)
 from humanwire.config import Settings
 from humanwire.directory import AmbiguousPersonError, OrganizationDirectory, UnknownPersonError
 from humanwire.domain import (
+    AvailabilityWindow,
     Channel,
     ContactRoute,
     DeliveryInstruction,
     DeliveryKind,
     DomainEvent,
+    EngagementDecision,
+    EngagementDecisionKind,
     EngagementType,
+    EvidenceItem,
+    EvidenceStatus,
+    EvidenceType,
+    EvidenceVisibility,
     IncomingMessage,
     InterviewSession,
+    Mandate,
     StakeholderAssignment,
     StakeholderState,
     WorkflowResult,
@@ -30,7 +44,9 @@ from humanwire.interviews import (
 )
 from humanwire.messages import (
     render_acknowledgement_intro,
+    render_approval_request,
     render_channel_switch,
+    render_engagement_availability_request,
     render_inform_update,
     render_reminder,
     render_unreachable_notice,
@@ -38,6 +54,7 @@ from humanwire.messages import (
 from humanwire.repository import SqlAlchemyHumanWireRepository
 from humanwire.state_machine import (
     ASSIGNMENT_TERMINAL_STATES,
+    MANDATE_TERMINAL_STATES,
     AssignmentCompletionProof,
     StakeholderStateMachine,
 )
@@ -85,11 +102,6 @@ class EngagementCoordinator:
         now: datetime,
     ) -> PreparedEngagement:
         engagement_type = assignment.engagement_type
-        if engagement_type in {
-            EngagementType.REVIEW_APPROVAL,
-            EngagementType.AVAILABILITY,
-        }:
-            raise ValueError(f"{engagement_type.value} is implemented in Task 5")
         response_required = engagement_type is not EngagementType.INFORM
         if assignment.response_required is not response_required:
             raise ValueError(
@@ -126,14 +138,19 @@ class EngagementCoordinator:
             "primary_outreach",
             now,
         )
-        if engagement_type is EngagementType.ACKNOWLEDGE:
+        if response_required:
             prepared_assignment = self._transition(
                 delivered,
                 StakeholderState.AWAITING_ACKNOWLEDGEMENT,
                 "primary_outreach",
                 now,
             )
-            text = render_acknowledgement_intro(token, summary, assignment.reason)
+            if engagement_type is EngagementType.ACKNOWLEDGE:
+                text = render_acknowledgement_intro(token, summary, assignment.reason)
+            elif engagement_type is EngagementType.REVIEW_APPROVAL:
+                text = render_approval_request(token)
+            else:
+                text = render_engagement_availability_request(token)
             next_action_at = now + timedelta(seconds=self.settings.acknowledgement_seconds)
         else:
             prepared_assignment = delivered
@@ -191,11 +208,6 @@ class EngagementCoordinator:
         if saved is None or saved.state in ASSIGNMENT_TERMINAL_STATES:
             return WorkflowResult()
         if saved.engagement_type is EngagementType.INFORM:
-            return WorkflowResult()
-        if saved.engagement_type in {
-            EngagementType.REVIEW_APPROVAL,
-            EngagementType.AVAILABILITY,
-        }:
             return WorkflowResult()
         if saved.engagement_type in {
             EngagementType.QUICK_RESPONSE,
@@ -389,6 +401,182 @@ class EngagementCoordinator:
             return WorkflowResult()
         return WorkflowResult()
 
+    def record_decision(
+        self,
+        message: IncomingMessage,
+        assignment: StakeholderAssignment,
+        command: EngagementDecisionCommand,
+        now: datetime,
+    ) -> WorkflowResult:
+        if not message.conversation_id.strip() or parse_command(message.text) != command:
+            return WorkflowResult()
+        for _ in range(_AUTHENTICATED_INBOUND_CAS_ATTEMPTS):
+            saved = self.repository.get_assignment(assignment.assignment_id)
+            if (
+                saved is None
+                or saved.state in ASSIGNMENT_TERMINAL_STATES
+                or saved.engagement_type is not EngagementType.REVIEW_APPROVAL
+                or not saved.response_required
+            ):
+                return WorkflowResult()
+            mandate = self._active_mandate(saved)
+            if mandate is None or mandate.token != command.token:
+                return WorkflowResult()
+            route = self._active_message_route(message, saved)
+            if route is None:
+                return WorkflowResult()
+            message_key = self._message_key(message)
+            event_key = f"engagement:{saved.assignment_id}:decision:{message_key}"
+            if (
+                self._event_exists(saved, event_key)
+                or self.repository.get_engagement_decision(saved.assignment_id) is not None
+            ):
+                return WorkflowResult()
+            pending = self._awaiting_explicit_response(
+                saved,
+                now,
+                "authenticated_decision_received",
+            )
+            if pending is None:
+                return WorkflowResult()
+            completed = self._transition(
+                pending,
+                StakeholderState.COMPLETE,
+                "decision_recorded",
+                now,
+                completion_proof=AssignmentCompletionProof.AUTHENTICATED_DECISION,
+            )
+            decision_key = f"engagement-decision:{message_key}"
+            decision = EngagementDecision(
+                decision_id=uuid5(NAMESPACE_URL, decision_key),
+                mandate_id=saved.mandate_id,
+                assignment_id=saved.assignment_id,
+                stakeholder_id=saved.person_id,
+                response=command.response,
+                change_text=command.change_text,
+                source_message_id=message.message_id,
+                created_at=now,
+                idempotency_key=decision_key,
+            )
+            statement = {
+                EngagementDecisionKind.APPROVE: "Approval response: approved",
+                EngagementDecisionKind.REJECT: "Approval response: rejected",
+                EngagementDecisionKind.CHANGE: "Approval response: change requested",
+            }[command.response]
+            evidence = EvidenceItem(
+                evidence_id=uuid5(
+                    NAMESPACE_URL,
+                    f"humanwire:engagement-decision-evidence:{message_key}",
+                ),
+                mandate_id=saved.mandate_id,
+                assignment_id=saved.assignment_id,
+                stakeholder_id=saved.person_id,
+                evidence_type=EvidenceType.DECISION,
+                statement=statement,
+                visibility=EvidenceVisibility.SHAREABLE,
+                status=EvidenceStatus.CONFIRMED,
+                source_message_id=message.message_id,
+                channel=message.channel,
+                created_at=now,
+            )
+            event = self._event(
+                "engagement.decision_recorded",
+                completed,
+                saved,
+                now,
+                event_key,
+                {"outcome": command.response.value},
+                channel=message.channel,
+            )
+            try:
+                with self.repository.transaction() as unit:
+                    if not unit.compare_and_save_assignment(saved, completed):
+                        continue
+                    unit.add_engagement_decision(decision)
+                    unit.add_evidence(evidence)
+                    if not unit.append_event_once(completed.mandate_id, event):
+                        raise ValueError("concurrent exact decision already won")
+            except ValueError:
+                return WorkflowResult()
+            return WorkflowResult()
+        return WorkflowResult()
+
+    def record_availability(
+        self,
+        message: IncomingMessage,
+        assignment: StakeholderAssignment,
+        windows: tuple[AvailabilityWindow, ...],
+        now: datetime,
+    ) -> WorkflowResult:
+        parsed = parse_command(message.text)
+        if (
+            not message.conversation_id.strip()
+            or not isinstance(parsed, AvailabilityCommand)
+            or parsed.windows != windows
+        ):
+            return WorkflowResult()
+        for _ in range(_AUTHENTICATED_INBOUND_CAS_ATTEMPTS):
+            saved = self.repository.get_assignment(assignment.assignment_id)
+            if (
+                saved is None
+                or saved.state in ASSIGNMENT_TERMINAL_STATES
+                or saved.engagement_type is not EngagementType.AVAILABILITY
+                or not saved.response_required
+            ):
+                return WorkflowResult()
+            mandate = self._active_mandate(saved)
+            if mandate is None or mandate.token != parsed.token:
+                return WorkflowResult()
+            route = self._active_message_route(message, saved)
+            if route is None:
+                return WorkflowResult()
+            message_key = self._message_key(message)
+            event_key = f"engagement:{saved.assignment_id}:availability:{message_key}"
+            if self._event_exists(saved, event_key):
+                return WorkflowResult()
+            pending = self._awaiting_explicit_response(
+                saved,
+                now,
+                "valid_availability_received",
+            )
+            if pending is None:
+                return WorkflowResult()
+            completed = self._transition(
+                pending,
+                StakeholderState.COMPLETE,
+                "availability_recorded",
+                now,
+                completion_proof=AssignmentCompletionProof.VALID_AVAILABILITY,
+            )
+            serialized = "|".join(
+                f"{window.start.isoformat()}/{window.end.isoformat()}"
+                for window in windows
+            )
+            event = self._event(
+                "availability.recorded",
+                completed,
+                saved,
+                now,
+                event_key,
+                {"attempt_count": len(windows)},
+                channel=message.channel,
+            )
+            try:
+                with self.repository.transaction() as unit:
+                    if not unit.compare_and_save_assignment(saved, completed):
+                        continue
+                    unit.set_runtime_status(
+                        f"availability:{saved.mandate_id}:{saved.person_id}",
+                        serialized,
+                        now,
+                    )
+                    if not unit.append_event_once(completed.mandate_id, event):
+                        raise ValueError("concurrent exact availability already won")
+            except ValueError:
+                return WorkflowResult()
+            return WorkflowResult()
+        return WorkflowResult()
+
     def record_answer(
         self,
         message: IncomingMessage,
@@ -415,10 +603,7 @@ class EngagementCoordinator:
         }:
             self.interviews.mark_delivery_success(assignment_id, delivery_id, now)
             return
-        if assignment.engagement_type in {
-            EngagementType.REVIEW_APPROVAL,
-            EngagementType.AVAILABILITY,
-        } or assignment.state in ASSIGNMENT_TERMINAL_STATES:
+        if assignment.state in ASSIGNMENT_TERMINAL_STATES:
             return
         allowed_states = (
             {StakeholderState.DELIVERED, StakeholderState.ALTERNATE_CHANNEL}
@@ -483,10 +668,7 @@ class EngagementCoordinator:
             EngagementType.STRUCTURED_INTERVIEW,
         }:
             return self.interviews.mark_delivery_failure(assignment_id, delivery_id, now)
-        if assignment.engagement_type in {
-            EngagementType.REVIEW_APPROVAL,
-            EngagementType.AVAILABILITY,
-        } or assignment.state in ASSIGNMENT_TERMINAL_STATES:
+        if assignment.state in ASSIGNMENT_TERMINAL_STATES:
             return WorkflowResult()
         allowed_states = (
             {StakeholderState.DELIVERED, StakeholderState.ALTERNATE_CHANNEL}
@@ -617,6 +799,8 @@ class EngagementCoordinator:
             EngagementType.ACKNOWLEDGE: range(1),
             EngagementType.QUICK_RESPONSE: range(1, 3),
             EngagementType.STRUCTURED_INTERVIEW: range(3, 6),
+            EngagementType.REVIEW_APPROVAL: range(1),
+            EngagementType.AVAILABILITY: range(1),
         }[engagement_type]
         if len(questions) not in allowed:
             raise ValueError(
@@ -702,6 +886,47 @@ class EngagementCoordinator:
             if mandate.mandate_id == assignment.mandate_id:
                 return mandate.token
         raise KeyError(str(assignment.mandate_id))
+
+    def _active_mandate(self, assignment: StakeholderAssignment) -> Mandate | None:
+        mandate = next(
+            (
+                item
+                for item in self.repository.list_recent_mandates(limit=1000)
+                if item.mandate_id == assignment.mandate_id
+            ),
+            None,
+        )
+        if mandate is None or mandate.state in MANDATE_TERMINAL_STATES:
+            return None
+        return mandate
+
+    def _awaiting_explicit_response(
+        self,
+        assignment: StakeholderAssignment,
+        now: datetime,
+        reason: str,
+    ) -> StakeholderAssignment | None:
+        if assignment.state is StakeholderState.AWAITING_ACKNOWLEDGEMENT:
+            return assignment
+        if assignment.state in {
+            StakeholderState.DELIVERED,
+            StakeholderState.FOLLOW_UP_DUE,
+            StakeholderState.ALTERNATE_CHANNEL,
+        }:
+            return self._transition(
+                assignment,
+                StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+                reason,
+                now,
+            )
+        return None
+
+    @staticmethod
+    def _message_key(message: IncomingMessage) -> str:
+        source = (
+            f"{message.connection_id}|{message.channel.value}|{message.message_id}"
+        )
+        return hashlib.sha256(source.encode()).hexdigest()
 
     def _owner_notice(
         self,

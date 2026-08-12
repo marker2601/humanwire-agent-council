@@ -8,15 +8,20 @@ from uuid import uuid4
 
 import pytest
 
+from humanwire.commands import EngagementDecisionCommand, parse_command
 from humanwire.config import Settings
 from humanwire.database import create_session_factory
 from humanwire.directory import InitiatorPolicy, OrganizationDirectory, OrganizationDocument
 from humanwire.domain import (
+    AvailabilityWindow,
     Channel,
     ContactRoute,
     Direction,
     DomainEvent,
+    EngagementDecisionKind,
     EngagementType,
+    EvidenceStatus,
+    EvidenceType,
     IncomingMessage,
     Mandate,
     MandateState,
@@ -26,7 +31,7 @@ from humanwire.domain import (
 )
 from humanwire.engagements import EngagementCoordinator
 from humanwire.evidence import RuleBasedEvidenceExtractor
-from humanwire.repository import SqlAlchemyHumanWireRepository
+from humanwire.repository import RepositoryUnitOfWork, SqlAlchemyHumanWireRepository
 from humanwire.state_machine import StakeholderStateMachine
 
 
@@ -192,6 +197,25 @@ def _message(
         sender_address=sender,
         text=text,
         received_at=now,
+    )
+
+
+def _decision(text: str) -> EngagementDecisionCommand:
+    command = parse_command(text)
+    assert isinstance(command, EngagementDecisionCommand)
+    return command
+
+
+def _availability_windows() -> tuple[AvailabilityWindow, ...]:
+    return (
+        AvailabilityWindow(
+            start="2026-08-14T15:00:00-05:00",
+            end="2026-08-14T16:00:00-05:00",
+        ),
+        AvailabilityWindow(
+            start="2026-08-15T10:00:00-05:00",
+            end="2026-08-15T11:30:00-05:00",
+        ),
     )
 
 
@@ -699,36 +723,495 @@ def test_question_reminder_and_alternate_copy_uses_type_without_destinations(
 
 
 @pytest.mark.parametrize(
+    ("engagement_type", "heading", "required_copy"),
+    [
+        (
+            EngagementType.REVIEW_APPROVAL,
+            "HUMANWIRE APPROVAL REVIEW",
+            "DECIDE HW-2411 APPROVE",
+        ),
+        (
+            EngagementType.AVAILABILITY,
+            "HUMANWIRE AVAILABILITY REQUEST",
+            "AVAILABLE HW-2411 <start>/<end>",
+        ),
+    ],
+)
+def test_approval_and_availability_prepare_without_interview_and_use_typed_ladder(
+    coordinator,
+    repository,
+    mandate,
+    now,
+    engagement_type,
+    heading,
+    required_copy,
+) -> None:
+    assignment = _assignment(mandate, engagement_type)
+    prepared = _prepare(coordinator, repository, mandate, assignment, [], now)
+
+    assert prepared.interview is None
+    assert prepared.delivery.text.startswith(heading)
+    assert required_copy in prepared.delivery.text
+    assert "interview" not in prepared.delivery.text.casefold()
+    assert repository.list_interviews(mandate.mandate_id) == []
+
+    coordinator.mark_delivery_success(
+        assignment.assignment_id,
+        _provider_delivery_id(prepared.delivery),
+        now,
+    )
+    after_success = repository.get_assignment(assignment.assignment_id)
+    assert after_success is not None
+    assert after_success.state is StakeholderState.AWAITING_ACKNOWLEDGEMENT
+    assert after_success.completed_at is None
+
+    reminder = coordinator.process_due_assignment(
+        assignment, now + timedelta(seconds=60)
+    )
+    alternate = coordinator.process_due_assignment(
+        assignment, now + timedelta(seconds=90)
+    )
+    unreachable = coordinator.process_due_assignment(
+        assignment, now + timedelta(seconds=150)
+    )
+
+    assert reminder.deliveries[0].text.startswith(heading)
+    assert alternate.deliveries[0].text.startswith(heading)
+    assert required_copy.split(" <", 1)[0] in alternate.deliveries[0].text
+    assert "interview" not in reminder.deliveries[0].text.casefold()
+    assert "interview" not in alternate.deliveries[0].text.casefold()
+    assert "required" in unreachable.deliveries[0].text.casefold()
+    assert "disagreed" not in unreachable.deliveries[0].text.casefold()
+    assert repository.get_assignment(assignment.assignment_id).state is (
+        StakeholderState.UNREACHABLE
+    )
+
+
+@pytest.mark.parametrize(
     "engagement_type",
     [EngagementType.REVIEW_APPROVAL, EngagementType.AVAILABILITY],
 )
-def test_unsupported_approval_and_availability_fail_closed_without_mutation(
+def test_approval_and_availability_provider_failure_uses_registered_routes_only(
     coordinator, repository, mandate, now, engagement_type
 ) -> None:
     assignment = _assignment(mandate, engagement_type)
-    repository.add_mandate(mandate)
-    repository.add_assignment(assignment)
+    prepared = _prepare(coordinator, repository, mandate, assignment, [], now)
 
-    with pytest.raises(ValueError, match="Task 5"):
-        coordinator.prepare_start(
+    alternate = coordinator.mark_delivery_failure(
+        assignment.assignment_id,
+        _provider_delivery_id(prepared.delivery),
+        now,
+    )
+    duplicate = coordinator.mark_delivery_failure(
+        assignment.assignment_id,
+        _provider_delivery_id(prepared.delivery),
+        now,
+    )
+
+    saved = repository.get_assignment(assignment.assignment_id)
+    assert len(alternate.deliveries) == 1
+    assert alternate.deliveries[0].conversation_id == "tg-priya"
+    assert "priya@example.test" not in alternate.deliveries[0].text
+    assert "tg-priya" not in alternate.deliveries[0].text
+    assert duplicate.deliveries == []
+    assert saved is not None
+    assert saved.state is StakeholderState.ALTERNATE_CHANNEL
+    assert saved.completed_at is None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_response", "expected_change", "expected_statement"),
+    [
+        (
+            "DECIDE HW-2411 APPROVE",
+            EngagementDecisionKind.APPROVE,
+            None,
+            "Approval response: approved",
+        ),
+        (
+            "DECIDE HW-2411 REJECT PRIVATE-REJECT-SENTINEL",
+            EngagementDecisionKind.REJECT,
+            "PRIVATE-REJECT-SENTINEL",
+            "Approval response: rejected",
+        ),
+        (
+            "DECIDE HW-2411 CHANGE PRIVATE-CHANGE-SENTINEL",
+            EngagementDecisionKind.CHANGE,
+            "PRIVATE-CHANGE-SENTINEL",
+            "Approval response: change requested",
+        ),
+    ],
+)
+def test_authenticated_approval_persists_exact_decision_safe_evidence_and_typed_completion(
+    coordinator,
+    repository,
+    mandate,
+    now,
+    text,
+    expected_response,
+    expected_change,
+    expected_statement,
+) -> None:
+    assignment = _assignment(mandate, EngagementType.REVIEW_APPROVAL)
+    prepared = _prepare(coordinator, repository, mandate, assignment, [], now)
+    message = _message(now, message_id=f"decision-{expected_response.value}", text=text)
+
+    result = coordinator.record_decision(
+        message,
+        assignment,
+        _decision(text),
+        now,
+    )
+
+    saved = repository.get_assignment(assignment.assignment_id)
+    decisions = repository.list_engagement_decisions(mandate.mandate_id)
+    evidence = repository.list_evidence(mandate.mandate_id)
+    decision_events = [
+        event
+        for event in repository.list_events(mandate.mandate_id)
+        if event.event_type == "engagement.decision_recorded"
+    ]
+    assert result.deliveries == []
+    assert saved is not None
+    assert saved.state is StakeholderState.COMPLETE
+    assert saved.completed_at == now
+    assert len(decisions) == 1
+    assert decisions[0].assignment_id == assignment.assignment_id
+    assert decisions[0].stakeholder_id == "priya"
+    assert decisions[0].response is expected_response
+    assert decisions[0].change_text == expected_change
+    assert decisions[0].source_message_id == message.message_id
+    assert len(evidence) == 1
+    assert evidence[0].evidence_type is EvidenceType.DECISION
+    assert evidence[0].status is EvidenceStatus.CONFIRMED
+    assert evidence[0].statement == expected_statement
+    assert len(decision_events) == 1
+    assert decision_events[0].metadata == {"outcome": expected_response.value}
+
+    public_text = "\n".join(
+        [
+            prepared.delivery.text,
+            evidence[0].model_dump_json(),
+            decision_events[0].model_dump_json(),
+            *[delivery.text for delivery in result.deliveries],
+        ]
+    )
+    if expected_change is not None:
+        assert expected_change not in public_text
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param(
+            lambda now: _message(
+                now,
+                message_id="decision-wrong-token",
+                text="DECIDE HW-9999 APPROVE",
+            ),
+            id="wrong-token",
+        ),
+        pytest.param(
+            lambda now: _message(
+                now,
+                message_id="decision-wrong-person",
+                text="DECIDE HW-2411 APPROVE",
+                sender="stranger@example.test",
+                conversation="mail-stranger",
+            ),
+            id="wrong-person",
+        ),
+        pytest.param(
+            lambda now: _message(
+                now,
+                message_id="decision-wrong-route",
+                text="DECIDE HW-2411 APPROVE",
+                channel=Channel.TELEGRAM,
+                sender="priya-telegram",
+                conversation="tg-priya",
+            ),
+            id="wrong-route",
+        ),
+        pytest.param(
+            lambda now: _message(
+                now,
+                message_id="decision-wrong-thread",
+                text="DECIDE HW-2411 APPROVE",
+                conversation="wrong-thread",
+            ),
+            id="wrong-thread",
+        ),
+    ],
+)
+def test_approval_rejects_wrong_token_person_route_and_thread_without_mutation(
+    coordinator, repository, mandate, now, message
+) -> None:
+    assignment = _assignment(mandate, EngagementType.REVIEW_APPROVAL)
+    _prepare(coordinator, repository, mandate, assignment, [], now)
+    incoming = message(now)
+    before_assignment = repository.get_assignment(assignment.assignment_id)
+    before_events = repository.list_events(mandate.mandate_id)
+
+    result = coordinator.record_decision(
+        incoming,
+        assignment,
+        _decision(incoming.text),
+        now,
+    )
+
+    assert result.deliveries == []
+    assert repository.get_assignment(assignment.assignment_id) == before_assignment
+    assert repository.list_engagement_decisions(mandate.mandate_id) == []
+    assert repository.list_evidence(mandate.mandate_id) == []
+    assert repository.list_events(mandate.mandate_id) == before_events
+
+
+def test_approval_ack_free_text_terminal_duplicate_and_conflicting_replay_are_inert(
+    coordinator, repository, mandate, now
+) -> None:
+    assignment = _assignment(mandate, EngagementType.REVIEW_APPROVAL)
+    _prepare(coordinator, repository, mandate, assignment, [], now)
+
+    coordinator.acknowledge(
+        _message(now, message_id="approval-ack-only", text="ACK HW-2411"),
+        assignment,
+        now,
+    )
+    coordinator.record_answer(
+        _message(now, message_id="approval-free-text", text="I approve"),
+        assignment,
+        now,
+    )
+    before_decision = repository.get_assignment(assignment.assignment_id)
+    assert before_decision is not None
+    assert before_decision.state is StakeholderState.AWAITING_ACKNOWLEDGEMENT
+    assert repository.list_engagement_decisions(mandate.mandate_id) == []
+
+    first_message = _message(
+        now,
+        message_id="approval-replay",
+        text="DECIDE HW-2411 REJECT First durable reason",
+    )
+    coordinator.record_decision(
+        first_message,
+        assignment,
+        _decision(first_message.text),
+        now,
+    )
+    durable = repository.list_engagement_decisions(mandate.mandate_id)
+    events = repository.list_events(mandate.mandate_id)
+    evidence = repository.list_evidence(mandate.mandate_id)
+
+    coordinator.record_decision(
+        first_message,
+        assignment,
+        _decision(first_message.text),
+        now,
+    )
+    conflicting = first_message.model_copy(
+        update={"text": "DECIDE HW-2411 CHANGE Conflicting replacement"}
+    )
+    coordinator.record_decision(
+        conflicting,
+        assignment,
+        _decision(conflicting.text),
+        now,
+    )
+    coordinator.record_decision(
+        _message(
+            now,
+            message_id="approval-late-terminal",
+            text="DECIDE HW-2411 APPROVE",
+        ),
+        assignment,
+        _decision("DECIDE HW-2411 APPROVE"),
+        now,
+    )
+
+    assert repository.list_engagement_decisions(mandate.mandate_id) == durable
+    assert durable[0].response is EngagementDecisionKind.REJECT
+    assert durable[0].change_text == "First durable reason"
+    assert repository.list_events(mandate.mandate_id) == events
+    assert repository.list_evidence(mandate.mandate_id) == evidence
+
+
+def test_decision_transaction_failure_rolls_back_assignment_decision_event_and_evidence(
+    coordinator, repository, mandate, now, monkeypatch
+) -> None:
+    assignment = _assignment(mandate, EngagementType.REVIEW_APPROVAL)
+    _prepare(coordinator, repository, mandate, assignment, [], now)
+    before_assignment = repository.get_assignment(assignment.assignment_id)
+    before_events = repository.list_events(mandate.mandate_id)
+    original = RepositoryUnitOfWork.add_evidence
+
+    def fail_after_evidence_is_staged(self, evidence):
+        original(self, evidence)
+        raise RuntimeError("injected decision evidence failure")
+
+    monkeypatch.setattr(RepositoryUnitOfWork, "add_evidence", fail_after_evidence_is_staged)
+    message = _message(
+        now,
+        message_id="approval-rollback",
+        text="DECIDE HW-2411 APPROVE",
+    )
+
+    with pytest.raises(RuntimeError, match="injected decision evidence failure"):
+        coordinator.record_decision(
+            message,
             assignment,
-            [],
-            mandate.token,
-            mandate.objective,
+            _decision(message.text),
             now,
         )
 
+    assert repository.get_assignment(assignment.assignment_id) == before_assignment
+    assert repository.list_engagement_decisions(mandate.mandate_id) == []
+    assert repository.list_evidence(mandate.mandate_id) == []
+    assert repository.list_events(mandate.mandate_id) == before_events
+
+
+def test_threaded_exact_decision_duplicate_records_one_atomic_result(
+    directory, mandate, now, tmp_path, monkeypatch
+) -> None:
+    repository = _file_repository(tmp_path)
+    coordinator = _file_coordinator(directory, repository)
+    assignment = _assignment(mandate, EngagementType.REVIEW_APPROVAL)
+    _prepare(coordinator, repository, mandate, assignment, [], now)
+    message = _message(
+        now,
+        message_id="approval-threaded-duplicate",
+        text="DECIDE HW-2411 APPROVE",
+    )
+    command = _decision(message.text)
+    original_transaction = repository.transaction
+    writers_ready = threading.Barrier(2)
+
+    @contextmanager
+    def synchronized_transaction():
+        writers_ready.wait(timeout=5)
+        with original_transaction() as unit:
+            yield unit
+
+    monkeypatch.setattr(repository, "transaction", synchronized_transaction)
+
+    def decide():
+        return coordinator.record_decision(message, assignment, command, now)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: decide(), range(2)))
+
+    saved = repository.get_assignment(assignment.assignment_id)
+    assert all(result.deliveries == [] for result in results)
+    assert saved is not None
+    assert saved.state is StakeholderState.COMPLETE
+    assert len(repository.list_engagement_decisions(mandate.mandate_id)) == 1
+    assert len(repository.list_evidence(mandate.mandate_id)) == 1
+    assert sum(
+        event.event_type == "engagement.decision_recorded"
+        for event in repository.list_events(mandate.mandate_id)
+    ) == 1
+
+
+def test_authenticated_availability_persists_compatible_windows_and_typed_completion(
+    coordinator, repository, mandate, now
+) -> None:
+    assignment = _assignment(mandate, EngagementType.AVAILABILITY)
+    _prepare(coordinator, repository, mandate, assignment, [], now)
+    windows = _availability_windows()
+    text = "AVAILABLE HW-2411 " + " ".join(
+        f"{window.start.isoformat()}/{window.end.isoformat()}" for window in windows
+    )
+    message = _message(now, message_id="engagement-availability", text=text)
+
+    result = coordinator.record_availability(message, assignment, windows, now)
+
+    saved = repository.get_assignment(assignment.assignment_id)
+    stored = repository.get_runtime_status(
+        f"availability:{mandate.mandate_id}:priya"
+    )
+    recorded = [
+        event
+        for event in repository.list_events(mandate.mandate_id)
+        if event.event_type == "availability.recorded"
+    ]
+    assert result.deliveries == []
+    assert saved is not None
+    assert saved.state is StakeholderState.COMPLETE
+    assert stored is not None
+    assert stored[0] == "|".join(
+        f"{window.start.isoformat()}/{window.end.isoformat()}" for window in windows
+    )
+    assert len(recorded) == 1
+    assert recorded[0].metadata == {"attempt_count": 2}
+    assert repository.list_engagement_decisions(mandate.mandate_id) == []
+    assert repository.list_evidence(mandate.mandate_id) == []
+
+
+def test_availability_wrong_route_ack_duplicate_and_conflicting_replay_cannot_mutate_windows(
+    coordinator, repository, mandate, now
+) -> None:
+    assignment = _assignment(mandate, EngagementType.AVAILABILITY)
+    _prepare(coordinator, repository, mandate, assignment, [], now)
+    windows = _availability_windows()
+    text = (
+        "AVAILABLE HW-2411 "
+        f"{windows[0].start.isoformat()}/{windows[0].end.isoformat()}"
+    )
+    wrong_route = _message(
+        now,
+        message_id="availability-wrong-route",
+        text=text,
+        channel=Channel.TELEGRAM,
+        sender="priya-telegram",
+        conversation="tg-priya",
+    )
     before = repository.get_assignment(assignment.assignment_id)
-    ack = coordinator.acknowledge(
-        _message(now, message_id="unsupported-ack", text="ACK HW-2411"), assignment, now
+
+    coordinator.record_availability(wrong_route, assignment, windows[:1], now)
+    coordinator.acknowledge(
+        _message(now, message_id="availability-ack", text="ACK HW-2411"),
+        assignment,
+        now,
     )
-    answer = coordinator.record_answer(
-        _message(now, message_id="unsupported-answer", text="Approved"), assignment, now
-    )
-    assert ack.deliveries == []
-    assert answer.deliveries == []
+
     assert repository.get_assignment(assignment.assignment_id) == before
-    assert repository.list_events(mandate.mandate_id) == []
+    assert repository.get_runtime_status(
+        f"availability:{mandate.mandate_id}:priya"
+    ) is None
+
+    accepted = _message(
+        now,
+        message_id="availability-replay",
+        text=text,
+    )
+    coordinator.record_availability(accepted, assignment, windows[:1], now)
+    durable = repository.get_runtime_status(
+        f"availability:{mandate.mandate_id}:priya"
+    )
+    events = repository.list_events(mandate.mandate_id)
+    conflicting_window = AvailabilityWindow(
+        start="2026-08-16T09:00:00-05:00",
+        end="2026-08-16T10:00:00-05:00",
+    )
+    conflicting_text = (
+        "AVAILABLE HW-2411 "
+        f"{conflicting_window.start.isoformat()}/{conflicting_window.end.isoformat()}"
+    )
+    conflicting = accepted.model_copy(update={"text": conflicting_text})
+
+    coordinator.record_availability(accepted, assignment, windows[:1], now)
+    coordinator.record_availability(
+        conflicting,
+        assignment,
+        (conflicting_window,),
+        now,
+    )
+
+    assert repository.get_runtime_status(
+        f"availability:{mandate.mandate_id}:priya"
+    ) == durable
+    assert repository.list_events(mandate.mandate_id) == events
+    assert repository.list_engagement_decisions(mandate.mandate_id) == []
+    assert repository.list_evidence(mandate.mandate_id) == []
 
 
 @pytest.mark.parametrize(

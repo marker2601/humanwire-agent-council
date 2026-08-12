@@ -32,6 +32,24 @@ def render_acknowledgement_intro(token: str, mandate_summary: str, reason: str) 
     )
 
 
+def render_approval_request(token: str) -> str:
+    return (
+        f"HUMANWIRE APPROVAL REVIEW \u00b7 {token}\n\n"
+        "A required decision response was requested.\n\n"
+        f"DECIDE {token} APPROVE\n"
+        f"DECIDE {token} REJECT <reason>\n"
+        f"DECIDE {token} CHANGE <requested change>"
+    )
+
+
+def render_engagement_availability_request(token: str) -> str:
+    return (
+        f"HUMANWIRE AVAILABILITY REQUEST \u00b7 {token}\n\n"
+        "A required scheduling response was requested.\n\n"
+        f"AVAILABLE {token} <start>/<end> [<start>/<end> ...]"
+    )
+
+
 def render_response_intro(
     token: str,
     mandate_summary: str,
@@ -77,6 +95,20 @@ def render_reminder(
     token: str,
     engagement_type: EngagementType = EngagementType.STRUCTURED_INTERVIEW,
 ) -> str:
+    if engagement_type is EngagementType.REVIEW_APPROVAL:
+        return (
+            f"HUMANWIRE APPROVAL REVIEW \u00b7 {token}\n\n"
+            "The required decision response has not been recorded.\n\n"
+            f"DECIDE {token} APPROVE\n"
+            f"DECIDE {token} REJECT <reason>\n"
+            f"DECIDE {token} CHANGE <requested change>"
+        )
+    if engagement_type is EngagementType.AVAILABILITY:
+        return (
+            f"HUMANWIRE AVAILABILITY REQUEST \u00b7 {token}\n\n"
+            "The required availability response has not been recorded.\n\n"
+            f"AVAILABLE {token} <start>/<end> [<start>/<end> ...]"
+        )
     if engagement_type is EngagementType.ACKNOWLEDGE:
         return (
             f"HUMANWIRE ACKNOWLEDGEMENT · {token}\n\n"
@@ -111,6 +143,20 @@ def render_channel_switch(
             "The prior registered route did not receive the required acknowledgement.\n\n"
             f"Reply ACK {token}."
         )
+    if engagement_type is EngagementType.REVIEW_APPROVAL:
+        return (
+            f"HUMANWIRE APPROVAL REVIEW \u00b7 {token}\n\n"
+            "The required decision response was not recorded on the prior registered route.\n\n"
+            f"DECIDE {token} APPROVE\n"
+            f"DECIDE {token} REJECT <reason>\n"
+            f"DECIDE {token} CHANGE <requested change>"
+        )
+    if engagement_type is EngagementType.AVAILABILITY:
+        return (
+            f"HUMANWIRE AVAILABILITY REQUEST \u00b7 {token}\n\n"
+            "The required availability response was not recorded on the prior registered route.\n\n"
+            f"AVAILABLE {token} <start>/<end> [<start>/<end> ...]"
+        )
     quick = engagement_type is EngagementType.QUICK_RESPONSE
     heading = "HUMANWIRE QUICK RESPONSE" if quick else "HUMANWIRE INTERVIEW"
     response = "quick response" if quick else "interview response"
@@ -134,6 +180,10 @@ def render_unreachable_notice(
         detail = f"{stakeholder_name} did not provide the required acknowledgement."
     elif engagement_type is EngagementType.QUICK_RESPONSE:
         detail = f"{stakeholder_name} did not provide the required quick response."
+    elif engagement_type is EngagementType.REVIEW_APPROVAL:
+        detail = f"{stakeholder_name} did not provide the required decision response."
+    elif engagement_type is EngagementType.AVAILABILITY:
+        detail = f"{stakeholder_name} did not provide the required availability response."
     else:
         detail = f"{stakeholder_name} did not provide the required interview response."
     return (

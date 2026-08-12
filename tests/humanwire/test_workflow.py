@@ -18,6 +18,8 @@ from humanwire.domain import (
     ContactRoute,
     DeliveryKind,
     Direction,
+    EngagementDecisionKind,
+    EngagementType,
     EvidenceItem,
     EvidenceStatus,
     EvidenceType,
@@ -27,6 +29,7 @@ from humanwire.domain import (
     MandateState,
     Person,
     PlannedStakeholder,
+    StakeholderAssignment,
     StakeholderState,
 )
 from humanwire.evidence import RuleBasedEvidenceExtractor
@@ -275,6 +278,30 @@ def _create_mandate(workflow, incoming_message_factory, *, message_id: str = "cr
         )
     )
     return workflow.repository.list_recent_mandates(1)[0], result
+
+
+def _convert_assignment_to_engagement(
+    repository: SqlAlchemyHumanWireRepository,
+    mandate,
+    engagement_type: EngagementType,
+) -> StakeholderAssignment:
+    assignment = repository.list_assignments(mandate.mandate_id)[0]
+    converted = assignment.model_copy(
+        update={
+            "engagement_type": engagement_type,
+            "response_required": True,
+            "state": StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+            "interview_id": None,
+            "attempt_count": 1,
+            "active_route_index": 0,
+            "next_action_at": mandate.created_at + timedelta(minutes=1),
+            "acknowledged_at": None,
+            "completed_at": None,
+            "failure_reason": None,
+        }
+    )
+    repository.save_assignment(converted)
+    return converted
 
 
 def _complete_interview(
@@ -1107,6 +1134,249 @@ def test_proposals_require_all_authenticated_respondents_and_cap_after_round_two
     assert {delivery.recipient for delivery in capped.deliveries if delivery.recipient} == set()
     assert any(delivery.conversation_id == "manager-conversation" for delivery in capped.deliveries)
     assert all("AVAILABLE" in delivery.text for delivery in capped.deliveries)
+
+
+def test_workflow_routes_exact_decision_to_engagement_without_proposal_negotiation(
+    repository, incoming_message_factory
+) -> None:
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _create_mandate(
+        workflow, incoming_message_factory, message_id="decision-workflow-create"
+    )
+    assignment = _convert_assignment_to_engagement(
+        repository, mandate, EngagementType.REVIEW_APPROVAL
+    )
+
+    result = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"DECIDE {mandate.token} CHANGE PRIVATE-WORKFLOW-CHANGE",
+            message_id="decision-workflow-change",
+        )
+    )
+
+    saved = repository.get_assignment(assignment.assignment_id)
+    decisions = repository.list_engagement_decisions(mandate.mandate_id)
+    assert saved is not None
+    assert saved.state is StakeholderState.COMPLETE
+    assert len(decisions) == 1
+    assert decisions[0].response is EngagementDecisionKind.CHANGE
+    assert decisions[0].change_text == "PRIVATE-WORKFLOW-CHANGE"
+    assert repository.list_proposal_responses(uuid4()) == []
+    public_text = "\n".join(delivery.text for delivery in result.deliveries)
+    event_text = "\n".join(
+        event.model_dump_json() for event in repository.list_events(mandate.mandate_id)
+    )
+    evidence_text = "\n".join(
+        item.model_dump_json() for item in repository.list_evidence(mandate.mandate_id)
+    )
+    assert "PRIVATE-WORKFLOW-CHANGE" not in public_text
+    assert "PRIVATE-WORKFLOW-CHANGE" not in event_text
+    assert "PRIVATE-WORKFLOW-CHANGE" not in evidence_text
+
+
+@pytest.mark.parametrize(
+    ("person_id", "conversation_id"),
+    [
+        ("vp-people", "people-thread"),
+        ("team-lead", "wrong-thread"),
+    ],
+    ids=["unrelated-person", "wrong-thread"],
+)
+def test_workflow_denies_unrelated_or_wrong_thread_decisions_without_disclosure(
+    repository, incoming_message_factory, person_id, conversation_id
+) -> None:
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _create_mandate(
+        workflow, incoming_message_factory, message_id=f"decision-deny-{person_id}"
+    )
+    assignment = _convert_assignment_to_engagement(
+        repository, mandate, EngagementType.REVIEW_APPROVAL
+    )
+    before_assignment = repository.get_assignment(assignment.assignment_id)
+    before_events = repository.list_events(mandate.mandate_id)
+
+    result = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            person_id,
+            f"DECIDE {mandate.token} APPROVE",
+            message_id=f"decision-denied-{person_id}-{conversation_id}",
+            conversation_id=conversation_id,
+        )
+    )
+
+    assert repository.get_assignment(assignment.assignment_id) == before_assignment
+    assert repository.list_engagement_decisions(mandate.mandate_id) == []
+    assert repository.list_evidence(mandate.mandate_id) == []
+    assert repository.list_events(mandate.mandate_id) == before_events
+    assert all(mandate.objective not in delivery.text for delivery in result.deliveries)
+
+
+def test_workflow_ambiguous_and_terminal_decision_candidates_fail_closed(
+    repository, incoming_message_factory
+) -> None:
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _create_mandate(
+        workflow, incoming_message_factory, message_id="decision-ambiguous-create"
+    )
+    first = _convert_assignment_to_engagement(
+        repository, mandate, EngagementType.REVIEW_APPROVAL
+    )
+    second = first.model_copy(update={"assignment_id": uuid4()})
+    repository.add_assignment(second)
+    before = repository.list_assignments(mandate.mandate_id)
+
+    ambiguous = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"DECIDE {mandate.token} APPROVE",
+            message_id="decision-ambiguous",
+        )
+    )
+
+    assert ambiguous.deliveries == []
+    assert repository.list_assignments(mandate.mandate_id) == before
+    assert repository.list_engagement_decisions(mandate.mandate_id) == []
+
+    cancelled = workflow.repository.get_mandate_by_token(mandate.token).model_copy(
+        update={
+            "state": MandateState.CANCELLED,
+            "completed_at": mandate.created_at,
+        }
+    )
+    with repository.transaction() as unit:
+        unit.save_mandate(cancelled)
+        unit.save_assignment(
+            second.model_copy(update={"state": StakeholderState.UNREACHABLE})
+        )
+    terminal_before = repository.list_assignments(mandate.mandate_id)
+    terminal = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"DECIDE {mandate.token} REJECT Too late",
+            message_id="decision-terminal",
+        )
+    )
+
+    assert repository.list_assignments(mandate.mandate_id) == terminal_before
+    assert repository.list_engagement_decisions(mandate.mandate_id) == []
+    assert all("Too late" not in delivery.text for delivery in terminal.deliveries)
+
+
+@pytest.mark.parametrize(
+    "engagement_type",
+    [EngagementType.REVIEW_APPROVAL, EngagementType.AVAILABILITY],
+)
+@pytest.mark.parametrize("reply", ["ACK {token}", "I agree with this request."])
+def test_workflow_ack_and_free_text_cannot_answer_explicit_engagements(
+    repository, incoming_message_factory, engagement_type, reply
+) -> None:
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _create_mandate(
+        workflow,
+        incoming_message_factory,
+        message_id=f"explicit-free-text-{engagement_type.value}",
+    )
+    assignment = _convert_assignment_to_engagement(
+        repository, mandate, engagement_type
+    )
+    before_assignment = repository.get_assignment(assignment.assignment_id)
+    before_events = repository.list_events(mandate.mandate_id)
+    before_evidence = repository.list_evidence(mandate.mandate_id)
+
+    result = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            reply.format(token=mandate.token),
+            message_id=f"explicit-inert-{engagement_type.value}-{reply[:3]}",
+        )
+    )
+
+    assert result.deliveries == []
+    assert repository.get_assignment(assignment.assignment_id) == before_assignment
+    assert repository.list_events(mandate.mandate_id) == before_events
+    assert repository.list_evidence(mandate.mandate_id) == before_evidence
+    assert repository.list_engagement_decisions(mandate.mandate_id) == []
+    assert repository.get_runtime_status(
+        f"availability:{mandate.mandate_id}:team-lead"
+    ) is None
+
+
+def test_workflow_routes_engagement_availability_before_scheduling_attendees(
+    repository, incoming_message_factory
+) -> None:
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _create_mandate(
+        workflow, incoming_message_factory, message_id="availability-engagement-create"
+    )
+    assignment = _convert_assignment_to_engagement(
+        repository, mandate, EngagementType.AVAILABILITY
+    )
+    window = "2026-08-12T15:00:00+00:00/2026-08-12T16:00:00+00:00"
+
+    result = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"AVAILABLE {mandate.token} {window}",
+            message_id="availability-engagement-recorded",
+        )
+    )
+
+    saved = repository.get_assignment(assignment.assignment_id)
+    stored = repository.get_runtime_status(
+        f"availability:{mandate.mandate_id}:team-lead"
+    )
+    assert saved is not None
+    assert saved.state is StakeholderState.COMPLETE
+    assert stored is not None
+    assert stored[0] == window
+    assert repository.get_meeting_package(mandate.mandate_id) is None
+    assert repository.list_engagement_decisions(mandate.mandate_id) == []
+    assert not any(
+        item.evidence_type is EvidenceType.DECISION
+        for item in repository.list_evidence(mandate.mandate_id)
+    )
+    assert all("agreement" not in delivery.text.casefold() for delivery in result.deliveries)
+
+
+def test_workflow_ambiguous_engagement_availability_cannot_replace_windows(
+    repository, incoming_message_factory
+) -> None:
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _create_mandate(
+        workflow, incoming_message_factory, message_id="availability-ambiguous-create"
+    )
+    first = _convert_assignment_to_engagement(
+        repository, mandate, EngagementType.AVAILABILITY
+    )
+    repository.add_assignment(first.model_copy(update={"assignment_id": uuid4()}))
+    before = repository.list_assignments(mandate.mandate_id)
+    window = "2026-08-12T15:00:00+00:00/2026-08-12T16:00:00+00:00"
+
+    result = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"AVAILABLE {mandate.token} {window}",
+            message_id="availability-ambiguous",
+        )
+    )
+
+    assert result.deliveries == []
+    assert repository.list_assignments(mandate.mandate_id) == before
+    assert repository.get_runtime_status(
+        f"availability:{mandate.mandate_id}:team-lead"
+    ) is None
+    assert not any(
+        event.event_type == "availability.recorded"
+        for event in repository.list_events(mandate.mandate_id)
+    )
 
 
 def test_availability_email_and_telegram_routes_survive_workflow_restart(

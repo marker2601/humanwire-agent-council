@@ -12,6 +12,7 @@ from humanwire.commands import (
     AcknowledgeCommand,
     AvailabilityCommand,
     CancelCommand,
+    EngagementDecisionCommand,
     FreeTextCommand,
     MandateCommand,
     ProposalResponseCommand,
@@ -23,10 +24,14 @@ from humanwire.directory import AmbiguousPersonError, OrganizationDirectory, Unk
 from humanwire.domain import (
     DeliveryInstruction,
     DeliveryKind,
+    EngagementType,
     IncomingMessage,
     MandateState,
+    StakeholderAssignment,
+    StakeholderState,
     WorkflowResult,
 )
+from humanwire.engagements import EngagementCoordinator
 from humanwire.evidence import EvidenceExtractor, shareable_evidence
 from humanwire.meetings import MeetingCoordinator
 from humanwire.messages import render_alignment_brief, render_meeting_confirmation, render_proposal
@@ -41,6 +46,7 @@ from humanwire.state_machine import (
     ASSIGNMENT_TERMINAL_STATES,
     MANDATE_TERMINAL_STATES,
     MandateStateMachine,
+    StakeholderStateMachine,
 )
 
 
@@ -50,6 +56,13 @@ class HumanWireWorkflow:
         self.repository = repository
         self.settings = settings
         self.mandates = MandateService(directory, repository, planner, evidence_extractor, settings)
+        self.engagements = EngagementCoordinator(
+            directory,
+            repository,
+            StakeholderStateMachine(),
+            evidence_extractor,
+            settings,
+        )
         self.negotiation_coordinator = negotiation_coordinator or NegotiationCoordinator(repository)
         self.meeting_coordinator_factory = meeting_coordinator_factory or MeetingCoordinator
         self.synthesis = SynthesisService(
@@ -67,6 +80,8 @@ class HumanWireWorkflow:
             return self._status(message, command.token)
         if isinstance(command, CancelCommand):
             return self._cancel(message, command.token)
+        if isinstance(command, EngagementDecisionCommand):
+            return self._engagement_decision(message, command)
         if isinstance(command, ProposalResponseCommand):
             return self._proposal(message, command)
         if isinstance(command, AvailabilityCommand):
@@ -97,7 +112,13 @@ class HumanWireWorkflow:
         for assignment in self.repository.list_due_assignments(now):
             if mandate_states.get(assignment.mandate_id) is not MandateState.INTERVIEWING:
                 continue
-            result = self.mandates.interviews.process_due_assignment(assignment, now)
+            coordinator = (
+                self.engagements
+                if assignment.engagement_type
+                in {EngagementType.REVIEW_APPROVAL, EngagementType.AVAILABILITY}
+                else self.mandates.interviews
+            )
+            result = coordinator.process_due_assignment(assignment, now)
             deliveries.extend(result.deliveries)
             deliveries.extend(self.synthesis.run(assignment.mandate_id, now).deliveries)
         return WorkflowResult(deliveries=deliveries)
@@ -114,10 +135,18 @@ class HumanWireWorkflow:
             ]
         )
         delivery_id = hashlib.sha256(delivery_source.encode()).hexdigest()[:48]
+        assignment = self.repository.get_assignment(instruction.assignment_id)
+        coordinator = (
+            self.engagements
+            if assignment is not None
+            and assignment.engagement_type
+            in {EngagementType.REVIEW_APPROVAL, EngagementType.AVAILABILITY}
+            else self.mandates.interviews
+        )
         if succeeded:
-            self.mandates.interviews.mark_delivery_success(instruction.assignment_id, delivery_id, now)
+            coordinator.mark_delivery_success(instruction.assignment_id, delivery_id, now)
         else:
-            failed = self.mandates.interviews.mark_delivery_failure(
+            failed = coordinator.mark_delivery_failure(
                 instruction.assignment_id, delivery_id, now
             )
             assignment = self.repository.get_assignment(instruction.assignment_id)
@@ -148,6 +177,11 @@ class HumanWireWorkflow:
             ):
                 assignment = self.repository.get_assignment(interview.assignment_id)
                 if assignment is not None:
+                    if assignment.engagement_type not in {
+                        EngagementType.QUICK_RESPONSE,
+                        EngagementType.STRUCTURED_INTERVIEW,
+                    }:
+                        continue
                     if (
                         mandate.state in MANDATE_TERMINAL_STATES
                         or assignment.state in ASSIGNMENT_TERMINAL_STATES
@@ -163,6 +197,12 @@ class HumanWireWorkflow:
                 and mandate.token == command.token
             ]
         if len(candidates) != 1:
+            if not candidates and self._has_active_explicit_engagement(
+                person.person_id,
+                message,
+                command,
+            ):
+                return WorkflowResult()
             if terminal_match:
                 return self._reply(message, "This mandate is closed. No response was recorded.")
             return self._reply(message, "Reply ACK <token> to select an active interview." if candidates else "Use /mandate to start a request.")
@@ -344,20 +384,104 @@ class HumanWireWorkflow:
             return WorkflowResult(deliveries=self.synthesis._route_deliveries(attendees, text, mandate.token))
         return WorkflowResult()
 
+    def _engagement_decision(
+        self,
+        message: IncomingMessage,
+        command: EngagementDecisionCommand,
+    ) -> WorkflowResult:
+        mandate = self.repository.get_mandate_by_token(command.token)
+        if mandate is None or mandate.state in MANDATE_TERMINAL_STATES:
+            return WorkflowResult()
+        try:
+            person = self.directory.person_for_sender(message)
+        except (UnknownPersonError, AmbiguousPersonError):
+            return WorkflowResult()
+        candidates = self._engagement_candidates(
+            mandate.mandate_id,
+            person.person_id,
+            EngagementType.REVIEW_APPROVAL,
+            message,
+        )
+        if len(candidates) != 1:
+            return WorkflowResult()
+        assignment = candidates[0]
+        result = self.engagements.record_decision(
+            message,
+            assignment,
+            command,
+            message.received_at,
+        )
+        completed = self.repository.get_assignment(assignment.assignment_id)
+        if (
+            completed is not None
+            and assignment.state is not StakeholderState.COMPLETE
+            and completed.state is StakeholderState.COMPLETE
+        ):
+            synthesis = self.synthesis.run(assignment.mandate_id, message.received_at)
+            return WorkflowResult(deliveries=[*result.deliveries, *synthesis.deliveries])
+        return result
+
     def _availability(self, message: IncomingMessage, command: AvailabilityCommand) -> WorkflowResult:
         mandate = self.repository.get_mandate_by_token(command.token)
-        if mandate is None or mandate.state is not MandateState.SCHEDULING:
+        if mandate is None:
             return self._reply(message, "There is no active availability request for that token.")
         try:
             person = self.directory.person_for_sender(message)
         except (UnknownPersonError, AmbiguousPersonError):
+            if mandate.state is not MandateState.SCHEDULING:
+                return WorkflowResult()
             return self._reply(message, "Availability must come from a registered attendee.")
+        if mandate.state not in MANDATE_TERMINAL_STATES:
+            candidates = self._engagement_candidates(
+                mandate.mandate_id,
+                person.person_id,
+                EngagementType.AVAILABILITY,
+                message,
+            )
+            if len(candidates) > 1:
+                return WorkflowResult()
+            if len(candidates) == 1:
+                assignment = candidates[0]
+                result = self.engagements.record_availability(
+                    message,
+                    assignment,
+                    command.windows,
+                    message.received_at,
+                )
+                completed = self.repository.get_assignment(assignment.assignment_id)
+                if (
+                    completed is not None
+                    and assignment.state is not StakeholderState.COMPLETE
+                    and completed.state is StakeholderState.COMPLETE
+                ):
+                    synthesis = self.synthesis.run(
+                        assignment.mandate_id, message.received_at
+                    )
+                    return WorkflowResult(
+                        deliveries=[*result.deliveries, *synthesis.deliveries]
+                    )
+                return result
+        if mandate.state is not MandateState.SCHEDULING:
+            return self._reply(message, "There is no active availability request for that token.")
         if person.person_id not in self._meeting_attendees(mandate) or not self._registered_route_matches(
             person.person_id, message
         ):
             return self._reply(message, "Availability must come from a requested registered attendee.")
-        self.repository.set_runtime_status(f"availability:{mandate.mandate_id}:{person.person_id}", json_windows(command), message.received_at)
-        self.repository.append_event(mandate.mandate_id, _event("availability.recorded", message.received_at, f"availability:{mandate.mandate_id}:{person.person_id}:{message.message_id}", actor_id=person.person_id, channel=message.channel))
+        self.repository.set_runtime_status(
+            f"availability:{mandate.mandate_id}:{person.person_id}",
+            json_windows(command),
+            message.received_at,
+        )
+        self.repository.append_event(
+            mandate.mandate_id,
+            _event(
+                "availability.recorded",
+                message.received_at,
+                f"availability:{mandate.mandate_id}:{person.person_id}:{message.message_id}",
+                actor_id=person.person_id,
+                channel=message.channel,
+            ),
+        )
         return self._try_schedule(mandate, message.received_at)
 
     def _try_schedule(self, mandate, now: datetime) -> WorkflowResult:
@@ -408,6 +532,70 @@ class HumanWireWorkflow:
         return sorted(
             self.meeting_coordinator_factory(mandate.initiator_id).required_attendees(
                 report, self.repository.list_assignments(mandate.mandate_id), mandate.initiator_id
+            )
+        )
+
+    def _engagement_candidates(
+        self,
+        mandate_id: UUID,
+        person_id: str,
+        engagement_type: EngagementType,
+        message: IncomingMessage,
+    ) -> list[StakeholderAssignment]:
+        return [
+            assignment
+            for assignment in self.repository.list_assignments(mandate_id)
+            if assignment.person_id.casefold() == person_id.casefold()
+            and assignment.engagement_type is engagement_type
+            and assignment.response_required
+            and assignment.state not in ASSIGNMENT_TERMINAL_STATES
+            and self._active_assignment_route_matches(assignment, message)
+        ]
+
+    def _has_active_explicit_engagement(
+        self,
+        person_id: str,
+        message: IncomingMessage,
+        command: FreeTextCommand | AcknowledgeCommand,
+    ) -> bool:
+        for mandate in self.repository.list_recent_mandates(1000):
+            if mandate.state in MANDATE_TERMINAL_STATES:
+                continue
+            if isinstance(command, AcknowledgeCommand) and mandate.token != command.token:
+                continue
+            if any(
+                assignment.person_id.casefold() == person_id.casefold()
+                and assignment.engagement_type
+                in {EngagementType.REVIEW_APPROVAL, EngagementType.AVAILABILITY}
+                and assignment.state not in ASSIGNMENT_TERMINAL_STATES
+                and self._active_assignment_route_matches(assignment, message)
+                for assignment in self.repository.list_assignments(mandate.mandate_id)
+            ):
+                return True
+        return False
+
+    def _active_assignment_route_matches(
+        self,
+        assignment: StakeholderAssignment,
+        message: IncomingMessage,
+    ) -> bool:
+        if not message.conversation_id.strip():
+            return False
+        allowed = set(assignment.route_ids)
+        routes = [
+            route
+            for route in self.directory.ordered_routes(assignment.person_id)
+            if route.route_id in allowed
+        ]
+        if assignment.active_route_index >= len(routes):
+            return False
+        active = routes[assignment.active_route_index]
+        return (
+            active.channel is message.channel
+            and active.sender_address.casefold() == message.sender_address.casefold()
+            and (
+                active.conversation_id is None
+                or active.conversation_id == message.conversation_id
             )
         )
 
