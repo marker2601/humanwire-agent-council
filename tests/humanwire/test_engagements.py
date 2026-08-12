@@ -1166,3 +1166,207 @@ def test_review_authenticated_quick_ack_survives_reminder_and_sends_question_one
     replay = coordinator.acknowledge(acknowledgement, assignment, now)
     assert replay.deliveries == []
     assert repository.list_events(mandate.mandate_id) == events
+
+
+@pytest.mark.parametrize(
+    ("engagement_type", "questions", "expected_question"),
+    [
+        pytest.param(
+            EngagementType.QUICK_RESPONSE,
+            ["Committed date?"],
+            "Question 1 of 1:\nCommitted date?",
+            id="quick",
+        ),
+        pytest.param(
+            EngagementType.STRUCTURED_INTERVIEW,
+            ["Fact?", "Constraint?", "Commitment?"],
+            "Question 1 of 3:\nFact?",
+            id="structured",
+        ),
+    ],
+)
+def test_review_explicit_ack_retry_rejects_a_route_that_became_stale(
+    directory,
+    mandate,
+    now,
+    tmp_path,
+    monkeypatch,
+    engagement_type,
+    questions,
+    expected_question,
+) -> None:
+    repository = _file_repository(tmp_path)
+    coordinator = _file_coordinator(directory, repository)
+    assignment = _assignment(mandate, engagement_type)
+    _prepare(coordinator, repository, mandate, assignment, questions, now)
+    coordinator.process_due_assignment(assignment, now + timedelta(seconds=60))
+    stale_primary_ack = _message(
+        now,
+        message_id=f"review-stale-route-{engagement_type.value}",
+        text="ACK HW-2411",
+    )
+    original_transaction = repository.transaction
+    acknowledgement_validated = threading.Event()
+    alternate_committed = threading.Event()
+    role = threading.local()
+
+    @contextmanager
+    def ordered_transaction():
+        if getattr(role, "name", None) == "ack":
+            attempt = getattr(role, "transaction_attempt", 0) + 1
+            role.transaction_attempt = attempt
+            if attempt == 1:
+                acknowledgement_validated.set()
+                assert alternate_committed.wait(timeout=5)
+        with original_transaction() as unit:
+            yield unit
+
+    monkeypatch.setattr(repository, "transaction", ordered_transaction)
+
+    def run_stale_ack():
+        role.name = "ack"
+        return coordinator.acknowledge(stale_primary_ack, assignment, now)
+
+    def switch_to_alternate():
+        role.name = "due"
+        assert acknowledgement_validated.wait(timeout=5)
+        result = coordinator.process_due_assignment(
+            assignment,
+            now + timedelta(seconds=90),
+        )
+        alternate_committed.set()
+        return result
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="review-stale-route") as executor:
+        ack_future = executor.submit(run_stale_ack)
+        due_future = executor.submit(switch_to_alternate)
+        stale_result = ack_future.result(timeout=10)
+        due_result = due_future.result(timeout=10)
+
+    after_stale = repository.get_assignment(assignment.assignment_id)
+    assert after_stale is not None
+    session = repository.get_interview(after_stale.interview_id)
+    events = repository.list_events(mandate.mandate_id)
+    assert len(due_result.deliveries) == 1
+    assert stale_result.deliveries == []
+    assert after_stale.state is StakeholderState.ALTERNATE_CHANNEL
+    assert after_stale.active_route_index == 1
+    assert session is not None
+    assert session.current_route_id == "telegram-priya"
+    assert session.current_conversation_id == "tg-priya"
+    assert [event.event_type for event in events].count("stakeholder.acknowledged") == 0
+
+    valid_alternate_ack = _message(
+        now,
+        message_id=f"review-active-route-{engagement_type.value}",
+        text="ACK HW-2411",
+        channel=Channel.TELEGRAM,
+        sender="priya-telegram",
+        conversation="tg-priya",
+    )
+    active_result = coordinator.acknowledge(valid_alternate_ack, after_stale, now)
+    completed = repository.get_assignment(assignment.assignment_id)
+    completed_session = repository.get_interview(after_stale.interview_id)
+    completed_events = repository.list_events(mandate.mandate_id)
+    assert [delivery.text for delivery in active_result.deliveries] == [expected_question]
+    assert completed is not None
+    assert completed.state is StakeholderState.INTERVIEWING
+    assert completed_session is not None
+    assert completed_session.current_route_id == "telegram-priya"
+    assert completed_session.current_conversation_id == "tg-priya"
+    assert (
+        [event.event_type for event in completed_events].count("stakeholder.acknowledged")
+        == 1
+    )
+
+
+@pytest.mark.parametrize(
+    ("engagement_type", "questions"),
+    [
+        pytest.param(
+            EngagementType.QUICK_RESPONSE,
+            ["Committed date?"],
+            id="quick",
+        ),
+        pytest.param(
+            EngagementType.STRUCTURED_INTERVIEW,
+            ["Fact?", "Constraint?", "Commitment?"],
+            id="structured",
+        ),
+    ],
+)
+def test_review_explicit_ack_retry_rejects_assignment_changed_to_non_question_type(
+    directory,
+    mandate,
+    now,
+    tmp_path,
+    monkeypatch,
+    engagement_type,
+    questions,
+) -> None:
+    repository = _file_repository(tmp_path)
+    coordinator = _file_coordinator(directory, repository)
+    assignment = _assignment(mandate, engagement_type)
+    _prepare(coordinator, repository, mandate, assignment, questions, now)
+    pending = repository.get_assignment(assignment.assignment_id)
+    assert pending is not None
+    changed_type = pending.model_copy(
+        update={
+            "engagement_type": EngagementType.ACKNOWLEDGE,
+            "state": StakeholderState.FOLLOW_UP_DUE,
+            "attempt_count": 2,
+            "next_action_at": now + timedelta(seconds=90),
+        }
+    )
+    acknowledgement = _message(
+        now,
+        message_id=f"review-type-change-{engagement_type.value}",
+        text="ACK HW-2411",
+    )
+    original_transaction = repository.transaction
+    acknowledgement_validated = threading.Event()
+    type_change_committed = threading.Event()
+    role = threading.local()
+
+    @contextmanager
+    def ordered_transaction():
+        if getattr(role, "name", None) == "ack":
+            attempt = getattr(role, "transaction_attempt", 0) + 1
+            role.transaction_attempt = attempt
+            if attempt == 1:
+                acknowledgement_validated.set()
+                assert type_change_committed.wait(timeout=5)
+        with original_transaction() as unit:
+            yield unit
+
+    monkeypatch.setattr(repository, "transaction", ordered_transaction)
+
+    def run_ack():
+        role.name = "ack"
+        return coordinator.acknowledge(acknowledgement, assignment, now)
+
+    def change_assignment_type():
+        assert acknowledgement_validated.wait(timeout=5)
+        with original_transaction() as unit:
+            changed = unit.compare_and_save_assignment(pending, changed_type)
+        type_change_committed.set()
+        return changed
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="review-type-change") as executor:
+        ack_future = executor.submit(run_ack)
+        type_future = executor.submit(change_assignment_type)
+        ack_result = ack_future.result(timeout=10)
+        type_changed = type_future.result(timeout=10)
+
+    saved = repository.get_assignment(assignment.assignment_id)
+    assert saved is not None
+    session = repository.get_interview(saved.interview_id)
+    events = repository.list_events(mandate.mandate_id)
+    assert type_changed is True
+    assert ack_result.deliveries == []
+    assert saved.engagement_type is EngagementType.ACKNOWLEDGE
+    assert saved.state is StakeholderState.FOLLOW_UP_DUE
+    assert session is not None
+    assert session.current_route_id == "email-priya"
+    assert session.current_conversation_id == "mail-priya"
+    assert [event.event_type for event in events].count("stakeholder.acknowledged") == 0

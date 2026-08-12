@@ -16,6 +16,7 @@ from humanwire.domain import (
     DeliveryInstruction,
     DeliveryKind,
     DomainEvent,
+    EngagementType,
     EvidenceVisibility,
     IncomingMessage,
     InterviewSession,
@@ -739,11 +740,17 @@ class InterviewCoordinator:
             if retry_authenticated_cas_loss
             else 1
         )
+        retrying_after_cas_loss = False
         for _ in range(attempt_limit):
             saved = self.repository.get_assignment(assignment.assignment_id)
             if saved is None or saved.state in ASSIGNMENT_TERMINAL_STATES:
                 return WorkflowResult()
             if retry_authenticated_cas_loss:
+                if saved.engagement_type not in {
+                    EngagementType.QUICK_RESPONSE,
+                    EngagementType.STRUCTURED_INTERVIEW,
+                }:
+                    return WorkflowResult()
                 parsed = parse_command(message.text)
                 if (
                     not isinstance(parsed, AcknowledgeCommand)
@@ -753,6 +760,13 @@ class InterviewCoordinator:
             route = self._message_route(message, saved)
             if route is None:
                 return WorkflowResult()
+            if retrying_after_cas_loss:
+                routes = self._assignment_routes(saved)
+                if (
+                    saved.active_route_index >= len(routes)
+                    or routes[saved.active_route_index].route_id != route.route_id
+                ):
+                    return WorkflowResult()
             key = f"interview:{saved.assignment_id}:ack:{message.message_id}"
             if any(
                 event.idempotency_key == key
@@ -818,6 +832,7 @@ class InterviewCoordinator:
             try:
                 with self.repository.transaction() as unit:
                     if not unit.compare_and_save_assignment(saved, interviewing):
+                        retrying_after_cas_loss = True
                         continue
                     unit.save_interview(updated_session)
                     if not unit.append_event_once(interviewing.mandate_id, event):
