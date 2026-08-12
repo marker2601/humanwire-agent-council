@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4
@@ -39,6 +40,59 @@ from humanwire.state_machine import (
 
 _VISIBILITY_PREFIX = re.compile(r"^(SHAREABLE|ANONYMOUS|PRIVATE)\b[\s:—-]*", re.IGNORECASE)
 _DECLINE = re.compile(r"^DECLINE\s+(HW-[A-Z0-9]{4,8})$", re.IGNORECASE)
+_OUTREACH_SENT_EVENTS = frozenset(
+    {"outreach.primary_sent", "outreach.reminder_sent", "outreach.alternate_sent"}
+)
+
+
+def _route_fingerprint(route: ContactRoute) -> str:
+    source = f"humanwire:route:v1:{route.route_id}".encode()
+    return hashlib.sha256(source).hexdigest()[:32]
+
+
+def _outbound_attempt(
+    assignment: StakeholderAssignment,
+    route: ContactRoute,
+    *,
+    attempt: int,
+    route_index: int,
+) -> tuple[str, dict[str, int | str]]:
+    fingerprint = _route_fingerprint(route)
+    source = hashlib.sha256(
+        (
+            f"humanwire:outbound:v1:{assignment.assignment_id}:"
+            f"{attempt}:{route_index}:{fingerprint}"
+        ).encode()
+    ).hexdigest()[:48]
+    delivery_id = hashlib.sha256(source.encode()).hexdigest()[:48]
+    return source, {
+        "attempt": attempt,
+        "delivery_id": delivery_id,
+        "route_fingerprint": fingerprint,
+        "route_index": route_index,
+    }
+
+
+def _matches_current_outbound_attempt(
+    repository: SqlAlchemyHumanWireRepository,
+    assignment: StakeholderAssignment,
+    route: ContactRoute,
+    delivery_id: str,
+) -> bool:
+    result_key = f"delivery:{assignment.assignment_id}:result:{delivery_id}"
+    for event in reversed(repository.list_events(assignment.mandate_id)):
+        if event.idempotency_key == result_key:
+            return False
+        if (
+            event.assignment_id == assignment.assignment_id
+            and event.event_type in _OUTREACH_SENT_EVENTS
+            and event.metadata.get("delivery_id") == delivery_id
+            and event.metadata.get("attempt") == assignment.attempt_count
+            and event.metadata.get("route_index") == assignment.active_route_index
+            and event.metadata.get("route_fingerprint") == _route_fingerprint(route)
+        ):
+            return True
+    return False
 
 
 class InterviewCoordinator:
@@ -125,6 +179,12 @@ class InterviewCoordinator:
             }
         )
         route = routes[0]
+        delivery_source, delivery_metadata = _outbound_attempt(
+            updated,
+            route,
+            attempt=updated.attempt_count,
+            route_index=updated.active_route_index,
+        )
         active_session = self._activate_route(session, route, route.conversation_id, now)
         event = self._event(
             "outreach.primary_sent",
@@ -132,7 +192,7 @@ class InterviewCoordinator:
             assignment,
             now,
             f"interview:{updated.assignment_id}:outreach.primary_sent:{updated.attempt_count}",
-            {"attempt": 0},
+            delivery_metadata,
         )
         delivery = self._route_delivery(
             route,
@@ -144,6 +204,7 @@ class InterviewCoordinator:
                 assignment.engagement_type,
             ),
             updated,
+            message_id=delivery_source,
         )
         return updated, active_session, event, delivery
 
@@ -187,14 +248,21 @@ class InterviewCoordinator:
                 }
             )
             updated_session = self._activate_route(session, route, route.conversation_id, now)
-            self._save_assignment_event(
+            delivery_source, delivery_metadata = _outbound_attempt(
+                updated,
+                route,
+                attempt=updated.attempt_count,
+                route_index=updated.active_route_index,
+            )
+            if not self._save_assignment_event(
                 updated,
                 saved,
                 "outreach.primary_sent",
                 now,
-                {"attempt": 0},
+                delivery_metadata,
                 session=updated_session,
-            )
+            ):
+                return WorkflowResult()
             return WorkflowResult(
                 deliveries=[
                     self._route_delivery(
@@ -207,6 +275,7 @@ class InterviewCoordinator:
                             saved.engagement_type,
                         ),
                         saved,
+                        message_id=delivery_source,
                     )
                 ]
             )
@@ -222,13 +291,27 @@ class InterviewCoordinator:
                 }
             )
             route = routes[min(saved.active_route_index, len(routes) - 1)]
-            self._save_assignment_event(updated, saved, "outreach.reminder_sent", now, {"attempt": 1})
+            delivery_source, delivery_metadata = _outbound_attempt(
+                updated,
+                route,
+                attempt=updated.attempt_count,
+                route_index=updated.active_route_index,
+            )
+            if not self._save_assignment_event(
+                updated,
+                saved,
+                "outreach.reminder_sent",
+                now,
+                delivery_metadata,
+            ):
+                return WorkflowResult()
             return WorkflowResult(
                 deliveries=[
                     self._route_delivery(
                         route,
                         render_reminder(self._token(saved), saved.engagement_type),
                         saved,
+                        message_id=delivery_source,
                     )
                 ]
             )
@@ -239,13 +322,14 @@ class InterviewCoordinator:
                 unreachable = self._transition(
                     saved, StakeholderState.UNREACHABLE, "no_alternate_registered_route", now
                 )
-                self._save_assignment_event(
+                if not self._save_assignment_event(
                     unreachable,
                     saved,
                     "stakeholder.unreachable",
                     now,
                     {"reason_code": "no_alternate_registered_route"},
-                )
+                ):
+                    return WorkflowResult()
                 return WorkflowResult(deliveries=self._owner_notice(saved))
             route = routes[alternate_index]
             session = self._session(saved)
@@ -260,14 +344,21 @@ class InterviewCoordinator:
                 }
             )
             updated_session = self._activate_route(session, route, route.conversation_id, now)
-            self._save_assignment_event(
+            delivery_source, delivery_metadata = _outbound_attempt(
+                updated,
+                route,
+                attempt=updated.attempt_count,
+                route_index=updated.active_route_index,
+            )
+            if not self._save_assignment_event(
                 updated,
                 saved,
                 "outreach.alternate_sent",
                 now,
-                {"attempt": 2},
+                delivery_metadata,
                 session=updated_session,
-            )
+            ):
+                return WorkflowResult()
             return WorkflowResult(
                 deliveries=[
                     self._route_delivery(
@@ -280,18 +371,20 @@ class InterviewCoordinator:
                             saved.engagement_type,
                         ),
                         saved,
+                        message_id=delivery_source,
                     )
                 ]
             )
 
         unreachable = self._transition(saved, StakeholderState.UNREACHABLE, "no_acknowledgement", now)
-        self._save_assignment_event(
+        if not self._save_assignment_event(
             unreachable,
             saved,
             "stakeholder.unreachable",
             now,
             {"reason_code": "no_acknowledgement"},
-        )
+        ):
+            return WorkflowResult()
         return WorkflowResult(deliveries=self._owner_notice(saved))
 
     def acknowledge(
@@ -478,21 +571,37 @@ class InterviewCoordinator:
         assignment = self.repository.get_assignment(assignment_id)
         if assignment is None:
             raise KeyError(str(assignment_id))
-        if assignment.state in ASSIGNMENT_TERMINAL_STATES:
+        if assignment.state not in {
+            StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+            StakeholderState.FOLLOW_UP_DUE,
+            StakeholderState.ALTERNATE_CHANNEL,
+        }:
+            return
+        routes = self._assignment_routes(assignment)
+        if assignment.active_route_index >= len(routes):
+            return
+        route = routes[assignment.active_route_index]
+        if not _matches_current_outbound_attempt(
+            self.repository, assignment, route, delivery_id
+        ):
             return
         key = f"delivery:{assignment_id}:result:{delivery_id}"
-        if any(event.idempotency_key == key for event in self.repository.list_events(assignment.mandate_id)):
-            return
         event = self._event(
             "outreach.delivery_confirmed",
             assignment,
             assignment,
             now,
             key,
-            {"outcome": "success"},
+            {"delivery_id": delivery_id, "outcome": "success"},
         )
-        with self.repository.transaction() as unit:
-            unit.append_event(assignment.mandate_id, event)
+        try:
+            with self.repository.transaction() as unit:
+                if not unit.compare_and_save_assignment(assignment, assignment):
+                    return
+                if not unit.append_event_once(assignment.mandate_id, event):
+                    raise ValueError("concurrent exact delivery result already won")
+        except ValueError:
+            return
 
     def mark_delivery_failure(
         self, assignment_id: UUID, delivery_id: str, now: datetime
@@ -501,20 +610,29 @@ class InterviewCoordinator:
         assignment = self.repository.get_assignment(assignment_id)
         if assignment is None:
             raise KeyError(str(assignment_id))
+        if assignment.state not in {
+            StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+            StakeholderState.FOLLOW_UP_DUE,
+            StakeholderState.ALTERNATE_CHANNEL,
+        }:
+            return WorkflowResult()
+        routes = self._assignment_routes(assignment)
+        if assignment.active_route_index >= len(routes):
+            return WorkflowResult()
+        active_route = routes[assignment.active_route_index]
+        if not _matches_current_outbound_attempt(
+            self.repository, assignment, active_route, delivery_id
+        ):
+            return WorkflowResult()
         key = f"delivery:{assignment_id}:result:{delivery_id}"
-        if any(event.idempotency_key == key for event in self.repository.list_events(assignment.mandate_id)):
-            return WorkflowResult()
-        if assignment.state in ASSIGNMENT_TERMINAL_STATES:
-            return WorkflowResult()
         event = self._event(
             "outreach.delivery_failed",
             assignment,
             assignment,
             now,
             key,
-            {"message_id": delivery_id, "outcome": "failure"},
+            {"delivery_id": delivery_id, "outcome": "failure"},
         )
-        routes = self._assignment_routes(assignment)
         next_index = assignment.active_route_index + 1
         if next_index < len(routes):
             route = routes[next_index]
@@ -524,27 +642,37 @@ class InterviewCoordinator:
             ).model_copy(
                 update={
                     "active_route_index": next_index,
-                    "attempt_count": max(assignment.attempt_count, 3),
+                    "attempt_count": max(assignment.attempt_count + 1, 3),
                     "last_delivery_at": now,
                     "next_action_at": now + timedelta(seconds=self.settings.acknowledgement_seconds),
                 }
             )
             updated_session = self._activate_route(session, route, route.conversation_id, now)
-            with self.repository.transaction() as unit:
-                unit.save_assignment(alternate)
-                unit.save_interview(updated_session)
-                unit.append_event(alternate.mandate_id, event)
-                unit.append_event(
-                    alternate.mandate_id,
-                    self._event(
-                        "outreach.alternate_sent",
-                        alternate,
-                        assignment,
-                        now,
-                        f"delivery:{assignment_id}:alternate:{delivery_id}",
-                        {"route_id": route.route_id},
-                    ),
-                )
+            delivery_source, delivery_metadata = _outbound_attempt(
+                alternate,
+                route,
+                attempt=alternate.attempt_count,
+                route_index=alternate.active_route_index,
+            )
+            alternate_event = self._event(
+                "outreach.alternate_sent",
+                alternate,
+                assignment,
+                now,
+                f"delivery:{assignment_id}:alternate:{delivery_id}",
+                delivery_metadata,
+            )
+            try:
+                with self.repository.transaction() as unit:
+                    if not unit.compare_and_save_assignment(assignment, alternate):
+                        return WorkflowResult()
+                    unit.save_interview(updated_session)
+                    if not unit.append_event_once(alternate.mandate_id, event):
+                        raise ValueError("concurrent exact delivery result already won")
+                    if not unit.append_event_once(alternate.mandate_id, alternate_event):
+                        raise ValueError("concurrent alternate outreach already won")
+            except ValueError:
+                return WorkflowResult()
             return WorkflowResult(
                 deliveries=[
                     self._route_delivery(
@@ -557,26 +685,31 @@ class InterviewCoordinator:
                             assignment.engagement_type,
                         ),
                         alternate,
+                        message_id=delivery_source,
                     )
                 ]
             )
         failed = self._transition(
             assignment, StakeholderState.DELIVERY_FAILED, "registered_routes_exhausted", now
         )
-        with self.repository.transaction() as unit:
-            unit.save_assignment(failed)
-            unit.append_event(failed.mandate_id, event)
-            unit.append_event(
-                failed.mandate_id,
-                self._event(
-                    "stakeholder.delivery_failed",
-                    failed,
-                    assignment,
-                    now,
-                    f"delivery:{assignment_id}:exhausted:{delivery_id}",
-                    {"reason_code": "registered_routes_exhausted"},
-                ),
-            )
+        terminal_event = self._event(
+            "stakeholder.delivery_failed",
+            failed,
+            assignment,
+            now,
+            f"delivery:{assignment_id}:exhausted:{delivery_id}",
+            {"reason_code": "registered_routes_exhausted"},
+        )
+        try:
+            with self.repository.transaction() as unit:
+                if not unit.compare_and_save_assignment(assignment, failed):
+                    return WorkflowResult()
+                if not unit.append_event_once(failed.mandate_id, event):
+                    raise ValueError("concurrent exact delivery result already won")
+                if not unit.append_event_once(failed.mandate_id, terminal_event):
+                    raise ValueError("concurrent terminal delivery result already won")
+        except ValueError:
+            return WorkflowResult()
         return WorkflowResult(deliveries=self._owner_notice(failed))
 
     def _acknowledge(
@@ -637,10 +770,15 @@ class InterviewCoordinator:
             {},
             channel=message.channel,
         )
-        with self.repository.transaction() as unit:
-            unit.save_assignment(interviewing)
-            unit.save_interview(updated_session)
-            unit.append_event(interviewing.mandate_id, event)
+        try:
+            with self.repository.transaction() as unit:
+                if not unit.compare_and_save_assignment(saved, interviewing):
+                    return WorkflowResult()
+                unit.save_interview(updated_session)
+                if not unit.append_event_once(interviewing.mandate_id, event):
+                    raise ValueError("concurrent exact acknowledgement already won")
+        except ValueError:
+            return WorkflowResult()
         if not send_question:
             return WorkflowResult()
         return WorkflowResult(
@@ -801,7 +939,7 @@ class InterviewCoordinator:
         metadata: dict[str, int | str],
         *,
         session: InterviewSession | None = None,
-    ) -> None:
+    ) -> bool:
         event = self._event(
             event_type,
             updated,
@@ -810,11 +948,17 @@ class InterviewCoordinator:
             f"interview:{updated.assignment_id}:{event_type}:{updated.attempt_count}",
             metadata,
         )
-        with self.repository.transaction() as unit:
-            unit.save_assignment(updated)
-            if session is not None:
-                unit.save_interview(session)
-            unit.append_event(updated.mandate_id, event)
+        try:
+            with self.repository.transaction() as unit:
+                if not unit.compare_and_save_assignment(previous, updated):
+                    return False
+                if session is not None:
+                    unit.save_interview(session)
+                if not unit.append_event_once(updated.mandate_id, event):
+                    raise ValueError("concurrent exact assignment event already won")
+        except ValueError:
+            return False
+        return True
 
     def _transition(
         self,
@@ -860,7 +1004,11 @@ class InterviewCoordinator:
 
     @staticmethod
     def _route_delivery(
-        route: ContactRoute, text: str, assignment: StakeholderAssignment
+        route: ContactRoute,
+        text: str,
+        assignment: StakeholderAssignment,
+        *,
+        message_id: str | None = None,
     ) -> DeliveryInstruction:
         if route.channel is Channel.EMAIL:
             return DeliveryInstruction(
@@ -868,12 +1016,14 @@ class InterviewCoordinator:
                 text=text,
                 mandate_token=None,
                 assignment_id=assignment.assignment_id,
+                message_id=message_id,
                 recipient=route.recipient,
             )
         return DeliveryInstruction(
             kind=DeliveryKind.SEND_TO_CONVERSATION,
             text=text,
             assignment_id=assignment.assignment_id,
+            message_id=message_id,
             conversation_id=route.conversation_id,
         )
 

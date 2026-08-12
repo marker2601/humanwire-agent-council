@@ -950,3 +950,63 @@ def test_transaction_commits_mandate_update_and_event_together(
 
     assert repository.get_mandate_by_token(updated.token) == updated
     assert repository.list_events(updated.mandate_id) == [event]
+
+
+def test_review_assignment_compare_and_save_rejects_a_stale_expected_snapshot(
+    tmp_path, sample_mandate, make_assignment, now
+) -> None:
+    database_path = tmp_path / "assignment-review-cas.db"
+    repository = SqlAlchemyHumanWireRepository(
+        create_session_factory(f"sqlite:///{database_path.as_posix()}")
+    )
+    repository.add_mandate(sample_mandate)
+    assignment = make_assignment(
+        state=StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+        attempt_count=1,
+        active_route_index=0,
+    )
+    repository.add_assignment(assignment)
+    acknowledged = assignment.model_copy(
+        update={
+            "state": StakeholderState.COMPLETE,
+            "acknowledged_at": now,
+            "completed_at": now,
+            "next_action_at": None,
+        }
+    )
+    stale_reminder = assignment.model_copy(
+        update={
+            "state": StakeholderState.FOLLOW_UP_DUE,
+            "attempt_count": 2,
+        }
+    )
+
+    with repository.transaction() as unit:
+        assert unit.compare_and_save_assignment(assignment, acknowledged) is True
+    with repository.transaction() as unit:
+        assert unit.compare_and_save_assignment(assignment, stale_reminder) is False
+
+    assert repository.get_assignment(assignment.assignment_id) == acknowledged
+
+
+def test_review_append_event_once_treats_exact_duplicate_as_inert(
+    tmp_path, sample_mandate, now
+) -> None:
+    database_path = tmp_path / "event-review-once.db"
+    repository = SqlAlchemyHumanWireRepository(
+        create_session_factory(f"sqlite:///{database_path.as_posix()}")
+    )
+    repository.add_mandate(sample_mandate)
+    event = DomainEvent(
+        event_type="outreach.delivery_confirmed",
+        created_at=now,
+        idempotency_key="delivery:review:result:one",
+        metadata={"delivery_id": "a" * 48, "outcome": "success"},
+    )
+
+    with repository.transaction() as unit:
+        assert unit.append_event_once(sample_mandate.mandate_id, event) is True
+    with repository.transaction() as unit:
+        assert unit.append_event_once(sample_mandate.mandate_id, event) is False
+
+    assert repository.list_events(sample_mandate.mandate_id) == [event]

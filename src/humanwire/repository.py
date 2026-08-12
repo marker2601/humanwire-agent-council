@@ -5,7 +5,8 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import insert, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -435,13 +436,21 @@ def _package_value(record: MeetingPackageRecord) -> MeetingPackage:
 
 _EVENT_BOOLEAN_KEYS = frozenset({"calendar_written", "fallback", "safe"})
 _EVENT_INTEGER_KEYS = frozenset(
-    {"attempt", "attempt_count", "duration_ms", "question_index", "round_number"}
+    {
+        "attempt",
+        "attempt_count",
+        "duration_ms",
+        "question_index",
+        "round_number",
+        "route_index",
+    }
 )
 _EVENT_IDENTIFIER_KEYS = frozenset(
     {
         "actor_id",
         "analyzer",
         "assignment_id",
+        "delivery_id",
         "error_code",
         "evidence_id",
         "issue_id",
@@ -452,6 +461,7 @@ _EVENT_IDENTIFIER_KEYS = frozenset(
         "person_id",
         "proposal_id",
         "reason_code",
+        "route_fingerprint",
         "route_id",
         "status",
     }
@@ -573,6 +583,36 @@ class RepositoryUnitOfWork:
             raise KeyError(str(assignment.assignment_id))
         _copy_columns(_assignment_record(assignment), record, {"assignment_id"})
 
+    def compare_and_save_assignment(
+        self,
+        expected: StakeholderAssignment,
+        updated: StakeholderAssignment,
+    ) -> bool:
+        """Save only while the persisted lifecycle snapshot still matches the caller's read."""
+        if expected.assignment_id != updated.assignment_id:
+            raise ValueError("assignment compare-and-save requires one assignment")
+        replacement = _assignment_record(updated)
+        values = {
+            column.key: getattr(replacement, column.key)
+            for column in replacement.__table__.columns
+            if column.key != "assignment_id"
+        }
+        result = self._session.execute(
+            update(StakeholderAssignmentRecord)
+            .where(
+                StakeholderAssignmentRecord.assignment_id == str(expected.assignment_id),
+                StakeholderAssignmentRecord.state == expected.state.value,
+                StakeholderAssignmentRecord.attempt_count == expected.attempt_count,
+                StakeholderAssignmentRecord.active_route_index
+                == expected.active_route_index,
+                StakeholderAssignmentRecord.interview_id
+                == (str(expected.interview_id) if expected.interview_id else None),
+            )
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        return result.rowcount == 1
+
     def add_interview(self, interview: InterviewSession) -> None:
         assignment = self._session.get(StakeholderAssignmentRecord, str(interview.assignment_id))
         if assignment is None:
@@ -670,6 +710,54 @@ class RepositoryUnitOfWork:
 
     def append_event(self, mandate_id: UUID, event: DomainEvent) -> None:
         self._session.add(_event_record(mandate_id, event))
+
+    def append_event_once(self, mandate_id: UUID, event: DomainEvent) -> bool:
+        """Append exactly once; an exact concurrent duplicate is inert."""
+        record = _event_record(mandate_id, event)
+        values = {
+            "mandate_id": record.mandate_id,
+            "event_type": record.event_type,
+            "created_at": record.created_at,
+            "idempotency_key": record.idempotency_key,
+            "actor_id": record.actor_id,
+            "assignment_id": record.assignment_id,
+            "person_id": record.person_id,
+            "department": record.department,
+            "direction": record.direction,
+            "channel": record.channel,
+            "previous_state": record.previous_state,
+            "new_state": record.new_state,
+            "event_metadata": record.event_metadata,
+        }
+        bind = self._session.get_bind()
+        if bind.dialect.name == "sqlite":
+            statement = (
+                sqlite_insert(DomainEventRecord)
+                .values(**values)
+                .on_conflict_do_nothing(index_elements=[DomainEventRecord.idempotency_key])
+            )
+            result = self._session.execute(statement)
+            if result.rowcount == 1:
+                return True
+        else:
+            try:
+                with self._session.begin_nested():
+                    self._session.execute(insert(DomainEventRecord).values(**values))
+                return True
+            except IntegrityError:
+                self._session.expire_all()
+        existing = self._session.scalar(
+            select(DomainEventRecord).where(
+                DomainEventRecord.idempotency_key == event.idempotency_key
+            )
+        )
+        if (
+            existing is not None
+            and existing.mandate_id == str(mandate_id)
+            and _event_value(existing) == event
+        ):
+            return False
+        raise ValueError(f"event idempotency key conflicts: {event.idempotency_key}")
 
     def set_runtime_status(self, key: str, value: str, updated_at: datetime) -> None:
         record = self._session.get(RuntimeStatusRecord, key)

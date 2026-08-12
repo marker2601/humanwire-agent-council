@@ -391,9 +391,14 @@ def test_delivery_success_is_idempotent(coordinator, repository, mandate, now) -
     assignment = _assignment(mandate)
     repository.add_assignment(assignment)
     coordinator.start_assignment(assignment, ["One?"], now)
+    delivery_id = next(
+        event.metadata["delivery_id"]
+        for event in repository.list_events(mandate.mandate_id)
+        if event.event_type == "outreach.primary_sent"
+    )
 
-    coordinator.mark_delivery_success(assignment.assignment_id, "delivery-1", now)
-    coordinator.mark_delivery_success(assignment.assignment_id, "delivery-1", now)
+    coordinator.mark_delivery_success(assignment.assignment_id, delivery_id, now)
+    coordinator.mark_delivery_success(assignment.assignment_id, delivery_id, now)
 
     events = repository.list_events(mandate.mandate_id)
     assert [event.event_type for event in events].count("outreach.delivery_confirmed") == 1

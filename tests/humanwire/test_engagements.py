@@ -1,3 +1,7 @@
+import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import timedelta
 from uuid import uuid4
@@ -212,6 +216,37 @@ def _prepare(
     return prepared
 
 
+def _provider_delivery_id(delivery) -> str:
+    source = delivery.message_id or "|".join(
+        [
+            delivery.kind.value,
+            delivery.recipient or "",
+            delivery.conversation_id or "",
+            str(delivery.assignment_id),
+        ]
+    )
+    return hashlib.sha256(source.encode()).hexdigest()[:48]
+
+
+def _file_repository(tmp_path) -> SqlAlchemyHumanWireRepository:
+    database_path = tmp_path / f"engagement-review-{uuid4().hex}.db"
+    factory = create_session_factory(f"sqlite:///{database_path.as_posix()}")
+    with factory.kw["bind"].begin() as connection:
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        connection.exec_driver_sql("PRAGMA busy_timeout=5000")
+    return SqlAlchemyHumanWireRepository(factory)
+
+
+def _file_coordinator(directory, repository) -> EngagementCoordinator:
+    return EngagementCoordinator(
+        directory,
+        repository,
+        StakeholderStateMachine(),
+        RuleBasedEvidenceExtractor(),
+        Settings(acknowledgement_seconds=60, reminder_seconds=30),
+    )
+
+
 def test_inform_prepares_one_delivery_and_completes_only_after_provider_success(
     coordinator, repository, mandate, now
 ) -> None:
@@ -229,7 +264,11 @@ def test_inform_prepares_one_delivery_and_completes_only_after_provider_success(
     assert before_callback.next_action_at is None
     assert repository.list_interviews(mandate.mandate_id) == []
 
-    coordinator.mark_delivery_success(assignment.assignment_id, "provider-inform-1", now)
+    coordinator.mark_delivery_success(
+        assignment.assignment_id,
+        _provider_delivery_id(prepared.delivery),
+        now,
+    )
 
     saved = repository.get_assignment(assignment.assignment_id)
     assert saved is not None
@@ -245,13 +284,14 @@ def test_inform_provider_failure_advances_once_then_success_is_replay_safe(
     coordinator, repository, mandate, now
 ) -> None:
     assignment = _assignment(mandate, EngagementType.INFORM)
-    _prepare(coordinator, repository, mandate, assignment, [], now)
+    prepared = _prepare(coordinator, repository, mandate, assignment, [], now)
+    primary_delivery_id = _provider_delivery_id(prepared.delivery)
 
     first = coordinator.mark_delivery_failure(
-        assignment.assignment_id, "provider-primary", now
+        assignment.assignment_id, primary_delivery_id, now
     )
     duplicate_failure = coordinator.mark_delivery_failure(
-        assignment.assignment_id, "provider-primary", now
+        assignment.assignment_id, primary_delivery_id, now
     )
 
     alternate = repository.get_assignment(assignment.assignment_id)
@@ -267,8 +307,13 @@ def test_inform_provider_failure_advances_once_then_success_is_replay_safe(
     assert "tg-priya" not in first.deliveries[0].text
     assert duplicate_failure.deliveries == []
 
-    coordinator.mark_delivery_success(assignment.assignment_id, "provider-alternate", now)
-    coordinator.mark_delivery_success(assignment.assignment_id, "provider-alternate", now)
+    alternate_delivery_id = _provider_delivery_id(first.deliveries[0])
+    coordinator.mark_delivery_success(
+        assignment.assignment_id, alternate_delivery_id, now
+    )
+    coordinator.mark_delivery_success(
+        assignment.assignment_id, alternate_delivery_id, now
+    )
 
     saved = repository.get_assignment(assignment.assignment_id)
     events = repository.list_events(mandate.mandate_id)
@@ -284,10 +329,12 @@ def test_inform_exhausted_routes_truthfully_marks_delivery_failed_and_notifies_o
     assignment = _assignment(
         mandate, EngagementType.INFORM, route_ids=["email-priya"]
     )
-    _prepare(coordinator, repository, mandate, assignment, [], now)
+    prepared = _prepare(coordinator, repository, mandate, assignment, [], now)
 
     result = coordinator.mark_delivery_failure(
-        assignment.assignment_id, "provider-only-route", now
+        assignment.assignment_id,
+        _provider_delivery_id(prepared.delivery),
+        now,
     )
 
     saved = repository.get_assignment(assignment.assignment_id)
@@ -307,7 +354,11 @@ def test_acknowledgement_completes_on_exact_registered_ack_without_question_or_e
     assignment = _assignment(mandate, EngagementType.ACKNOWLEDGE)
     prepared = _prepare(coordinator, repository, mandate, assignment, [], now)
 
-    coordinator.mark_delivery_success(assignment.assignment_id, "provider-ack", now)
+    coordinator.mark_delivery_success(
+        assignment.assignment_id,
+        _provider_delivery_id(prepared.delivery),
+        now,
+    )
     after_delivery = repository.get_assignment(assignment.assignment_id)
     assert prepared.interview is None
     assert prepared.delivery.text.startswith("HUMANWIRE ACKNOWLEDGEMENT")
@@ -739,3 +790,244 @@ def test_persist_prepared_rolls_back_assignment_interview_and_events_together(
     assert repository.get_assignment(assignment.assignment_id) == assignment
     assert repository.list_interviews(mandate.mandate_id) == []
     assert repository.list_events(mandate.mandate_id) == []
+
+
+def test_review_route_delivery_persists_stable_current_attempt_correlation(
+    directory, mandate, now, tmp_path
+) -> None:
+    repository = _file_repository(tmp_path)
+    coordinator = _file_coordinator(directory, repository)
+    assignment = _assignment(mandate, EngagementType.QUICK_RESPONSE)
+    prepared = _prepare(
+        coordinator,
+        repository,
+        mandate,
+        assignment,
+        ["Committed date?"],
+        now,
+    )
+
+    sent = repository.list_events(mandate.mandate_id)[0]
+    assert prepared.delivery.message_id is not None
+    assert sent.metadata == {
+        "attempt": 1,
+        "delivery_id": _provider_delivery_id(prepared.delivery),
+        "route_fingerprint": sent.metadata["route_fingerprint"],
+        "route_index": 0,
+    }
+    assert len(sent.metadata["route_fingerprint"]) == 32
+    assert "email-priya" not in sent.metadata["route_fingerprint"]
+    assert "priya@example.test" not in str(sent.metadata)
+
+
+def test_review_late_question_delivery_failure_after_interviewing_is_inert(
+    directory, mandate, now, tmp_path
+) -> None:
+    repository = _file_repository(tmp_path)
+    coordinator = _file_coordinator(directory, repository)
+    assignment = _assignment(mandate, EngagementType.QUICK_RESPONSE)
+    prepared = _prepare(
+        coordinator,
+        repository,
+        mandate,
+        assignment,
+        ["Committed date?"],
+        now,
+    )
+    coordinator.acknowledge(
+        _message(now, message_id="review-late-ack", text="ACK HW-2411"),
+        assignment,
+        now,
+    )
+    before = repository.get_assignment(assignment.assignment_id)
+    event_count = len(repository.list_events(mandate.mandate_id))
+
+    result = coordinator.mark_delivery_failure(
+        assignment.assignment_id,
+        _provider_delivery_id(prepared.delivery),
+        now + timedelta(seconds=1),
+    )
+
+    assert result.deliveries == []
+    assert repository.get_assignment(assignment.assignment_id) == before
+    assert len(repository.list_events(mandate.mandate_id)) == event_count
+
+
+def test_review_stale_primary_failure_cannot_exhaust_active_alternate(
+    directory, mandate, now, tmp_path
+) -> None:
+    repository = _file_repository(tmp_path)
+    coordinator = _file_coordinator(directory, repository)
+    assignment = _assignment(mandate, EngagementType.STRUCTURED_INTERVIEW)
+    prepared = _prepare(
+        coordinator,
+        repository,
+        mandate,
+        assignment,
+        ["Fact?", "Constraint?", "Commitment?"],
+        now,
+    )
+    coordinator.process_due_assignment(assignment, now + timedelta(seconds=60))
+    coordinator.process_due_assignment(assignment, now + timedelta(seconds=90))
+    before = repository.get_assignment(assignment.assignment_id)
+    event_count = len(repository.list_events(mandate.mandate_id))
+
+    result = coordinator.mark_delivery_failure(
+        assignment.assignment_id,
+        _provider_delivery_id(prepared.delivery),
+        now + timedelta(seconds=91),
+    )
+
+    assert result.deliveries == []
+    assert repository.get_assignment(assignment.assignment_id) == before
+    assert len(repository.list_events(mandate.mandate_id)) == event_count
+
+
+def test_review_unmatched_question_callback_is_inert(
+    directory, mandate, now, tmp_path
+) -> None:
+    repository = _file_repository(tmp_path)
+    coordinator = _file_coordinator(directory, repository)
+    assignment = _assignment(mandate, EngagementType.QUICK_RESPONSE)
+    _prepare(
+        coordinator,
+        repository,
+        mandate,
+        assignment,
+        ["Committed date?"],
+        now,
+    )
+    before = repository.get_assignment(assignment.assignment_id)
+    event_count = len(repository.list_events(mandate.mandate_id))
+
+    result = coordinator.mark_delivery_failure(
+        assignment.assignment_id,
+        "0" * 48,
+        now,
+    )
+
+    assert result.deliveries == []
+    assert repository.get_assignment(assignment.assignment_id) == before
+    assert len(repository.list_events(mandate.mandate_id)) == event_count
+
+
+def test_review_threaded_duplicate_same_callback_is_inert(
+    directory, mandate, now, tmp_path, monkeypatch
+) -> None:
+    repository = _file_repository(tmp_path)
+    coordinator = _file_coordinator(directory, repository)
+    assignment = _assignment(mandate, EngagementType.ACKNOWLEDGE)
+    prepared = _prepare(coordinator, repository, mandate, assignment, [], now)
+    delivery_id = _provider_delivery_id(prepared.delivery)
+    original_transaction = repository.transaction
+    writers_ready = threading.Barrier(2)
+
+    @contextmanager
+    def synchronized_transaction():
+        writers_ready.wait(timeout=5)
+        with original_transaction() as unit:
+            yield unit
+
+    monkeypatch.setattr(repository, "transaction", synchronized_transaction)
+
+    def callback() -> None:
+        coordinator.mark_delivery_success(assignment.assignment_id, delivery_id, now)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(lambda _: callback(), range(2)))
+
+    events = repository.list_events(mandate.mandate_id)
+    assert [event.event_type for event in events].count("outreach.delivery_confirmed") == 1
+
+
+def test_review_threaded_duplicate_exact_ack_is_inert(
+    directory, mandate, now, tmp_path, monkeypatch
+) -> None:
+    repository = _file_repository(tmp_path)
+    coordinator = _file_coordinator(directory, repository)
+    assignment = _assignment(mandate, EngagementType.ACKNOWLEDGE)
+    _prepare(coordinator, repository, mandate, assignment, [], now)
+    acknowledgement = _message(
+        now,
+        message_id="review-threaded-same-ack",
+        text="ACK HW-2411",
+    )
+    original_transaction = repository.transaction
+    writers_ready = threading.Barrier(2)
+
+    @contextmanager
+    def synchronized_transaction():
+        writers_ready.wait(timeout=5)
+        with original_transaction() as unit:
+            yield unit
+
+    monkeypatch.setattr(repository, "transaction", synchronized_transaction)
+
+    def acknowledge():
+        return coordinator.acknowledge(acknowledgement, assignment, now)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(lambda _: acknowledge(), range(2)))
+
+    assert sum(len(result.deliveries) for result in outcomes) == 0
+    saved = repository.get_assignment(assignment.assignment_id)
+    assert saved is not None
+    assert saved.state is StakeholderState.COMPLETE
+    events = repository.list_events(mandate.mandate_id)
+    assert [event.event_type for event in events].count("stakeholder.acknowledged") == 1
+
+
+def test_review_due_worker_losing_to_ack_cannot_resurrect_complete_or_send_reminder(
+    directory, mandate, now, tmp_path, monkeypatch
+) -> None:
+    repository = _file_repository(tmp_path)
+    coordinator = _file_coordinator(directory, repository)
+    assignment = _assignment(mandate, EngagementType.ACKNOWLEDGE)
+    _prepare(coordinator, repository, mandate, assignment, [], now)
+    acknowledgement = _message(
+        now,
+        message_id="review-due-race-ack",
+        text="ACK HW-2411",
+    )
+    original_transaction = repository.transaction
+    due_waiting = threading.Event()
+    acknowledgement_committed = threading.Event()
+    role = threading.local()
+
+    @contextmanager
+    def ordered_transaction():
+        if getattr(role, "name", None) == "due":
+            due_waiting.set()
+            assert acknowledgement_committed.wait(timeout=5)
+        with original_transaction() as unit:
+            yield unit
+        if getattr(role, "name", None) == "ack":
+            acknowledgement_committed.set()
+
+    monkeypatch.setattr(repository, "transaction", ordered_transaction)
+
+    def run_due():
+        role.name = "due"
+        return coordinator.process_due_assignment(
+            assignment,
+            now + timedelta(seconds=60),
+        )
+
+    def run_ack():
+        role.name = "ack"
+        assert due_waiting.wait(timeout=5)
+        return coordinator.acknowledge(acknowledgement, assignment, now)
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="review") as executor:
+        due_future = executor.submit(run_due)
+        ack_future = executor.submit(run_ack)
+        due_result = due_future.result(timeout=10)
+        ack_result = ack_future.result(timeout=10)
+
+    saved = repository.get_assignment(assignment.assignment_id)
+    assert ack_result.deliveries == []
+    assert due_result.deliveries == []
+    assert saved is not None
+    assert saved.state is StakeholderState.COMPLETE
+    events = repository.list_events(mandate.mandate_id)
+    assert [event.event_type for event in events].count("outreach.reminder_sent") == 0
