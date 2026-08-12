@@ -370,6 +370,47 @@ def test_model_failure_fallback_preserves_trusted_explicit_action(
     assert stakeholder.engagement_type is expected
 
 
+@pytest.mark.parametrize(
+    ("action", "expected"),
+    [
+        ("Interview", EngagementType.STRUCTURED_INTERVIEW),
+        ("Approve", EngagementType.REVIEW_APPROVAL),
+        ("Notify", EngagementType.INFORM),
+        ("Schedule", EngagementType.AVAILABILITY),
+    ],
+)
+@pytest.mark.parametrize("failure", ["timeout", "invalid_schema", "policy"])
+def test_public_fallback_never_discovers_people_only_named_in_objective(
+    directory,
+    manager,
+    action: str,
+    expected: EngagementType,
+    failure: str,
+) -> None:
+    objective = (
+        f"{action} US Team Lead about the mandate. "
+        f"{action} APAC Team Lead about the mandate."
+    )
+
+    class FailingClient:
+        def complete_json(self, system: str, user: str) -> dict:
+            if failure == "timeout":
+                raise ModelFailure("timeout")
+            if failure == "invalid_schema":
+                return {"objective": "missing exact schema"}
+            return _model_plan("us-lead")
+
+    result = FeatherlessMandatePlanner(FailingClient(), directory).plan_public(
+        _public_projection("US Team Lead", objective=objective), manager
+    )
+
+    assert result.planner == "rules"
+    assert result.fallback_reason == ("timeout" if failure == "timeout" else "invalid_schema")
+    assert [person.person_id for person in result.people] == ["us-lead"]
+    assert [stakeholder.person_ref for stakeholder in result.plan.stakeholders] == ["us-lead"]
+    assert result.plan.stakeholders[0].engagement_type is expected
+
+
 def test_raw_mandate_text_never_calls_the_model(directory, manager) -> None:
     transport_calls: list[httpx.Request] = []
 
