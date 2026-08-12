@@ -28,6 +28,7 @@ from humanwire.domain import (
     Person,
     StakeholderAssignment,
     StakeholderState,
+    WorkflowResult,
 )
 from humanwire.engagements import EngagementCoordinator
 from humanwire.evidence import RuleBasedEvidenceExtractor
@@ -1205,6 +1206,105 @@ def test_terminal_mandate_commit_wins_before_explicit_response_uow(
     assert result.deliveries == []
     assert saved_mandate is not None and saved_mandate.state is terminal_state
     assert repository.get_assignment(assignment.assignment_id) == before_assignment
+    assert repository.list_engagement_decisions(mandate.mandate_id) == []
+    assert repository.list_evidence(mandate.mandate_id) == before_evidence
+    assert repository.list_events(mandate.mandate_id) == before_events
+    assert repository.get_runtime_status(
+        f"availability:{mandate.mandate_id}:priya"
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ("field", "changed_value"),
+    [
+        ("engagement_type", EngagementType.ACKNOWLEDGE),
+        ("response_required", False),
+        ("person_id", "stranger"),
+        ("route_ids", ["telegram-priya"]),
+    ],
+)
+@pytest.mark.parametrize(
+    "response_kind",
+    [EngagementType.REVIEW_APPROVAL, EngagementType.AVAILABILITY],
+)
+def test_explicit_response_loses_authorization_contract_change_after_validation(
+    directory,
+    mandate,
+    now,
+    tmp_path,
+    monkeypatch,
+    field,
+    changed_value,
+    response_kind,
+) -> None:
+    repository = _file_repository(tmp_path)
+    coordinator = _file_coordinator(directory, repository)
+    assignment = _assignment(mandate, response_kind)
+    _prepare(coordinator, repository, mandate, assignment, [], now)
+    expected = repository.get_assignment(assignment.assignment_id)
+    assert expected is not None
+    changed = expected.model_copy(update={field: changed_value})
+    before_events = repository.list_events(mandate.mandate_id)
+    before_evidence = repository.list_evidence(mandate.mandate_id)
+    original_transaction = repository.transaction
+    response_validated = threading.Event()
+    contract_committed = threading.Event()
+    role = threading.local()
+
+    @contextmanager
+    def contract_first_transaction():
+        if getattr(role, "name", None) == "response":
+            response_validated.set()
+            assert contract_committed.wait(timeout=5)
+        with original_transaction() as unit:
+            yield unit
+
+    monkeypatch.setattr(repository, "transaction", contract_first_transaction)
+
+    def respond():
+        role.name = "response"
+        if response_kind is EngagementType.REVIEW_APPROVAL:
+            message = _message(
+                now,
+                message_id=f"contract-race-{field}-decision",
+                text="DECIDE HW-2411 APPROVE",
+            )
+            return coordinator.record_decision(
+                message,
+                assignment,
+                _decision(message.text),
+                now,
+            )
+        windows = _availability_windows()
+        text = "AVAILABLE HW-2411 " + " ".join(
+            f"{window.start.isoformat()}/{window.end.isoformat()}"
+            for window in windows
+        )
+        return coordinator.record_availability(
+            _message(
+                now,
+                message_id=f"contract-race-{field}-availability",
+                text=text,
+            ),
+            assignment,
+            windows,
+            now,
+        )
+
+    def change_contract() -> None:
+        assert response_validated.wait(timeout=5)
+        with original_transaction() as unit:
+            assert unit.compare_and_save_assignment(expected, changed) is True
+        contract_committed.set()
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="contract-response") as executor:
+        response_future = executor.submit(respond)
+        contract_future = executor.submit(change_contract)
+        result = response_future.result(timeout=10)
+        contract_future.result(timeout=10)
+
+    assert result == WorkflowResult()
+    assert repository.get_assignment(assignment.assignment_id) == changed
     assert repository.list_engagement_decisions(mandate.mandate_id) == []
     assert repository.list_evidence(mandate.mandate_id) == before_evidence
     assert repository.list_events(mandate.mandate_id) == before_events

@@ -473,14 +473,17 @@ class HumanWireWorkflow:
             channel=message.channel,
             metadata={"attempt_count": len(command.windows)},
         )
-        with self.repository.transaction() as unit:
-            if not unit.append_event_once(mandate.mandate_id, event):
-                return WorkflowResult()
-            unit.set_runtime_status(
-                f"availability:{mandate.mandate_id}:{person.person_id}",
-                json_windows(command),
-                message.received_at,
-            )
+        try:
+            with self.repository.transaction() as unit:
+                if not unit.append_event_once(mandate.mandate_id, event):
+                    return WorkflowResult()
+                unit.set_runtime_status(
+                    f"availability:{mandate.mandate_id}:{person.person_id}",
+                    json_windows(command),
+                    message.received_at,
+                )
+        except ValueError:
+            return WorkflowResult()
         return self._try_schedule(mandate, message.received_at)
 
     def _try_schedule(self, mandate, now: datetime) -> WorkflowResult:

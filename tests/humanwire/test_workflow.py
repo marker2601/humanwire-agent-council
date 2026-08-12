@@ -1,3 +1,6 @@
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import timedelta
 from uuid import uuid4
 
@@ -1549,6 +1552,156 @@ def test_scheduling_availability_same_count_conflicting_replay_is_inert(
 
     assert result.deliveries == []
     assert _terminal_snapshot(repository, mandate) == before
+
+
+def test_scheduling_availability_different_count_conflicting_replay_is_inert(
+    repository, incoming_message_factory
+) -> None:
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _create_mandate(
+        workflow,
+        incoming_message_factory,
+        message_id="schedule-count-conflict-create",
+    )
+    _move_to_scheduling(repository, mandate)
+    first_window = "2026-08-12T15:00:00+00:00/2026-08-12T16:00:00+00:00"
+    message = _message_for(
+        incoming_message_factory,
+        "team-lead",
+        f"AVAILABLE {mandate.token} {first_window}",
+        message_id="schedule-count-conflicting-availability",
+        conversation_id="lead-thread",
+    )
+    workflow.handle(message)
+    before = _terminal_snapshot(repository, mandate)
+    conflicting = message.model_copy(
+        update={
+            "text": (
+                f"AVAILABLE {mandate.token} {first_window} "
+                "2026-08-13T15:00:00+00:00/2026-08-13T16:00:00+00:00"
+            )
+        }
+    )
+
+    result = workflow.handle(conflicting)
+
+    assert result == WorkflowResult()
+    assert _terminal_snapshot(repository, mandate) == before
+
+
+def test_scheduling_availability_changed_receipt_time_replay_is_inert(
+    repository, incoming_message_factory
+) -> None:
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _create_mandate(
+        workflow,
+        incoming_message_factory,
+        message_id="schedule-received-at-conflict-create",
+    )
+    _move_to_scheduling(repository, mandate)
+    window = "2026-08-12T15:00:00+00:00/2026-08-12T16:00:00+00:00"
+    message = _message_for(
+        incoming_message_factory,
+        "team-lead",
+        f"AVAILABLE {mandate.token} {window}",
+        message_id="schedule-received-at-conflicting-availability",
+        conversation_id="lead-thread",
+    )
+    workflow.handle(message)
+    before = _terminal_snapshot(repository, mandate)
+    replay = message.model_copy(
+        update={"received_at": message.received_at + timedelta(seconds=1)}
+    )
+
+    result = workflow.handle(replay)
+
+    assert result == WorkflowResult()
+    assert _terminal_snapshot(repository, mandate) == before
+
+
+def test_file_scheduling_concurrent_conflicting_replay_preserves_first_windows(
+    tmp_path, incoming_message_factory, monkeypatch
+) -> None:
+    database_path = tmp_path / "scheduling-conflicting-replay.sqlite3"
+    factory = create_session_factory(f"sqlite:///{database_path.as_posix()}")
+    with factory.kw["bind"].begin() as connection:
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        connection.exec_driver_sql("PRAGMA busy_timeout=5000")
+    repository = SqlAlchemyHumanWireRepository(factory)
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _create_mandate(
+        workflow,
+        incoming_message_factory,
+        message_id="schedule-concurrent-conflict-create",
+    )
+    _move_to_scheduling(repository, mandate)
+    first_window = "2026-08-12T15:00:00+00:00/2026-08-12T16:00:00+00:00"
+    first = _message_for(
+        incoming_message_factory,
+        "team-lead",
+        f"AVAILABLE {mandate.token} {first_window}",
+        message_id="schedule-concurrent-conflicting-availability",
+        conversation_id="lead-thread",
+    )
+    conflicting = first.model_copy(
+        update={
+            "text": (
+                f"AVAILABLE {mandate.token} "
+                "2026-08-13T15:00:00+00:00/2026-08-13T16:00:00+00:00 "
+                "2026-08-14T15:00:00+00:00/2026-08-14T16:00:00+00:00"
+            )
+        }
+    )
+    original_transaction = repository.transaction
+    conflicting_validated = threading.Event()
+    first_committed = threading.Event()
+    role = threading.local()
+
+    @contextmanager
+    def first_wins_transaction():
+        if getattr(role, "name", None) == "first":
+            assert conflicting_validated.wait(timeout=5)
+        elif getattr(role, "name", None) == "conflicting":
+            conflicting_validated.set()
+            assert first_committed.wait(timeout=5)
+        with original_transaction() as unit:
+            yield unit
+        if getattr(role, "name", None) == "first":
+            first_committed.set()
+
+    monkeypatch.setattr(repository, "transaction", first_wins_transaction)
+
+    def record_first():
+        role.name = "first"
+        return workflow.handle(first)
+
+    def record_conflicting():
+        role.name = "conflicting"
+        return workflow.handle(conflicting)
+
+    with ThreadPoolExecutor(
+        max_workers=2,
+        thread_name_prefix="scheduling-conflict",
+    ) as executor:
+        first_future = executor.submit(record_first)
+        conflicting_future = executor.submit(record_conflicting)
+        results = [
+            first_future.result(timeout=10),
+            conflicting_future.result(timeout=10),
+        ]
+
+    recorded = [
+        event
+        for event in repository.list_events(mandate.mandate_id)
+        if event.event_type == "availability.recorded"
+    ]
+    stored = repository.get_runtime_status(
+        f"availability:{mandate.mandate_id}:team-lead"
+    )
+    assert results == [WorkflowResult(), WorkflowResult()]
+    assert stored is not None and stored[0] == first_window
+    assert len(recorded) == 1
+    assert recorded[0].metadata == {"attempt_count": 1}
 
 
 def test_scheduling_availability_identity_includes_channel_connection_and_message(

@@ -645,6 +645,12 @@ class RepositoryUnitOfWork:
                 StakeholderAssignmentRecord.assignment_id
                 == str(expected.assignment_id),
                 StakeholderAssignmentRecord.mandate_id == str(expected.mandate_id),
+                StakeholderAssignmentRecord.engagement_type
+                == expected.engagement_type.value,
+                StakeholderAssignmentRecord.response_required
+                == expected.response_required,
+                StakeholderAssignmentRecord.person_id == expected.person_id,
+                StakeholderAssignmentRecord.route_ids == expected.route_ids,
                 StakeholderAssignmentRecord.state == expected.state.value,
                 StakeholderAssignmentRecord.attempt_count == expected.attempt_count,
                 StakeholderAssignmentRecord.active_route_index

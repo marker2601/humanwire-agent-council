@@ -1033,6 +1033,52 @@ def test_mandate_coupled_assignment_cas_requires_active_unexpired_mandate(
     )
 
 
+@pytest.mark.parametrize(
+    ("field", "changed_value"),
+    [
+        ("engagement_type", domain.EngagementType.AVAILABILITY),
+        ("response_required", False),
+        ("person_id", "replacement-person"),
+        ("route_ids", ["replacement-route"]),
+    ],
+)
+def test_mandate_coupled_assignment_cas_rejects_changed_authorization_contract(
+    repository,
+    sample_mandate,
+    make_assignment,
+    now,
+    field,
+    changed_value,
+) -> None:
+    assignment = make_assignment(
+        engagement_type=domain.EngagementType.REVIEW_APPROVAL,
+        response_required=True,
+        person_id="team-lead",
+        route_ids=["team-lead-email", "team-lead-telegram"],
+    )
+    changed = assignment.model_copy(update={field: changed_value})
+    completed = assignment.model_copy(
+        update={
+            "state": StakeholderState.COMPLETE,
+            "completed_at": now,
+            "next_action_at": None,
+        }
+    )
+    repository.add_mandate(sample_mandate)
+    repository.add_assignment(assignment)
+    repository.save_assignment(changed)
+
+    with repository.transaction() as unit:
+        saved = unit.compare_and_save_assignment_if_mandate_active(
+            assignment,
+            completed,
+            now,
+        )
+
+    assert saved is False
+    assert repository.get_assignment(assignment.assignment_id) == changed
+
+
 def test_review_append_event_once_treats_exact_duplicate_as_inert(
     tmp_path, sample_mandate, now
 ) -> None:
