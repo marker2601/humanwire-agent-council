@@ -1,10 +1,11 @@
 """Channel-neutral text for HumanWire's stakeholder interview workflow."""
 
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import UTC, datetime
 
-from humanwire.domain import Proposal
+from humanwire.domain import MeetingPackage, Proposal
 from humanwire.evidence import ShareableEvidence
+from humanwire.redaction import redact_sensitive
 
 
 def render_interview_intro(
@@ -79,4 +80,50 @@ def render_proposal(
         f"Reply ACCEPT {token}\n"
         f"Reply REJECT {token}\n"
         f"Reply CHANGE {token} <requested change>"
+    )
+
+
+def render_availability_request(token: str, purpose: str) -> str:
+    """Ask for timezone-aware availability without exposing routes or private evidence."""
+    return (
+        f"HUMANWIRE AVAILABILITY REQUEST \u00b7 {token}\n\n"
+        f"Purpose: {redact_sensitive(purpose)}\n\n"
+        "Reply AVAILABLE "
+        f"{token} <start>/<end> [<start>/<end> ...] using ISO-8601 timestamps with offsets."
+    )
+
+
+def render_meeting_confirmation(
+    token: str,
+    package: MeetingPackage,
+    *,
+    acknowledged_attendee_ids: Iterable[str] = (),
+) -> str:
+    """Render a proposed meeting until every required attendee acknowledges its slot."""
+    acknowledged = set(acknowledged_attendee_ids)
+    confirmed = set(package.required_attendee_ids).issubset(acknowledged)
+    label = "Meeting confirmed" if confirmed else "Proposed meeting"
+    return (
+        f"HUMANWIRE {label.upper()} \u00b7 {token}\n\n"
+        f"{label}: {_slot_text(package)}\n"
+        f"Purpose: {redact_sensitive(package.purpose)}\n\n"
+        "Agenda:\n" + "\n".join(package.agenda)
+    )
+
+
+def render_meeting_reminder(token: str, package: MeetingPackage) -> str:
+    """Render a privacy-safe reminder for the local calendar artifact."""
+    return (
+        f"HUMANWIRE MEETING REMINDER \u00b7 {token}\n\n"
+        f"Proposed meeting: {_slot_text(package)}\n"
+        f"Purpose: {redact_sensitive(package.purpose)}"
+    )
+
+
+def _slot_text(package: MeetingPackage) -> str:
+    if package.proposed_start is None or package.proposed_end is None:
+        return "awaiting confirmed availability"
+    return (
+        f"{package.proposed_start.astimezone(UTC).isoformat()} to "
+        f"{package.proposed_end.astimezone(UTC).isoformat()}"
     )
