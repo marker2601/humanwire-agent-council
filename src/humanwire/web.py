@@ -79,8 +79,26 @@ def _redact(value: str | None) -> str | None:
 
 
 def _scrub_known_private(value: str, denied_values: frozenset[str]) -> str:
+    if value in denied_values:
+        return _PRIVATE_MARKER
     for private_value in sorted(denied_values, key=len, reverse=True):
-        value = value.replace(private_value, _PRIVATE_MARKER)
+        distinctive_embedded_value = (
+            len(private_value) >= 24
+            or (len(private_value) >= 16 and any(character.isspace() for character in private_value))
+            or (
+                len(private_value) >= 6
+                and any(character.isdigit() for character in private_value)
+                and not private_value.isalnum()
+            )
+        )
+        if distinctive_embedded_value:
+            start_boundary = r"(?<![A-Za-z0-9])" if private_value[0].isalnum() else ""
+            end_boundary = r"(?![A-Za-z0-9])" if private_value[-1].isalnum() else ""
+            value = re.sub(
+                start_boundary + re.escape(private_value) + end_boundary,
+                lambda _: _PRIVATE_MARKER,
+                value,
+            )
     return value
 
 
@@ -120,6 +138,8 @@ def _public_projection(
     if not isinstance(value, str):
         return value
     value = _scrub_known_private(value, denied_values)
+    if value == _PRIVATE_MARKER:
+        return value
     if field in _IDENTIFIER_FIELDS or (field is not None and field.endswith("_ids")):
         return value if _SAFE_IDENTIFIER.fullmatch(value) else "[REDACTED]"
     if field == "event_type":
@@ -399,19 +419,41 @@ def _verified_calendar(repository: Any, mandate: Mandate, current_time: datetime
             proposed_slot=slot,
             created_at=creation_event.created_at,
         )
-    return render_ics(rebuilt, coordinator)
+    calendar = render_ics(rebuilt, coordinator).decode("utf-8")
+    return "\r\n".join(
+        _scrub_known_private(line, denied_values) for line in calendar.split("\r\n")
+    ).encode("utf-8")
 
 
-def _html_page(title: str, payload: Any) -> HTMLResponse:
-    safe_title = html.escape(_public_projection(title))
+def _html_page(
+    title: str,
+    payload: Any,
+    denied_values: frozenset[str] = frozenset(),
+) -> HTMLResponse:
+    safe_title = html.escape(_public_projection(title, denied_values=denied_values))
     safe_payload = html.escape(
-        json.dumps(_public_projection(payload), sort_keys=True, separators=(",", ":"))
+        json.dumps(
+            _public_projection(payload, denied_values=denied_values),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     )
     return HTMLResponse(
         "<!doctype html><html><head>"
         f"<title>{safe_title}</title></head><body><main><h1>{safe_title}</h1>"
         f"<pre>{safe_payload}</pre></main></body></html>"
     )
+
+
+def _calendar_filename(token: str, denied_values: frozenset[str]) -> str:
+    candidate = f"{token}-meeting.ics"
+    if (
+        _SAFE_IDENTIFIER.fullmatch(token)
+        and _scrub_known_private(token, denied_values) == token
+        and _scrub_known_private(candidate, denied_values) == candidate
+    ):
+        return candidate
+    return "humanwire-meeting.ics"
 
 
 def create_app(
@@ -470,46 +512,61 @@ def create_app(
     @app.get("/", response_class=HTMLResponse)
     def home():
         def project():
-            return [
+            mandates = repository.list_recent_mandates()
+            corpora = {
+                mandate.mandate_id: _private_deny_values(repository, mandate)
+                for mandate in mandates
+            }
+            rows = [
                 _public_projection(
                     _mandate_summary(repository, item),
-                    denied_values=_private_deny_values(repository, item),
+                    denied_values=corpora[item.mandate_id],
                 )
-                for item in repository.list_recent_mandates()
+                for item in mandates
             ]
+            return rows, frozenset().union(*corpora.values()) if corpora else frozenset()
 
-        mandates = safe_projection(project)
-        return _html_page("HumanWire", mandates)
+        mandates, denied_values = safe_projection(project)
+        return _html_page("HumanWire", mandates, denied_values)
 
     @app.get("/mandates/{token}", response_class=HTMLResponse)
     def decision_room(token: str):
         mandate = load_mandate(token)
+        denied_values = _private_deny_values(repository, mandate)
+        public_token = _scrub_known_private(mandate.token, denied_values)
         return _html_page(
-            f"HumanWire {mandate.token}",
+            f"HumanWire {public_token}",
             safe_projection(lambda: _mandate_detail(repository, mandate), mandate),
+            denied_values,
         )
 
     @app.get("/mandates/{token}/reach", response_class=HTMLResponse)
     def reach(token: str):
         mandate = load_mandate(token)
+        denied_values = _private_deny_values(repository, mandate)
         rows = safe_projection(lambda: _stakeholders(repository, mandate), mandate)
         lanes = {
             direction: [row for row in rows if row["direction"] == direction]
             for direction in ("downward", "lateral", "upward", "external")
         }
-        return _html_page(f"HumanWire {mandate.token} Reach", lanes)
+        public_token = _scrub_known_private(mandate.token, denied_values)
+        return _html_page(f"HumanWire {public_token} Reach", lanes, denied_values)
 
     @app.get("/mandates/{token}/data", response_class=HTMLResponse)
     def data(token: str):
         mandate = load_mandate(token)
+        denied_values = _private_deny_values(repository, mandate)
+        public_token = _scrub_known_private(mandate.token, denied_values)
         return _html_page(
-            f"HumanWire {mandate.token} Data",
+            f"HumanWire {public_token} Data",
             safe_projection(lambda: _events(repository, mandate), mandate),
+            denied_values,
         )
 
     @app.get("/mandates/{token}/meeting.ics")
     def meeting_ics(token: str):
         mandate = load_mandate(token)
+        denied_values = _private_deny_values(repository, mandate)
         content = safe_projection(lambda: _verified_calendar(repository, mandate, now()), mandate)
         if content is None:
             raise HTTPException(status_code=404, detail="Not found")
@@ -518,8 +575,7 @@ def create_app(
             media_type="text/calendar; charset=utf-8",
             headers={
                 "Content-Disposition": (
-                    f'attachment; filename="{_public_projection(mandate.token, "token")}'
-                    '-meeting.ics"'
+                    f'attachment; filename="{_calendar_filename(mandate.token, denied_values)}"'
                 )
             },
         )

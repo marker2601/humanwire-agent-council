@@ -399,6 +399,127 @@ def test_private_evidence_text_is_denied_on_every_surface_but_public_text_remain
     assert anonymous_item["stakeholder_id"] is None
 
 
+def test_private_common_word_does_not_damage_independently_public_prose(demo_app) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assert mandate is not None
+    evidence = repository.list_evidence(mandate.mandate_id)
+    private = next(item for item in evidence if item.visibility == EvidenceVisibility.PRIVATE)
+    shareable = next(
+        item for item in evidence if item.visibility == EvidenceVisibility.SHAREABLE
+    )
+    distinctive = "The north conference room will be unavailable on Friday."
+    public_statement = "Approved public coverage remains available."
+    with repository._session_factory() as session:
+        session.execute(
+            update(EvidenceItemRecord)
+            .where(EvidenceItemRecord.evidence_id == str(private.evidence_id))
+            .values(statement="coverage", related_decision=distinctive)
+        )
+        session.execute(
+            update(EvidenceItemRecord)
+            .where(EvidenceItemRecord.evidence_id == str(shareable.evidence_id))
+            .values(statement=public_statement)
+        )
+        session.execute(
+            update(MandateRecord)
+            .where(MandateRecord.mandate_id == str(mandate.mandate_id))
+            .values(objective="coverage")
+        )
+        assignment_id = session.scalar(
+            StakeholderAssignmentRecord.__table__.select()
+            .with_only_columns(StakeholderAssignmentRecord.assignment_id)
+            .where(StakeholderAssignmentRecord.mandate_id == str(mandate.mandate_id))
+            .limit(1)
+        )
+        session.execute(
+            update(StakeholderAssignmentRecord)
+            .where(StakeholderAssignmentRecord.assignment_id == assignment_id)
+            .values(reason=f"Discuss {distinctive} after lunch.")
+        )
+        event_id = session.scalar(
+            DomainEventRecord.__table__.select()
+            .with_only_columns(DomainEventRecord.event_id)
+            .where(DomainEventRecord.mandate_id == str(mandate.mandate_id))
+            .limit(1)
+        )
+        session.execute(
+            update(DomainEventRecord)
+            .where(DomainEventRecord.event_id == event_id)
+            .values(event_metadata={"references": [{"status": distinctive}]})
+        )
+        session.commit()
+
+    client = TestClient(demo_app)
+    detail = client.get("/api/v1/mandates/HW-2411")
+    stakeholders = client.get("/api/v1/mandates/HW-2411/stakeholders")
+    events = client.get("/api/v1/mandates/HW-2411/outreach-events")
+    summary = client.get("/api/v1/mandates/HW-2411/evidence-summary")
+    serialized = "\n".join(
+        response.text for response in (detail, stakeholders, events, summary)
+    )
+
+    assert all(
+        response.status_code == 200 for response in (detail, stakeholders, events, summary)
+    )
+    assert detail.json()["objective"] == "[PRIVATE]"
+    assert public_statement in serialized
+    assert "APAC coverage requires a documented handoff." in serialized
+    assert distinctive not in serialized
+    assert "Discuss [PRIVATE] after lunch." in serialized
+    assert events.json()[0]["metadata"] == {"references": [{"status": "[PRIVATE]"}]}
+
+
+def test_private_token_and_meeting_id_are_removed_at_final_html_header_and_ics_boundary(
+    demo_app,
+) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2413")
+    assert mandate is not None
+    package = repository.get_meeting_package(mandate.mandate_id)
+    evidence = repository.list_evidence(mandate.mandate_id)
+    assignments = repository.list_assignments(mandate.mandate_id)
+    assert package is not None and evidence and assignments
+    meeting_id = str(package.meeting_id)
+    repository.add_evidence(
+        evidence[0].model_copy(
+            update={
+                "evidence_id": uuid4(),
+                "assignment_id": assignments[0].assignment_id,
+                "visibility": EvidenceVisibility.PRIVATE,
+                "statement": mandate.token,
+                "source_message_id": meeting_id,
+                "related_decision": meeting_id,
+            }
+        )
+    )
+
+    client = TestClient(demo_app)
+    html_response = client.get("/mandates/HW-2413")
+    json_response = client.get("/api/v1/mandates/HW-2413")
+    ics_response = client.get("/mandates/HW-2413/meeting.ics")
+    serialized = "\n".join(
+        response.text + json.dumps(dict(response.headers))
+        for response in (html_response, json_response, ics_response)
+    )
+
+    assert html_response.status_code == 200
+    assert json_response.status_code == 200
+    assert ics_response.status_code == 200
+    assert mandate.token not in serialized
+    assert meeting_id not in serialized
+    assert json_response.json()["token"] == "[PRIVATE]"
+    assert "HumanWire [PRIVATE]" in html_response.text
+    assert ics_response.headers["content-disposition"] == (
+        'attachment; filename="humanwire-meeting.ics"'
+    )
+    assert "\r" not in ics_response.headers["content-disposition"]
+    assert "\n" not in ics_response.headers["content-disposition"]
+    assert "BEGIN:VCALENDAR" in ics_response.text
+    assert "DTSTART:20260814T200000Z" in ics_response.text
+    assert "SUMMARY:Resolve the launch approval decision" in ics_response.text
+
+
 def test_list_filter_stakeholders_events_evidence_and_reach_are_persisted_projections(
     web_client,
 ) -> None:
