@@ -1,5 +1,5 @@
 import re
-from collections.abc import Generator
+from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -1154,6 +1154,56 @@ class RepositoryUnitOfWork:
             )
         ).all()
         return [_engagement_decision_value(record) for record in records]
+
+    def contribution_snapshot_matches(
+        self,
+        mandate_id: UUID,
+        *,
+        assignments: Sequence[StakeholderAssignment],
+        evidence: Sequence[EvidenceItem],
+        decisions: Sequence[EngagementDecision],
+        availability: Mapping[str, tuple[str, datetime] | None],
+    ) -> bool:
+        """Verify every synthesis authority input inside the fenced write transaction."""
+        assignment_records = self._session.scalars(
+            select(StakeholderAssignmentRecord)
+            .where(StakeholderAssignmentRecord.mandate_id == str(mandate_id))
+            .order_by(StakeholderAssignmentRecord.assignment_id)
+        ).all()
+        persisted_assignments = [_assignment_value(record) for record in assignment_records]
+        expected_assignments = sorted(assignments, key=lambda item: str(item.assignment_id))
+        if persisted_assignments != expected_assignments:
+            return False
+
+        evidence_records = self._session.scalars(
+            select(EvidenceItemRecord)
+            .where(EvidenceItemRecord.mandate_id == str(mandate_id))
+            .order_by(EvidenceItemRecord.created_at, EvidenceItemRecord.evidence_id)
+        ).all()
+        persisted_evidence = [_evidence_value(record) for record in evidence_records]
+        expected_evidence = sorted(
+            evidence,
+            key=lambda item: (item.created_at, str(item.evidence_id)),
+        )
+        if persisted_evidence != expected_evidence:
+            return False
+
+        if self.list_engagement_decisions(mandate_id) != sorted(
+            decisions,
+            key=lambda item: (item.created_at, str(item.decision_id)),
+        ):
+            return False
+
+        for key, expected in availability.items():
+            record = self._session.get(RuntimeStatusRecord, key)
+            persisted = (
+                None
+                if record is None
+                else (record.value, _utc(record.updated_at))
+            )
+            if persisted != expected:
+                return False
+        return True
 
     def save_meeting_package(self, package: MeetingPackage) -> None:
         record = self._session.get(MeetingPackageRecord, str(package.meeting_id))

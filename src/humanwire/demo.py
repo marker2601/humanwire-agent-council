@@ -19,6 +19,9 @@ from humanwire.domain import (
     Channel,
     Direction,
     DomainEvent,
+    EngagementDecision,
+    EngagementDecisionKind,
+    EngagementType,
     EvidenceItem,
     EvidenceStatus,
     EvidenceType,
@@ -91,7 +94,10 @@ def _assignment(
     reason: str,
     offset: int,
     *,
-    interview: bool = True,
+    engagement_type: EngagementType,
+    required: bool = True,
+    interview: bool,
+    active_route_index: int = 0,
 ) -> StakeholderAssignment:
     assignment_id = _id("assignment", f"{mandate.token}:{person_id}")
     started = mandate.created_at + timedelta(minutes=offset)
@@ -103,11 +109,13 @@ def _assignment(
         department=department,
         direction=direction,
         reason=reason,
-        required=True,
+        required=required,
+        engagement_type=engagement_type,
+        response_required=engagement_type is not EngagementType.INFORM,
         state=state,
         route_ids=[f"demo-route-{person_id}-primary", f"demo-route-{person_id}-alternate"],
-        active_route_index=1 if state is StakeholderState.ALTERNATE_CHANNEL else 0,
-        attempt_count=2 if state is StakeholderState.ALTERNATE_CHANNEL else 1,
+        active_route_index=active_route_index,
+        attempt_count=2 if active_route_index else 1,
         interview_id=_id("interview", f"{mandate.token}:{person_id}") if interview else None,
         first_contact_at=started,
         last_delivery_at=started + timedelta(minutes=2),
@@ -118,29 +126,47 @@ def _assignment(
         ),
         acknowledged_at=(
             started + timedelta(minutes=3)
-            if state in {StakeholderState.ACKNOWLEDGED, StakeholderState.INTERVIEWING, StakeholderState.COMPLETE}
+            if engagement_type is not EngagementType.INFORM
+            and state
+            in {
+                StakeholderState.ACKNOWLEDGED,
+                StakeholderState.INTERVIEWING,
+                StakeholderState.COMPLETE,
+            }
             else None
         ),
         completed_at=started + timedelta(minutes=8) if complete else None,
     )
 
 
-def _interview(mandate: Mandate, assignment: StakeholderAssignment) -> InterviewSession:
+def _interview(
+    mandate: Mandate,
+    assignment: StakeholderAssignment,
+    questions: list[str],
+    *,
+    current_question_index: int | None = None,
+    current_channel: Channel = Channel.EMAIL,
+) -> InterviewSession:
     completed = assignment.state is StakeholderState.COMPLETE
+    index = (
+        len(questions)
+        if completed
+        else (current_question_index if current_question_index is not None else 0)
+    )
     return InterviewSession(
         session_id=assignment.interview_id,
         mandate_id=mandate.mandate_id,
         assignment_id=assignment.assignment_id,
-        questions=["What constraint matters?", "What outcome can you support?"],
-        current_question_index=2 if completed else 0,
-        current_channel=(
-            Channel.TELEGRAM
-            if assignment.state is StakeholderState.ALTERNATE_CHANNEL
-            else Channel.EMAIL
-        ),
-        current_route_id=f"demo-route-{assignment.person_id}-primary",
+        questions=questions,
+        current_question_index=index,
+        current_channel=current_channel,
+        current_route_id=assignment.route_ids[assignment.active_route_index],
         current_conversation_id=f"demo-conversation-{assignment.person_id}",
-        channel_history=[Channel.EMAIL],
+        channel_history=(
+            [Channel.EMAIL, Channel.TELEGRAM]
+            if assignment.active_route_index
+            else [current_channel]
+        ),
         acknowledged_at=assignment.acknowledged_at,
         started_at=assignment.first_contact_at,
         updated_at=assignment.last_delivery_at,
@@ -182,7 +208,10 @@ def _seed_people(repository: SqlAlchemyHumanWireRepository) -> None:
         "arun-patel": ("Arun Patel", "Support Manager"),
         "eli-torres": ("Eli Torres", "US Team Lead"),
         "sora-kim": ("Sora Kim", "APAC Team Lead"),
-        "priya-raman": ("Priya Raman", "People Partner"),
+        "priya-shah": ("Priya Shah", "People Partner"),
+        "nora-chen": ("Nora Chen", "VP Support"),
+        "maya-brooks": ("Maya Brooks", "COO"),
+        "inez-ward": ("Inez Ward", "Launch Observer"),
         "nora-okafor": ("Nora Okafor", "VP Support"),
         "maya-chen": ("Maya Chen", "COO"),
         "lena-ortiz": ("Lena Ortiz", "Operations Manager"),
@@ -201,31 +230,49 @@ def _seed_primary(repository: SqlAlchemyHumanWireRepository) -> None:
             person_ref="eli-torres",
             reason="Confirm US launch coverage",
             direction=Direction.DOWNWARD,
+            engagement_type=EngagementType.QUICK_RESPONSE,
             questions=["Can the US team cover the launch window?"],
         ),
         PlannedStakeholder(
             person_ref="sora-kim",
             reason="Confirm APAC launch coverage",
             direction=Direction.DOWNWARD,
+            engagement_type=EngagementType.QUICK_RESPONSE,
             questions=["Can the APAC team cover the launch window?"],
         ),
         PlannedStakeholder(
-            person_ref="priya-raman",
+            person_ref="priya-shah",
             reason="Confirm staffing policy constraints",
             direction=Direction.LATERAL,
-            questions=["Which notice rule applies?"],
+            engagement_type=EngagementType.STRUCTURED_INTERVIEW,
+            questions=[
+                "Which staffing rule applies?",
+                "What constraint affects coverage?",
+                "What safe option can you support?",
+            ],
         ),
         PlannedStakeholder(
-            person_ref="nora-okafor",
-            reason="Request executive sponsorship",
+            person_ref="nora-chen",
+            reason="Acknowledge executive sponsorship receipt",
             direction=Direction.UPWARD,
-            questions=["Will you sponsor this coverage plan?"],
+            engagement_type=EngagementType.ACKNOWLEDGE,
+            questions=[],
         ),
         PlannedStakeholder(
-            person_ref="maya-chen",
+            person_ref="maya-brooks",
             reason="Review the approval request",
             direction=Direction.UPWARD,
-            questions=["Can you approve this coverage plan?"],
+            engagement_type=EngagementType.REVIEW_APPROVAL,
+            questions=[],
+        ),
+        PlannedStakeholder(
+            person_ref="inez-ward",
+            reason="Receive the launch coordination update",
+            direction=Direction.DOWNWARD,
+            required=False,
+            engagement_type=EngagementType.INFORM,
+            response_required=False,
+            questions=[],
         ),
     ]
     mandate = _mandate(
@@ -246,6 +293,8 @@ def _seed_primary(repository: SqlAlchemyHumanWireRepository) -> None:
             StakeholderState.COMPLETE,
             "Confirm US launch coverage",
             4,
+            engagement_type=EngagementType.QUICK_RESPONSE,
+            interview=True,
         ),
         _assignment(
             mandate,
@@ -255,54 +304,93 @@ def _seed_primary(repository: SqlAlchemyHumanWireRepository) -> None:
             StakeholderState.COMPLETE,
             "Confirm APAC launch coverage",
             5,
+            engagement_type=EngagementType.QUICK_RESPONSE,
+            interview=True,
         ),
         _assignment(
             mandate,
-            "priya-raman",
+            "priya-shah",
             "People",
             Direction.LATERAL,
-            StakeholderState.ALTERNATE_CHANNEL,
+            StakeholderState.INTERVIEWING,
             "Confirm staffing policy constraints",
             6,
+            engagement_type=EngagementType.STRUCTURED_INTERVIEW,
+            interview=True,
+            active_route_index=1,
         ),
         _assignment(
             mandate,
-            "nora-okafor",
+            "nora-chen",
             "Support Leadership",
             Direction.UPWARD,
-            StakeholderState.ACKNOWLEDGED,
-            "Request executive sponsorship",
+            StakeholderState.COMPLETE,
+            "Acknowledge executive sponsorship receipt",
             7,
+            engagement_type=EngagementType.ACKNOWLEDGE,
+            interview=False,
         ),
         _assignment(
             mandate,
-            "maya-chen",
+            "maya-brooks",
             "Executive",
             Direction.UPWARD,
-            StakeholderState.INTERVIEWING,
+            StakeholderState.AWAITING_ACKNOWLEDGEMENT,
             "Review the approval request",
             8,
+            engagement_type=EngagementType.REVIEW_APPROVAL,
+            interview=False,
+        ),
+        _assignment(
+            mandate,
+            "inez-ward",
+            "Observers",
+            Direction.DOWNWARD,
+            StakeholderState.COMPLETE,
+            "Receive the launch coordination update",
+            9,
+            engagement_type=EngagementType.INFORM,
+            required=False,
+            interview=False,
         ),
     ]
+    planned_by_person = {item.person_ref: item for item in planned}
     for assignment in assignments:
         repository.add_assignment(assignment)
-        repository.add_interview(_interview(mandate, assignment))
+        if assignment.interview_id is not None:
+            repository.add_interview(
+                _interview(
+                    mandate,
+                    assignment,
+                    planned_by_person[assignment.person_id].questions,
+                    current_question_index=(
+                        1 if assignment.person_id == "priya-shah" else None
+                    ),
+                    current_channel=(
+                        Channel.TELEGRAM
+                        if assignment.person_id in {"sora-kim", "priya-shah"}
+                        else Channel.EMAIL
+                    ),
+                )
+            )
 
     events = [
         (0, "mandate.created", None, None, None, None, "received", "planned"),
-        (1, "mandate.interviewing", None, None, None, None, "planned", "interviewing"),
-        (2, "outreach.sent", "eli-torres", "US Support", Direction.DOWNWARD, Channel.EMAIL, None, "awaiting_acknowledgement"),
-        (3, "outreach.sent", "sora-kim", "APAC Support", Direction.DOWNWARD, Channel.TELEGRAM, None, "awaiting_acknowledgement"),
-        (4, "outreach.sent", "priya-raman", "People", Direction.LATERAL, Channel.EMAIL, None, "awaiting_acknowledgement"),
-        (5, "interview.acknowledged", "eli-torres", "US Support", Direction.DOWNWARD, Channel.EMAIL, "awaiting_acknowledgement", "interviewing"),
-        (6, "interview.completed", "eli-torres", "US Support", Direction.DOWNWARD, Channel.EMAIL, "interviewing", "complete"),
-        (7, "interview.acknowledged", "sora-kim", "APAC Support", Direction.DOWNWARD, Channel.TELEGRAM, "awaiting_acknowledgement", "interviewing"),
-        (8, "interview.completed", "sora-kim", "APAC Support", Direction.DOWNWARD, Channel.TELEGRAM, "interviewing", "complete"),
-        (9, "outreach.reminder_sent", "priya-raman", "People", Direction.LATERAL, Channel.EMAIL, "awaiting_acknowledgement", "follow_up_due"),
-        (10, "outreach.alternate_pending", "priya-raman", "People", Direction.LATERAL, Channel.TELEGRAM, "follow_up_due", "alternate_channel"),
-        (11, "approval.request_sent", "nora-okafor", "Support Leadership", Direction.UPWARD, Channel.EMAIL, None, "awaiting_acknowledgement"),
-        (12, "approval.acknowledged", "nora-okafor", "Support Leadership", Direction.UPWARD, Channel.EMAIL, "awaiting_acknowledgement", "acknowledged"),
-        (13, "approval.request_reviewing", "maya-chen", "Executive", Direction.UPWARD, Channel.EMAIL, "acknowledged", "interviewing"),
+        (1, "engagement.plan_previewed", None, None, None, None, "planned", "planned"),
+        (2, "engagement.plan_released", None, None, None, None, "planned", "interviewing"),
+        (3, "mandate.interviewing", None, None, None, None, "planned", "interviewing"),
+        (4, "engagement.quick_response_sent", "eli-torres", "US Support", Direction.DOWNWARD, Channel.EMAIL, None, "awaiting_acknowledgement"),
+        (5, "engagement.quick_response_sent", "sora-kim", "APAC Support", Direction.DOWNWARD, Channel.TELEGRAM, None, "awaiting_acknowledgement"),
+        (6, "engagement.structured_interview_sent", "priya-shah", "People", Direction.LATERAL, Channel.EMAIL, None, "awaiting_acknowledgement"),
+        (7, "engagement.acknowledgement_sent", "nora-chen", "Support Leadership", Direction.UPWARD, Channel.EMAIL, None, "awaiting_acknowledgement"),
+        (8, "engagement.approval_pending", "maya-brooks", "Executive", Direction.UPWARD, Channel.EMAIL, None, "awaiting_acknowledgement"),
+        (9, "engagement.inform_delivered", "inez-ward", "Observers", Direction.DOWNWARD, Channel.EMAIL, "delivered", "complete"),
+        (10, "engagement.quick_response_completed", "eli-torres", "US Support", Direction.DOWNWARD, Channel.EMAIL, "interviewing", "complete"),
+        (11, "engagement.quick_response_completed", "sora-kim", "APAC Support", Direction.DOWNWARD, Channel.TELEGRAM, "interviewing", "complete"),
+        (12, "engagement.acknowledged", "nora-chen", "Support Leadership", Direction.UPWARD, Channel.EMAIL, "awaiting_acknowledgement", "complete"),
+        (13, "engagement.structured_interview_reminder", "priya-shah", "People", Direction.LATERAL, Channel.EMAIL, "awaiting_acknowledgement", "follow_up_due"),
+        (14, "engagement.structured_interview_alternate_selected", "priya-shah", "People", Direction.LATERAL, Channel.TELEGRAM, "follow_up_due", "alternate_channel"),
+        (15, "engagement.structured_interview_progressed", "priya-shah", "People", Direction.LATERAL, Channel.TELEGRAM, "alternate_channel", "interviewing"),
     ]
     for values in events:
         index, event_type, person_id, department, direction, channel, previous, new = values
@@ -323,9 +411,9 @@ def _seed_primary(repository: SqlAlchemyHumanWireRepository) -> None:
 
     evidence_specs = [
         ("us", "eli-torres", EvidenceVisibility.SHAREABLE, EvidenceType.COMMITMENT, "The US lead can staff one voluntary on-call shift."),
-        ("apac", "sora-kim", EvidenceVisibility.ANONYMOUS, EvidenceType.CONSTRAINT, "APAC coverage requires a documented handoff."),
-        ("sponsor", "nora-okafor", EvidenceVisibility.SHAREABLE, EvidenceType.FACT, "Executive sponsorship was acknowledged."),
-        ("private", "priya-raman", EvidenceVisibility.PRIVATE, EvidenceType.CONSTRAINT, "Private medical leave details must remain confidential."),
+        ("policy", "priya-shah", EvidenceVisibility.ANONYMOUS, EvidenceType.CONSTRAINT, "Coverage requires a documented handoff."),
+        ("apac", "sora-kim", EvidenceVisibility.SHAREABLE, EvidenceType.COMMITMENT, "The APAC lead confirmed the launch handoff."),
+        ("private", "priya-shah", EvidenceVisibility.PRIVATE, EvidenceType.CONSTRAINT, "Private medical leave details must remain confidential."),
     ]
     by_person = {item.person_id: item for item in assignments}
     for offset, (label, person_id, visibility, evidence_type, statement) in enumerate(
@@ -357,7 +445,8 @@ def _seed_aligned(repository: SqlAlchemyHumanWireRepository) -> None:
                 person_ref="nora-okafor",
                 reason="Confirm ownership",
                 direction=Direction.UPWARD,
-                questions=["Can you own the review?"],
+                engagement_type=EngagementType.REVIEW_APPROVAL,
+                questions=[],
             )
         ],
     )
@@ -378,9 +467,22 @@ def _seed_aligned(repository: SqlAlchemyHumanWireRepository) -> None:
         StakeholderState.COMPLETE,
         "Confirm incident review ownership",
         2,
+        engagement_type=EngagementType.REVIEW_APPROVAL,
+        interview=False,
     )
     repository.add_assignment(assignment)
-    repository.add_interview(_interview(mandate, assignment))
+    repository.add_engagement_decision(
+        EngagementDecision(
+            decision_id=_id("decision", f"{mandate.token}:approve"),
+            mandate_id=mandate.mandate_id,
+            assignment_id=assignment.assignment_id,
+            stakeholder_id=assignment.person_id,
+            response=EngagementDecisionKind.APPROVE,
+            source_message_id="demo-source-aligned-approval",
+            created_at=mandate.created_at + timedelta(minutes=3),
+            idempotency_key=f"demo-decision-{mandate.token.lower()}",
+        )
+    )
     repository.append_event(mandate.mandate_id, _event(mandate, 0, "mandate.created"))
     repository.append_event(mandate.mandate_id, _event(mandate, 3, "mandate.aligned"))
 
@@ -393,7 +495,8 @@ def _seed_meeting_ready(repository: SqlAlchemyHumanWireRepository) -> None:
                 person_ref="maya-chen",
                 reason="Make the approval decision",
                 direction=Direction.UPWARD,
-                questions=["Can the launch proceed?"],
+                engagement_type=EngagementType.REVIEW_APPROVAL,
+                questions=[],
             )
         ],
     )
@@ -414,16 +517,30 @@ def _seed_meeting_ready(repository: SqlAlchemyHumanWireRepository) -> None:
         StakeholderState.COMPLETE,
         "Make the approval decision",
         2,
+        engagement_type=EngagementType.REVIEW_APPROVAL,
+        interview=False,
     )
     repository.add_assignment(assignment)
-    repository.add_interview(_interview(mandate, assignment))
+    repository.add_engagement_decision(
+        EngagementDecision(
+            decision_id=_id("decision", f"{mandate.token}:change"),
+            mandate_id=mandate.mandate_id,
+            assignment_id=assignment.assignment_id,
+            stakeholder_id=assignment.person_id,
+            response=EngagementDecisionKind.CHANGE,
+            change_text="Use a narrower approval scope before proceeding.",
+            source_message_id="demo-source-meeting-change",
+            created_at=mandate.created_at + timedelta(minutes=3),
+            idempotency_key=f"demo-decision-{mandate.token.lower()}",
+        )
+    )
     issue = AlignmentIssue(
         issue_id=_id("issue", mandate.token),
         mandate_id=mandate.mandate_id,
-        issue_type=AlignmentIssueType.AUTHORITY_GAP,
+        issue_type=AlignmentIssueType.HARD_CONSTRAINT,
         stakeholder_ids=["maya-chen"],
         related_decision="Approve the launch plan",
-        summary="The approval decision needs the accountable owner.",
+        summary="The accountable owner requested a narrower approval scope.",
         blocking=True,
     )
     repository.add_issue(issue)

@@ -6,15 +6,21 @@ import pytest
 from humanwire.alignment import (
     AlignmentEngine,
     AlignmentReport,
+    ContributionState,
     HybridAlignmentEngine,
     NegotiationCoordinator,
     NegotiationLimitReached,
     NegotiationOutcome,
+    contribution_status,
 )
 from humanwire.database import create_session_factory
 from humanwire.domain import (
+    AlignmentIssueType,
     Channel,
     Direction,
+    EngagementDecision,
+    EngagementDecisionKind,
+    EngagementType,
     EvidenceItem,
     EvidenceStatus,
     EvidenceType,
@@ -148,6 +154,421 @@ def evidence_factory(mandate, complete_assignments, now):
 @pytest.fixture
 def engine(mandate) -> AlignmentEngine:
     return AlignmentEngine(mandate.mandate_id)
+
+
+def _contribution_assignment(
+    mandate: Mandate,
+    engagement_type: EngagementType,
+    *,
+    state: StakeholderState = StakeholderState.COMPLETE,
+    required: bool = True,
+) -> StakeholderAssignment:
+    return StakeholderAssignment(
+        assignment_id=uuid4(),
+        mandate_id=mandate.mandate_id,
+        person_id="contributor",
+        department="Operations",
+        direction=Direction.LATERAL,
+        reason="Supply the trusted contribution",
+        required=required,
+        engagement_type=engagement_type,
+        response_required=engagement_type is not EngagementType.INFORM,
+        state=state,
+        route_ids=["contributor-route"],
+    )
+
+
+def _contribution_evidence(
+    assignment: StakeholderAssignment,
+    now,
+    *,
+    visibility: EvidenceVisibility = EvidenceVisibility.SHAREABLE,
+    status: EvidenceStatus = EvidenceStatus.CONFIRMED,
+) -> EvidenceItem:
+    return EvidenceItem(
+        evidence_id=uuid4(),
+        mandate_id=assignment.mandate_id,
+        assignment_id=assignment.assignment_id,
+        stakeholder_id=assignment.person_id,
+        evidence_type=EvidenceType.FACT,
+        statement="A persisted fact was supplied.",
+        visibility=visibility,
+        status=status,
+        source_message_id="contribution-message",
+        channel=Channel.EMAIL,
+        created_at=now,
+    )
+
+
+def _approval_decision(
+    assignment: StakeholderAssignment,
+    now,
+    response: EngagementDecisionKind,
+) -> EngagementDecision:
+    return EngagementDecision(
+        decision_id=uuid4(),
+        mandate_id=assignment.mandate_id,
+        assignment_id=assignment.assignment_id,
+        stakeholder_id=assignment.person_id,
+        response=response,
+        change_text=("PRIVATE-CHANGE-TEXT" if response is EngagementDecisionKind.CHANGE else None),
+        source_message_id="approval-message",
+        created_at=now,
+        idempotency_key=f"approval:{assignment.assignment_id}",
+    )
+
+
+@pytest.mark.parametrize(
+    ("engagement_type", "uses_evidence", "uses_decision", "has_availability"),
+    [
+        (EngagementType.INFORM, False, False, False),
+        (EngagementType.ACKNOWLEDGE, False, False, False),
+        (EngagementType.QUICK_RESPONSE, True, False, False),
+        (EngagementType.STRUCTURED_INTERVIEW, True, False, False),
+        (EngagementType.REVIEW_APPROVAL, False, True, False),
+        (EngagementType.AVAILABILITY, False, False, True),
+    ],
+)
+def test_contribution_complete_matrix_uses_each_engagement_contract(
+    mandate,
+    now,
+    engagement_type,
+    uses_evidence,
+    uses_decision,
+    has_availability,
+) -> None:
+    assignment = _contribution_assignment(mandate, engagement_type)
+    evidence = [_contribution_evidence(assignment, now)] if uses_evidence else []
+    decisions = (
+        [_approval_decision(assignment, now, EngagementDecisionKind.APPROVE)]
+        if uses_decision
+        else []
+    )
+
+    result = contribution_status(
+        assignment,
+        evidence=evidence,
+        decisions=decisions,
+        has_availability=has_availability,
+    )
+
+    assert result.state is ContributionState.COMPLETE
+    assert result.blocking is False
+
+
+@pytest.mark.parametrize("required", [True, False], ids=["required", "optional"])
+@pytest.mark.parametrize("engagement_type", list(EngagementType))
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        (StakeholderState.AWAITING_ACKNOWLEDGEMENT, ContributionState.MISSING_RESPONSE),
+        (StakeholderState.DECLINED, ContributionState.MISSING_RESPONSE),
+        (StakeholderState.UNREACHABLE, ContributionState.DELIVERY_FAILED),
+        (StakeholderState.DELIVERY_FAILED, ContributionState.DELIVERY_FAILED),
+    ],
+)
+def test_contribution_lifecycle_matrix_preserves_required_and_optional_blocking(
+    mandate, state, expected, engagement_type, required
+) -> None:
+    assignment = _contribution_assignment(
+        mandate,
+        engagement_type,
+        state=state,
+        required=required,
+    )
+
+    result = contribution_status(
+        assignment,
+        evidence=[],
+        decisions=[],
+        has_availability=False,
+    )
+
+    assert result.state is expected
+    assert result.blocking is required
+
+
+@pytest.mark.parametrize(
+    ("mutation", "visibility", "status"),
+    [
+        ({"assignment_id": uuid4()}, EvidenceVisibility.SHAREABLE, EvidenceStatus.CONFIRMED),
+        ({"mandate_id": uuid4()}, EvidenceVisibility.SHAREABLE, EvidenceStatus.CONFIRMED),
+        ({"stakeholder_id": "another-person"}, EvidenceVisibility.SHAREABLE, EvidenceStatus.CONFIRMED),
+        ({}, EvidenceVisibility.ANONYMOUS, EvidenceStatus.CONFIRMED),
+        ({}, EvidenceVisibility.SHAREABLE, EvidenceStatus.DISPUTED),
+        ({}, EvidenceVisibility.SHAREABLE, EvidenceStatus.ASSERTED),
+    ],
+    ids=["wrong-assignment", "wrong-mandate", "wrong-person", "anonymous", "disputed", "unconfirmed"],
+)
+def test_contribution_evidence_requires_exact_confirmed_assignment_proof(
+    mandate, now, mutation, visibility, status
+) -> None:
+    assignment = _contribution_assignment(mandate, EngagementType.QUICK_RESPONSE)
+    evidence = _contribution_evidence(
+        assignment,
+        now,
+        visibility=visibility,
+        status=status,
+    ).model_copy(update=mutation)
+
+    result = contribution_status(
+        assignment,
+        evidence=[evidence],
+        decisions=[],
+        has_availability=False,
+    )
+
+    assert result.state is ContributionState.MISSING_EVIDENCE
+    assert result.blocking is True
+
+
+def test_private_contribution_evidence_establishes_internal_readiness(mandate, now) -> None:
+    assignment = _contribution_assignment(
+        mandate, EngagementType.STRUCTURED_INTERVIEW
+    )
+    private = _contribution_evidence(
+        assignment,
+        now,
+        visibility=EvidenceVisibility.PRIVATE,
+    )
+
+    result = contribution_status(
+        assignment,
+        evidence=[private],
+        decisions=[],
+        has_availability=False,
+    )
+
+    assert result.state is ContributionState.COMPLETE
+    assert shareable_evidence([private]) == []
+
+
+@pytest.mark.parametrize(
+    ("response", "expected", "blocking"),
+    [
+        (EngagementDecisionKind.APPROVE, ContributionState.COMPLETE, False),
+        (EngagementDecisionKind.REJECT, ContributionState.REJECTED, True),
+        (EngagementDecisionKind.CHANGE, ContributionState.CHANGE_REQUESTED, True),
+    ],
+)
+def test_contribution_approval_uses_only_exact_persisted_decision(
+    mandate, now, response, expected, blocking
+) -> None:
+    assignment = _contribution_assignment(mandate, EngagementType.REVIEW_APPROVAL)
+
+    result = contribution_status(
+        assignment,
+        evidence=[],
+        decisions=[_approval_decision(assignment, now, response)],
+        has_availability=False,
+    )
+
+    assert result.state is expected
+    assert result.blocking is blocking
+
+
+def test_contribution_approval_and_availability_fail_closed_without_exact_records(
+    mandate, now
+) -> None:
+    approval = _contribution_assignment(mandate, EngagementType.REVIEW_APPROVAL)
+    unrelated = _contribution_assignment(mandate, EngagementType.REVIEW_APPROVAL)
+    availability = _contribution_assignment(mandate, EngagementType.AVAILABILITY)
+
+    approval_result = contribution_status(
+        approval,
+        evidence=[],
+        decisions=[_approval_decision(unrelated, now, EngagementDecisionKind.APPROVE)],
+        has_availability=False,
+    )
+    availability_result = contribution_status(
+        availability,
+        evidence=[],
+        decisions=[],
+        has_availability=False,
+    )
+
+    assert approval_result.state is ContributionState.MISSING_RESPONSE
+    assert approval_result.blocking is True
+    assert availability_result.state is ContributionState.MISSING_RESPONSE
+    assert availability_result.blocking is True
+
+
+@pytest.mark.parametrize(
+    "engagement_type",
+    [
+        EngagementType.INFORM,
+        EngagementType.ACKNOWLEDGE,
+        EngagementType.AVAILABILITY,
+    ],
+)
+def test_engagement_receipt_delivery_and_availability_cannot_cover_required_decision(
+    mandate, now, engagement_type
+) -> None:
+    assignment = _contribution_assignment(mandate, engagement_type)
+    evidence = _contribution_evidence(assignment, now).model_copy(
+        update={
+            "evidence_type": EvidenceType.COMMITMENT,
+            "statement": "Everyone agreed and approved this decision.",
+            "related_decision": "Launch date",
+        }
+    )
+    plan = MandatePlan(
+        objective="Choose a launch plan",
+        required_decisions=["Launch date"],
+        stakeholders=[
+            PlannedStakeholder(
+                person_ref=assignment.person_id,
+                reason=assignment.reason,
+                direction=assignment.direction,
+                engagement_type=engagement_type,
+                response_required=engagement_type is not EngagementType.INFORM,
+                questions=[],
+            )
+        ],
+        completion_conditions=["Record the required decision"],
+    )
+
+    report = AlignmentEngine(mandate.mandate_id).analyze(
+        plan,
+        shareable_evidence([evidence]),
+        [assignment],
+        contribution_evidence=[evidence],
+        decisions=[],
+        availability_assignment_ids=(
+            {assignment.assignment_id}
+            if engagement_type is EngagementType.AVAILABILITY
+            else set()
+        ),
+    )
+
+    assert report.is_aligned is False
+    assert report.agreements == []
+    assert report.covered_decisions == []
+    assert any(
+        issue.issue_type is AlignmentIssueType.AUTHORITY_GAP and issue.blocking
+        for issue in report.issues
+    )
+
+
+def test_model_cannot_remove_deterministic_contribution_issue_or_invent_approval(
+    mandate, now
+) -> None:
+    assignment = _contribution_assignment(
+        mandate,
+        EngagementType.REVIEW_APPROVAL,
+        state=StakeholderState.COMPLETE,
+    )
+    plan = MandatePlan(
+        objective="Choose a launch plan",
+        required_decisions=["Launch date"],
+        stakeholders=[
+            PlannedStakeholder(
+                person_ref=assignment.person_id,
+                reason=assignment.reason,
+                direction=assignment.direction,
+                engagement_type=EngagementType.REVIEW_APPROVAL,
+                response_required=True,
+                questions=[],
+            )
+        ],
+        completion_conditions=["Persist authenticated approval"],
+    )
+
+    class ApprovalInventingClient:
+        def complete_json(self, system: str, user: str) -> dict:
+            return {"issues": []}
+
+    report = HybridAlignmentEngine(
+        mandate.mandate_id, ApprovalInventingClient()
+    ).analyze(
+        plan,
+        [],
+        [assignment],
+        contribution_evidence=[],
+        decisions=[],
+        availability_assignment_ids=set(),
+    )
+
+    assert report.is_aligned is False
+    assert report.covered_decisions == []
+    assert any(
+        issue.issue_type is AlignmentIssueType.AUTHORITY_GAP and issue.blocking
+        for issue in report.issues
+    )
+
+
+def test_assignment_from_another_mandate_cannot_supply_local_authority(
+    mandate, now
+) -> None:
+    assignment = _contribution_assignment(
+        mandate, EngagementType.QUICK_RESPONSE
+    ).model_copy(update={"mandate_id": uuid4()})
+    evidence = _contribution_evidence(assignment, now).model_copy(
+        update={"related_decision": "Launch date"}
+    )
+    plan = MandatePlan(
+        objective="Choose a launch plan",
+        required_decisions=["Launch date"],
+        stakeholders=[
+            PlannedStakeholder(
+                person_ref=assignment.person_id,
+                reason=assignment.reason,
+                direction=assignment.direction,
+                engagement_type=EngagementType.QUICK_RESPONSE,
+                questions=["Which date is viable?"],
+            )
+        ],
+        completion_conditions=["Record the decision"],
+    )
+
+    report = AlignmentEngine(mandate.mandate_id).analyze(
+        plan,
+        shareable_evidence([evidence]),
+        [assignment],
+        contribution_evidence=[evidence],
+    )
+
+    assert report.is_aligned is False
+    assert report.covered_decisions == []
+
+
+def test_optional_anonymous_response_cannot_be_projected_as_agreement(
+    mandate, now
+) -> None:
+    assignment = _contribution_assignment(
+        mandate,
+        EngagementType.QUICK_RESPONSE,
+        required=False,
+    )
+    evidence = _contribution_evidence(
+        assignment,
+        now,
+        visibility=EvidenceVisibility.ANONYMOUS,
+    ).model_copy(update={"evidence_type": EvidenceType.COMMITMENT})
+    plan = MandatePlan(
+        objective="Share an optional launch observation",
+        required_decisions=["Launch date"],
+        stakeholders=[
+            PlannedStakeholder(
+                person_ref=assignment.person_id,
+                reason=assignment.reason,
+                direction=assignment.direction,
+                required=False,
+                engagement_type=EngagementType.QUICK_RESPONSE,
+                questions=["Any optional observation?"],
+            )
+        ],
+        completion_conditions=["Record any optional response"],
+    )
+
+    report = AlignmentEngine(mandate.mandate_id).analyze(
+        plan,
+        shareable_evidence([evidence]),
+        [assignment],
+        contribution_evidence=[evidence],
+    )
+
+    assert report.agreements == []
 
 
 @pytest.fixture

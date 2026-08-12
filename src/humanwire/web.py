@@ -18,13 +18,17 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from humanwire.alignment import AlignmentReport
 from humanwire.config import Settings
 from humanwire.domain import (
+    AvailabilityWindow,
     Channel,
     Direction,
+    EngagementDecisionKind,
+    EngagementType,
     EvidenceStatus,
     EvidenceType,
     EvidenceVisibility,
     Mandate,
     MandateState,
+    PlannedStakeholder,
     StakeholderAssignment,
     StakeholderState,
 )
@@ -61,6 +65,24 @@ _SAFE_PUBLIC_KEY = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _ENUM_FIELDS = {
     "channel": {item.value for item in Channel},
     "direction": {item.value for item in Direction},
+    "engagement_type": {item.value for item in EngagementType},
+    "engagement_status": {
+        "acknowledged",
+        "approved",
+        "awaiting acknowledgement",
+        "awaiting response",
+        "change requested",
+        "complete",
+        "declined",
+        "delivered",
+        "delivery failed",
+        "in progress",
+        "missing",
+        "pending",
+        "recorded",
+        "rejected",
+        "unreachable",
+    },
     "evidence_type": {item.value for item in EvidenceType},
     "interview_status": {"complete", "in_progress", "not_started"},
     "state": {item.value for item in MandateState} | {item.value for item in StakeholderState},
@@ -68,6 +90,7 @@ _ENUM_FIELDS = {
     "previous_state": {item.value for item in MandateState}
     | {item.value for item in StakeholderState},
     "new_state": {item.value for item in MandateState} | {item.value for item in StakeholderState},
+    "phase_label": {item.value for item in MandateState} | {"coordinating"},
 }
 _PRIVATE_MARKER = "[PRIVATE]"
 _CALENDAR_UID_NAMESPACE = b"humanwire:calendar:uid:v1:"
@@ -120,6 +143,11 @@ def _private_deny_values(repository: Any, mandate: Mandate) -> frozenset[str]:
             )
             if value
         )
+    denied.update(
+        decision.change_text
+        for decision in repository.list_engagement_decisions(mandate.mandate_id)
+        if decision.change_text
+    )
     return frozenset(denied)
 
 
@@ -186,6 +214,8 @@ def _assignment_projection(
     repository: Any,
     assignment: StakeholderAssignment,
     interviews: dict[Any, Any],
+    planned: PlannedStakeholder | None,
+    decisions: dict[Any, Any],
 ) -> dict[str, Any]:
     interview = interviews.get(assignment.interview_id)
     if interview is None:
@@ -197,12 +227,24 @@ def _assignment_projection(
     else:
         interview_status = "in_progress"
         question = interview.current_question_index + 1
+    engagement_status, progress_current, progress_total = _engagement_progress(
+        repository,
+        assignment,
+        interview,
+        planned,
+        decisions.get(assignment.assignment_id),
+    )
     return {
         **_person(repository, assignment.person_id),
         "department": redact_sensitive(assignment.department),
         "direction": assignment.direction.value,
         "reason": redact_sensitive(assignment.reason),
         "required": assignment.required,
+        "engagement_type": assignment.engagement_type.value,
+        "response_required": assignment.response_required,
+        "engagement_status": engagement_status,
+        "progress_current": progress_current,
+        "progress_total": progress_total,
         "state": assignment.state.value,
         "attempt_count": assignment.attempt_count,
         "channel": interview.current_channel.value if interview and interview.current_channel else None,
@@ -214,6 +256,96 @@ def _assignment_projection(
         "acknowledged_at": _iso(assignment.acknowledged_at),
         "completed_at": _iso(assignment.completed_at),
     }
+
+
+def _engagement_progress(
+    repository: Any,
+    assignment: StakeholderAssignment,
+    interview: Any,
+    planned: PlannedStakeholder | None,
+    decision: Any,
+) -> tuple[str, int, int]:
+    engagement_type = assignment.engagement_type
+    question_engagement = engagement_type in {
+        EngagementType.QUICK_RESPONSE,
+        EngagementType.STRUCTURED_INTERVIEW,
+    }
+    question_total = (
+        len(interview.questions)
+        if interview is not None
+        else len(planned.questions if planned else [])
+    )
+    question_current = (
+        min(max(interview.current_question_index, 0), question_total)
+        if interview is not None
+        else 0
+    )
+    terminal_labels = {
+        StakeholderState.DELIVERY_FAILED: "delivery failed",
+        StakeholderState.UNREACHABLE: "unreachable",
+        StakeholderState.DECLINED: "declined",
+    }
+    if assignment.state in terminal_labels:
+        return (
+            terminal_labels[assignment.state],
+            question_current if question_engagement else 0,
+            question_total if question_engagement else 1,
+        )
+
+    if engagement_type is EngagementType.INFORM:
+        return "delivered", int(assignment.state is StakeholderState.COMPLETE), 1
+    if engagement_type is EngagementType.ACKNOWLEDGE:
+        complete = assignment.state is StakeholderState.COMPLETE
+        return ("acknowledged" if complete else "awaiting acknowledgement"), int(complete), 1
+    if engagement_type in {
+        EngagementType.QUICK_RESPONSE,
+        EngagementType.STRUCTURED_INTERVIEW,
+    }:
+        if assignment.state is StakeholderState.COMPLETE:
+            return "complete", question_total, question_total
+        status = (
+            "in progress"
+            if interview is not None and question_current > 0
+            else "awaiting response"
+        )
+        return status, question_current, question_total
+    if engagement_type is EngagementType.REVIEW_APPROVAL:
+        labels = {
+            EngagementDecisionKind.APPROVE: "approved",
+            EngagementDecisionKind.REJECT: "rejected",
+            EngagementDecisionKind.CHANGE: "change requested",
+        }
+        return (labels[decision.response], 1, 1) if decision is not None else ("pending", 0, 1)
+
+    recorded = _has_exact_availability(repository, assignment)
+    return ("recorded" if recorded else "missing"), int(recorded), 1
+
+
+def _has_exact_availability(repository: Any, assignment: StakeholderAssignment) -> bool:
+    stored = repository.get_runtime_status(
+        f"availability:{assignment.mandate_id}:{assignment.person_id}"
+    )
+    if (
+        stored is None
+        or assignment.state is not StakeholderState.COMPLETE
+        or assignment.completed_at is None
+        or stored[1] != assignment.completed_at
+    ):
+        return False
+    raw_windows = stored[0].split("|")
+    if not raw_windows or any(not raw for raw in raw_windows):
+        return False
+    try:
+        windows = [
+            AvailabilityWindow(
+                start=datetime.fromisoformat(raw.split("/", 1)[0]),
+                end=datetime.fromisoformat(raw.split("/", 1)[1]),
+            )
+            for raw in raw_windows
+        ]
+    except (IndexError, ValueError):
+        return False
+    return bool(windows)
 
 
 def _next_action(assignments: list[StakeholderAssignment]) -> dict[str, Any] | None:
@@ -239,6 +371,11 @@ def _mandate_summary(repository: Any, mandate: Mandate) -> dict[str, Any]:
         "token": mandate.token,
         "objective": redact_sensitive(mandate.objective),
         "state": mandate.state.value,
+        "phase_label": (
+            "coordinating"
+            if mandate.state is MandateState.INTERVIEWING
+            else mandate.state.value
+        ),
         "initiator": _person(repository, mandate.initiator_id),
         "created_at": _iso(mandate.created_at),
         "updated_at": _iso(mandate.updated_at),
@@ -273,8 +410,19 @@ def _stakeholders(repository: Any, mandate: Mandate) -> list[dict[str, Any]]:
         for interview in repository.list_interviews(mandate.mandate_id)
     }
     assignments = repository.list_assignments(mandate.mandate_id)
+    planned = {item.person_ref: item for item in mandate.plan.stakeholders}
+    decisions = {
+        item.assignment_id: item
+        for item in repository.list_engagement_decisions(mandate.mandate_id)
+    }
     return [
-        _assignment_projection(repository, assignment, interviews)
+        _assignment_projection(
+            repository,
+            assignment,
+            interviews,
+            planned.get(assignment.person_id),
+            decisions,
+        )
         for assignment in sorted(
             assignments,
             key=lambda item: (item.direction.value, item.person_id, str(item.assignment_id)),

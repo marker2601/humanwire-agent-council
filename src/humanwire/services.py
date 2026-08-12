@@ -7,7 +7,12 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-from humanwire.alignment import AlignmentEngine, NegotiationCoordinator
+from humanwire.alignment import (
+    AlignmentEngine,
+    ContributionStatus,
+    NegotiationCoordinator,
+    contribution_status,
+)
 from humanwire.commands import EngageCommand, MandateCommand
 from humanwire.config import Settings
 from humanwire.directory import (
@@ -16,6 +21,7 @@ from humanwire.directory import (
     UnknownPersonError,
 )
 from humanwire.domain import (
+    AvailabilityWindow,
     Channel,
     DeliveryInstruction,
     DeliveryKind,
@@ -633,8 +639,12 @@ class MandateService:
         return WorkflowResult(deliveries=[DeliveryInstruction(kind=DeliveryKind.REPLY_TO_MESSAGE, text=text, message_id=message.message_id, conversation_id=message.conversation_id)])
 
 
+class _StaleSynthesisSnapshot(RuntimeError):
+    """Raised internally so the unit of work rolls back a stale synthesis."""
+
+
 class SynthesisService:
-    """Runs only after authenticated interview evidence is complete and durable."""
+    """Projects a contribution aggregate only from a transaction-fenced snapshot."""
 
     def __init__(
         self,
@@ -657,50 +667,166 @@ class SynthesisService:
         required = [item for item in assignments if item.required]
         if not required or any(item.state not in {StakeholderState.COMPLETE, StakeholderState.DECLINED, StakeholderState.UNREACHABLE, StakeholderState.DELIVERY_FAILED} for item in required):
             return WorkflowResult()
-        if any(item.state is not StakeholderState.COMPLETE for item in required):
-            return self._partial(mandate, now)
-        synthesizing = self.state_machine.transition(mandate, MandateState.SYNTHESIZING, "required_interviews_complete", now)
         evidence = self.repository.list_evidence(mandate_id)
-        report = self.alignment_engine_factory(mandate_id).analyze(mandate.plan, shareable_evidence(evidence), assignments, private_blocker_count=private_blocker_count(evidence))
-        with self.repository.transaction() as unit:
-            unit.save_mandate(synthesizing)
-            unit.append_event(mandate_id, _event("mandate.synthesizing", now, f"synthesis:{mandate_id}", actor_id=mandate.initiator_id, previous_state="interviewing", new_state="synthesizing"))
-            for issue in report.issues:
-                unit.add_issue(issue)
+        decisions = self.repository.list_engagement_decisions(mandate_id)
+        availability = self._availability_snapshot(assignments)
+        availability_assignment_ids = self._availability_assignment_ids(
+            assignments, availability
+        )
+        statuses = {
+            assignment.assignment_id: contribution_status(
+                assignment,
+                evidence=evidence,
+                decisions=decisions,
+                has_availability=(
+                    assignment.assignment_id in availability_assignment_ids
+                ),
+            )
+            for assignment in assignments
+        }
+        engine = self.alignment_engine_factory(mandate_id)
+        valid_assignment_ids = engine._valid_assignment_ids(mandate.plan, assignments)
+        eligible_evidence_ids = engine._eligible_contribution_evidence_ids(
+            assignments,
+            evidence,
+            valid_assignment_ids,
+        )
+        complete_assignment_ids = {
+            assignment.assignment_id
+            for assignment in assignments
+            if not statuses[assignment.assignment_id].blocking
+            and assignment.state is StakeholderState.COMPLETE
+        }
+        relevant_evidence = [
+            item
+            for item in evidence
+            if item.evidence_id in eligible_evidence_ids
+            and item.assignment_id in complete_assignment_ids
+        ]
+        public_evidence = shareable_evidence(relevant_evidence)
+        report = engine.analyze(
+            mandate.plan,
+            public_evidence,
+            assignments,
+            private_blocker_count=private_blocker_count(relevant_evidence),
+            contribution_evidence=evidence,
+            decisions=decisions,
+            availability_assignment_ids=availability_assignment_ids,
+        )
+        if any(statuses[item.assignment_id].blocking for item in required):
+            return self._partial(
+                mandate,
+                now,
+                required,
+                statuses,
+                report.issues,
+                assignments,
+                evidence,
+                decisions,
+                availability,
+            )
+        synthesizing = self.state_machine.transition(mandate, MandateState.SYNTHESIZING, "required_contributions_complete", now)
         if report.is_aligned:
             aligned = self.state_machine.transition(synthesizing, MandateState.ALIGNED, "alignment_complete", now)
-            public_evidence = shareable_evidence(evidence)
             brief = render_alignment_brief(mandate.token, public_evidence)
-            with self.repository.transaction() as unit:
-                unit.save_mandate(aligned)
-                unit.set_runtime_status(f"alignment-brief:{mandate_id}", brief, now)
-                unit.append_event(mandate_id, _event("mandate.aligned", now, f"aligned:{mandate_id}", actor_id=mandate.initiator_id, previous_state="synthesizing", new_state="aligned"))
-                unit.append_event(mandate_id, _event("alignment.brief_persisted", now, f"alignment-brief:{mandate_id}", actor_id=mandate.initiator_id))
+            try:
+                with self.repository.transaction() as unit:
+                    self._fence_snapshot(
+                        unit,
+                        mandate,
+                        aligned,
+                        now,
+                        assignments,
+                        evidence,
+                        decisions,
+                        availability,
+                    )
+                    for issue in report.issues:
+                        unit.add_issue(issue)
+                    unit.set_runtime_status(f"alignment-brief:{mandate_id}", brief, now)
+                    unit.append_event(mandate_id, _event("mandate.synthesizing", now, f"synthesis:{mandate_id}", actor_id=mandate.initiator_id, previous_state="interviewing", new_state="synthesizing"))
+                    unit.append_event(mandate_id, _event("mandate.aligned", now, f"aligned:{mandate_id}", actor_id=mandate.initiator_id, previous_state="synthesizing", new_state="aligned"))
+                    unit.append_event(mandate_id, _event("alignment.brief_persisted", now, f"alignment-brief:{mandate_id}", actor_id=mandate.initiator_id))
+            except _StaleSynthesisSnapshot:
+                return WorkflowResult()
             recipients = [mandate.initiator_id, *(item.person_id for item in required)]
             return WorkflowResult(deliveries=self._route_deliveries(recipients, brief, mandate.token))
         negotiating = self.state_machine.transition(synthesizing, MandateState.NEGOTIATING, "blocking_issues", now)
         coordinator = self.negotiation_coordinator
-        proposal = coordinator.create_proposal(synthesizing, report, 1, now)
-        with self.repository.transaction() as unit:
-            unit.save_mandate(negotiating)
-            unit.append_event(mandate_id, _event("mandate.negotiating", now, f"negotiating:{mandate_id}", actor_id=mandate.initiator_id, previous_state="synthesizing", new_state="negotiating"))
-        text = render_proposal(mandate.token, proposal, shareable_evidence(evidence))
+        proposal = coordinator.prepare_proposal(synthesizing, report, 1, now)
+        try:
+            with self.repository.transaction() as unit:
+                self._fence_snapshot(
+                    unit,
+                    mandate,
+                    negotiating,
+                    now,
+                    assignments,
+                    evidence,
+                    decisions,
+                    availability,
+                )
+                for issue in report.issues:
+                    unit.add_issue(issue)
+                unit.add_proposal(proposal)
+                unit.append_event(mandate_id, _event("mandate.synthesizing", now, f"synthesis:{mandate_id}", actor_id=mandate.initiator_id, previous_state="interviewing", new_state="synthesizing"))
+                unit.append_event(
+                    mandate_id,
+                    DomainEvent(
+                        event_type="proposal.created",
+                        created_at=now,
+                        idempotency_key=f"proposal:create:{proposal.proposal_id}",
+                        metadata={
+                            "proposal_id": str(proposal.proposal_id),
+                            "round_number": 1,
+                        },
+                    ),
+                )
+                unit.append_event(mandate_id, _event("mandate.negotiating", now, f"negotiating:{mandate_id}", actor_id=mandate.initiator_id, previous_state="synthesizing", new_state="negotiating"))
+        except _StaleSynthesisSnapshot:
+            return WorkflowResult()
+        text = render_proposal(mandate.token, proposal, public_evidence)
         return WorkflowResult(
             deliveries=self._route_deliveries(
                 proposal.required_respondent_ids, text, mandate.token
             )
         )
 
-    def _partial(self, mandate: Mandate, now: datetime) -> WorkflowResult:
+    def _partial(
+        self,
+        mandate: Mandate,
+        now: datetime,
+        required: list[StakeholderAssignment],
+        statuses: dict[UUID, ContributionStatus],
+        issues: list,
+        assignments: list[StakeholderAssignment],
+        evidence: list,
+        decisions: list,
+        availability: dict[str, tuple[str, datetime] | None],
+    ) -> WorkflowResult:
         partial = self.state_machine.transition(mandate, MandateState.PARTIAL, "required_response_missing", now)
         missing_names = [
             self.directory.resolve_person(assignment.person_id).display_name
-            for assignment in self.repository.list_assignments(mandate.mandate_id)
-            if assignment.required and assignment.state is not StakeholderState.COMPLETE
+            for assignment in required
+            if statuses[assignment.assignment_id].blocking
         ]
-        with self.repository.transaction() as unit:
-            unit.save_mandate(partial)
-            unit.append_event(mandate.mandate_id, _event("mandate.partial", now, f"partial:{mandate.mandate_id}", actor_id=mandate.initiator_id, previous_state="interviewing", new_state="partial", metadata={"reason_code": "required_response_missing"}))
+        try:
+            with self.repository.transaction() as unit:
+                self._fence_snapshot(
+                    unit,
+                    mandate,
+                    partial,
+                    now,
+                    assignments,
+                    evidence,
+                    decisions,
+                    availability,
+                )
+                for issue in issues:
+                    unit.add_issue(issue)
+                unit.append_event(mandate.mandate_id, _event("mandate.partial", now, f"partial:{mandate.mandate_id}", actor_id=mandate.initiator_id, previous_state="interviewing", new_state="partial", metadata={"reason_code": "required_response_missing"}))
+        except _StaleSynthesisSnapshot:
+            return WorkflowResult()
         missing = ", ".join(missing_names) if missing_names else "a required stakeholder"
         text = (
             f"HUMANWIRE PARTIAL · {mandate.token}\n\n"
@@ -710,6 +836,76 @@ class SynthesisService:
         return WorkflowResult(
             deliveries=self._route_deliveries([mandate.initiator_id], text, mandate.token)
         )
+
+    def _availability_snapshot(
+        self, assignments: list[StakeholderAssignment]
+    ) -> dict[str, tuple[str, datetime] | None]:
+        return {
+            f"availability:{assignment.mandate_id}:{assignment.person_id}": (
+                self.repository.get_runtime_status(
+                    f"availability:{assignment.mandate_id}:{assignment.person_id}"
+                )
+            )
+            for assignment in assignments
+            if assignment.engagement_type is EngagementType.AVAILABILITY
+        }
+
+    @staticmethod
+    def _availability_assignment_ids(
+        assignments: list[StakeholderAssignment],
+        availability: dict[str, tuple[str, datetime] | None],
+    ) -> set[UUID]:
+        valid: set[UUID] = set()
+        for assignment in assignments:
+            if assignment.engagement_type is not EngagementType.AVAILABILITY:
+                continue
+            stored = availability[
+                f"availability:{assignment.mandate_id}:{assignment.person_id}"
+            ]
+            if (
+                stored is None
+                or assignment.completed_at is None
+                or stored[1] != assignment.completed_at
+            ):
+                continue
+            raw_windows = stored[0].split("|")
+            if not raw_windows or any(not raw for raw in raw_windows):
+                continue
+            try:
+                windows = [
+                    AvailabilityWindow(
+                        start=datetime.fromisoformat(raw.split("/", 1)[0]),
+                        end=datetime.fromisoformat(raw.split("/", 1)[1]),
+                    )
+                    for raw in raw_windows
+                ]
+            except (IndexError, ValueError):
+                continue
+            if windows:
+                valid.add(assignment.assignment_id)
+        return valid
+
+    @staticmethod
+    def _fence_snapshot(
+        unit,
+        expected: Mandate,
+        updated: Mandate,
+        now: datetime,
+        assignments: list[StakeholderAssignment],
+        evidence: list,
+        decisions: list,
+        availability: dict[str, tuple[str, datetime] | None],
+    ) -> None:
+        if not unit.compare_and_save_mandate_if_unexpired(expected, updated, now):
+            raise _StaleSynthesisSnapshot
+        if not unit.contribution_snapshot_matches(
+            expected.mandate_id,
+            assignments=assignments,
+            evidence=evidence,
+            decisions=decisions,
+            availability=availability,
+        ):
+            raise _StaleSynthesisSnapshot
 
     def _route_deliveries(
         self, person_ids: list[str], text: str, token: str

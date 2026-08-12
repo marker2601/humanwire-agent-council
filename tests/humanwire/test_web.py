@@ -13,13 +13,22 @@ from humanwire.config import Settings
 from humanwire.database import (
     DomainEventRecord,
     EvidenceItemRecord,
+    InterviewSessionRecord,
     MandateRecord,
     MeetingPackageRecord,
     RuntimeStatusRecord,
     StakeholderAssignmentRecord,
 )
 from humanwire.demo import create_demo_app
-from humanwire.domain import AvailabilityWindow, DomainEvent, EvidenceVisibility
+from humanwire.domain import (
+    AvailabilityWindow,
+    DomainEvent,
+    EngagementDecision,
+    EngagementDecisionKind,
+    EngagementType,
+    EvidenceVisibility,
+    StakeholderState,
+)
 from humanwire.web import create_app
 from humanwire.workflow import json_windows
 
@@ -94,8 +103,7 @@ def test_mandate_api_contains_live_workflow_state_but_no_routes(web_client) -> N
     assert payload["state"] == "interviewing"
     assert payload["initiator"]["person_id"] == "arun-patel"
     assert payload["initiator"]["name"] == "Arun Patel"
-    assert payload["next_action"]["event_type"] == "outreach.alternate_send"
-    assert payload["next_action"]["person_id"] == "priya-raman"
+    assert payload["next_action"] is None
     serialized = json.dumps(payload)
     for forbidden in (
         "@example.com",
@@ -111,6 +119,232 @@ def test_mandate_api_contains_live_workflow_state_but_no_routes(web_client) -> N
         "medical leave",
     ):
         assert forbidden not in serialized
+
+
+def test_public_progress_projects_each_persisted_engagement_contract(web_client) -> None:
+    detail = web_client.get("/api/v1/mandates/HW-2411").json()
+    summary = next(
+        item
+        for item in web_client.get("/api/v1/mandates").json()
+        if item["token"] == "HW-2411"
+    )
+    rows = {
+        item["person_id"]: item
+        for item in web_client.get("/api/v1/mandates/HW-2411/stakeholders").json()
+    }
+
+    assert detail["state"] == "interviewing"
+    assert detail["phase_label"] == "coordinating"
+    assert summary["phase_label"] == "coordinating"
+    assert {
+        person_id: (
+            row["engagement_type"],
+            row["response_required"],
+            row["engagement_status"],
+            row["progress_current"],
+            row["progress_total"],
+        )
+        for person_id, row in rows.items()
+    } == {
+        "eli-torres": ("quick_response", True, "complete", 1, 1),
+        "sora-kim": ("quick_response", True, "complete", 1, 1),
+        "priya-shah": ("structured_interview", True, "in progress", 1, 3),
+        "nora-chen": ("acknowledge", True, "acknowledged", 1, 1),
+        "maya-brooks": ("review_approval", True, "pending", 0, 1),
+        "inez-ward": ("inform", False, "delivered", 1, 1),
+    }
+
+
+@pytest.mark.parametrize(
+    ("state", "status"),
+    [
+        (StakeholderState.DELIVERY_FAILED, "delivery failed"),
+        (StakeholderState.UNREACHABLE, "unreachable"),
+        (StakeholderState.DECLINED, "declined"),
+    ],
+)
+def test_terminal_assignment_progress_is_truthful(demo_app, state, status) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assignment = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.person_id == "inez-ward"
+    )
+    repository.save_assignment(
+        assignment.model_copy(
+            update={"state": state, "completed_at": None, "failure_reason": status}
+        )
+    )
+
+    rows = TestClient(demo_app).get(
+        "/api/v1/mandates/HW-2411/stakeholders"
+    ).json()
+    row = next(item for item in rows if item["person_id"] == "inez-ward")
+
+    assert row["engagement_status"] == status
+    assert (row["progress_current"], row["progress_total"]) == (0, 1)
+
+
+def test_declined_structured_interview_preserves_truthful_question_progress(
+    demo_app,
+) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assignment = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.person_id == "priya-shah"
+    )
+    repository.save_assignment(
+        assignment.model_copy(update={"state": StakeholderState.DECLINED})
+    )
+
+    rows = TestClient(demo_app).get(
+        "/api/v1/mandates/HW-2411/stakeholders"
+    ).json()
+    row = next(item for item in rows if item["person_id"] == "priya-shah")
+
+    assert row["engagement_status"] == "declined"
+    assert (row["progress_current"], row["progress_total"]) == (1, 3)
+
+
+def test_missing_legacy_interview_fails_safe_without_inventing_progress(demo_app) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assignment = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.person_id == "priya-shah"
+    )
+    with repository._session_factory() as session:
+        session.execute(
+            delete(InterviewSessionRecord).where(
+                InterviewSessionRecord.session_id == str(assignment.interview_id)
+            )
+        )
+        session.commit()
+
+    rows = TestClient(demo_app).get(
+        "/api/v1/mandates/HW-2411/stakeholders"
+    ).json()
+    row = next(item for item in rows if item["person_id"] == "priya-shah")
+
+    assert row["engagement_status"] == "awaiting response"
+    assert (row["progress_current"], row["progress_total"]) == (0, 3)
+
+
+def test_availability_progress_requires_the_exact_persisted_record(demo_app) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assignment = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.person_id == "inez-ward"
+    ).model_copy(
+        update={
+            "engagement_type": EngagementType.AVAILABILITY,
+            "response_required": True,
+        }
+    )
+    repository.save_assignment(assignment)
+    repository.set_runtime_status(
+        f"availability:{mandate.mandate_id}:{assignment.person_id}",
+        "2026-08-12T15:00:00+00:00/2026-08-12T16:00:00+00:00",
+        assignment.completed_at,
+    )
+
+    rows = TestClient(demo_app).get(
+        "/api/v1/mandates/HW-2411/stakeholders"
+    ).json()
+    row = next(item for item in rows if item["person_id"] == assignment.person_id)
+
+    assert row["engagement_status"] == "recorded"
+    assert (row["progress_current"], row["progress_total"]) == (1, 1)
+
+
+def test_raw_engagement_change_text_is_denied_on_every_public_route(demo_app) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assignment = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.person_id == "maya-brooks"
+    )
+    repository.add_engagement_decision(
+        EngagementDecision(
+            decision_id=uuid4(),
+            mandate_id=mandate.mandate_id,
+            assignment_id=assignment.assignment_id,
+            stakeholder_id=assignment.person_id,
+            response=EngagementDecisionKind.CHANGE,
+            change_text="PRIVATE-DECISION-CHANGE-SENTINEL",
+            source_message_id="private-change-source",
+            created_at=NOW,
+            idempotency_key="private-change-sentinel",
+        )
+    )
+    client = TestClient(demo_app)
+    paths = (
+        "/",
+        "/mandates/HW-2411",
+        "/mandates/HW-2411/reach",
+        "/mandates/HW-2411/data",
+        "/api/v1/mandates",
+        "/api/v1/mandates/HW-2411",
+        "/api/v1/mandates/HW-2411/stakeholders",
+        "/api/v1/mandates/HW-2411/outreach-events",
+        "/api/v1/mandates/HW-2411/evidence-summary",
+        "/mandates/HW-2413/meeting.ics",
+    )
+
+    responses = [client.get(path) for path in paths]
+
+    assert all(response.status_code == 200 for response in responses)
+    assert "PRIVATE-DECISION-CHANGE-SENTINEL" not in "".join(
+        response.text for response in responses
+    )
+
+
+@pytest.mark.parametrize(
+    ("response", "status"),
+    [
+        (EngagementDecisionKind.APPROVE, "approved"),
+        (EngagementDecisionKind.REJECT, "rejected"),
+        (EngagementDecisionKind.CHANGE, "change requested"),
+    ],
+)
+def test_review_progress_comes_only_from_the_exact_persisted_decision(
+    demo_app, response, status
+) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assignment = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.person_id == "maya-brooks"
+    )
+    repository.add_engagement_decision(
+        EngagementDecision(
+            decision_id=uuid4(),
+            mandate_id=mandate.mandate_id,
+            assignment_id=assignment.assignment_id,
+            stakeholder_id=assignment.person_id,
+            response=response,
+            change_text="PRIVATE-REVIEW-SENTINEL" if response is EngagementDecisionKind.CHANGE else None,
+            source_message_id=f"review-progress-{response.value}",
+            created_at=NOW,
+            idempotency_key=f"review-progress-{response.value}",
+        )
+    )
+
+    rows = TestClient(demo_app).get(
+        "/api/v1/mandates/HW-2411/stakeholders"
+    ).json()
+    row = next(item for item in rows if item["person_id"] == assignment.person_id)
+
+    assert row["engagement_status"] == status
+    assert (row["progress_current"], row["progress_total"]) == (1, 1)
 
 
 def test_public_projection_redacts_a_destination_even_if_it_reaches_persisted_text(
@@ -474,7 +708,7 @@ def test_private_common_word_does_not_damage_independently_public_prose(demo_app
     )
     assert detail.json()["objective"] == "[PRIVATE]"
     assert public_statement in serialized
-    assert "APAC coverage requires a documented handoff." in serialized
+    assert "Coverage requires a documented handoff." in serialized
     assert distinctive not in serialized
     assert "Discuss [PRIVATE] after lunch." in serialized
     assert events.json()[0]["metadata"] == {"references": [{"status": "[PRIVATE]"}]}
@@ -615,11 +849,11 @@ def test_list_filter_stakeholders_events_evidence_and_reach_are_persisted_projec
     assert [item["token"] for item in aligned] == ["HW-2412"]
     assert {(item["direction"], item["state"]) for item in stakeholders} >= {
         ("downward", "complete"),
-        ("lateral", "alternate_channel"),
-        ("upward", "acknowledged"),
-        ("upward", "interviewing"),
+        ("lateral", "interviewing"),
+        ("upward", "complete"),
+        ("upward", "awaiting_acknowledgement"),
     }
-    assert len([item for item in stakeholders if item["direction"] == "downward" and item["state"] == "complete"]) == 2
+    assert len([item for item in stakeholders if item["direction"] == "downward" and item["state"] == "complete"]) == 3
     assert [item["created_at"] for item in events] == sorted(item["created_at"] for item in events)
     assert len(events) >= 12
     assert evidence["counts"] == {"shareable": 2, "anonymous": 1, "private_blockers": 1}

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import datetime, timedelta
 from enum import StrEnum
 from uuid import UUID, uuid4
@@ -17,8 +17,13 @@ from humanwire.domain import (
     AlignmentIssue,
     AlignmentIssueType,
     DomainEvent,
+    EngagementDecision,
+    EngagementDecisionKind,
+    EngagementType,
+    EvidenceItem,
     EvidenceStatus,
     EvidenceType,
+    EvidenceVisibility,
     Mandate,
     MandatePlan,
     Proposal,
@@ -54,6 +59,96 @@ class NegotiationOutcome(StrEnum):
     MEETING_REQUIRED = "meeting_required"
 
 
+class ContributionState(StrEnum):
+    COMPLETE = "complete"
+    MISSING_RESPONSE = "missing_response"
+    MISSING_EVIDENCE = "missing_evidence"
+    REJECTED = "rejected"
+    CHANGE_REQUESTED = "change_requested"
+    DELIVERY_FAILED = "delivery_failed"
+
+
+class ContributionStatus(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    state: ContributionState
+    blocking: bool
+
+
+def contribution_status(
+    assignment: StakeholderAssignment,
+    *,
+    evidence: Sequence[EvidenceItem],
+    decisions: Sequence[EngagementDecision],
+    has_availability: bool,
+) -> ContributionStatus:
+    """Evaluate one contribution solely from exact persisted trusted facts."""
+    if assignment.state in {
+        StakeholderState.DELIVERY_FAILED,
+        StakeholderState.UNREACHABLE,
+    }:
+        return ContributionStatus(
+            state=ContributionState.DELIVERY_FAILED,
+            blocking=assignment.required,
+        )
+    if assignment.state is not StakeholderState.COMPLETE:
+        return ContributionStatus(
+            state=ContributionState.MISSING_RESPONSE,
+            blocking=assignment.required,
+        )
+    if assignment.engagement_type in {
+        EngagementType.QUICK_RESPONSE,
+        EngagementType.STRUCTURED_INTERVIEW,
+    }:
+        has_exact_evidence = any(
+            item.mandate_id == assignment.mandate_id
+            and item.assignment_id == assignment.assignment_id
+            and item.stakeholder_id == assignment.person_id
+            and item.status is EvidenceStatus.CONFIRMED
+            and item.visibility
+            in {EvidenceVisibility.SHAREABLE, EvidenceVisibility.PRIVATE}
+            for item in evidence
+        )
+        if not has_exact_evidence:
+            return ContributionStatus(
+                state=ContributionState.MISSING_EVIDENCE,
+                blocking=assignment.required,
+            )
+    elif assignment.engagement_type is EngagementType.REVIEW_APPROVAL:
+        exact_decisions = [
+            item
+            for item in decisions
+            if item.mandate_id == assignment.mandate_id
+            and item.assignment_id == assignment.assignment_id
+            and item.stakeholder_id == assignment.person_id
+        ]
+        if len(exact_decisions) != 1:
+            return ContributionStatus(
+                state=ContributionState.MISSING_RESPONSE,
+                blocking=assignment.required,
+            )
+        response = exact_decisions[0].response
+        if response is EngagementDecisionKind.REJECT:
+            return ContributionStatus(
+                state=ContributionState.REJECTED,
+                blocking=True,
+            )
+        if response is EngagementDecisionKind.CHANGE:
+            return ContributionStatus(
+                state=ContributionState.CHANGE_REQUESTED,
+                blocking=True,
+            )
+    elif (
+        assignment.engagement_type is EngagementType.AVAILABILITY
+        and not has_availability
+    ):
+        return ContributionStatus(
+            state=ContributionState.MISSING_RESPONSE,
+            blocking=assignment.required,
+        )
+    return ContributionStatus(state=ContributionState.COMPLETE, blocking=False)
+
+
 class AlignmentReport(BaseModel):
     mandate_id: UUID
     agreements: list[str] = Field(default_factory=list)
@@ -80,10 +175,46 @@ class AlignmentEngine:
         assignments: Iterable[StakeholderAssignment],
         *,
         private_blocker_count: int = 0,
+        contribution_evidence: Sequence[EvidenceItem] | None = None,
+        decisions: Sequence[EngagementDecision] = (),
+        availability_assignment_ids: set[UUID] | frozenset[UUID] = frozenset(),
     ) -> AlignmentReport:
+        assignment_values = sorted(assignments, key=lambda item: str(item.assignment_id))
         public_evidence = self._public_evidence(evidence)
-        required_assignments = [assignment for assignment in assignments if assignment.required]
-        issues = self._deterministic_issues(plan, public_evidence, required_assignments)
+        required_assignments = [
+            assignment for assignment in assignment_values if assignment.required
+        ]
+        statuses: dict[UUID, ContributionStatus] | None = None
+        valid_assignment_ids: set[UUID] | None = None
+        if contribution_evidence is not None:
+            valid_assignment_ids = self._valid_assignment_ids(plan, assignment_values)
+            statuses = {
+                assignment.assignment_id: contribution_status(
+                    assignment,
+                    evidence=contribution_evidence,
+                    decisions=decisions,
+                    has_availability=(
+                        assignment.assignment_id in availability_assignment_ids
+                    ),
+                )
+                for assignment in assignment_values
+            }
+            eligible_evidence_ids = self._eligible_contribution_evidence_ids(
+                assignment_values,
+                contribution_evidence,
+                valid_assignment_ids,
+            )
+            public_evidence = [
+                item for item in public_evidence if item.evidence_id in eligible_evidence_ids
+            ]
+        issues = self._deterministic_issues(
+            plan,
+            public_evidence,
+            required_assignments,
+            assignments=assignment_values,
+            contribution_statuses=statuses,
+            valid_assignment_ids=valid_assignment_ids,
+        )
         if private_blocker_count:
             issues.append(
                 self._issue(
@@ -93,15 +224,63 @@ class AlignmentEngine:
                 )
             )
 
-        covered = self._covered_decisions(plan, public_evidence)
+        covered = (
+            self._covered_contribution_decisions(
+                plan,
+                assignment_values,
+                contribution_evidence,
+                decisions,
+                statuses or {},
+                valid_assignment_ids or set(),
+            )
+            if contribution_evidence is not None
+            else self._covered_decisions(plan, public_evidence)
+        )
+        if contribution_evidence is not None:
+            for decision in plan.required_decisions:
+                if decision not in covered:
+                    issues.append(
+                        self._issue(
+                            AlignmentIssueType.AUTHORITY_GAP,
+                            "A required decision lacks authenticated evidence or approval authority.",
+                            related_decision=decision,
+                            blocking=True,
+                        )
+                    )
         planned_required_ids = {
             stakeholder.person_ref for stakeholder in plan.stakeholders if stakeholder.required
         }
-        completed_ids = {
-            assignment.person_id for assignment in required_assignments if assignment.state is StakeholderState.COMPLETE
-        }
-        all_required_complete = bool(planned_required_ids) and planned_required_ids.issubset(completed_ids)
-        agreements = self._agreements(public_evidence, issues)
+        if contribution_evidence is None:
+            completed_ids = {
+                assignment.person_id
+                for assignment in required_assignments
+                if assignment.state is StakeholderState.COMPLETE
+            }
+            all_required_complete = bool(planned_required_ids) and planned_required_ids.issubset(
+                completed_ids
+            )
+        else:
+            all_required_complete = all(
+                len(
+                    [
+                        assignment
+                        for assignment in required_assignments
+                        if assignment.person_id == person_id
+                        and assignment.assignment_id in (valid_assignment_ids or set())
+                        and statuses is not None
+                        and statuses[assignment.assignment_id].state
+                        is ContributionState.COMPLETE
+                    ]
+                )
+                == 1
+                for person_id in planned_required_ids
+            )
+        agreement_evidence = (
+            [item for item in public_evidence if item.stakeholder_id is not None]
+            if contribution_evidence is not None
+            else public_evidence
+        )
+        agreements = self._agreements(agreement_evidence, issues)
         return AlignmentReport(
             mandate_id=self.mandate_id,
             agreements=agreements,
@@ -120,15 +299,23 @@ class AlignmentEngine:
         plan: MandatePlan,
         evidence: list[ShareableEvidence],
         required_assignments: list[StakeholderAssignment],
+        *,
+        assignments: list[StakeholderAssignment] | None = None,
+        contribution_statuses: dict[UUID, ContributionStatus] | None = None,
+        valid_assignment_ids: set[UUID] | None = None,
     ) -> list[AlignmentIssue]:
         issues: list[AlignmentIssue] = []
         planned_required_ids = {
             stakeholder.person_ref for stakeholder in plan.stakeholders if stakeholder.required
         }
-        by_person = {assignment.person_id: assignment for assignment in required_assignments}
         accounted_for: set[str] = set()
         for person_id in sorted(planned_required_ids):
-            assignment = by_person.get(person_id)
+            matching = [
+                assignment
+                for assignment in required_assignments
+                if assignment.person_id == person_id
+            ]
+            assignment = matching[0] if len(matching) == 1 else None
             accounted_for.add(person_id)
             if assignment is None:
                 issues.append(
@@ -139,6 +326,23 @@ class AlignmentEngine:
                         blocking=True,
                     )
                 )
+            elif contribution_statuses is not None:
+                if assignment.assignment_id not in (valid_assignment_ids or set()):
+                    issues.append(
+                        self._issue(
+                            AlignmentIssueType.AUTHORITY_GAP,
+                            "A required assignment does not match its trusted engagement plan.",
+                            stakeholder_ids=[assignment.person_id],
+                            blocking=True,
+                        )
+                    )
+                else:
+                    issue = self._contribution_issue(
+                        assignment,
+                        contribution_statuses[assignment.assignment_id],
+                    )
+                    if issue is not None:
+                        issues.append(issue)
             elif assignment.state is not StakeholderState.COMPLETE:
                 issues.append(
                     self._issue(
@@ -149,7 +353,10 @@ class AlignmentEngine:
                     )
                 )
         for assignment in required_assignments:
-            if assignment.person_id not in accounted_for and assignment.state is not StakeholderState.COMPLETE:
+            if assignment.person_id not in accounted_for and (
+                contribution_statuses is not None
+                or assignment.state is not StakeholderState.COMPLETE
+            ):
                 issues.append(
                     self._issue(
                         AlignmentIssueType.MISSING_EVIDENCE,
@@ -158,6 +365,18 @@ class AlignmentEngine:
                         blocking=True,
                     )
                 )
+        if contribution_statuses is not None:
+            for assignment in assignments or []:
+                if assignment.required or assignment.assignment_id not in (
+                    valid_assignment_ids or set()
+                ):
+                    continue
+                issue = self._contribution_issue(
+                    assignment,
+                    contribution_statuses[assignment.assignment_id],
+                )
+                if issue is not None:
+                    issues.append(issue)
 
         by_decision = self._by_decision(plan, evidence)
         for decision, candidates in by_decision.items():
@@ -178,6 +397,136 @@ class AlignmentEngine:
             issues.extend(self._resource_conflicts(candidates, decision))
             issues.extend(self._hard_constraints(candidates, decision))
         return issues
+
+    def _contribution_issue(
+        self,
+        assignment: StakeholderAssignment,
+        status: ContributionStatus,
+    ) -> AlignmentIssue | None:
+        if not status.blocking or status.state is ContributionState.COMPLETE:
+            return None
+        if status.state in {
+            ContributionState.REJECTED,
+            ContributionState.CHANGE_REQUESTED,
+        }:
+            issue_type = AlignmentIssueType.HARD_CONSTRAINT
+            summary = (
+                "An authenticated approval response rejected the request."
+                if status.state is ContributionState.REJECTED
+                else "An authenticated approval response requested changes."
+            )
+        elif assignment.engagement_type is EngagementType.REVIEW_APPROVAL:
+            issue_type = AlignmentIssueType.AUTHORITY_GAP
+            summary = "Required authenticated approval is missing."
+        elif status.state is ContributionState.MISSING_EVIDENCE:
+            issue_type = AlignmentIssueType.MISSING_EVIDENCE
+            summary = "A required response lacks confirmed assignment-bound evidence."
+        elif status.state is ContributionState.DELIVERY_FAILED:
+            issue_type = AlignmentIssueType.MISSING_EVIDENCE
+            summary = "A required contribution could not be delivered or reached."
+        else:
+            issue_type = AlignmentIssueType.MISSING_EVIDENCE
+            summary = "A required authenticated response is missing."
+        return self._issue(
+            issue_type,
+            summary,
+            stakeholder_ids=[assignment.person_id],
+            blocking=True,
+        )
+
+    def _valid_assignment_ids(
+        self,
+        plan: MandatePlan,
+        assignments: Sequence[StakeholderAssignment],
+    ) -> set[UUID]:
+        planned_by_person: dict[str, list] = {}
+        for stakeholder in plan.stakeholders:
+            planned_by_person.setdefault(stakeholder.person_ref, []).append(stakeholder)
+        assignment_counts: dict[str, int] = {}
+        for assignment in assignments:
+            assignment_counts[assignment.person_id] = (
+                assignment_counts.get(assignment.person_id, 0) + 1
+            )
+        return {
+            assignment.assignment_id
+            for assignment in assignments
+            if assignment.mandate_id == self.mandate_id
+            and assignment_counts[assignment.person_id] == 1
+            and len(planned_by_person.get(assignment.person_id, [])) == 1
+            and (
+                stakeholder := planned_by_person[assignment.person_id][0]
+            ).direction
+            is assignment.direction
+            and stakeholder.reason == assignment.reason
+            and stakeholder.required is assignment.required
+            and stakeholder.engagement_type is assignment.engagement_type
+            and stakeholder.response_required is assignment.response_required
+        }
+
+    @staticmethod
+    def _eligible_contribution_evidence_ids(
+        assignments: Sequence[StakeholderAssignment],
+        evidence: Sequence[EvidenceItem],
+        valid_assignment_ids: set[UUID],
+    ) -> set[UUID]:
+        by_id = {item.assignment_id: item for item in assignments}
+        return {
+            item.evidence_id
+            for item in evidence
+            if item.assignment_id in valid_assignment_ids
+            and (assignment := by_id.get(item.assignment_id)) is not None
+            and assignment.engagement_type
+            in {
+                EngagementType.QUICK_RESPONSE,
+                EngagementType.STRUCTURED_INTERVIEW,
+            }
+            and item.mandate_id == assignment.mandate_id
+            and item.stakeholder_id == assignment.person_id
+        }
+
+    def _covered_contribution_decisions(
+        self,
+        plan: MandatePlan,
+        assignments: Sequence[StakeholderAssignment],
+        evidence: Sequence[EvidenceItem],
+        decisions: Sequence[EngagementDecision],
+        statuses: dict[UUID, ContributionStatus],
+        valid_assignment_ids: set[UUID],
+    ) -> list[str]:
+        by_id = {assignment.assignment_id: assignment for assignment in assignments}
+        approved = any(
+            decision.response is EngagementDecisionKind.APPROVE
+            and decision.assignment_id in valid_assignment_ids
+            and (assignment := by_id.get(decision.assignment_id)) is not None
+            and assignment.engagement_type is EngagementType.REVIEW_APPROVAL
+            and statuses[assignment.assignment_id].state is ContributionState.COMPLETE
+            and decision.mandate_id == assignment.mandate_id
+            and decision.stakeholder_id == assignment.person_id
+            for decision in decisions
+        )
+        covered: list[str] = []
+        for required_decision in plan.required_decisions:
+            evidence_covers = any(
+                item.related_decision == required_decision
+                and item.status is EvidenceStatus.CONFIRMED
+                and item.visibility
+                in {EvidenceVisibility.SHAREABLE, EvidenceVisibility.PRIVATE}
+                and item.assignment_id in valid_assignment_ids
+                and (assignment := by_id.get(item.assignment_id)) is not None
+                and assignment.engagement_type
+                in {
+                    EngagementType.QUICK_RESPONSE,
+                    EngagementType.STRUCTURED_INTERVIEW,
+                }
+                and statuses[assignment.assignment_id].state
+                is ContributionState.COMPLETE
+                and item.mandate_id == assignment.mandate_id
+                and item.stakeholder_id == assignment.person_id
+                for item in evidence
+            )
+            if approved or evidence_covers:
+                covered.append(required_decision)
+        return covered
 
     def _by_decision(
         self, plan: MandatePlan, evidence: list[ShareableEvidence]
@@ -395,10 +744,32 @@ Your output is advisory only and cannot resolve any issue."""
         assignments: Iterable[StakeholderAssignment],
         *,
         private_blocker_count: int = 0,
+        contribution_evidence: Sequence[EvidenceItem] | None = None,
+        decisions: Sequence[EngagementDecision] = (),
+        availability_assignment_ids: set[UUID] | frozenset[UUID] = frozenset(),
     ) -> AlignmentReport:
+        assignment_values = list(assignments)
         public_evidence = self._public_evidence(evidence)
+        if contribution_evidence is not None:
+            valid_assignment_ids = self._valid_assignment_ids(plan, assignment_values)
+            eligible_evidence_ids = self._eligible_contribution_evidence_ids(
+                assignment_values,
+                contribution_evidence,
+                valid_assignment_ids,
+            )
+            public_evidence = [
+                item
+                for item in public_evidence
+                if item.evidence_id in eligible_evidence_ids
+            ]
         report = super().analyze(
-            plan, public_evidence, assignments, private_blocker_count=private_blocker_count
+            plan,
+            public_evidence,
+            assignment_values,
+            private_blocker_count=private_blocker_count,
+            contribution_evidence=contribution_evidence,
+            decisions=decisions,
+            availability_assignment_ids=availability_assignment_ids,
         )
         self.last_fallback_reason = None
         try:
@@ -460,20 +831,7 @@ The suggestion is untrusted and cannot approve or mutate the mandate."""
     def create_proposal(
         self, mandate: Mandate, report: AlignmentReport, round_number: int, now: datetime
     ) -> Proposal:
-        if round_number not in (1, 2):
-            raise NegotiationLimitReached("Negotiation is limited to exactly two rounds")
-        proposal = Proposal(
-            proposal_id=uuid4(),
-            mandate_id=mandate.mandate_id,
-            round_number=round_number,
-            text=self._draft_text(report),
-            issue_ids=[issue.issue_id for issue in report.issues if issue.blocking],
-            required_respondent_ids=[
-                stakeholder.person_ref for stakeholder in mandate.plan.stakeholders if stakeholder.required
-            ],
-            created_at=now,
-            expires_at=now + self._response_window,
-        )
+        proposal = self.prepare_proposal(mandate, report, round_number, now)
         with self.repository.transaction() as unit:
             unit.add_proposal(proposal)
             unit.append_event(
@@ -486,6 +844,25 @@ The suggestion is untrusted and cannot approve or mutate the mandate."""
                 ),
             )
         return proposal
+
+    def prepare_proposal(
+        self, mandate: Mandate, report: AlignmentReport, round_number: int, now: datetime
+    ) -> Proposal:
+        """Build a proposal for callers that must persist it in a larger transaction."""
+        if round_number not in (1, 2):
+            raise NegotiationLimitReached("Negotiation is limited to exactly two rounds")
+        return Proposal(
+            proposal_id=uuid4(),
+            mandate_id=mandate.mandate_id,
+            round_number=round_number,
+            text=self._draft_text(report),
+            issue_ids=[issue.issue_id for issue in report.issues if issue.blocking],
+            required_respondent_ids=[
+                stakeholder.person_ref for stakeholder in mandate.plan.stakeholders if stakeholder.required
+            ],
+            created_at=now,
+            expires_at=now + self._response_window,
+        )
 
     def record_response(
         self,

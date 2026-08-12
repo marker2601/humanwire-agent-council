@@ -16,6 +16,11 @@ from humanwire.domain import (
     DeliveryInstruction,
     DeliveryKind,
     Direction,
+    EngagementType,
+    EvidenceItem,
+    EvidenceStatus,
+    EvidenceType,
+    EvidenceVisibility,
     IncomingMessage,
     Mandate,
     MandatePlan,
@@ -98,6 +103,7 @@ def make_settings(tmp_path, **overrides) -> Settings:
 def seed_complete_mandate(container, *, suffix: str) -> Mandate:
     mandate_id = UUID(f"00000000-0000-0000-0000-{int(suffix):012d}")
     assignment_id = UUID(f"10000000-0000-0000-0000-{int(suffix):012d}")
+    evidence_id = UUID(f"20000000-0000-0000-0000-{int(suffix):012d}")
     mandate = Mandate(
         mandate_id=mandate_id,
         token=f"HW-MODEL{suffix}",
@@ -134,12 +140,28 @@ def seed_complete_mandate(container, *, suffix: str) -> Mandate:
         direction=Direction.DOWNWARD,
         reason="Owns the operating plan.",
         required=True,
+        engagement_type=EngagementType.QUICK_RESPONSE,
         state=StakeholderState.COMPLETE,
         route_ids=["team-lead-email"],
     )
     with container.repository.transaction() as unit:
         unit.add_mandate(mandate)
         unit.add_assignment(assignment)
+    container.repository.add_evidence(
+        EvidenceItem(
+            evidence_id=evidence_id,
+            mandate_id=mandate_id,
+            assignment_id=assignment_id,
+            stakeholder_id="team-lead",
+            evidence_type=EvidenceType.FACT,
+            statement="The authenticated contribution is confirmed.",
+            visibility=EvidenceVisibility.SHAREABLE,
+            status=EvidenceStatus.CONFIRMED,
+            source_message_id=f"confirmed-{suffix}",
+            channel=Channel.EMAIL,
+            created_at=NOW,
+        )
+    )
     return mandate
 
 
@@ -230,7 +252,8 @@ def test_offline_container_workflow_uses_exact_deterministic_proposal_fallback(t
     assert proposal is not None
     assert proposal.text == (
         "HUMANWIRE DRAFT PROPOSAL\n"
-        "Review the proposed decision. Reply ACCEPT, REJECT, or CHANGE with a requested change."
+        "A required decision lacks authenticated evidence or approval authority. "
+        "Reply ACCEPT, REJECT, or CHANGE with a requested change."
     )
 
 

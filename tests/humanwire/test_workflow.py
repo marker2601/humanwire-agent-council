@@ -7,9 +7,10 @@ from uuid import uuid4
 
 import pytest
 
+from humanwire.alignment import HybridAlignmentEngine
 from humanwire.config import Settings
 from humanwire.container import DueActionWorker
-from humanwire.database import create_session_factory
+from humanwire.database import RuntimeStatusRecord, create_session_factory
 from humanwire.directory import InitiatorPolicy, OrganizationDirectory, OrganizationDocument
 from humanwire.domain import (
     AlignmentIssue,
@@ -18,6 +19,7 @@ from humanwire.domain import (
     ContactRoute,
     DeliveryKind,
     Direction,
+    EngagementDecision,
     EngagementDecisionKind,
     EngagementType,
     EvidenceItem,
@@ -544,6 +546,26 @@ def _complete_interview(
             message_id=f"{prefix}-ack",
         )
     )
+    assignment = next(
+        item
+        for item in workflow.repository.list_assignments(mandate.mandate_id)
+        if item.person_id == person_id
+    )
+    workflow.repository.add_evidence(
+        EvidenceItem(
+            evidence_id=uuid4(),
+            mandate_id=mandate.mandate_id,
+            assignment_id=assignment.assignment_id,
+            stakeholder_id=person_id,
+            evidence_type=EvidenceType.FACT,
+            statement="An authenticated contribution was confirmed.",
+            visibility=EvidenceVisibility.SHAREABLE,
+            status=EvidenceStatus.CONFIRMED,
+            source_message_id=f"{prefix}-confirmed-contribution",
+            channel=Channel.EMAIL,
+            created_at=mandate.created_at,
+        )
+    )
     return workflow.handle(
         _message_for(
             incoming_message_factory,
@@ -718,6 +740,166 @@ def _mixed_preview(
     result = workflow.handle(message)
     mandate = workflow.repository.list_recent_mandates(1)[0]
     return message, mandate, result
+
+
+def _persist_ready_mixed_contributions(
+    workflow: HumanWireWorkflow,
+    repository: SqlAlchemyHumanWireRepository,
+    mandate,
+    released: WorkflowResult,
+    now,
+    *,
+    approval: EngagementDecisionKind | None = EngagementDecisionKind.APPROVE,
+    structured_evidence: bool = True,
+    optional_inform_complete: bool = True,
+) -> dict[str, StakeholderAssignment]:
+    for delivery in released.deliveries:
+        assignment = repository.get_assignment(delivery.assignment_id)
+        assert assignment is not None
+        if assignment.engagement_type is EngagementType.INFORM:
+            if optional_inform_complete:
+                workflow.mark_delivery_result(
+                    delivery,
+                    succeeded=True,
+                    now=now + timedelta(seconds=2),
+                )
+            continue
+        workflow.mark_delivery_result(
+            delivery,
+            succeeded=True,
+            now=now + timedelta(seconds=2),
+        )
+
+    assignments = {
+        item.person_id: item
+        for item in repository.list_assignments(mandate.mandate_id)
+    }
+    sessions_by_id = {
+        session.session_id: session
+        for session in repository.list_interviews(mandate.mandate_id)
+    }
+    completed_at = now + timedelta(seconds=3)
+    with repository.transaction() as unit:
+        for person_id, assignment in assignments.items():
+            if person_id == "inform-person":
+                continue
+            unit.save_assignment(
+                assignment.model_copy(
+                    update={
+                        "state": StakeholderState.COMPLETE,
+                        "next_action_at": None,
+                        "completed_at": completed_at,
+                    }
+                )
+            )
+            if assignment.interview_id is not None:
+                session = sessions_by_id.get(assignment.interview_id)
+                assert session is not None
+                unit.save_interview(
+                    session.model_copy(
+                        update={
+                            "current_question_index": len(session.questions),
+                            "completed_at": completed_at,
+                            "updated_at": completed_at,
+                        }
+                    )
+                )
+
+        for person_id, visibility, statement in (
+            (
+                "quick-person",
+                EvidenceVisibility.SHAREABLE,
+                "The focused launch fact is confirmed.",
+            ),
+            (
+                "structured-person",
+                EvidenceVisibility.PRIVATE,
+                "PRIVATE-CONTRIBUTION-SENTINEL must remain internal.",
+            ),
+        ):
+            if person_id == "structured-person" and not structured_evidence:
+                continue
+            assignment = assignments[person_id]
+            unit.add_evidence(
+                EvidenceItem(
+                    evidence_id=uuid4(),
+                    mandate_id=mandate.mandate_id,
+                    assignment_id=assignment.assignment_id,
+                    stakeholder_id=person_id,
+                    evidence_type=EvidenceType.FACT,
+                    statement=statement,
+                    visibility=visibility,
+                    status=EvidenceStatus.CONFIRMED,
+                    source_message_id=f"ready-{person_id}",
+                    channel=Channel.EMAIL,
+                    created_at=completed_at,
+                )
+            )
+
+        if approval is not None:
+            approval_assignment = assignments["approval-person"]
+            unit.add_engagement_decision(
+                EngagementDecision(
+                    decision_id=uuid4(),
+                    mandate_id=mandate.mandate_id,
+                    assignment_id=approval_assignment.assignment_id,
+                    stakeholder_id=approval_assignment.person_id,
+                    response=approval,
+                    change_text=(
+                        "PRIVATE-APPROVAL-CHANGE-SENTINEL"
+                        if approval is EngagementDecisionKind.CHANGE
+                        else None
+                    ),
+                    source_message_id="ready-approval",
+                    created_at=completed_at,
+                    idempotency_key=f"ready-approval:{mandate.mandate_id}",
+                )
+            )
+        unit.set_runtime_status(
+            f"availability:{mandate.mandate_id}:availability-person",
+            "2026-08-12T15:00:00+00:00/2026-08-12T16:00:00+00:00",
+            completed_at,
+        )
+    return {
+        item.person_id: item
+        for item in repository.list_assignments(mandate.mandate_id)
+    }
+
+
+def _ready_mixed_synthesis(
+    repository,
+    incoming_message_factory,
+    now,
+    **ready_options,
+):
+    workflow = _build_mixed_workflow(
+        repository,
+        settings=Settings(_env_file=None, engagement_require_go=True),
+    )
+    message, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id=f"ready-mixed-{uuid4()}",
+        received_at=now,
+    )
+    released = workflow.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": f"ready-mixed-go-{uuid4()}",
+                "received_at": now + timedelta(seconds=1),
+            }
+        )
+    )
+    assignments = _persist_ready_mixed_contributions(
+        workflow,
+        repository,
+        mandate,
+        released,
+        now,
+        **ready_options,
+    )
+    return workflow, mandate, assignments
 
 
 def _release_selected_mixed_delivery(
@@ -5164,6 +5346,348 @@ def test_process_due_merges_ladder_and_synthesis_deliveries_at_workflow_boundary
     assert {"outreach.reminder_sent", "mandate.aligned", "alignment.brief_persisted"} <= _event_types(
         repository, mandate.mandate_id
     )
+
+
+def test_contribution_aware_synthesis_aligns_valid_mixed_engagement_aggregate(
+    repository, incoming_message_factory, now
+) -> None:
+    workflow, mandate, assignments = _ready_mixed_synthesis(
+        repository,
+        incoming_message_factory,
+        now,
+        optional_inform_complete=False,
+    )
+
+    result = workflow.synthesis.run(mandate.mandate_id, now + timedelta(seconds=4))
+
+    saved = repository.get_mandate_by_token(mandate.token)
+    sessions = repository.list_interviews(mandate.mandate_id)
+    assert saved is not None and saved.state is MandateState.ALIGNED
+    assert assignments["inform-person"].required is False
+    assert assignments["inform-person"].state is StakeholderState.DELIVERED
+    assert {session.assignment_id for session in sessions} == {
+        assignments["quick-person"].assignment_id,
+        assignments["structured-person"].assignment_id,
+    }
+    assert assignments["ack-person"].interview_id is None
+    assert assignments["approval-person"].interview_id is None
+    assert assignments["availability-person"].interview_id is None
+    assert repository.get_active_proposal(mandate.mandate_id) is None
+    assert repository.get_runtime_status(
+        f"alignment-brief:{mandate.mandate_id}"
+    ) is not None
+    assert any("ALIGNMENT BRIEF" in delivery.text for delivery in result.deliveries)
+
+
+def test_required_contribution_missing_confirmed_evidence_is_truthful_partial(
+    repository, incoming_message_factory, now
+) -> None:
+    workflow, mandate, assignments = _ready_mixed_synthesis(
+        repository,
+        incoming_message_factory,
+        now,
+        structured_evidence=False,
+    )
+
+    result = workflow.synthesis.run(mandate.mandate_id, now + timedelta(seconds=4))
+
+    saved = repository.get_mandate_by_token(mandate.token)
+    issues = repository.list_issues(mandate.mandate_id)
+    serialized = "\n".join(delivery.text for delivery in result.deliveries)
+    assert saved is not None and saved.state is MandateState.PARTIAL
+    assert any(
+        issue.issue_type is AlignmentIssueType.MISSING_EVIDENCE
+        and issue.stakeholder_ids == [assignments["structured-person"].person_id]
+        and issue.blocking
+        for issue in issues
+    )
+    assert "Priya Raman" in serialized
+    assert "No agreement or approval was inferred" in serialized
+    assert repository.get_active_proposal(mandate.mandate_id) is None
+
+
+def test_availability_contribution_rejects_a_partially_malformed_exact_record(
+    repository, incoming_message_factory, now
+) -> None:
+    workflow, mandate, assignments = _ready_mixed_synthesis(
+        repository,
+        incoming_message_factory,
+        now,
+    )
+    availability = assignments["availability-person"]
+    repository.set_runtime_status(
+        f"availability:{mandate.mandate_id}:{availability.person_id}",
+        "|2026-08-12T15:00:00+00:00/2026-08-12T16:00:00+00:00",
+        availability.completed_at,
+    )
+
+    result = workflow.synthesis.run(mandate.mandate_id, now + timedelta(seconds=4))
+
+    saved = repository.get_mandate_by_token(mandate.token)
+    issues = repository.list_issues(mandate.mandate_id)
+    assert saved is not None and saved.state is MandateState.PARTIAL
+    assert any(
+        issue.issue_type is AlignmentIssueType.MISSING_EVIDENCE
+        and issue.stakeholder_ids == [availability.person_id]
+        for issue in issues
+    )
+    assert any("No agreement or approval was inferred" in item.text for item in result.deliveries)
+
+
+@pytest.mark.parametrize("invalid_record", ["missing", "wrong_person", "wrong_mandate", "stale"])
+def test_availability_contribution_requires_the_exact_fresh_runtime_record(
+    repository, incoming_message_factory, now, invalid_record
+) -> None:
+    workflow, mandate, assignments = _ready_mixed_synthesis(
+        repository,
+        incoming_message_factory,
+        now,
+    )
+    assignment = assignments["availability-person"]
+    exact_key = f"availability:{mandate.mandate_id}:{assignment.person_id}"
+    stored = repository.get_runtime_status(exact_key)
+    assert stored is not None
+    with repository._session_factory() as session:
+        record = session.get(RuntimeStatusRecord, exact_key)
+        assert record is not None
+        session.delete(record)
+        session.commit()
+    if invalid_record == "wrong_person":
+        repository.set_runtime_status(
+            f"availability:{mandate.mandate_id}:someone-else",
+            stored[0],
+            assignment.completed_at,
+        )
+    elif invalid_record == "wrong_mandate":
+        repository.set_runtime_status(
+            f"availability:{uuid4()}:{assignment.person_id}",
+            stored[0],
+            assignment.completed_at,
+        )
+    elif invalid_record == "stale":
+        repository.set_runtime_status(
+            exact_key,
+            stored[0],
+            assignment.completed_at - timedelta(seconds=1),
+        )
+
+    workflow.synthesis.run(mandate.mandate_id, now + timedelta(seconds=4))
+
+    assert repository.get_mandate_by_token(mandate.token).state is MandateState.PARTIAL
+
+
+def test_change_requested_contribution_blocks_without_exposing_raw_change_text(
+    repository, incoming_message_factory, now
+) -> None:
+    captured: list[str] = []
+
+    class CapturingClient:
+        def complete_json(self, system: str, user: str) -> dict:
+            captured.append(user)
+            return {"issues": []}
+
+    workflow, mandate, assignments = _ready_mixed_synthesis(
+        repository,
+        incoming_message_factory,
+        now,
+        approval=EngagementDecisionKind.CHANGE,
+    )
+    workflow.synthesis.alignment_engine_factory = lambda mandate_id: HybridAlignmentEngine(
+        mandate_id, CapturingClient()
+    )
+
+    result = workflow.synthesis.run(mandate.mandate_id, now + timedelta(seconds=4))
+
+    saved = repository.get_mandate_by_token(mandate.token)
+    issues = repository.list_issues(mandate.mandate_id)
+    public_output = "\n".join(delivery.text for delivery in result.deliveries)
+    events = "\n".join(
+        event.model_dump_json()
+        for event in repository.list_events(mandate.mandate_id)
+    )
+    assert saved is not None and saved.state is MandateState.PARTIAL
+    assert any(
+        issue.issue_type is AlignmentIssueType.HARD_CONSTRAINT
+        and issue.stakeholder_ids == [assignments["approval-person"].person_id]
+        and issue.blocking
+        for issue in issues
+    )
+    assert captured
+    for serialized in (captured[0], public_output, events):
+        assert "PRIVATE-APPROVAL-CHANGE-SENTINEL" not in serialized
+    assert repository.get_active_proposal(mandate.mandate_id) is None
+
+
+def test_required_delivery_failure_persists_contribution_issue_with_partial_output(
+    workflow, telegram_mandate, repository, now
+) -> None:
+    workflow.handle(telegram_mandate)
+    mandate = repository.list_recent_mandates(1)[0]
+    released = workflow.handle(
+        telegram_mandate.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": "contribution-delivery-failure-go",
+            }
+        )
+    )
+    primary = next(
+        item
+        for item in released.deliveries
+        if item.assignment_id is not None and item.recipient == "lead@example.test"
+    )
+    alternate = workflow.mark_delivery_result(
+        primary, succeeded=False, now=now
+    ).deliveries[0]
+    with repository.transaction() as unit:
+        for assignment in repository.list_assignments(mandate.mandate_id):
+            if assignment.person_id == "team-lead":
+                continue
+            completed = assignment.model_copy(
+                update={
+                    "state": StakeholderState.COMPLETE,
+                    "completed_at": now,
+                    "next_action_at": None,
+                }
+            )
+            unit.save_assignment(completed)
+            unit.add_evidence(
+                EvidenceItem(
+                    evidence_id=uuid4(),
+                    mandate_id=mandate.mandate_id,
+                    assignment_id=assignment.assignment_id,
+                    stakeholder_id=assignment.person_id,
+                    evidence_type=EvidenceType.FACT,
+                    statement=f"Confirmed contribution from {assignment.person_id}.",
+                    visibility=EvidenceVisibility.SHAREABLE,
+                    status=EvidenceStatus.CONFIRMED,
+                    source_message_id=f"delivery-failure-ready:{assignment.person_id}",
+                    channel=Channel.EMAIL,
+                    created_at=now,
+                    related_decision="Approve coverage",
+                )
+            )
+
+    result = workflow.mark_delivery_result(alternate, succeeded=False, now=now)
+
+    issues = repository.list_issues(mandate.mandate_id)
+    assert repository.get_mandate_by_token(mandate.token).state is MandateState.PARTIAL
+    assert any(
+        issue.issue_type is AlignmentIssueType.MISSING_EVIDENCE
+        and issue.stakeholder_ids == ["team-lead"]
+        and issue.blocking
+        for issue in issues
+    )
+    assert any("No agreement or approval was inferred" in item.text for item in result.deliveries)
+
+
+@pytest.mark.parametrize("terminal_state", [MandateState.CANCELLED, MandateState.EXPIRED])
+def test_file_backed_synthesis_cannot_resurrect_terminal_mandate(
+    tmp_path,
+    incoming_message_factory,
+    now,
+    monkeypatch,
+    terminal_state,
+) -> None:
+    database_path = tmp_path / f"synthesis-{terminal_state.value}.sqlite3"
+    factory = create_session_factory(f"sqlite:///{database_path.as_posix()}")
+    with factory.kw["bind"].begin() as connection:
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        connection.exec_driver_sql("PRAGMA busy_timeout=5000")
+    repository = SqlAlchemyHumanWireRepository(factory)
+    workflow, mandate, _ = _ready_mixed_synthesis(
+        repository,
+        incoming_message_factory,
+        now,
+    )
+    events_before = repository.list_events(mandate.mandate_id)
+    issues_before = repository.list_issues(mandate.mandate_id)
+    terminal_at = (
+        mandate.expires_at
+        if terminal_state is MandateState.EXPIRED
+        else now + timedelta(seconds=4)
+    )
+    raced = _terminal_wins_before_next_transaction(
+        repository,
+        monkeypatch,
+        mandate.mandate_id,
+        terminal_state,
+        terminal_at,
+    )
+
+    result = workflow.synthesis.run(
+        mandate.mandate_id,
+        now + timedelta(seconds=4),
+    )
+
+    assert raced()
+    assert result == WorkflowResult()
+    assert repository.get_mandate_by_token(mandate.token).state is terminal_state
+    assert repository.list_events(mandate.mandate_id) == events_before
+    assert repository.list_issues(mandate.mandate_id) == issues_before
+    assert repository.get_active_proposal(mandate.mandate_id) is None
+    assert repository.get_runtime_status(f"alignment-brief:{mandate.mandate_id}") is None
+
+
+def test_file_backed_final_approval_racing_synthesis_fails_closed_then_retries_fresh(
+    tmp_path,
+    incoming_message_factory,
+    now,
+    monkeypatch,
+) -> None:
+    database_path = tmp_path / "synthesis-final-approval.sqlite3"
+    factory = create_session_factory(f"sqlite:///{database_path.as_posix()}")
+    with factory.kw["bind"].begin() as connection:
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        connection.exec_driver_sql("PRAGMA busy_timeout=5000")
+    repository = SqlAlchemyHumanWireRepository(factory)
+    workflow, mandate, assignments = _ready_mixed_synthesis(
+        repository,
+        incoming_message_factory,
+        now,
+        approval=None,
+    )
+    approval_assignment = assignments["approval-person"]
+    approval = EngagementDecision(
+        decision_id=uuid4(),
+        mandate_id=mandate.mandate_id,
+        assignment_id=approval_assignment.assignment_id,
+        stakeholder_id=approval_assignment.person_id,
+        response=EngagementDecisionKind.APPROVE,
+        source_message_id="racing-final-approval",
+        created_at=now + timedelta(seconds=4),
+        idempotency_key=f"racing-final-approval:{mandate.mandate_id}",
+    )
+    original_transaction = repository.transaction
+    raced = False
+
+    @contextmanager
+    def approval_first_transaction():
+        nonlocal raced
+        if not raced:
+            raced = True
+            concurrent = SqlAlchemyHumanWireRepository(repository._session_factory)
+            concurrent.add_engagement_decision(approval)
+        with original_transaction() as unit:
+            yield unit
+
+    monkeypatch.setattr(repository, "transaction", approval_first_transaction)
+    events_before = repository.list_events(mandate.mandate_id)
+
+    stale = workflow.synthesis.run(mandate.mandate_id, now + timedelta(seconds=4))
+
+    assert raced
+    assert stale == WorkflowResult()
+    assert repository.get_mandate_by_token(mandate.token).state is MandateState.INTERVIEWING
+    assert repository.list_issues(mandate.mandate_id) == []
+    assert repository.list_events(mandate.mandate_id) == events_before
+    assert repository.get_engagement_decision(approval_assignment.assignment_id) == approval
+
+    monkeypatch.setattr(repository, "transaction", original_transaction)
+    fresh = workflow.synthesis.run(mandate.mandate_id, now + timedelta(seconds=5))
+
+    assert repository.get_mandate_by_token(mandate.token).state is MandateState.ALIGNED
+    assert any("ALIGNMENT BRIEF" in item.text for item in fresh.deliveries)
 
 
 def test_release_transaction_rolls_back_every_row_when_interview_persistence_fails(

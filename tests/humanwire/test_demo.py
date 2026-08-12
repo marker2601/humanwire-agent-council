@@ -3,6 +3,7 @@ import json
 from fastapi.testclient import TestClient
 
 from humanwire.demo import create_demo_app
+from humanwire.domain import EngagementDecisionKind, EngagementType, StakeholderState
 
 
 def test_demo_is_deterministic_isolated_and_ready_without_local_configuration(
@@ -101,9 +102,9 @@ def test_exact_hw_2411_story_and_public_fixture_are_safe() -> None:
     assert {(row["direction"], row["name"], row["state"]) for row in stakeholders} >= {
         ("downward", "Eli Torres", "complete"),
         ("downward", "Sora Kim", "complete"),
-        ("lateral", "Priya Raman", "alternate_channel"),
-        ("upward", "Nora Okafor", "acknowledged"),
-        ("upward", "Maya Chen", "interviewing"),
+        ("lateral", "Priya Shah", "interviewing"),
+        ("upward", "Nora Chen", "complete"),
+        ("upward", "Maya Brooks", "awaiting_acknowledgement"),
     }
     assert any(row["interview_status"] == "complete" for row in stakeholders)
     assert any(row["interview_status"] == "in_progress" for row in stakeholders)
@@ -126,3 +127,126 @@ def test_exact_hw_2411_story_and_public_fixture_are_safe() -> None:
         "real-looking-secret",
     ):
         assert forbidden not in serialized
+
+
+def test_hw_2411_is_the_exact_mixed_engagement_story() -> None:
+    app = create_demo_app()
+    repository = app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assert mandate is not None
+    assignments = {
+        item.person_id: item
+        for item in repository.list_assignments(mandate.mandate_id)
+    }
+
+    assert {
+        person_id: (
+            assignment.engagement_type,
+            assignment.required,
+            assignment.state,
+            assignment.interview_id is not None,
+        )
+        for person_id, assignment in assignments.items()
+    } == {
+        "eli-torres": (
+            EngagementType.QUICK_RESPONSE,
+            True,
+            StakeholderState.COMPLETE,
+            True,
+        ),
+        "sora-kim": (
+            EngagementType.QUICK_RESPONSE,
+            True,
+            StakeholderState.COMPLETE,
+            True,
+        ),
+        "priya-shah": (
+            EngagementType.STRUCTURED_INTERVIEW,
+            True,
+            StakeholderState.INTERVIEWING,
+            True,
+        ),
+        "nora-chen": (
+            EngagementType.ACKNOWLEDGE,
+            True,
+            StakeholderState.COMPLETE,
+            False,
+        ),
+        "maya-brooks": (
+            EngagementType.REVIEW_APPROVAL,
+            True,
+            StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+            False,
+        ),
+        "inez-ward": (
+            EngagementType.INFORM,
+            False,
+            StakeholderState.COMPLETE,
+            False,
+        ),
+    }
+    sessions = repository.list_interviews(mandate.mandate_id)
+    assert len(sessions) == 3
+    priya = next(
+        session
+        for session in sessions
+        if session.assignment_id == assignments["priya-shah"].assignment_id
+    )
+    assert priya.questions == [
+        "Which staffing rule applies?",
+        "What constraint affects coverage?",
+        "What safe option can you support?",
+    ]
+    assert priya.current_question_index == 1
+    assert priya.current_channel.value == "telegram"
+    assert priya.current_route_id == "demo-route-priya-shah-alternate"
+    assert repository.get_engagement_decision(
+        assignments["maya-brooks"].assignment_id
+    ) is None
+
+    events = repository.list_events(mandate.mandate_id)
+    event_types = [item.event_type for item in events]
+    assert {
+        "engagement.plan_previewed",
+        "engagement.plan_released",
+        "engagement.inform_delivered",
+        "engagement.acknowledged",
+        "engagement.quick_response_completed",
+        "engagement.structured_interview_progressed",
+        "engagement.approval_pending",
+    } <= set(event_types)
+    assert not any(
+        item.person_id == "inez-ward" and "reminder" in item.event_type
+        for item in events
+    )
+    assert "mandate.aligned" not in event_types
+    assert "engagement.approved" not in event_types
+
+
+def test_secondary_demo_cases_have_consistent_typed_authority_facts() -> None:
+    app = create_demo_app()
+    repository = app.state.repository
+    aligned = repository.get_mandate_by_token("HW-2412")
+    meeting = repository.get_mandate_by_token("HW-2413")
+    assert aligned is not None and meeting is not None
+
+    aligned_assignment = repository.list_assignments(aligned.mandate_id)[0]
+    meeting_assignment = repository.list_assignments(meeting.mandate_id)[0]
+    aligned_decision = repository.get_engagement_decision(
+        aligned_assignment.assignment_id
+    )
+    meeting_decision = repository.get_engagement_decision(
+        meeting_assignment.assignment_id
+    )
+
+    assert aligned_assignment.engagement_type is EngagementType.REVIEW_APPROVAL
+    assert aligned_assignment.interview_id is None
+    assert aligned_decision is not None
+    assert aligned_decision.response is EngagementDecisionKind.APPROVE
+    assert meeting_assignment.engagement_type is EngagementType.REVIEW_APPROVAL
+    assert meeting_assignment.interview_id is None
+    assert meeting_decision is not None
+    assert meeting_decision.response in {
+        EngagementDecisionKind.REJECT,
+        EngagementDecisionKind.CHANGE,
+    }
