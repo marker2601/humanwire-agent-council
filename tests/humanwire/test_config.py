@@ -15,3 +15,12 @@ def test_listener_credentials_return_plain_values() -> None:
         telegram_bot_token=SecretStr("telegram"),
     )
     assert settings.require_listener_credentials() == ("caspian", "telegram")
+
+
+def test_analytics_read_token_is_secret_and_optional() -> None:
+    assert Settings(_env_file=None).analytics_read_token is None
+    configured = Settings(_env_file=None, analytics_read_token="fictional-read-token")
+
+    assert configured.analytics_read_token is not None
+    assert configured.analytics_read_token.get_secret_value() == "fictional-read-token"
+    assert "fictional-read-token" not in repr(configured)

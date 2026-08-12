@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     telegram_bot_token: SecretStr | None = None
     caspian_email_username: str = "humanwire"
     featherless_api_key: SecretStr | None = None
+    analytics_read_token: SecretStr | None = None
     featherless_base_url: str = "https://api.featherless.ai/v1"
     featherless_model: str = "Qwen/Qwen2.5-7B-Instruct"
     database_url: str = "sqlite:///data/humanwire.db"
