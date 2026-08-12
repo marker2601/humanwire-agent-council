@@ -1,11 +1,17 @@
 """Channel-neutral text for HumanWire's stakeholder interview workflow."""
 
+from __future__ import annotations
+
 from collections.abc import Iterable
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from humanwire.domain import MeetingPackage, Proposal
 from humanwire.evidence import ShareableEvidence
 from humanwire.redaction import redact_sensitive
+
+if TYPE_CHECKING:
+    from humanwire.meetings import MeetingCoordinator
 
 
 def render_interview_intro(
@@ -98,30 +104,41 @@ def render_meeting_confirmation(
     package: MeetingPackage,
     *,
     acknowledged_attendee_ids: Iterable[str] = (),
+    coordinator: MeetingCoordinator | None = None,
 ) -> str:
     """Render a proposed meeting until every required attendee acknowledges its slot."""
     acknowledged = set(acknowledged_attendee_ids)
-    confirmed = set(package.required_attendee_ids).issubset(acknowledged)
+    verified = _has_verified_slot(package, coordinator)
+    confirmed = verified and set(package.required_attendee_ids).issubset(acknowledged)
     label = "Meeting confirmed" if confirmed else "Proposed meeting"
     return (
         f"HUMANWIRE {label.upper()} \u00b7 {token}\n\n"
-        f"{label}: {_slot_text(package)}\n"
+        f"{label}: {_slot_text(package, verified)}\n"
         f"Purpose: {redact_sensitive(package.purpose)}\n\n"
         "Agenda:\n" + "\n".join(package.agenda)
     )
 
 
-def render_meeting_reminder(token: str, package: MeetingPackage) -> str:
+def render_meeting_reminder(
+    token: str, package: MeetingPackage, *, coordinator: MeetingCoordinator | None = None
+) -> str:
     """Render a privacy-safe reminder for the local calendar artifact."""
+    verified = _has_verified_slot(package, coordinator)
     return (
         f"HUMANWIRE MEETING REMINDER \u00b7 {token}\n\n"
-        f"Proposed meeting: {_slot_text(package)}\n"
+        f"Proposed meeting: {_slot_text(package, verified)}\n"
         f"Purpose: {redact_sensitive(package.purpose)}"
     )
 
 
-def _slot_text(package: MeetingPackage) -> str:
-    if not package.slot_verified or package.proposed_start is None or package.proposed_end is None:
+def _has_verified_slot(
+    package: MeetingPackage, coordinator: MeetingCoordinator | None
+) -> bool:
+    return coordinator is not None and coordinator.has_current_verified_package(package)
+
+
+def _slot_text(package: MeetingPackage, verified: bool) -> str:
+    if not verified:
         return "awaiting confirmed availability"
     return (
         f"{package.proposed_start.astimezone(UTC).isoformat()} to "

@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -20,7 +21,7 @@ from humanwire.domain import (
     StakeholderState,
 )
 from humanwire.evidence import ShareableEvidence
-from humanwire.meetings import MeetingCoordinator, render_ics
+from humanwire.meetings import MeetingCoordinator, VerifiedOverlap, render_ics
 from humanwire.messages import (
     render_availability_request,
     render_meeting_confirmation,
@@ -304,7 +305,7 @@ def test_package_and_ics_are_deterministic_and_exclude_private_evidence(
         proposed_slot=slot,
         created_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
     )
-    ics = render_ics(package).decode("utf-8")
+    ics = render_ics(package, coordinator).decode("utf-8")
 
     assert package.purpose == "Resolve the customer, launch; review\nplan"
     assert package.decision_owner_id == "coo"
@@ -320,7 +321,6 @@ def test_package_and_ics_are_deterministic_and_exclude_private_evidence(
     assert package.pre_read_evidence_ids == [public_evidence.evidence_id]
     assert package.proposed_start == slot.start
     assert package.proposed_end == slot.end
-    assert package.slot_verified is True
     assert package.calendar_written is False
     assert "BEGIN:VCALENDAR" in ics
     assert "DTSTART:20260814T200000Z" in ics
@@ -394,9 +394,255 @@ def test_ics_and_confirmation_fail_closed_for_an_unverified_package_slot() -> No
     )
 
     with pytest.raises(ValueError, match="verified"):
-        render_ics(package)
+        render_ics(package, MeetingCoordinator(initiator_id="manager"))
 
-    assert "awaiting confirmed availability" in render_meeting_confirmation("HW-AB12", package)
+    assert "awaiting confirmed availability" in render_meeting_confirmation(
+        "HW-AB12", package, coordinator=MeetingCoordinator(initiator_id="manager")
+    )
+
+
+def test_build_package_rejects_a_dataclass_replaced_verified_overlap(
+    coordinator: MeetingCoordinator,
+) -> None:
+    report = sample_report()
+    assigned = assignments()
+    slot = record_required_overlap(coordinator, report, assigned)
+    forged = replace(slot, start=slot.start.replace(hour=21), end=slot.end.replace(hour=21))
+
+    with pytest.raises(ValueError, match="verified overlap"):
+        coordinator.build_package(
+            sample_plan(),
+            report,
+            assigned,
+            decision_owner_id="coo",
+            evidence=[],
+            proposed_slot=forged,
+            created_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+        )
+
+
+def test_build_package_rejects_a_publicly_constructed_verified_overlap(
+    coordinator: MeetingCoordinator,
+) -> None:
+    report = sample_report()
+    assigned = assignments()
+    slot = record_required_overlap(coordinator, report, assigned)
+    forged = VerifiedOverlap(
+        start=slot.start,
+        end=slot.end,
+        required_attendee_ids=slot.required_attendee_ids,
+    )
+
+    with pytest.raises(ValueError, match="verified overlap"):
+        coordinator.build_package(
+            sample_plan(),
+            report,
+            assigned,
+            decision_owner_id="coo",
+            evidence=[],
+            proposed_slot=forged,
+            created_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+        )
+
+
+def test_build_package_rejects_an_overlap_issued_by_another_coordinator(
+    coordinator: MeetingCoordinator,
+) -> None:
+    report = sample_report()
+    assigned = assignments()
+    record_required_overlap(coordinator, report, assigned)
+    other = MeetingCoordinator(initiator_id="manager")
+    other_slot = record_required_overlap(other, report, assigned)
+
+    with pytest.raises(ValueError, match="verified overlap"):
+        coordinator.build_package(
+            sample_plan(),
+            report,
+            assigned,
+            decision_owner_id="coo",
+            evidence=[],
+            proposed_slot=other_slot,
+            created_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+        )
+
+
+def test_build_package_rejects_an_issued_overlap_after_availability_changes(
+    coordinator: MeetingCoordinator,
+) -> None:
+    report = sample_report()
+    assigned = assignments()
+    slot = record_required_overlap(coordinator, report, assigned)
+    coordinator.record_availability(
+        "coo",
+        [
+            AvailabilityWindow(
+                start=datetime(2026, 8, 14, 21, 0, tzinfo=UTC),
+                end=datetime(2026, 8, 14, 22, 0, tzinfo=UTC),
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="current confirmed availability"):
+        coordinator.build_package(
+            sample_plan(),
+            report,
+            assigned,
+            decision_owner_id="coo",
+            evidence=[],
+            proposed_slot=slot,
+            created_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+        )
+
+
+def test_ics_and_confirmation_reject_direct_or_deserialized_packages_even_with_a_slot(
+    coordinator: MeetingCoordinator,
+) -> None:
+    report = sample_report()
+    assigned = assignments()
+    slot = record_required_overlap(coordinator, report, assigned)
+    issued = coordinator.build_package(
+        sample_plan(),
+        report,
+        assigned,
+        decision_owner_id="coo",
+        evidence=[],
+        proposed_slot=slot,
+        created_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+    )
+    direct = MeetingPackage(
+        meeting_id=uuid4(),
+        mandate_id=issued.mandate_id,
+        purpose=issued.purpose,
+        decision_owner_id=issued.decision_owner_id,
+        required_attendee_ids=issued.required_attendee_ids,
+        proposed_start=issued.proposed_start,
+        proposed_end=issued.proposed_end,
+        agreed_facts=issued.agreed_facts,
+        open_decisions=issued.open_decisions,
+        agenda=issued.agenda,
+        pre_read_evidence_ids=issued.pre_read_evidence_ids,
+        slot_verified=True,
+        created_at=issued.created_at,
+    )
+    deserialized = MeetingPackage.model_validate(issued.model_dump())
+
+    for package in (direct, deserialized):
+        with pytest.raises(ValueError, match="verified"):
+            render_ics(package, coordinator)
+        confirmation = render_meeting_confirmation(
+            "HW-AB12",
+            package,
+            acknowledged_attendee_ids={"coo", "manager", "vp-people"},
+            coordinator=coordinator,
+        )
+        assert "PROPOSED MEETING" in confirmation
+        assert "awaiting confirmed availability" in confirmation
+
+    assert "2026-08-14T20:00:00+00:00" in render_meeting_confirmation(
+        "HW-AB12", issued, coordinator=coordinator
+    )
+
+
+def test_changed_package_slot_cannot_be_certified_by_matching_new_availability(
+    coordinator: MeetingCoordinator,
+) -> None:
+    report = sample_report()
+    assigned = assignments()
+    slot = record_required_overlap(coordinator, report, assigned)
+    package = coordinator.build_package(
+        sample_plan(),
+        report,
+        assigned,
+        decision_owner_id="coo",
+        evidence=[],
+        proposed_slot=slot,
+        created_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+    )
+    package.proposed_start = datetime(2026, 8, 14, 20, 30, tzinfo=UTC)
+    package.proposed_end = datetime(2026, 8, 14, 21, 0, tzinfo=UTC)
+    for attendee_id in package.required_attendee_ids:
+        coordinator.record_availability(
+            attendee_id,
+            [
+                AvailabilityWindow(
+                    start=datetime(2026, 8, 14, 20, 30, tzinfo=UTC),
+                    end=datetime(2026, 8, 14, 21, 30, tzinfo=UTC),
+                )
+            ],
+        )
+
+    with pytest.raises(ValueError, match="verified"):
+        render_ics(package, coordinator)
+    confirmation = render_meeting_confirmation(
+        "HW-AB12",
+        package,
+        acknowledged_attendee_ids={"coo", "manager", "vp-people"},
+        coordinator=coordinator,
+    )
+    assert "PROPOSED MEETING" in confirmation
+    assert "awaiting confirmed availability" in confirmation
+
+
+def test_package_is_revalidated_after_availability_changes(
+    coordinator: MeetingCoordinator,
+) -> None:
+    report = sample_report()
+    assigned = assignments()
+    slot = record_required_overlap(coordinator, report, assigned)
+    package = coordinator.build_package(
+        sample_plan(),
+        report,
+        assigned,
+        decision_owner_id="coo",
+        evidence=[],
+        proposed_slot=slot,
+        created_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+    )
+    coordinator.record_availability(
+        "coo",
+        [
+            AvailabilityWindow(
+                start=datetime(2026, 8, 14, 21, 0, tzinfo=UTC),
+                end=datetime(2026, 8, 14, 22, 0, tzinfo=UTC),
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="verified"):
+        render_ics(package, coordinator)
+    confirmation = render_meeting_confirmation(
+        "HW-AB12",
+        package,
+        acknowledged_attendee_ids={"coo", "manager", "vp-people"},
+        coordinator=coordinator,
+    )
+    assert "PROPOSED MEETING" in confirmation
+    assert "awaiting confirmed availability" in confirmation
+
+
+def test_package_is_not_valid_for_another_coordinator_with_matching_availability(
+    coordinator: MeetingCoordinator,
+) -> None:
+    report = sample_report()
+    assigned = assignments()
+    slot = record_required_overlap(coordinator, report, assigned)
+    package = coordinator.build_package(
+        sample_plan(),
+        report,
+        assigned,
+        decision_owner_id="coo",
+        evidence=[],
+        proposed_slot=slot,
+        created_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+    )
+    other = MeetingCoordinator(initiator_id="manager")
+    record_required_overlap(other, report, assigned)
+
+    with pytest.raises(ValueError, match="verified"):
+        render_ics(package, other)
+    assert "awaiting confirmed availability" in render_meeting_confirmation(
+        "HW-AB12", package, coordinator=other
+    )
 
 
 def test_meeting_messages_do_not_disclose_private_evidence_or_destinations(
@@ -425,21 +671,30 @@ def test_meeting_messages_do_not_disclose_private_evidence_or_destinations(
 def test_meeting_confirmation_stays_proposed_until_every_required_attendee_acknowledges(
     coordinator: MeetingCoordinator,
 ) -> None:
+    report = sample_report()
+    assigned = assignments()
+    slot = record_required_overlap(coordinator, report, assigned)
     package = coordinator.build_package(
         sample_plan(),
-        sample_report(),
-        assignments(),
+        report,
+        assigned,
         decision_owner_id="coo",
         evidence=[],
-        proposed_slot=None,
+        proposed_slot=slot,
         created_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
     )
 
     partial = render_meeting_confirmation(
-        "HW-AB12", package, acknowledged_attendee_ids={"coo", "manager"}
+        "HW-AB12",
+        package,
+        acknowledged_attendee_ids={"coo", "manager"},
+        coordinator=coordinator,
     )
     complete = render_meeting_confirmation(
-        "HW-AB12", package, acknowledged_attendee_ids={"coo", "manager", "vp-people"}
+        "HW-AB12",
+        package,
+        acknowledged_attendee_ids={"coo", "manager", "vp-people"},
+        coordinator=coordinator,
     )
 
     assert "PROPOSED MEETING" in partial

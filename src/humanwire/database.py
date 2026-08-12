@@ -200,7 +200,6 @@ class MeetingPackageRecord(Base):
     open_decisions: Mapped[list[str]] = mapped_column(JSON)
     agenda: Mapped[list[str]] = mapped_column(JSON)
     pre_read_evidence_ids: Mapped[list[str]] = mapped_column(JSON)
-    slot_verified: Mapped[bool] = mapped_column(default=False)
     calendar_written: Mapped[bool]
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
