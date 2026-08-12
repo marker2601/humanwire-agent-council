@@ -1031,3 +1031,138 @@ def test_review_due_worker_losing_to_ack_cannot_resurrect_complete_or_send_remin
     assert saved.state is StakeholderState.COMPLETE
     events = repository.list_events(mandate.mandate_id)
     assert [event.event_type for event in events].count("outreach.reminder_sent") == 0
+
+
+def test_review_authenticated_ack_survives_a_reminder_winning_before_its_cas(
+    directory, mandate, now, tmp_path, monkeypatch
+) -> None:
+    repository = _file_repository(tmp_path)
+    coordinator = _file_coordinator(directory, repository)
+    assignment = _assignment(mandate, EngagementType.ACKNOWLEDGE)
+    _prepare(coordinator, repository, mandate, assignment, [], now)
+    acknowledgement = _message(
+        now,
+        message_id="review-ack-after-reminder",
+        text="ACK HW-2411",
+    )
+    original_transaction = repository.transaction
+    acknowledgement_validated = threading.Event()
+    reminder_committed = threading.Event()
+    role = threading.local()
+
+    @contextmanager
+    def ordered_transaction():
+        if getattr(role, "name", None) == "ack":
+            attempt = getattr(role, "transaction_attempt", 0) + 1
+            role.transaction_attempt = attempt
+            if attempt == 1:
+                acknowledgement_validated.set()
+                assert reminder_committed.wait(timeout=5)
+        with original_transaction() as unit:
+            yield unit
+        if getattr(role, "name", None) == "due":
+            reminder_committed.set()
+
+    monkeypatch.setattr(repository, "transaction", ordered_transaction)
+
+    def run_ack():
+        role.name = "ack"
+        return coordinator.acknowledge(acknowledgement, assignment, now)
+
+    def run_due():
+        role.name = "due"
+        assert acknowledgement_validated.wait(timeout=5)
+        return coordinator.process_due_assignment(
+            assignment,
+            now + timedelta(seconds=60),
+        )
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="review-reverse") as executor:
+        ack_future = executor.submit(run_ack)
+        due_future = executor.submit(run_due)
+        ack_result = ack_future.result(timeout=10)
+        due_result = due_future.result(timeout=10)
+
+    saved = repository.get_assignment(assignment.assignment_id)
+    events = repository.list_events(mandate.mandate_id)
+    assert len(due_result.deliveries) == 1
+    assert ack_result.deliveries == []
+    assert saved is not None
+    assert saved.state is StakeholderState.COMPLETE
+    assert [event.event_type for event in events].count("outreach.reminder_sent") == 1
+    assert [event.event_type for event in events].count("stakeholder.acknowledged") == 1
+    replay = coordinator.acknowledge(acknowledgement, assignment, now)
+    assert replay.deliveries == []
+    assert repository.list_events(mandate.mandate_id) == events
+
+
+def test_review_authenticated_quick_ack_survives_reminder_and_sends_question_one_once(
+    directory, mandate, now, tmp_path, monkeypatch
+) -> None:
+    repository = _file_repository(tmp_path)
+    coordinator = _file_coordinator(directory, repository)
+    assignment = _assignment(mandate, EngagementType.QUICK_RESPONSE)
+    _prepare(
+        coordinator,
+        repository,
+        mandate,
+        assignment,
+        ["Committed date?"],
+        now,
+    )
+    acknowledgement = _message(
+        now,
+        message_id="review-quick-ack-after-reminder",
+        text="ACK HW-2411",
+    )
+    original_transaction = repository.transaction
+    acknowledgement_validated = threading.Event()
+    reminder_committed = threading.Event()
+    role = threading.local()
+
+    @contextmanager
+    def ordered_transaction():
+        if getattr(role, "name", None) == "ack":
+            attempt = getattr(role, "transaction_attempt", 0) + 1
+            role.transaction_attempt = attempt
+            if attempt == 1:
+                acknowledgement_validated.set()
+                assert reminder_committed.wait(timeout=5)
+        with original_transaction() as unit:
+            yield unit
+        if getattr(role, "name", None) == "due":
+            reminder_committed.set()
+
+    monkeypatch.setattr(repository, "transaction", ordered_transaction)
+
+    def run_ack():
+        role.name = "ack"
+        return coordinator.acknowledge(acknowledgement, assignment, now)
+
+    def run_due():
+        role.name = "due"
+        assert acknowledgement_validated.wait(timeout=5)
+        return coordinator.process_due_assignment(
+            assignment,
+            now + timedelta(seconds=60),
+        )
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="review-reverse") as executor:
+        ack_future = executor.submit(run_ack)
+        due_future = executor.submit(run_due)
+        ack_result = ack_future.result(timeout=10)
+        due_result = due_future.result(timeout=10)
+
+    saved = repository.get_assignment(assignment.assignment_id)
+    events = repository.list_events(mandate.mandate_id)
+    assert len(due_result.deliveries) == 1
+    assert [delivery.text for delivery in ack_result.deliveries] == [
+        "Question 1 of 1:\nCommitted date?"
+    ]
+    assert saved is not None
+    assert saved.state is StakeholderState.INTERVIEWING
+    assert [event.event_type for event in events].count("outreach.reminder_sent") == 1
+    assert [event.event_type for event in events].count("stakeholder.acknowledged") == 1
+    replay = coordinator.acknowledge(acknowledgement, assignment, now)
+    assert replay.deliveries == []
+    assert repository.list_events(mandate.mandate_id) == events

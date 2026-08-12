@@ -43,6 +43,7 @@ _DECLINE = re.compile(r"^DECLINE\s+(HW-[A-Z0-9]{4,8})$", re.IGNORECASE)
 _OUTREACH_SENT_EVENTS = frozenset(
     {"outreach.primary_sent", "outreach.reminder_sent", "outreach.alternate_sent"}
 )
+_AUTHENTICATED_INBOUND_CAS_ATTEMPTS = 3
 
 
 def _route_fingerprint(route: ContactRoute) -> str:
@@ -396,7 +397,13 @@ class InterviewCoordinator:
         parsed = parse_command(message.text)
         if not isinstance(parsed, AcknowledgeCommand) or parsed.token != self._token(assignment):
             return WorkflowResult()
-        return self._acknowledge(message, assignment, now, send_question=True)
+        return self._acknowledge(
+            message,
+            assignment,
+            now,
+            send_question=True,
+            retry_authenticated_cas_loss=True,
+        )
 
     def record_answer(
         self, message: IncomingMessage, assignment: StakeholderAssignment, now: datetime
@@ -453,7 +460,13 @@ class InterviewCoordinator:
             StakeholderState.FOLLOW_UP_DUE,
             StakeholderState.ALTERNATE_CHANNEL,
         }:
-            self._acknowledge(message, saved, now, send_question=False)
+            self._acknowledge(
+                message,
+                saved,
+                now,
+                send_question=False,
+                retry_authenticated_cas_loss=False,
+            )
             saved = self.repository.get_assignment(saved.assignment_id)
             if saved is None:
                 return WorkflowResult()
@@ -719,81 +732,114 @@ class InterviewCoordinator:
         now: datetime,
         *,
         send_question: bool,
+        retry_authenticated_cas_loss: bool,
     ) -> WorkflowResult:
-        saved = self.repository.get_assignment(assignment.assignment_id)
-        if saved is None or saved.state in ASSIGNMENT_TERMINAL_STATES:
-            return WorkflowResult()
-        route = self._message_route(message, saved)
-        if route is None:
-            return WorkflowResult()
-        key = f"interview:{saved.assignment_id}:ack:{message.message_id}"
-        if any(event.idempotency_key == key for event in self.repository.list_events(saved.mandate_id)):
-            return WorkflowResult()
-        acknowledged = saved
-        if saved.state is StakeholderState.ALTERNATE_CHANNEL:
-            acknowledged = self._transition(
-                acknowledged, StakeholderState.AWAITING_ACKNOWLEDGEMENT, "alternate_reply", now
-            )
-        if acknowledged.state is StakeholderState.DELIVERED:
-            acknowledged = self._transition(
-                acknowledged, StakeholderState.AWAITING_ACKNOWLEDGEMENT, "delivered_reply", now
-            )
-        if acknowledged.state is StakeholderState.FOLLOW_UP_DUE:
-            acknowledged = self._transition(
-                acknowledged, StakeholderState.AWAITING_ACKNOWLEDGEMENT, "follow_up_reply", now
-            )
-        if acknowledged.state is not StakeholderState.AWAITING_ACKNOWLEDGEMENT:
-            return WorkflowResult()
-        acknowledged = self._transition(
-            acknowledged, StakeholderState.ACKNOWLEDGED, "stakeholder_acknowledged", now
+        attempt_limit = (
+            _AUTHENTICATED_INBOUND_CAS_ATTEMPTS
+            if retry_authenticated_cas_loss
+            else 1
         )
-        interviewing = self._transition(
-            acknowledged, StakeholderState.INTERVIEWING, "interview_started", now
-        ).model_copy(update={"acknowledged_at": now, "next_action_at": None})
-        session = self._session(saved)
-        updated_session = session.model_copy(
-            update={
-                "current_channel": message.channel,
-                "current_route_id": route.route_id,
-                "current_conversation_id": message.conversation_id,
-                "channel_history": self._channel_history(session, message.channel),
-                "acknowledged_at": now,
-                "updated_at": now,
-            }
-        )
-        event = self._event(
-            "stakeholder.acknowledged",
-            interviewing,
-            saved,
-            now,
-            key,
-            {},
-            channel=message.channel,
-        )
-        try:
-            with self.repository.transaction() as unit:
-                if not unit.compare_and_save_assignment(saved, interviewing):
+        for _ in range(attempt_limit):
+            saved = self.repository.get_assignment(assignment.assignment_id)
+            if saved is None or saved.state in ASSIGNMENT_TERMINAL_STATES:
+                return WorkflowResult()
+            if retry_authenticated_cas_loss:
+                parsed = parse_command(message.text)
+                if (
+                    not isinstance(parsed, AcknowledgeCommand)
+                    or parsed.token != self._token(saved)
+                ):
                     return WorkflowResult()
-                unit.save_interview(updated_session)
-                if not unit.append_event_once(interviewing.mandate_id, event):
-                    raise ValueError("concurrent exact acknowledgement already won")
-        except ValueError:
-            return WorkflowResult()
-        if not send_question:
-            return WorkflowResult()
-        return WorkflowResult(
-            deliveries=[
-                self._reply(
-                    message,
-                    render_question(
-                        updated_session.questions[updated_session.current_question_index],
-                        updated_session.current_question_index + 1,
-                        len(updated_session.questions),
-                    ),
-                    interviewing,
+            route = self._message_route(message, saved)
+            if route is None:
+                return WorkflowResult()
+            key = f"interview:{saved.assignment_id}:ack:{message.message_id}"
+            if any(
+                event.idempotency_key == key
+                for event in self.repository.list_events(saved.mandate_id)
+            ):
+                return WorkflowResult()
+            acknowledged = saved
+            if saved.state is StakeholderState.ALTERNATE_CHANNEL:
+                acknowledged = self._transition(
+                    acknowledged,
+                    StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+                    "alternate_reply",
+                    now,
                 )
-            ]
-        )
+            if acknowledged.state is StakeholderState.DELIVERED:
+                acknowledged = self._transition(
+                    acknowledged,
+                    StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+                    "delivered_reply",
+                    now,
+                )
+            if acknowledged.state is StakeholderState.FOLLOW_UP_DUE:
+                acknowledged = self._transition(
+                    acknowledged,
+                    StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+                    "follow_up_reply",
+                    now,
+                )
+            if acknowledged.state is not StakeholderState.AWAITING_ACKNOWLEDGEMENT:
+                return WorkflowResult()
+            acknowledged = self._transition(
+                acknowledged,
+                StakeholderState.ACKNOWLEDGED,
+                "stakeholder_acknowledged",
+                now,
+            )
+            interviewing = self._transition(
+                acknowledged,
+                StakeholderState.INTERVIEWING,
+                "interview_started",
+                now,
+            ).model_copy(update={"acknowledged_at": now, "next_action_at": None})
+            session = self._session(saved)
+            updated_session = session.model_copy(
+                update={
+                    "current_channel": message.channel,
+                    "current_route_id": route.route_id,
+                    "current_conversation_id": message.conversation_id,
+                    "channel_history": self._channel_history(session, message.channel),
+                    "acknowledged_at": now,
+                    "updated_at": now,
+                }
+            )
+            event = self._event(
+                "stakeholder.acknowledged",
+                interviewing,
+                saved,
+                now,
+                key,
+                {},
+                channel=message.channel,
+            )
+            try:
+                with self.repository.transaction() as unit:
+                    if not unit.compare_and_save_assignment(saved, interviewing):
+                        continue
+                    unit.save_interview(updated_session)
+                    if not unit.append_event_once(interviewing.mandate_id, event):
+                        raise ValueError("concurrent exact acknowledgement already won")
+            except ValueError:
+                return WorkflowResult()
+            if not send_question:
+                return WorkflowResult()
+            return WorkflowResult(
+                deliveries=[
+                    self._reply(
+                        message,
+                        render_question(
+                            updated_session.questions[updated_session.current_question_index],
+                            updated_session.current_question_index + 1,
+                            len(updated_session.questions),
+                        ),
+                        interviewing,
+                    )
+                ]
+            )
+        return WorkflowResult()
 
     def _assignment_routes(self, assignment: StakeholderAssignment) -> list[ContactRoute]:
         allowed = set(assignment.route_ids)

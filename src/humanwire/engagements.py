@@ -42,6 +42,8 @@ from humanwire.state_machine import (
     StakeholderStateMachine,
 )
 
+_AUTHENTICATED_INBOUND_CAS_ATTEMPTS = 3
+
 
 @dataclass(frozen=True)
 class PreparedEngagement:
@@ -308,6 +310,11 @@ class EngagementCoordinator:
         assignment: StakeholderAssignment,
         now: datetime,
     ) -> WorkflowResult:
+        if not message.conversation_id.strip():
+            return WorkflowResult()
+        parsed = parse_command(message.text)
+        if not isinstance(parsed, AcknowledgeCommand):
+            return WorkflowResult()
         saved = self.repository.get_assignment(assignment.assignment_id)
         if saved is None or saved.state in ASSIGNMENT_TERMINAL_STATES:
             return WorkflowResult()
@@ -318,55 +325,67 @@ class EngagementCoordinator:
             return self.interviews.acknowledge(message, saved, now)
         if saved.engagement_type is not EngagementType.ACKNOWLEDGE:
             return WorkflowResult()
-        if not message.conversation_id.strip():
-            return WorkflowResult()
-        parsed = parse_command(message.text)
-        if not isinstance(parsed, AcknowledgeCommand) or parsed.token != self._token(saved):
-            return WorkflowResult()
-        route = self._active_message_route(message, saved)
-        if route is None:
-            return WorkflowResult()
-        key = f"engagement:{saved.assignment_id}:ack:{message.message_id}"
-        if self._event_exists(saved, key):
-            return WorkflowResult()
 
-        acknowledged = saved
-        if acknowledged.state in {
-            StakeholderState.DELIVERED,
-            StakeholderState.FOLLOW_UP_DUE,
-            StakeholderState.ALTERNATE_CHANNEL,
-        }:
+        for _ in range(_AUTHENTICATED_INBOUND_CAS_ATTEMPTS):
+            saved = self.repository.get_assignment(assignment.assignment_id)
+            if saved is None or saved.state in ASSIGNMENT_TERMINAL_STATES:
+                return WorkflowResult()
+            if (
+                saved.engagement_type is not EngagementType.ACKNOWLEDGE
+                or parsed.token != self._token(saved)
+            ):
+                return WorkflowResult()
+            route = self._active_message_route(message, saved)
+            if route is None:
+                return WorkflowResult()
+            key = f"engagement:{saved.assignment_id}:ack:{message.message_id}"
+            if self._event_exists(saved, key):
+                return WorkflowResult()
+
+            acknowledged = saved
+            if acknowledged.state in {
+                StakeholderState.DELIVERED,
+                StakeholderState.FOLLOW_UP_DUE,
+                StakeholderState.ALTERNATE_CHANNEL,
+            }:
+                acknowledged = self._transition(
+                    acknowledged,
+                    StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+                    "authenticated_acknowledgement_received",
+                    now,
+                )
+            if acknowledged.state is not StakeholderState.AWAITING_ACKNOWLEDGEMENT:
+                return WorkflowResult()
             acknowledged = self._transition(
                 acknowledged,
-                StakeholderState.AWAITING_ACKNOWLEDGEMENT,
-                "authenticated_acknowledgement_received",
+                StakeholderState.ACKNOWLEDGED,
+                "stakeholder_acknowledged",
                 now,
+            ).model_copy(update={"acknowledged_at": now})
+            completed = self._transition(
+                acknowledged,
+                StakeholderState.COMPLETE,
+                "acknowledgement_complete",
+                now,
+                completion_proof=AssignmentCompletionProof.AUTHENTICATED_ACKNOWLEDGEMENT,
             )
-        if acknowledged.state is not StakeholderState.AWAITING_ACKNOWLEDGEMENT:
-            return WorkflowResult()
-        acknowledged = self._transition(
-            acknowledged,
-            StakeholderState.ACKNOWLEDGED,
-            "stakeholder_acknowledged",
-            now,
-        ).model_copy(update={"acknowledged_at": now})
-        completed = self._transition(
-            acknowledged,
-            StakeholderState.COMPLETE,
-            "acknowledgement_complete",
-            now,
-            completion_proof=AssignmentCompletionProof.AUTHENTICATED_ACKNOWLEDGEMENT,
-        )
-        event = self._event(
-            "stakeholder.acknowledged",
-            completed,
-            saved,
-            now,
-            key,
-            {},
-            channel=message.channel,
-        )
-        if not self._save_assignment_events(saved, completed, (event,)):
+            event = self._event(
+                "stakeholder.acknowledged",
+                completed,
+                saved,
+                now,
+                key,
+                {},
+                channel=message.channel,
+            )
+            try:
+                with self.repository.transaction() as unit:
+                    if not unit.compare_and_save_assignment(saved, completed):
+                        continue
+                    if not unit.append_event_once(completed.mandate_id, event):
+                        raise ValueError("concurrent exact acknowledgement already won")
+            except ValueError:
+                return WorkflowResult()
             return WorkflowResult()
         return WorkflowResult()
 
