@@ -42,6 +42,7 @@ from humanwire.interviews import (
     InterviewCoordinator,
     _matches_current_outbound_attempt,
     _outbound_attempt,
+    _resolve_assignment_route,
 )
 from humanwire.messages import (
     render_acknowledgement_intro,
@@ -124,10 +125,9 @@ class EngagementCoordinator:
             )
             return PreparedEngagement(updated, session, (event,), delivery)
 
-        routes = self._assignment_routes(assignment)
-        if not routes:
+        route = _resolve_assignment_route(self.directory, assignment, 0)
+        if route is None:
             raise ValueError("assignment has no registered route")
-        route = routes[0]
         if assignment.state is StakeholderState.NOT_CONTACTED:
             queued = self._transition(
                 assignment,
@@ -234,21 +234,11 @@ class EngagementCoordinator:
             or assignment.active_route_index != entry.route_index
         ):
             return None
-        if not 0 <= entry.route_index < len(assignment.route_ids):
+        route = _resolve_assignment_route(
+            self.directory, assignment, entry.route_index
+        )
+        if route is None:
             return None
-        persisted_route_id = assignment.route_ids[entry.route_index]
-        try:
-            registered_routes = self.directory.ordered_routes(assignment.person_id)
-        except (AmbiguousPersonError, UnknownPersonError):
-            return None
-        matching_routes = [
-            route
-            for route in registered_routes
-            if route.route_id == persisted_route_id
-        ]
-        if len(matching_routes) != 1:
-            return None
-        route = matching_routes[0]
         session = None
         if assignment.engagement_type in {
             EngagementType.QUICK_RESPONSE,
@@ -312,10 +302,14 @@ class EngagementCoordinator:
         if saved.next_action_at is not None and saved.next_action_at > now:
             return WorkflowResult()
 
-        routes = self._assignment_routes(saved)
-        if not routes:
+        if not saved.route_ids:
             return self._mark_unreachable(saved, now, "no_registered_route", delivery=True)
         if saved.attempt_count == 1:
+            route = _resolve_assignment_route(
+                self.directory, saved, saved.active_route_index
+            )
+            if route is None:
+                return WorkflowResult()
             reminder = self._transition(
                 saved,
                 StakeholderState.FOLLOW_UP_DUE,
@@ -328,7 +322,6 @@ class EngagementCoordinator:
                     "next_action_at": now + timedelta(seconds=self.settings.reminder_seconds),
                 }
             )
-            route = routes[min(saved.active_route_index, len(routes) - 1)]
             delivery_source, delivery_metadata = _outbound_attempt(
                 reminder,
                 route,
@@ -360,14 +353,18 @@ class EngagementCoordinator:
             )
         if saved.attempt_count == 2:
             alternate_index = saved.active_route_index + 1
-            if alternate_index >= len(routes):
+            if alternate_index >= len(saved.route_ids):
                 return self._mark_unreachable(
                     saved,
                     now,
                     "no_alternate_registered_route",
                     delivery=False,
                 )
-            route = routes[alternate_index]
+            route = _resolve_assignment_route(
+                self.directory, saved, alternate_index
+            )
+            if route is None:
+                return WorkflowResult()
             alternate = self._transition(
                 saved,
                 StakeholderState.ALTERNATE_CHANNEL,
@@ -738,10 +735,11 @@ class EngagementCoordinator:
         )
         if assignment.state not in allowed_states:
             return
-        routes = self._assignment_routes(assignment)
-        if assignment.active_route_index >= len(routes):
+        route = _resolve_assignment_route(
+            self.directory, assignment, assignment.active_route_index
+        )
+        if route is None:
             return
-        route = routes[assignment.active_route_index]
         if not _matches_current_outbound_attempt(
             self.repository,
             assignment,
@@ -820,10 +818,11 @@ class EngagementCoordinator:
         )
         if assignment.state not in allowed_states:
             return WorkflowResult()
-        routes = self._assignment_routes(assignment)
-        if assignment.active_route_index >= len(routes):
+        active_route = _resolve_assignment_route(
+            self.directory, assignment, assignment.active_route_index
+        )
+        if active_route is None:
             return WorkflowResult()
-        active_route = routes[assignment.active_route_index]
         if not _matches_current_outbound_attempt(
             self.repository,
             assignment,
@@ -841,9 +840,13 @@ class EngagementCoordinator:
             key,
             {"delivery_id": delivery_id, "outcome": "failure"},
         )
-        if next_index < len(routes):
+        if next_index < len(assignment.route_ids):
+            route = _resolve_assignment_route(
+                self.directory, assignment, next_index
+            )
+            if route is None:
+                return WorkflowResult()
             alternate_claim_owner = str(uuid4())
-            route = routes[next_index]
             alternate_source = assignment
             if alternate_source.state is StakeholderState.ALTERNATE_CHANNEL:
                 bridge = (
@@ -1032,20 +1035,6 @@ class EngagementCoordinator:
             return False
         return True
 
-    def _assignment_routes(self, assignment: StakeholderAssignment) -> list[ContactRoute]:
-        registered_by_id: dict[str, ContactRoute] = {}
-        duplicate_ids: set[str] = set()
-        for route in self.directory.ordered_routes(assignment.person_id):
-            if route.route_id in registered_by_id:
-                duplicate_ids.add(route.route_id)
-                continue
-            registered_by_id[route.route_id] = route
-        return [
-            registered_by_id[route_id]
-            for route_id in assignment.route_ids
-            if route_id in registered_by_id and route_id not in duplicate_ids
-        ]
-
     def _active_message_route(
         self,
         message: IncomingMessage,
@@ -1057,10 +1046,11 @@ class EngagementCoordinator:
             return None
         if person.person_id.casefold() != assignment.person_id.casefold():
             return None
-        routes = self._assignment_routes(assignment)
-        if not routes:
+        active = _resolve_assignment_route(
+            self.directory, assignment, assignment.active_route_index
+        )
+        if active is None:
             return None
-        active = routes[min(assignment.active_route_index, len(routes) - 1)]
         if (
             active.channel is not message.channel
             or active.sender_address.casefold() != message.sender_address.casefold()

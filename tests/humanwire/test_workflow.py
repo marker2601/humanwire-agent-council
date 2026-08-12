@@ -720,6 +720,57 @@ def _mixed_preview(
     return message, mandate, result
 
 
+def _release_selected_mixed_delivery(
+    database_url,
+    incoming_message_factory,
+    now,
+    *,
+    person_id,
+    prefix,
+    route_overrides=None,
+):
+    settings = Settings(
+        _env_file=None,
+        engagement_require_go=True,
+        acknowledgement_seconds=60,
+        reminder_seconds=30,
+    )
+    repository = SqlAlchemyHumanWireRepository(create_session_factory(database_url))
+    workflow = _build_mixed_workflow(
+        repository,
+        settings=settings,
+        route_overrides=route_overrides,
+    )
+    message, mandate, _ = _mixed_preview(
+        workflow,
+        incoming_message_factory,
+        message_id=f"{prefix}-create",
+        received_at=now,
+    )
+    released = workflow.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": f"{prefix}-go",
+                "received_at": now + timedelta(seconds=1),
+            }
+        )
+    )
+    selected = next(
+        delivery
+        for delivery in released.deliveries
+        if repository.get_assignment(delivery.assignment_id).person_id == person_id
+    )
+    for delivery in released.deliveries:
+        if delivery.assignment_id != selected.assignment_id:
+            workflow.mark_delivery_result(
+                delivery,
+                succeeded=True,
+                now=now + timedelta(seconds=2),
+            )
+    return settings, repository, workflow, mandate, selected
+
+
 def test_mandate_previews_mixed_engagements_before_release_without_outreach(
     repository, incoming_message_factory, now
 ) -> None:
@@ -1917,6 +1968,264 @@ def test_restart_skips_failed_primary_alternate_when_saved_route_was_removed(
     assert saved is not None
     assert saved.active_route_index == 1
     assert saved.route_ids[1] == "structured-person-telegram-route"
+
+
+@pytest.mark.parametrize(
+    ("person_id", "succeeded", "expected_state"),
+    [
+        pytest.param(
+            "inform-person",
+            True,
+            StakeholderState.COMPLETE,
+            id="generic-success",
+        ),
+        pytest.param(
+            "inform-person",
+            False,
+            StakeholderState.DELIVERY_FAILED,
+            id="generic-failure",
+        ),
+        pytest.param(
+            "structured-person",
+            True,
+            StakeholderState.ALTERNATE_CHANNEL,
+            id="interview-success",
+        ),
+        pytest.param(
+            "structured-person",
+            False,
+            StakeholderState.DELIVERY_FAILED,
+            id="interview-failure",
+        ),
+    ],
+)
+def test_restart_callback_correlates_recovered_alternate_when_primary_route_was_removed(
+    tmp_path,
+    incoming_message_factory,
+    now,
+    person_id,
+    succeeded,
+    expected_state,
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'alternate-callback-route-gap.db').as_posix()}"
+    settings, _repository, first, mandate, primary = _release_selected_mixed_delivery(
+        database_url,
+        incoming_message_factory,
+        now,
+        person_id=person_id,
+        prefix=f"alternate-callback-{person_id}-{succeeded}",
+    )
+    alternate = first.mark_delivery_result(
+        primary,
+        succeeded=False,
+        now=now + timedelta(seconds=2),
+    ).deliveries[0]
+    original_routes = _mixed_directory()[0].resolve_person(person_id).routes
+
+    restarted_repository = SqlAlchemyHumanWireRepository(
+        create_session_factory(database_url)
+    )
+    restarted = _build_mixed_workflow(
+        restarted_repository,
+        settings=settings,
+        route_overrides={person_id: [original_routes[1]]},
+    )
+    recovered = restarted.process_due(now + timedelta(seconds=34))
+    recovered_alternate = next(
+        delivery
+        for delivery in recovered.deliveries
+        if delivery.assignment_id == primary.assignment_id
+    )
+    assert recovered_alternate.message_id == alternate.message_id
+    assert recovered_alternate.conversation_id == (
+        f"{person_id}-private-conversation"
+    )
+
+    restarted.mark_delivery_result(
+        recovered_alternate,
+        succeeded=succeeded,
+        now=now + timedelta(seconds=35),
+    )
+
+    saved = restarted_repository.get_assignment(primary.assignment_id)
+    alternate_row = next(
+        row
+        for row in restarted_repository.list_release_outbox(mandate.mandate_id)
+        if row.assignment_id == primary.assignment_id and row.attempt_count > 1
+    )
+    assert saved is not None
+    assert saved.state is expected_state
+    assert alternate_row.state == "completed"
+    assert restarted.process_due(now + timedelta(seconds=36)) == WorkflowResult()
+
+
+@pytest.mark.parametrize("person_id", ["ack-person", "structured-person"])
+@pytest.mark.parametrize(
+    "route_variant",
+    ["missing", "duplicate", "persisted-duplicate", "out-of-bounds"],
+)
+def test_due_reminder_is_inert_when_exact_active_route_cannot_be_resolved(
+    tmp_path,
+    incoming_message_factory,
+    now,
+    person_id,
+    route_variant,
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'due-active-route-gap.db').as_posix()}"
+    settings, repository, first, mandate, primary_delivery = (
+        _release_selected_mixed_delivery(
+            database_url,
+            incoming_message_factory,
+            now,
+            person_id=person_id,
+            prefix=f"due-active-{person_id}-{route_variant}",
+        )
+    )
+    first.mark_delivery_result(
+        primary_delivery,
+        succeeded=True,
+        now=now + timedelta(seconds=2),
+    )
+    persisted = repository.get_assignment(primary_delivery.assignment_id)
+    assert persisted is not None
+    primary, alternate = _mixed_directory()[0].resolve_person(person_id).routes
+    if route_variant == "missing":
+        current_routes = [alternate]
+    elif route_variant == "duplicate":
+        duplicate_primary = primary.model_copy(
+            update={
+                "sender_address": f"{person_id}-duplicate-email",
+                "recipient": f"{person_id}-duplicate@example.test",
+            }
+        )
+        current_routes = [primary, duplicate_primary, alternate]
+    elif route_variant == "persisted-duplicate":
+        persisted = persisted.model_copy(
+            update={
+                "route_ids": [
+                    primary.route_id,
+                    primary.route_id,
+                    alternate.route_id,
+                ]
+            }
+        )
+        repository.save_assignment(persisted)
+        current_routes = [primary, alternate]
+    else:
+        persisted = persisted.model_copy(update={"active_route_index": 2})
+        repository.save_assignment(persisted)
+        current_routes = [primary, alternate]
+
+    restarted_repository = SqlAlchemyHumanWireRepository(
+        create_session_factory(database_url)
+    )
+    restarted = _build_mixed_workflow(
+        restarted_repository,
+        settings=settings,
+        route_overrides={person_id: current_routes},
+    )
+    before_assignment = restarted_repository.get_assignment(
+        primary_delivery.assignment_id
+    )
+    before_events = restarted_repository.list_events(mandate.mandate_id)
+    before_interviews = restarted_repository.list_interviews(mandate.mandate_id)
+    assert before_assignment is not None
+
+    result = restarted.engagements.process_due_assignment(
+        before_assignment,
+        now + timedelta(seconds=61),
+    )
+
+    assert result == WorkflowResult()
+    assert restarted_repository.get_assignment(primary_delivery.assignment_id) == (
+        before_assignment
+    )
+    assert restarted_repository.list_events(mandate.mandate_id) == before_events
+    assert restarted_repository.list_interviews(mandate.mandate_id) == before_interviews
+    assert f"{person_id}-private-conversation" not in repr(result)
+    assert f"{person_id}-duplicate@example.test" not in repr(result)
+
+
+@pytest.mark.parametrize("person_id", ["ack-person", "structured-person"])
+@pytest.mark.parametrize("route_variant", ["missing", "duplicate"])
+def test_due_alternate_is_inert_when_exact_next_route_cannot_be_resolved(
+    tmp_path,
+    incoming_message_factory,
+    now,
+    person_id,
+    route_variant,
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'due-next-route-gap.db').as_posix()}"
+    default_routes = _mixed_directory()[0].resolve_person(person_id).routes
+    primary, middle = default_routes
+    final = ContactRoute(
+        route_id=f"{person_id}-final-route",
+        channel=Channel.EMAIL,
+        sender_address=f"{person_id}-final@example.test",
+        recipient=f"{person_id}-final@example.test",
+    )
+    settings, repository, first, mandate, primary_delivery = (
+        _release_selected_mixed_delivery(
+            database_url,
+            incoming_message_factory,
+            now,
+            person_id=person_id,
+            prefix=f"due-next-{person_id}-{route_variant}",
+            route_overrides={person_id: [primary, middle, final]},
+        )
+    )
+    first.mark_delivery_result(
+        primary_delivery,
+        succeeded=True,
+        now=now + timedelta(seconds=2),
+    )
+    pending = repository.get_assignment(primary_delivery.assignment_id)
+    assert pending is not None
+    reminder = first.engagements.process_due_assignment(
+        pending,
+        now + timedelta(seconds=61),
+    )
+    assert reminder.deliveries[0].recipient == f"{person_id}@private.example.test"
+
+    if route_variant == "missing":
+        current_routes = [primary, final]
+    else:
+        duplicate_middle = middle.model_copy(
+            update={
+                "sender_address": f"{person_id}-duplicate-chat",
+                "conversation_id": f"{person_id}-duplicate-conversation",
+            }
+        )
+        current_routes = [primary, middle, duplicate_middle, final]
+    restarted_repository = SqlAlchemyHumanWireRepository(
+        create_session_factory(database_url)
+    )
+    restarted = _build_mixed_workflow(
+        restarted_repository,
+        settings=settings,
+        route_overrides={person_id: current_routes},
+    )
+    before_assignment = restarted_repository.get_assignment(
+        primary_delivery.assignment_id
+    )
+    before_events = restarted_repository.list_events(mandate.mandate_id)
+    before_interviews = restarted_repository.list_interviews(mandate.mandate_id)
+    assert before_assignment is not None
+    assert before_assignment.attempt_count == 2
+
+    result = restarted.engagements.process_due_assignment(
+        before_assignment,
+        now + timedelta(seconds=91),
+    )
+
+    assert result == WorkflowResult()
+    assert restarted_repository.get_assignment(primary_delivery.assignment_id) == (
+        before_assignment
+    )
+    assert restarted_repository.list_events(mandate.mandate_id) == before_events
+    assert restarted_repository.list_interviews(mandate.mandate_id) == before_interviews
+    assert f"{person_id}-final@example.test" not in repr(result)
+    assert f"{person_id}-duplicate-conversation" not in repr(result)
 
 
 def test_concurrent_restart_drains_claim_each_initial_release_entry_once(

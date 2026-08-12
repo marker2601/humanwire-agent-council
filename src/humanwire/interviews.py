@@ -101,6 +101,30 @@ def _matches_current_outbound_attempt(
     return False
 
 
+def _resolve_assignment_route(
+    directory: OrganizationDirectory,
+    assignment: StakeholderAssignment,
+    route_index: int,
+) -> ContactRoute | None:
+    """Resolve one persisted route position without compacting missing identities."""
+    if not 0 <= route_index < len(assignment.route_ids):
+        return None
+    try:
+        person = directory.resolve_person(assignment.person_id)
+        if person.person_id.casefold() != assignment.person_id.casefold():
+            return None
+        registered_routes = directory.ordered_routes(person.person_id)
+    except (AmbiguousPersonError, UnknownPersonError):
+        return None
+    persisted_route_id = assignment.route_ids[route_index]
+    if assignment.route_ids.count(persisted_route_id) != 1:
+        return None
+    matches = [
+        route for route in registered_routes if route.route_id == persisted_route_id
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 class InterviewCoordinator:
     """Coordinates one short interview session for each assigned stakeholder."""
 
@@ -159,8 +183,8 @@ class InterviewCoordinator:
         bounded_questions = questions[:5]
         if not bounded_questions:
             raise ValueError("interview questions are required")
-        routes = self._assignment_routes(assignment)
-        if not routes:
+        route = _resolve_assignment_route(self.directory, assignment, 0)
+        if route is None:
             raise ValueError("assignment has no registered route")
         session = InterviewSession(
             session_id=uuid4(),
@@ -197,7 +221,6 @@ class InterviewCoordinator:
                 "next_action_at": now + timedelta(seconds=self.settings.acknowledgement_seconds),
             }
         )
-        route = routes[0]
         delivery_source, delivery_metadata = _outbound_attempt(
             updated,
             route,
@@ -235,8 +258,7 @@ class InterviewCoordinator:
         if saved.next_action_at is not None and saved.next_action_at > now:
             return WorkflowResult()
 
-        routes = self._assignment_routes(saved)
-        if not routes:
+        if not saved.route_ids:
             failed = self._transition(saved, StakeholderState.DELIVERY_FAILED, "no_registered_route", now)
             self._save_assignment_event(
                 failed,
@@ -249,7 +271,9 @@ class InterviewCoordinator:
 
         if saved.attempt_count == 0:
             session = self._session(saved)
-            route = routes[0]
+            route = _resolve_assignment_route(self.directory, saved, 0)
+            if route is None:
+                return WorkflowResult()
             queued = self._transition(saved, StakeholderState.CONTACT_QUEUED, "primary_outreach", now)
             delivered = self._transition(queued, StakeholderState.DELIVERED, "primary_outreach", now)
             updated = self._transition(
@@ -300,6 +324,11 @@ class InterviewCoordinator:
             )
 
         if saved.attempt_count == 1:
+            route = _resolve_assignment_route(
+                self.directory, saved, saved.active_route_index
+            )
+            if route is None:
+                return WorkflowResult()
             updated = self._transition(
                 saved, StakeholderState.FOLLOW_UP_DUE, "acknowledgement_reminder", now
             ).model_copy(
@@ -309,7 +338,6 @@ class InterviewCoordinator:
                     "next_action_at": now + timedelta(seconds=self.settings.reminder_seconds),
                 }
             )
-            route = routes[min(saved.active_route_index, len(routes) - 1)]
             delivery_source, delivery_metadata = _outbound_attempt(
                 updated,
                 route,
@@ -337,7 +365,7 @@ class InterviewCoordinator:
 
         if saved.attempt_count == 2:
             alternate_index = saved.active_route_index + 1
-            if alternate_index >= len(routes):
+            if alternate_index >= len(saved.route_ids):
                 unreachable = self._transition(
                     saved, StakeholderState.UNREACHABLE, "no_alternate_registered_route", now
                 )
@@ -350,7 +378,11 @@ class InterviewCoordinator:
                 ):
                     return WorkflowResult()
                 return WorkflowResult(deliveries=self._owner_notice(saved))
-            route = routes[alternate_index]
+            route = _resolve_assignment_route(
+                self.directory, saved, alternate_index
+            )
+            if route is None:
+                return WorkflowResult()
             session = self._session(saved)
             updated = self._transition(
                 saved, StakeholderState.ALTERNATE_CHANNEL, "alternate_outreach", now
@@ -623,10 +655,11 @@ class InterviewCoordinator:
             StakeholderState.ALTERNATE_CHANNEL,
         }:
             return
-        routes = self._assignment_routes(assignment)
-        if assignment.active_route_index >= len(routes):
+        route = _resolve_assignment_route(
+            self.directory, assignment, assignment.active_route_index
+        )
+        if route is None:
             return
-        route = routes[assignment.active_route_index]
         if not _matches_current_outbound_attempt(
             self.repository, assignment, route, delivery_id
         ):
@@ -677,10 +710,11 @@ class InterviewCoordinator:
             StakeholderState.ALTERNATE_CHANNEL,
         }:
             return WorkflowResult()
-        routes = self._assignment_routes(assignment)
-        if assignment.active_route_index >= len(routes):
+        active_route = _resolve_assignment_route(
+            self.directory, assignment, assignment.active_route_index
+        )
+        if active_route is None:
             return WorkflowResult()
-        active_route = routes[assignment.active_route_index]
         if not _matches_current_outbound_attempt(
             self.repository, assignment, active_route, delivery_id
         ):
@@ -695,9 +729,13 @@ class InterviewCoordinator:
             {"delivery_id": delivery_id, "outcome": "failure"},
         )
         next_index = assignment.active_route_index + 1
-        if next_index < len(routes):
+        if next_index < len(assignment.route_ids):
+            route = _resolve_assignment_route(
+                self.directory, assignment, next_index
+            )
+            if route is None:
+                return WorkflowResult()
             alternate_claim_owner = str(uuid4())
-            route = routes[next_index]
             session = self._session(assignment)
             alternate = self._transition(
                 assignment, StakeholderState.ALTERNATE_CHANNEL, "gateway_primary_failed", now
@@ -851,11 +889,10 @@ class InterviewCoordinator:
             if route is None:
                 return WorkflowResult()
             if retrying_after_cas_loss:
-                routes = self._assignment_routes(saved)
-                if (
-                    saved.active_route_index >= len(routes)
-                    or routes[saved.active_route_index].route_id != route.route_id
-                ):
+                active_route = _resolve_assignment_route(
+                    self.directory, saved, saved.active_route_index
+                )
+                if active_route is None or active_route.route_id != route.route_id:
                     return WorkflowResult()
             key = f"interview:{saved.assignment_id}:ack:{message.message_id}"
             if any(
@@ -958,20 +995,6 @@ class InterviewCoordinator:
             )
         return WorkflowResult()
 
-    def _assignment_routes(self, assignment: StakeholderAssignment) -> list[ContactRoute]:
-        registered_by_id: dict[str, ContactRoute] = {}
-        duplicate_ids: set[str] = set()
-        for route in self.directory.ordered_routes(assignment.person_id):
-            if route.route_id in registered_by_id:
-                duplicate_ids.add(route.route_id)
-                continue
-            registered_by_id[route.route_id] = route
-        return [
-            registered_by_id[route_id]
-            for route_id in assignment.route_ids
-            if route_id in registered_by_id and route_id not in duplicate_ids
-        ]
-
     def _message_route(
         self, message: IncomingMessage, assignment: StakeholderAssignment
     ) -> ContactRoute | None:
@@ -981,7 +1004,12 @@ class InterviewCoordinator:
             return None
         if person.person_id.casefold() != assignment.person_id.casefold():
             return None
-        for route in self._assignment_routes(assignment):
+        for route_index in range(len(assignment.route_ids)):
+            route = _resolve_assignment_route(
+                self.directory, assignment, route_index
+            )
+            if route is None:
+                continue
             if (
                 route.channel is message.channel
                 and route.sender_address.casefold() == message.sender_address.casefold()
