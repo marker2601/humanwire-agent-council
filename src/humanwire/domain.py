@@ -3,7 +3,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class Channel(StrEnum):
@@ -97,6 +97,21 @@ class ProposalState(StrEnum):
     UNRESOLVED = "unresolved"
 
 
+class EngagementType(StrEnum):
+    INFORM = "inform"
+    ACKNOWLEDGE = "acknowledge"
+    QUICK_RESPONSE = "quick_response"
+    STRUCTURED_INTERVIEW = "structured_interview"
+    REVIEW_APPROVAL = "review_approval"
+    AVAILABILITY = "availability"
+
+
+class EngagementDecisionKind(StrEnum):
+    APPROVE = "approve"
+    REJECT = "reject"
+    CHANGE = "change"
+
+
 class DeliveryKind(StrEnum):
     REPLY_TO_MESSAGE = "reply_to_message"
     SEND_TO_CONVERSATION = "send_to_conversation"
@@ -148,7 +163,45 @@ class PlannedStakeholder(BaseModel):
     reason: str
     direction: Direction
     required: bool = True
-    questions: list[str] = Field(min_length=1, max_length=5)
+    engagement_type: EngagementType = EngagementType.STRUCTURED_INTERVIEW
+    response_required: bool = True
+    questions: list[str] = Field(default_factory=list, max_length=5)
+
+    @model_validator(mode="before")
+    @classmethod
+    def infer_legacy_engagement_type(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or "engagement_type" in data:
+            return data
+        values = dict(data)
+        questions = values.get("questions", [])
+        question_count = len(questions) if isinstance(questions, list) else 0
+        if 1 <= question_count <= 2:
+            values["engagement_type"] = EngagementType.QUICK_RESPONSE
+        values.setdefault("response_required", True)
+        return values
+
+    @model_validator(mode="after")
+    def has_valid_engagement_contract(self) -> "PlannedStakeholder":
+        question_count = len(self.questions)
+        expected: dict[EngagementType, tuple[bool, range]] = {
+            EngagementType.INFORM: (False, range(1)),
+            EngagementType.ACKNOWLEDGE: (True, range(1)),
+            EngagementType.QUICK_RESPONSE: (True, range(1, 3)),
+            EngagementType.STRUCTURED_INTERVIEW: (True, range(3, 6)),
+            EngagementType.REVIEW_APPROVAL: (True, range(1)),
+            EngagementType.AVAILABILITY: (True, range(1)),
+        }
+        response_required, allowed_question_counts = expected[self.engagement_type]
+        if self.response_required is not response_required:
+            raise ValueError(
+                f"{self.engagement_type.value} requires response_required="
+                f"{str(response_required).lower()}"
+            )
+        if question_count not in allowed_question_counts:
+            raise ValueError(
+                f"{self.engagement_type.value} does not allow {question_count} questions"
+            )
+        return self
 
 
 class MandatePlan(BaseModel):
@@ -187,6 +240,8 @@ class StakeholderAssignment(BaseModel):
     direction: Direction
     reason: str
     required: bool
+    engagement_type: EngagementType = EngagementType.STRUCTURED_INTERVIEW
+    response_required: bool = True
     state: StakeholderState
     route_ids: list[str]
     active_route_index: int = 0
@@ -263,6 +318,20 @@ class ProposalResponse(BaseModel):
     proposal_id: UUID
     stakeholder_id: str
     response: ProposalResponseKind
+    change_text: str | None = Field(default=None, max_length=400)
+    source_message_id: str
+    created_at: datetime
+    idempotency_key: str
+
+
+class EngagementDecision(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    decision_id: UUID
+    mandate_id: UUID
+    assignment_id: UUID
+    stakeholder_id: str
+    response: EngagementDecisionKind
     change_text: str | None = Field(default=None, max_length=400)
     source_message_id: str
     created_at: datetime

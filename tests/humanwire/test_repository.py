@@ -3,8 +3,10 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 
+from humanwire import domain
 from humanwire.database import InterviewSessionRecord, create_session_factory
 from humanwire.domain import (
     AlignmentIssue,
@@ -152,6 +154,256 @@ def test_round_trips_assignment_and_interview(
         repository.find_active_interview(assignment.mandate_id, assignment.person_id) == interview
     )
     assert repository.list_interviews(sample_mandate.mandate_id) == [interview]
+
+
+def test_assignment_round_trip_preserves_engagement_contract(
+    repository, sample_mandate, make_assignment
+) -> None:
+    repository.add_mandate(sample_mandate)
+    assignment = make_assignment(
+        engagement_type=domain.EngagementType.ACKNOWLEDGE,
+        response_required=True,
+    )
+
+    repository.add_assignment(assignment)
+
+    assert repository.get_assignment(assignment.assignment_id) == assignment
+
+
+@pytest.mark.parametrize(
+    ("engagement_type", "response_required", "questions"),
+    [
+        ("inform", False, []),
+        ("acknowledge", True, []),
+        ("quick_response", True, ["One?"]),
+        ("quick_response", True, ["One?", "Two?"]),
+        ("structured_interview", True, ["One?", "Two?", "Three?"]),
+        (
+            "structured_interview",
+            True,
+            ["One?", "Two?", "Three?", "Four?", "Five?"],
+        ),
+        ("review_approval", True, []),
+        ("availability", True, []),
+    ],
+)
+def test_planned_stakeholder_accepts_valid_engagement_contract(
+    engagement_type, response_required, questions
+) -> None:
+    stakeholder = domain.PlannedStakeholder(
+        person_ref="team-lead",
+        reason="Needed for the mandate",
+        direction=Direction.DOWNWARD,
+        engagement_type=engagement_type,
+        response_required=response_required,
+        questions=questions,
+    )
+
+    assert stakeholder.engagement_type.value == engagement_type
+
+
+@pytest.mark.parametrize(
+    ("engagement_type", "response_required", "questions"),
+    [
+        ("inform", True, []),
+        ("inform", False, ["Unexpected question?"]),
+        ("acknowledge", False, []),
+        ("acknowledge", True, ["Unexpected question?"]),
+        ("quick_response", True, []),
+        ("quick_response", True, ["One?", "Two?", "Three?"]),
+        ("structured_interview", True, ["One?", "Two?"]),
+        ("review_approval", True, ["Unexpected question?"]),
+        ("availability", True, ["Unexpected question?"]),
+    ],
+)
+def test_planned_stakeholder_rejects_invalid_engagement_contract(
+    engagement_type, response_required, questions
+) -> None:
+    with pytest.raises(ValidationError):
+        domain.PlannedStakeholder(
+            person_ref="team-lead",
+            reason="Needed for the mandate",
+            direction=Direction.DOWNWARD,
+            engagement_type=engagement_type,
+            response_required=response_required,
+            questions=questions,
+        )
+
+
+@pytest.mark.parametrize(
+    ("questions", "expected_type"),
+    [
+        (["Legacy quick question?"], "quick_response"),
+        (["One?", "Two?"], "quick_response"),
+        (["One?", "Two?", "Three?"], "structured_interview"),
+    ],
+)
+def test_legacy_planned_stakeholder_infers_valid_engagement_contract(
+    questions, expected_type
+) -> None:
+    stakeholder = domain.PlannedStakeholder(
+        person_ref="team-lead",
+        reason="Needed for the mandate",
+        direction=Direction.DOWNWARD,
+        questions=questions,
+    )
+
+    assert stakeholder.engagement_type.value == expected_type
+    assert stakeholder.response_required is True
+    assert domain.PlannedStakeholder.model_validate(stakeholder.model_dump()) == stakeholder
+
+
+def test_engagement_decision_is_idempotent_and_queryable(
+    repository, sample_mandate, make_assignment, now
+) -> None:
+    repository.add_mandate(sample_mandate)
+    assignment = make_assignment()
+    repository.add_assignment(assignment)
+    decision = domain.EngagementDecision(
+        decision_id=uuid4(),
+        mandate_id=sample_mandate.mandate_id,
+        assignment_id=assignment.assignment_id,
+        stakeholder_id=assignment.person_id,
+        response=domain.EngagementDecisionKind.APPROVE,
+        source_message_id="message-approval",
+        created_at=now,
+        idempotency_key="engagement-decision:approval",
+    )
+
+    repository.add_engagement_decision(decision)
+    repository.add_engagement_decision(decision)
+
+    assert repository.get_engagement_decision(decision.assignment_id) == decision
+    assert repository.list_engagement_decisions(decision.mandate_id) == [decision]
+
+
+def test_unit_of_work_queries_engagement_decision(
+    repository, sample_mandate, make_assignment, now
+) -> None:
+    repository.add_mandate(sample_mandate)
+    assignment = make_assignment()
+    repository.add_assignment(assignment)
+    decision = domain.EngagementDecision(
+        decision_id=uuid4(),
+        mandate_id=sample_mandate.mandate_id,
+        assignment_id=assignment.assignment_id,
+        stakeholder_id=assignment.person_id,
+        response=domain.EngagementDecisionKind.CHANGE,
+        change_text="Move the deadline.",
+        source_message_id="message-change",
+        created_at=now,
+        idempotency_key="engagement-decision:uow",
+    )
+
+    with repository.transaction() as unit:
+        unit.add_engagement_decision(decision)
+        unit.add_engagement_decision(decision)
+        assert unit.get_engagement_decision(assignment.assignment_id) == decision
+        assert unit.list_engagement_decisions(sample_mandate.mandate_id) == [decision]
+
+
+def test_engagement_decisions_are_ordered_by_created_at_then_decision_id(
+    repository, sample_mandate, make_assignment, now
+) -> None:
+    repository.add_mandate(sample_mandate)
+    later_assignment = make_assignment(assignment_id=uuid4(), person_id="later")
+    first_assignment = make_assignment(assignment_id=uuid4(), person_id="first")
+    second_assignment = make_assignment(assignment_id=uuid4(), person_id="second")
+    for assignment in (later_assignment, first_assignment, second_assignment):
+        repository.add_assignment(assignment)
+    first_id = uuid4()
+    second_id = uuid4()
+    if str(first_id) > str(second_id):
+        first_id, second_id = second_id, first_id
+    decisions = [
+        domain.EngagementDecision(
+            decision_id=second_id,
+            mandate_id=sample_mandate.mandate_id,
+            assignment_id=second_assignment.assignment_id,
+            stakeholder_id=second_assignment.person_id,
+            response=domain.EngagementDecisionKind.REJECT,
+            source_message_id="message-second",
+            created_at=now,
+            idempotency_key="engagement-decision:second",
+        ),
+        domain.EngagementDecision(
+            decision_id=uuid4(),
+            mandate_id=sample_mandate.mandate_id,
+            assignment_id=later_assignment.assignment_id,
+            stakeholder_id=later_assignment.person_id,
+            response=domain.EngagementDecisionKind.APPROVE,
+            source_message_id="message-later",
+            created_at=now + timedelta(seconds=1),
+            idempotency_key="engagement-decision:later",
+        ),
+        domain.EngagementDecision(
+            decision_id=first_id,
+            mandate_id=sample_mandate.mandate_id,
+            assignment_id=first_assignment.assignment_id,
+            stakeholder_id=first_assignment.person_id,
+            response=domain.EngagementDecisionKind.CHANGE,
+            change_text="Revise the timing.",
+            source_message_id="message-first",
+            created_at=now,
+            idempotency_key="engagement-decision:first",
+        ),
+    ]
+    for decision in decisions:
+        repository.add_engagement_decision(decision)
+
+    assert repository.list_engagement_decisions(sample_mandate.mandate_id) == [
+        decisions[2],
+        decisions[0],
+        decisions[1],
+    ]
+
+
+def test_conflicting_engagement_decision_cannot_replace_first_durable_decision(
+    repository, sample_mandate, make_assignment, now
+) -> None:
+    repository.add_mandate(sample_mandate)
+    assignment = make_assignment()
+    repository.add_assignment(assignment)
+    first = domain.EngagementDecision(
+        decision_id=uuid4(),
+        mandate_id=sample_mandate.mandate_id,
+        assignment_id=assignment.assignment_id,
+        stakeholder_id=assignment.person_id,
+        response=domain.EngagementDecisionKind.APPROVE,
+        source_message_id="message-first",
+        created_at=now,
+        idempotency_key="engagement-decision:first-durable",
+    )
+    conflicting = first.model_copy(
+        update={
+            "decision_id": uuid4(),
+            "response": domain.EngagementDecisionKind.REJECT,
+            "source_message_id": "message-conflicting",
+            "idempotency_key": "engagement-decision:conflicting",
+        }
+    )
+    repository.add_engagement_decision(first)
+
+    with pytest.raises(ValueError, match="already has a decision"):
+        repository.add_engagement_decision(conflicting)
+
+    assert repository.get_engagement_decision(assignment.assignment_id) == first
+
+
+def test_engagement_decision_is_immutable(sample_mandate, make_assignment, now) -> None:
+    decision = domain.EngagementDecision(
+        decision_id=uuid4(),
+        mandate_id=sample_mandate.mandate_id,
+        assignment_id=make_assignment().assignment_id,
+        stakeholder_id="team-lead",
+        response=domain.EngagementDecisionKind.APPROVE,
+        source_message_id="message-approval",
+        created_at=now,
+        idempotency_key="engagement-decision:immutable",
+    )
+
+    with pytest.raises(ValidationError):
+        decision.response = domain.EngagementDecisionKind.REJECT
 
 
 def test_rejects_duplicate_active_interview_for_the_same_stakeholder(

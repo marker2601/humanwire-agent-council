@@ -3,6 +3,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     DateTime,
     ForeignKey,
     Index,
@@ -56,6 +57,18 @@ class StakeholderAssignmentRecord(Base):
     direction: Mapped[str] = mapped_column(String(32))
     reason: Mapped[str] = mapped_column(Text)
     required: Mapped[bool]
+    engagement_type: Mapped[str] = mapped_column(
+        String(40),
+        nullable=False,
+        default="structured_interview",
+        server_default="structured_interview",
+    )
+    response_required: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default=text("1"),
+    )
     state: Mapped[str] = mapped_column(String(40), index=True)
     route_ids: Mapped[list[str]] = mapped_column(JSON)
     active_route_index: Mapped[int] = mapped_column(Integer)
@@ -173,6 +186,27 @@ class ProposalResponseRecord(Base):
     response_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
     proposal_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("hw_proposals.proposal_id"), index=True
+    )
+    stakeholder_id: Mapped[str] = mapped_column(String(128), index=True)
+    response: Mapped[str] = mapped_column(String(32))
+    change_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_message_id: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+
+
+class EngagementDecisionRecord(Base):
+    __tablename__ = "hw_engagement_decisions"
+
+    decision_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    mandate_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("hw_mandates.mandate_id"), index=True
+    )
+    assignment_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("hw_assignments.assignment_id"),
+        unique=True,
+        index=True,
     )
     stakeholder_id: Mapped[str] = mapped_column(String(128), index=True)
     response: Mapped[str] = mapped_column(String(32))

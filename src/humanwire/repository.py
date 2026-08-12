@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from humanwire.database import (
     AlignmentIssueRecord,
     DomainEventRecord,
+    EngagementDecisionRecord,
     EvidenceItemRecord,
     InterviewSessionRecord,
     MandateRecord,
@@ -27,6 +28,9 @@ from humanwire.domain import (
     Channel,
     Direction,
     DomainEvent,
+    EngagementDecision,
+    EngagementDecisionKind,
+    EngagementType,
     EvidenceItem,
     EvidenceStatus,
     EvidenceType,
@@ -123,6 +127,8 @@ def _assignment_record(value: StakeholderAssignment) -> StakeholderAssignmentRec
         direction=value.direction.value,
         reason=value.reason,
         required=value.required,
+        engagement_type=value.engagement_type.value,
+        response_required=value.response_required,
         state=value.state.value,
         route_ids=value.route_ids,
         active_route_index=value.active_route_index,
@@ -146,6 +152,8 @@ def _assignment_value(record: StakeholderAssignmentRecord) -> StakeholderAssignm
         direction=Direction(record.direction),
         reason=record.reason,
         required=record.required,
+        engagement_type=EngagementType(record.engagement_type),
+        response_required=record.response_required,
         state=StakeholderState(record.state),
         route_ids=record.route_ids,
         active_route_index=record.active_route_index,
@@ -314,6 +322,34 @@ def _response_value(record: ProposalResponseRecord) -> ProposalResponse:
         proposal_id=UUID(record.proposal_id),
         stakeholder_id=record.stakeholder_id,
         response=ProposalResponseKind(record.response),
+        change_text=record.change_text,
+        source_message_id=record.source_message_id,
+        created_at=_utc(record.created_at),
+        idempotency_key=record.idempotency_key,
+    )
+
+
+def _engagement_decision_record(value: EngagementDecision) -> EngagementDecisionRecord:
+    return EngagementDecisionRecord(
+        decision_id=str(value.decision_id),
+        mandate_id=str(value.mandate_id),
+        assignment_id=str(value.assignment_id),
+        stakeholder_id=value.stakeholder_id,
+        response=value.response.value,
+        change_text=value.change_text,
+        source_message_id=value.source_message_id,
+        created_at=value.created_at,
+        idempotency_key=value.idempotency_key,
+    )
+
+
+def _engagement_decision_value(record: EngagementDecisionRecord) -> EngagementDecision:
+    return EngagementDecision(
+        decision_id=UUID(record.decision_id),
+        mandate_id=UUID(record.mandate_id),
+        assignment_id=UUID(record.assignment_id),
+        stakeholder_id=record.stakeholder_id,
+        response=EngagementDecisionKind(record.response),
         change_text=record.change_text,
         source_message_id=record.source_message_id,
         created_at=_utc(record.created_at),
@@ -555,6 +591,46 @@ class RepositoryUnitOfWork:
         ).all()
         return [_response_value(record) for record in records]
 
+    def add_engagement_decision(self, decision: EngagementDecision) -> None:
+        existing_key = self._session.scalar(
+            select(EngagementDecisionRecord).where(
+                EngagementDecisionRecord.idempotency_key == decision.idempotency_key
+            )
+        )
+        if existing_key is not None:
+            if _engagement_decision_value(existing_key) == decision:
+                return
+            raise ValueError("engagement decision idempotency key conflicts")
+        existing_assignment = self._session.scalar(
+            select(EngagementDecisionRecord).where(
+                EngagementDecisionRecord.assignment_id == str(decision.assignment_id)
+            )
+        )
+        if existing_assignment is not None:
+            if _engagement_decision_value(existing_assignment) == decision:
+                return
+            raise ValueError("assignment already has a decision")
+        self._session.add(_engagement_decision_record(decision))
+
+    def get_engagement_decision(self, assignment_id: UUID) -> EngagementDecision | None:
+        record = self._session.scalar(
+            select(EngagementDecisionRecord).where(
+                EngagementDecisionRecord.assignment_id == str(assignment_id)
+            )
+        )
+        return _engagement_decision_value(record) if record else None
+
+    def list_engagement_decisions(self, mandate_id: UUID) -> list[EngagementDecision]:
+        records = self._session.scalars(
+            select(EngagementDecisionRecord)
+            .where(EngagementDecisionRecord.mandate_id == str(mandate_id))
+            .order_by(
+                EngagementDecisionRecord.created_at,
+                EngagementDecisionRecord.decision_id,
+            )
+        ).all()
+        return [_engagement_decision_value(record) for record in records]
+
     def save_meeting_package(self, package: MeetingPackage) -> None:
         record = self._session.get(MeetingPackageRecord, str(package.meeting_id))
         replacement = _package_record(package)
@@ -777,6 +853,20 @@ class SqlAlchemyHumanWireRepository:
                 .order_by(ProposalResponseRecord.receipt_order)
             ).all()
             return [_response_value(record) for record in records]
+
+    def add_engagement_decision(self, decision: EngagementDecision) -> None:
+        try:
+            self._write(RepositoryUnitOfWork.add_engagement_decision, decision)
+        except IntegrityError as error:
+            raise ValueError("assignment already has a decision") from error
+
+    def get_engagement_decision(self, assignment_id: UUID) -> EngagementDecision | None:
+        with self._session_factory() as session:
+            return RepositoryUnitOfWork(session).get_engagement_decision(assignment_id)
+
+    def list_engagement_decisions(self, mandate_id: UUID) -> list[EngagementDecision]:
+        with self._session_factory() as session:
+            return RepositoryUnitOfWork(session).list_engagement_decisions(mandate_id)
 
     def save_meeting_package(self, package: MeetingPackage) -> None:
         self._write(RepositoryUnitOfWork.save_meeting_package, package)

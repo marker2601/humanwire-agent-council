@@ -132,9 +132,12 @@ def test_mandate_invalid_transition_names_source_and_target(make_mandate, now) -
     [
         (StakeholderState.NOT_CONTACTED, StakeholderState.CONTACT_QUEUED),
         (StakeholderState.CONTACT_QUEUED, StakeholderState.DELIVERED),
+        (StakeholderState.DELIVERED, StakeholderState.COMPLETE),
         (StakeholderState.DELIVERED, StakeholderState.AWAITING_ACKNOWLEDGEMENT),
         (StakeholderState.AWAITING_ACKNOWLEDGEMENT, StakeholderState.ACKNOWLEDGED),
+        (StakeholderState.AWAITING_ACKNOWLEDGEMENT, StakeholderState.COMPLETE),
         (StakeholderState.AWAITING_ACKNOWLEDGEMENT, StakeholderState.FOLLOW_UP_DUE),
+        (StakeholderState.ACKNOWLEDGED, StakeholderState.COMPLETE),
         (StakeholderState.ACKNOWLEDGED, StakeholderState.INTERVIEWING),
         (StakeholderState.INTERVIEWING, StakeholderState.COMPLETE),
         (StakeholderState.FOLLOW_UP_DUE, StakeholderState.ALTERNATE_CHANNEL),
@@ -172,6 +175,19 @@ def test_required_approver_cannot_be_completed_from_unreachable(make_assignment,
     assignment = make_assignment(required=True, state=StakeholderState.UNREACHABLE)
     with pytest.raises(InvalidTransitionError):
         StakeholderStateMachine().transition(assignment, StakeholderState.COMPLETE, "forced", now)
+
+
+@pytest.mark.parametrize(
+    "source",
+    (StakeholderState.FOLLOW_UP_DUE, StakeholderState.DELIVERY_FAILED),
+)
+def test_assignment_cannot_complete_from_silence_or_delivery_failure(
+    make_assignment, now, source
+) -> None:
+    with pytest.raises(InvalidTransitionError):
+        StakeholderStateMachine().transition(
+            make_assignment(state=source), StakeholderState.COMPLETE, "forced", now
+        )
 
 
 def test_assignment_terminal_transition_sets_completed_at(make_assignment, now) -> None:
