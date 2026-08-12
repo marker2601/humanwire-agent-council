@@ -28,8 +28,13 @@ from humanwire.evidence import EvidenceExtractor, shareable_evidence
 from humanwire.meetings import MeetingCoordinator
 from humanwire.messages import render_alignment_brief, render_meeting_confirmation, render_proposal
 from humanwire.repository import SqlAlchemyHumanWireRepository
-from humanwire.services import MandateService, SynthesisService, _event
-from humanwire.state_machine import MandateStateMachine
+from humanwire.services import (
+    MandateService,
+    SynthesisService,
+    _event,
+    incoming_idempotency_key,
+)
+from humanwire.state_machine import MANDATE_TERMINAL_STATES, MandateStateMachine
 
 
 class HumanWireWorkflow:
@@ -56,16 +61,31 @@ class HumanWireWorkflow:
 
     def process_due(self, now: datetime) -> WorkflowResult:
         deliveries: list[DeliveryInstruction] = []
-        for assignment in self.repository.list_due_assignments(now):
-            result = self.mandates.interviews.process_due_assignment(assignment, now)
-            deliveries.extend(result.deliveries)
-            deliveries.extend(self.synthesis.run(assignment.mandate_id, now).deliveries)
         for mandate in self.repository.list_recent_mandates(1000):
-            if mandate.expires_at <= now and mandate.state not in {MandateState.ALIGNED, MandateState.MEETING_READY, MandateState.PARTIAL, MandateState.CANCELLED, MandateState.EXPIRED}:
+            if mandate.expires_at <= now and mandate.state not in MANDATE_TERMINAL_STATES:
                 expired = MandateStateMachine().transition(mandate, MandateState.EXPIRED, "deadline_elapsed", now)
                 with self.repository.transaction() as unit:
                     unit.save_mandate(expired)
                     unit.append_event(mandate.mandate_id, _event("mandate.expired", now, f"expired:{mandate.mandate_id}", actor_id=mandate.initiator_id, previous_state=mandate.state.value, new_state="expired"))
+                text = (
+                    f"HUMANWIRE EXPIRED · {mandate.token}\n\n"
+                    "The mandate deadline elapsed. No agreement or approval was inferred."
+                )
+                deliveries.extend(
+                    self.synthesis._route_deliveries(
+                        [mandate.initiator_id], text, mandate.token
+                    )
+                )
+        mandate_states = {
+            mandate.mandate_id: mandate.state
+            for mandate in self.repository.list_recent_mandates(1000)
+        }
+        for assignment in self.repository.list_due_assignments(now):
+            if mandate_states.get(assignment.mandate_id) is not MandateState.INTERVIEWING:
+                continue
+            result = self.mandates.interviews.process_due_assignment(assignment, now)
+            deliveries.extend(result.deliveries)
+            deliveries.extend(self.synthesis.run(assignment.mandate_id, now).deliveries)
         return WorkflowResult(deliveries=deliveries)
 
     def mark_delivery_result(self, instruction: DeliveryInstruction, succeeded: bool, now: datetime) -> WorkflowResult:
@@ -105,11 +125,15 @@ class HumanWireWorkflow:
         ):
             return self._reply(message, "Reply ACK <token> to select an active interview.")
         candidates = []
+        terminal_match = False
         for mandate in self.repository.list_recent_mandates(1000):
             interview = self.repository.find_active_interview(mandate.mandate_id, person.person_id)
             if interview is not None and (interview.current_conversation_id in {None, message.conversation_id}):
                 assignment = self.repository.get_assignment(interview.assignment_id)
                 if assignment is not None:
+                    if mandate.state in {MandateState.CANCELLED, MandateState.EXPIRED}:
+                        terminal_match = True
+                        continue
                     candidates.append(assignment)
         if isinstance(command, AcknowledgeCommand):
             candidates = [
@@ -119,6 +143,8 @@ class HumanWireWorkflow:
                 and mandate.token == command.token
             ]
         if len(candidates) != 1:
+            if terminal_match:
+                return self._reply(message, "This mandate is closed. No response was recorded.")
             return self._reply(message, "Reply ACK <token> to select an active interview." if candidates else "Use /mandate to start a request.")
         assignment = candidates[0]
         result = self.mandates.interviews.acknowledge(message, assignment, message.received_at) if isinstance(command, AcknowledgeCommand) else self.mandates.interviews.record_answer(message, assignment, message.received_at)
@@ -170,6 +196,12 @@ class HumanWireWorkflow:
         mandate = self.repository.get_mandate_by_token(token)
         if mandate is None:
             return self._reply(message, "No mandate matches that token.")
+        event_key = f"{incoming_idempotency_key(message)}:cancel"
+        if any(
+            event.idempotency_key == event_key
+            for event in self.repository.list_events(mandate.mandate_id)
+        ):
+            return WorkflowResult()
         try:
             sender = self.directory.person_for_sender(message)
         except (UnknownPersonError, AmbiguousPersonError):
@@ -181,13 +213,15 @@ class HumanWireWorkflow:
         cancelled = MandateStateMachine().transition(mandate, MandateState.CANCELLED, "initiator_cancelled", message.received_at)
         with self.repository.transaction() as unit:
             unit.save_mandate(cancelled)
-            unit.append_event(mandate.mandate_id, _event("mandate.cancelled", message.received_at, f"cancel:{mandate.mandate_id}:{message.message_id}", actor_id=sender.person_id, previous_state=mandate.state.value, new_state="cancelled"))
+            unit.append_event(mandate.mandate_id, _event("mandate.cancelled", message.received_at, event_key, actor_id=sender.person_id, previous_state=mandate.state.value, new_state="cancelled"))
         return self._reply(message, f"HumanWire {token} is cancelled.")
 
     def _proposal(self, message: IncomingMessage, command: ProposalResponseCommand) -> WorkflowResult:
         mandate = self.repository.get_mandate_by_token(command.token)
         if mandate is None:
             return self._reply(message, "No mandate matches that token.")
+        if mandate.state is not MandateState.NEGOTIATING:
+            return self._reply(message, "There is no active proposal for that token.")
         proposal = self.repository.get_active_proposal(mandate.mandate_id)
         if proposal is None:
             return self._reply(message, "There is no active proposal for that token.")

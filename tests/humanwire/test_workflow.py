@@ -1,3 +1,4 @@
+from datetime import timedelta
 from uuid import uuid4
 
 import pytest
@@ -275,6 +276,83 @@ def _event_types(repository, mandate_id) -> set[str]:
     return {event.event_type for event in repository.list_events(mandate_id)}
 
 
+def _terminal_snapshot(repository, mandate):
+    proposal = repository.get_active_proposal(mandate.mandate_id)
+    return {
+        "mandate": repository.get_mandate_by_token(mandate.token),
+        "assignments": repository.list_assignments(mandate.mandate_id),
+        "interviews": repository.list_interviews(mandate.mandate_id),
+        "evidence": repository.list_evidence(mandate.mandate_id),
+        "proposal": proposal,
+        "proposal_responses": (
+            repository.list_proposal_responses(proposal.proposal_id) if proposal else []
+        ),
+        "manager_availability": repository.get_runtime_status(
+            f"availability:{mandate.mandate_id}:manager"
+        ),
+        "lead_availability": repository.get_runtime_status(
+            f"availability:{mandate.mandate_id}:team-lead"
+        ),
+        "events": repository.list_events(mandate.mandate_id),
+    }
+
+
+def _late_terminal_message(workflow, incoming_message_factory, mandate, input_kind: str):
+    if input_kind == "ack":
+        return _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"ACK {mandate.token}",
+            message_id="late-terminal-ack",
+        )
+    if input_kind == "free_text":
+        return _message_for(
+            incoming_message_factory,
+            "team-lead",
+            "PRIVATE-LATE-SENTINEL must never become evidence.",
+            message_id="late-terminal-answer",
+        )
+
+    _complete_interview(
+        workflow,
+        incoming_message_factory,
+        mandate,
+        "team-lead",
+        prefix=f"late-{input_kind}",
+    )
+    if input_kind == "proposal":
+        return _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"ACCEPT {mandate.token}",
+            message_id="late-terminal-proposal",
+        )
+
+    workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"REJECT {mandate.token}",
+            message_id="late-availability-round-one",
+        )
+    )
+    workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"REJECT {mandate.token}",
+            message_id="late-availability-round-two",
+        )
+    )
+    window = "2026-08-12T15:00:00+00:00/2026-08-12T16:00:00+00:00"
+    return _message_for(
+        incoming_message_factory,
+        "manager",
+        f"AVAILABLE {mandate.token} {window}",
+        message_id="late-terminal-availability",
+    )
+
+
 @pytest.fixture
 def repository() -> SqlAlchemyHumanWireRepository:
     return SqlAlchemyHumanWireRepository(create_session_factory("sqlite://"))
@@ -318,6 +396,68 @@ def test_duplicate_incoming_mandate_returns_existing_state_without_second_outrea
     assert len(repository.list_recent_mandates()) == 1
     assert len(first.deliveries) == 5
     assert second.deliveries == []
+
+
+def test_required_stakeholder_without_route_is_atomically_partial_and_explained_to_initiator(
+    repository, incoming_message_factory
+) -> None:
+    """Break caught: route exhaustion is hidden behind a generic creation acknowledgement."""
+    manager, people = _people()
+    missing = people[0].model_copy(update={"routes": [], "role": "Launch Lead"})
+    directory = OrganizationDirectory(
+        OrganizationDocument(
+            people=[manager, missing],
+            initiator_policies=[
+                InitiatorPolicy(
+                    person_id="manager",
+                    allowed_directions={Direction.DOWNWARD},
+                    allowed_departments={"Operations"},
+                )
+            ],
+        )
+    )
+    workflow = HumanWireWorkflow(
+        directory,
+        repository,
+        DeterministicPlanner([missing]),
+        RuleBasedEvidenceExtractor(),
+        Settings(),
+    )
+    message = incoming_message_factory(
+        text="/mandate\nCoordinate launch coverage. PRIVATE-CREATION-SENTINEL",
+        message_id="required-no-route",
+    )
+
+    first = workflow.handle(message)
+    mandate = repository.list_recent_mandates(1)[0]
+    assignment = repository.list_assignments(mandate.mandate_id)[0]
+    events = repository.list_events(mandate.mandate_id)
+    duplicate = workflow.handle(message)
+
+    assert mandate.state is MandateState.PARTIAL
+    assert assignment.state is StakeholderState.DELIVERY_FAILED
+    assert assignment.failure_reason == "no_registered_route"
+    assert {"stakeholder.delivery_failed", "mandate.partial"} <= {
+        event.event_type for event in events
+    }
+    assert any(event.new_state == StakeholderState.DELIVERY_FAILED.value for event in events)
+    assert len(first.deliveries) == 1
+    assert first.deliveries[0].kind is DeliveryKind.SEND_TO_CONVERSATION
+    assert first.deliveries[0].conversation_id == "manager-conversation"
+    assert "Riley Chen" in first.deliveries[0].text
+    assert "Launch Lead" in first.deliveries[0].text
+    assert "missing" in first.deliveries[0].text.casefold()
+    public_text = first.deliveries[0].text
+    event_text = "\n".join(event.model_dump_json() for event in events)
+    for private_value in (
+        "PRIVATE-CREATION-SENTINEL",
+        "manager-chat",
+        "lead@example.test",
+    ):
+        assert private_value not in public_text
+        assert private_value not in event_text
+    assert duplicate.deliveries == []
+    assert repository.list_events(mandate.mandate_id) == events
 
 
 def test_model_planning_failure_uses_persisted_fallback_and_duplicate_is_inert(
@@ -950,15 +1090,191 @@ def test_creation_transaction_rolls_back_every_row_when_event_persistence_fails(
         assert session.scalar(select(func.count()).select_from(DomainEventRecord)) == 0
 
 
-def test_only_originating_initiator_can_cancel(workflow, telegram_mandate, incoming_message_factory, repository) -> None:
-    """Break caught: a stakeholder can cancel someone else's mandate."""
+def test_initiator_can_request_status(workflow, telegram_mandate, incoming_message_factory, repository) -> None:
+    """Break caught: the owner cannot observe the durable mandate state."""
     workflow.handle(telegram_mandate)
-    token = repository.list_recent_mandates(1)[0].token
-    intruder = incoming_message_factory(text=f"/cancel {token}", sender_address="lead@example.test", channel=Channel.EMAIL, conversation_id="lead@example.test", message_id="intruder")
+    mandate = repository.list_recent_mandates(1)[0]
+    events = repository.list_events(mandate.mandate_id)
 
-    workflow.handle(intruder)
+    result = workflow.handle(
+        incoming_message_factory(
+            text=f"/status {mandate.token}",
+            message_id="initiator-status",
+        )
+    )
 
-    assert repository.get_mandate_by_token(token).state is MandateState.INTERVIEWING
+    assert len(result.deliveries) == 1
+    assert result.deliveries[0].kind is DeliveryKind.REPLY_TO_MESSAGE
+    assert result.deliveries[0].conversation_id == "manager-conversation"
+    assert mandate.token in result.deliveries[0].text
+    assert MandateState.INTERVIEWING.value in result.deliveries[0].text
+    assert repository.list_events(mandate.mandate_id) == events
+
+
+def test_assigned_stakeholder_can_request_status(
+    repository, incoming_message_factory
+) -> None:
+    """Break caught: an assigned registered stakeholder is incorrectly denied status."""
+    workflow = _build_workflow(repository)
+    mandate, _ = _create_mandate(workflow, incoming_message_factory)
+
+    result = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"/status {mandate.token}",
+            message_id="stakeholder-status",
+        )
+    )
+
+    assert len(result.deliveries) == 1
+    assert result.deliveries[0].kind is DeliveryKind.REPLY_TO_MESSAGE
+    assert mandate.token in result.deliveries[0].text
+    assert MandateState.INTERVIEWING.value in result.deliveries[0].text
+
+
+def test_unrelated_registered_person_is_denied_status_without_disclosure(
+    repository, incoming_message_factory
+) -> None:
+    """Break caught: any directory member can enumerate another mandate's state."""
+    workflow = _build_workflow(repository)
+    mandate, _ = _create_mandate(workflow, incoming_message_factory)
+    before = _terminal_snapshot(repository, mandate)
+
+    result = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "vp-people",
+            f"/status {mandate.token}",
+            message_id="unrelated-status",
+        )
+    )
+
+    assert len(result.deliveries) == 1
+    assert result.deliveries[0].kind is DeliveryKind.REPLY_TO_MESSAGE
+    assert "not authorized" in result.deliveries[0].text.casefold()
+    assert mandate.token not in result.deliveries[0].text
+    assert mandate.objective not in result.deliveries[0].text
+    assert MandateState.INTERVIEWING.value not in result.deliveries[0].text
+    assert _terminal_snapshot(repository, mandate) == before
+
+
+def test_initiator_cancellation_persists_event_routes_acknowledgement_and_duplicate_is_inert(
+    workflow, telegram_mandate, incoming_message_factory, repository
+) -> None:
+    """Break caught: owner cancellation lacks an audit event or replays its acknowledgement."""
+    workflow.handle(telegram_mandate)
+    mandate = repository.list_recent_mandates(1)[0]
+    cancel = incoming_message_factory(
+        text=f"/cancel {mandate.token}",
+        message_id="initiator-cancel",
+    )
+
+    first = workflow.handle(cancel)
+    events = repository.list_events(mandate.mandate_id)
+    duplicate = workflow.handle(cancel)
+
+    assert repository.get_mandate_by_token(mandate.token).state is MandateState.CANCELLED
+    cancelled = [event for event in events if event.event_type == "mandate.cancelled"]
+    assert len(cancelled) == 1
+    assert cancelled[0].new_state == MandateState.CANCELLED.value
+    assert len(first.deliveries) == 1
+    assert first.deliveries[0].kind is DeliveryKind.REPLY_TO_MESSAGE
+    assert first.deliveries[0].conversation_id == "manager-conversation"
+    assert "cancelled" in first.deliveries[0].text.casefold()
+    assert duplicate.deliveries == []
+    assert repository.list_events(mandate.mandate_id) == events
+
+
+def test_non_owner_cancellation_is_denied_without_mutation(
+    repository, incoming_message_factory
+) -> None:
+    """Break caught: a registered stakeholder can cancel the owner's mandate."""
+    workflow = _build_workflow(repository)
+    mandate, _ = _create_mandate(workflow, incoming_message_factory)
+    before = _terminal_snapshot(repository, mandate)
+
+    result = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"/cancel {mandate.token}",
+            message_id="non-owner-cancel",
+        )
+    )
+
+    assert len(result.deliveries) == 1
+    assert result.deliveries[0].kind is DeliveryKind.REPLY_TO_MESSAGE
+    assert "original initiator" in result.deliveries[0].text.casefold()
+    assert _terminal_snapshot(repository, mandate) == before
+
+
+def test_process_due_expires_mandate_once_and_never_resurrects_outreach(
+    repository, incoming_message_factory
+) -> None:
+    """Break caught: reminders run before expiry or resume from a terminal mandate."""
+    workflow = _build_workflow(repository)
+    mandate, _ = _create_mandate(workflow, incoming_message_factory)
+    assignments = repository.list_assignments(mandate.mandate_id)
+
+    first = workflow.process_due(mandate.expires_at)
+    events = repository.list_events(mandate.mandate_id)
+    assignments_after_expiry = repository.list_assignments(mandate.mandate_id)
+    second = workflow.process_due(mandate.expires_at)
+    much_later = workflow.process_due(mandate.expires_at + Settings().mandate_timeout_seconds * timedelta(seconds=1))
+
+    assert repository.get_mandate_by_token(mandate.token).state is MandateState.EXPIRED
+    expired = [event for event in events if event.event_type == "mandate.expired"]
+    assert len(expired) == 1
+    assert expired[0].previous_state == MandateState.INTERVIEWING.value
+    assert expired[0].new_state == MandateState.EXPIRED.value
+    assert len(first.deliveries) == 1
+    assert first.deliveries[0].kind is DeliveryKind.SEND_TO_CONVERSATION
+    assert first.deliveries[0].conversation_id == "manager-conversation"
+    assert "expired" in first.deliveries[0].text.casefold()
+    assert assignments_after_expiry == assignments
+    assert second.deliveries == []
+    assert much_later.deliveries == []
+    assert repository.list_assignments(mandate.mandate_id) == assignments
+    assert repository.list_evidence(mandate.mandate_id) == []
+    assert repository.list_events(mandate.mandate_id) == events
+
+
+@pytest.mark.parametrize("terminal_state", ["cancelled", "expired"])
+@pytest.mark.parametrize("input_kind", ["ack", "free_text", "proposal", "availability"])
+def test_terminal_mandates_reject_late_inputs_without_mutation(
+    repository, incoming_message_factory, terminal_state: str, input_kind: str
+) -> None:
+    """Break caught: a terminal mandate accepts a late human input and reopens durable work."""
+    workflow = _build_workflow(repository)
+    mandate, _ = _create_mandate(workflow, incoming_message_factory)
+    late_message = _late_terminal_message(
+        workflow, incoming_message_factory, mandate, input_kind
+    )
+    if terminal_state == "cancelled":
+        workflow.handle(
+            incoming_message_factory(
+                text=f"/cancel {mandate.token}",
+                message_id=f"terminal-{input_kind}-cancel",
+            )
+        )
+        expected_state = MandateState.CANCELLED
+        late_at = mandate.created_at + timedelta(seconds=1)
+    else:
+        workflow.process_due(mandate.expires_at)
+        expected_state = MandateState.EXPIRED
+        late_at = mandate.expires_at + timedelta(seconds=1)
+    late_message = late_message.model_copy(update={"received_at": late_at})
+    before = _terminal_snapshot(repository, mandate)
+
+    result = workflow.handle(late_message)
+
+    assert repository.get_mandate_by_token(mandate.token).state is expected_state
+    assert len(result.deliveries) == 1
+    assert result.deliveries[0].kind is DeliveryKind.REPLY_TO_MESSAGE
+    assert "PRIVATE-LATE-SENTINEL" not in result.deliveries[0].text
+    assert "@example.test" not in result.deliveries[0].text
+    assert _terminal_snapshot(repository, mandate) == before
 
 
 def test_aligned_synthesis_persists_public_brief_and_routes_it_to_required_people(

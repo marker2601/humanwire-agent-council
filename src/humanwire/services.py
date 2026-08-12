@@ -116,10 +116,13 @@ class MandateService:
         interviewing = self.state_machine.transition(planned, MandateState.INTERVIEWING, "interviews_created", now)
         assignments: list[StakeholderAssignment] = []
         unavailable_required = False
+        missing_required_people = []
         for stakeholder, person in zip(resolved.plan.stakeholders, resolved.people, strict=True):
             routes = self.directory.ordered_routes(person.person_id)
             state = StakeholderState.NOT_CONTACTED if routes else StakeholderState.DELIVERY_FAILED
             unavailable_required = unavailable_required or (stakeholder.required and not routes)
+            if stakeholder.required and not routes:
+                missing_required_people.append(person)
             assignments.append(
                 StakeholderAssignment(
                     assignment_id=uuid4(), mandate_id=mandate.mandate_id, person_id=person.person_id,
@@ -159,15 +162,71 @@ class MandateService:
                 unit.add_assignment(assignment)
                 if assignment.state is StakeholderState.DELIVERY_FAILED:
                     unit.append_event(mandate.mandate_id, _event("outreach.delivery_failed", now, f"assignment:{assignment.assignment_id}:no-route", actor_id=initiator.person_id, metadata={"assignment_id": str(assignment.assignment_id), "reason_code": "no_registered_route"}))
+                    unit.append_event(
+                        mandate.mandate_id,
+                        DomainEvent(
+                            event_type="stakeholder.delivery_failed",
+                            created_at=now,
+                            idempotency_key=f"assignment:{assignment.assignment_id}:delivery-failed:no-route",
+                            actor_id=initiator.person_id,
+                            assignment_id=assignment.assignment_id,
+                            person_id=assignment.person_id,
+                            department=assignment.department,
+                            direction=assignment.direction,
+                            previous_state=StakeholderState.NOT_CONTACTED.value,
+                            new_state=StakeholderState.DELIVERY_FAILED.value,
+                            metadata={"reason_code": "no_registered_route"},
+                        ),
+                    )
             for _, interview, event, _ in prepared_outreach:
                 unit.add_interview(interview)
                 unit.append_event(mandate.mandate_id, event)
             if unavailable_required:
                 unit.append_event(mandate.mandate_id, _event("mandate.partial", now, f"{key}:partial", actor_id=initiator.person_id, previous_state="interviewing", new_state="partial", metadata={"reason_code": "required_stakeholder_unreachable"}))
 
-        deliveries = self._reply(message, f"HumanWire mandate {token} is recorded.").deliveries
+        if unavailable_required:
+            missing = ", ".join(
+                f"{person.display_name} ({person.role})" for person in missing_required_people
+            )
+            text = (
+                f"HUMANWIRE PARTIAL · {token}\n\n"
+                f"Required response missing from: {missing}. "
+                "No registered delivery route is available, so no agreement or approval was inferred."
+            )
+            deliveries = self._route_deliveries([initiator.person_id], text, token)
+        else:
+            deliveries = self._reply(message, f"HumanWire mandate {token} is recorded.").deliveries
         deliveries.extend(item[3] for item in prepared_outreach)
         return WorkflowResult(deliveries=deliveries)
+
+    def _route_deliveries(
+        self, person_ids: list[str], text: str, token: str
+    ) -> list[DeliveryInstruction]:
+        deliveries: list[DeliveryInstruction] = []
+        for person_id in dict.fromkeys(person_ids):
+            routes = self.directory.ordered_routes(person_id)
+            if not routes:
+                continue
+            route = routes[0]
+            if route.channel is Channel.EMAIL:
+                deliveries.append(
+                    DeliveryInstruction(
+                        kind=DeliveryKind.INITIATE_EMAIL,
+                        text=text,
+                        mandate_token=token,
+                        recipient=route.recipient,
+                    )
+                )
+            else:
+                deliveries.append(
+                    DeliveryInstruction(
+                        kind=DeliveryKind.SEND_TO_CONVERSATION,
+                        text=text,
+                        mandate_token=token,
+                        conversation_id=route.conversation_id,
+                    )
+                )
+        return deliveries
 
     @staticmethod
     def _reply(message: IncomingMessage, text: str) -> WorkflowResult:
