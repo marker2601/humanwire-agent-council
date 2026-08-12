@@ -1,5 +1,7 @@
 # HumanWire Product Design
 
+> **Approved adaptive-engagement amendment (2026-08-12):** HumanWire assigns the minimum necessary engagement per stakeholder; it does not interview everybody. The authoritative amendment is [2026-08-12-humanwire-adaptive-engagement-design.md](2026-08-12-humanwire-adaptive-engagement-design.md) and supersedes conflicting universal-interview wording in this document.
+
 **Date:** 2026-08-11  
 **Status:** Approved for implementation
 **Product:** AI chief of staff that interviews the organization  
