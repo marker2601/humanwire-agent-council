@@ -1,7 +1,7 @@
 # HumanWire Adaptive Stakeholder Engagement Design
 
-**Date:** 2026-08-12  
-**Status:** Approved conversational design; written specification awaiting final user review  
+**Date:** 2026-08-12
+**Status:** Approved conversational design; written specification awaiting final user review
 **Product:** HumanWire
 
 ## 1. Decision
