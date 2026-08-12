@@ -17,6 +17,7 @@ from humanwire.commands import (
 from humanwire.config import Settings
 from humanwire.directory import AmbiguousPersonError, OrganizationDirectory, UnknownPersonError
 from humanwire.domain import (
+    Channel,
     DeliveryInstruction,
     DeliveryKind,
     IncomingMessage,
@@ -37,7 +38,7 @@ class HumanWireWorkflow:
         self.repository = repository
         self.settings = settings
         self.mandates = MandateService(directory, repository, planner, evidence_extractor, settings)
-        self.synthesis = SynthesisService(repository)
+        self.synthesis = SynthesisService(directory, repository)
 
     def handle(self, message: IncomingMessage) -> WorkflowResult:
         command = parse_command(message.text)
@@ -58,7 +59,7 @@ class HumanWireWorkflow:
         for assignment in self.repository.list_due_assignments(now):
             result = self.mandates.interviews.process_due_assignment(assignment, now)
             deliveries.extend(result.deliveries)
-            self.synthesis.run(assignment.mandate_id, now)
+            deliveries.extend(self.synthesis.run(assignment.mandate_id, now).deliveries)
         for mandate in self.repository.list_recent_mandates(1000):
             if mandate.expires_at <= now and mandate.state not in {MandateState.ALIGNED, MandateState.MEETING_READY, MandateState.PARTIAL, MandateState.CANCELLED, MandateState.EXPIRED}:
                 expired = MandateStateMachine().transition(mandate, MandateState.EXPIRED, "deadline_elapsed", now)
@@ -74,7 +75,10 @@ class HumanWireWorkflow:
         if succeeded:
             self.mandates.interviews.mark_delivery_success(instruction.assignment_id, delivery_id, now)
         else:
-            self.mandates.interviews.mark_delivery_failure(instruction.assignment_id, delivery_id, now)
+            failed = self.mandates.interviews.mark_delivery_failure(
+                instruction.assignment_id, delivery_id, now
+            )
+            return WorkflowResult(deliveries=failed.deliveries)
         return WorkflowResult()
 
     def _interview(self, message: IncomingMessage, command: FreeTextCommand | AcknowledgeCommand) -> WorkflowResult:
@@ -93,13 +97,20 @@ class HumanWireWorkflow:
             return self._reply(message, "Reply ACK <token> to select an active interview." if candidates else "Use /mandate to start a request.")
         assignment = candidates[0]
         result = self.mandates.interviews.acknowledge(message, assignment, message.received_at) if isinstance(command, AcknowledgeCommand) else self.mandates.interviews.record_answer(message, assignment, message.received_at)
-        self.synthesis.run(assignment.mandate_id, message.received_at)
-        return result
+        synthesis = self.synthesis.run(assignment.mandate_id, message.received_at)
+        return WorkflowResult(deliveries=[*result.deliveries, *synthesis.deliveries])
 
     def _status(self, message: IncomingMessage, token: str) -> WorkflowResult:
         mandate = self.repository.get_mandate_by_token(token)
         if mandate is None:
             return self._reply(message, "No mandate matches that token.")
+        try:
+            sender = self.directory.person_for_sender(message)
+        except (UnknownPersonError, AmbiguousPersonError):
+            return self._reply(message, "You are not authorized to view this mandate.")
+        assigned = {item.person_id for item in self.repository.list_assignments(mandate.mandate_id)}
+        if sender.person_id not in assigned | {mandate.initiator_id}:
+            return self._reply(message, "You are not authorized to view this mandate.")
         return self._reply(message, f"HumanWire {token}: {mandate.state.value}.")
 
     def _cancel(self, message: IncomingMessage, token: str) -> WorkflowResult:
@@ -157,7 +168,11 @@ class HumanWireWorkflow:
         elif outcome is NegotiationOutcome.NEXT_ROUND:
             report = AlignmentReport(mandate_id=mandate.mandate_id, issues=self.repository.list_issues(mandate.mandate_id), is_aligned=False)
             next_proposal = coordinator.create_proposal(mandate, report, 2, message.received_at)
-            return WorkflowResult(deliveries=[DeliveryInstruction(kind=DeliveryKind.SEND_TO_CONVERSATION, text=render_proposal(mandate.token, next_proposal, shareable_evidence(self.repository.list_evidence(mandate.mandate_id))), mandate_token=mandate.token)])
+            return WorkflowResult(deliveries=self.synthesis._route_deliveries(
+                next_proposal.required_respondent_ids,
+                render_proposal(mandate.token, next_proposal, shareable_evidence(self.repository.list_evidence(mandate.mandate_id))),
+                mandate.token,
+            ))
         elif outcome is NegotiationOutcome.MEETING_REQUIRED:
             machine = MandateStateMachine()
             required = machine.transition(mandate, MandateState.MEETING_REQUIRED, "two_round_cap", message.received_at)
@@ -166,7 +181,9 @@ class HumanWireWorkflow:
                 unit.save_mandate(scheduling)
                 unit.append_event(mandate.mandate_id, _event("mandate.meeting_required", message.received_at, f"meeting-required:{proposal.proposal_id}", actor_id=person.person_id, previous_state="negotiating", new_state="meeting_required"))
                 unit.append_event(mandate.mandate_id, _event("mandate.scheduling", message.received_at, f"scheduling:{proposal.proposal_id}", actor_id=person.person_id, previous_state="meeting_required", new_state="scheduling"))
-            return WorkflowResult(deliveries=[DeliveryInstruction(kind=DeliveryKind.SEND_TO_CONVERSATION, text=f"HUMANWIRE AVAILABILITY REQUEST · {mandate.token}\n\nReply AVAILABLE {mandate.token} <start>/<end> using ISO-8601 timestamps with offsets.", mandate_token=mandate.token)])
+            attendees = self._meeting_attendees(mandate)
+            text = f"HUMANWIRE AVAILABILITY REQUEST · {mandate.token}\n\nReply AVAILABLE {mandate.token} <start>/<end> using ISO-8601 timestamps with offsets."
+            return WorkflowResult(deliveries=self.synthesis._route_deliveries(attendees, text, mandate.token))
         return WorkflowResult()
 
     def _availability(self, message: IncomingMessage, command: AvailabilityCommand) -> WorkflowResult:
@@ -177,6 +194,10 @@ class HumanWireWorkflow:
             person = self.directory.person_for_sender(message)
         except (UnknownPersonError, AmbiguousPersonError):
             return self._reply(message, "Availability must come from a registered attendee.")
+        if person.person_id not in self._meeting_attendees(mandate) or not self._registered_route_matches(
+            person.person_id, message
+        ):
+            return self._reply(message, "Availability must come from a requested registered attendee.")
         self.repository.set_runtime_status(f"availability:{mandate.mandate_id}:{person.person_id}", json_windows(command), message.received_at)
         self.repository.append_event(mandate.mandate_id, _event("availability.recorded", message.received_at, f"availability:{mandate.mandate_id}:{person.person_id}:{message.message_id}", actor_id=person.person_id, channel=message.channel))
         return self._try_schedule(mandate, message.received_at)
@@ -212,7 +233,33 @@ class HumanWireWorkflow:
             unit.save_mandate(ready)
             unit.append_event(mandate.mandate_id, _event("meeting.package_created", now, f"meeting:{package.meeting_id}", actor_id=mandate.initiator_id, metadata={"meeting_id": str(package.meeting_id)}))
             unit.append_event(mandate.mandate_id, _event("mandate.meeting_ready", now, f"meeting-ready:{package.meeting_id}", actor_id=mandate.initiator_id, previous_state="scheduling", new_state="meeting_ready"))
-        return WorkflowResult(deliveries=[DeliveryInstruction(kind=DeliveryKind.SEND_TO_CONVERSATION, text=render_meeting_confirmation(mandate.token, package, coordinator=coordinator), mandate_token=mandate.token)])
+        return WorkflowResult(deliveries=self.synthesis._route_deliveries(
+            package.required_attendee_ids,
+            render_meeting_confirmation(mandate.token, package, coordinator=coordinator),
+            mandate.token,
+        ))
+
+    def _meeting_attendees(self, mandate) -> list[str]:
+        from humanwire.alignment import AlignmentReport
+
+        report = AlignmentReport(
+            mandate_id=mandate.mandate_id,
+            issues=self.repository.list_issues(mandate.mandate_id),
+            is_aligned=False,
+        )
+        return sorted(
+            MeetingCoordinator(mandate.initiator_id).required_attendees(
+                report, self.repository.list_assignments(mandate.mandate_id), mandate.initiator_id
+            )
+        )
+
+    def _registered_route_matches(self, person_id: str, message: IncomingMessage) -> bool:
+        return any(
+            route.channel is message.channel
+            and route.sender_address.casefold() == message.sender_address.casefold()
+            and (route.channel is not Channel.TELEGRAM or route.conversation_id == message.conversation_id)
+            for route in self.directory.ordered_routes(person_id)
+        )
 
     @staticmethod
     def _reply(message: IncomingMessage, text: str) -> WorkflowResult:

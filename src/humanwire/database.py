@@ -229,7 +229,10 @@ class RuntimeStatusRecord(Base):
     __tablename__ = "hw_runtime_status"
 
     key: Mapped[str] = mapped_column(String(100), primary_key=True)
-    value: Mapped[str] = mapped_column(String(100))
+    # Runtime records include durable, public alignment briefs as well as
+    # compact scheduler checkpoints; a short varchar would truncate the brief
+    # on databases that enforce declared string lengths.
+    value: Mapped[str] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 

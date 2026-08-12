@@ -89,6 +89,21 @@ def render_proposal(
     )
 
 
+def render_alignment_brief(token: str, evidence: Iterable[ShareableEvidence]) -> str:
+    """Render a durable public-only summary; private evidence never crosses this boundary."""
+    statements = [
+        item.statement
+        for item in evidence
+        if isinstance(item, ShareableEvidence) and item.status.value == "confirmed"
+    ]
+    summary = "\n".join(f"- {statement}" for statement in statements[:5])
+    return (
+        f"HUMANWIRE ALIGNMENT BRIEF · {token}\n\n"
+        f"Confirmed shared inputs:\n{summary or '- No confirmed shared inputs were recorded.'}\n\n"
+        "This is a recorded alignment summary, not a new approval request."
+    )
+
+
 def render_availability_request(token: str, purpose: str) -> str:
     """Ask for timezone-aware availability without exposing routes or private evidence."""
     return (

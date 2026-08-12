@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 import pytest
 
 from humanwire.config import Settings
@@ -8,10 +10,15 @@ from humanwire.domain import (
     ContactRoute,
     DeliveryKind,
     Direction,
+    EvidenceItem,
+    EvidenceStatus,
+    EvidenceType,
+    EvidenceVisibility,
     MandatePlan,
     MandateState,
     Person,
     PlannedStakeholder,
+    StakeholderState,
 )
 from humanwire.evidence import RuleBasedEvidenceExtractor
 from humanwire.planning import ResolvedPlan
@@ -124,3 +131,36 @@ def test_only_originating_initiator_can_cancel(workflow, telegram_mandate, incom
     workflow.handle(intruder)
 
     assert repository.get_mandate_by_token(token).state is MandateState.INTERVIEWING
+
+
+def test_aligned_synthesis_persists_public_brief_and_routes_it_to_required_people(
+    workflow, telegram_mandate, repository, now
+) -> None:
+    """Break caught: an aligned result is hidden or sent to an unrouted destination."""
+    workflow.handle(telegram_mandate)
+    mandate = repository.list_recent_mandates(1)[0]
+    assignments = repository.list_assignments(mandate.mandate_id)
+    with repository.transaction() as unit:
+        for assignment in assignments:
+            complete = assignment.model_copy(update={"state": StakeholderState.COMPLETE})
+            unit.save_assignment(complete)
+            unit.add_evidence(
+                EvidenceItem(
+                    evidence_id=uuid4(), mandate_id=mandate.mandate_id,
+                    assignment_id=assignment.assignment_id, stakeholder_id=assignment.person_id,
+                    evidence_type=EvidenceType.COMMITMENT,
+                    statement="I will support the coverage decision.",
+                    visibility=EvidenceVisibility.SHAREABLE, status=EvidenceStatus.CONFIRMED,
+                    source_message_id=f"answer-{assignment.person_id}", channel=Channel.EMAIL,
+                    created_at=now, related_decision="Approve coverage",
+                )
+            )
+
+    result = workflow.synthesis.run(mandate.mandate_id, now)
+
+    assert repository.get_runtime_status(f"alignment-brief:{mandate.mandate_id}") is not None
+    assert {delivery.recipient for delivery in result.deliveries if delivery.recipient} == {
+        "lead@example.test", "people@example.test", "coo@example.test", "support@example.test"
+    }
+    assert any(delivery.conversation_id == "manager-conversation" for delivery in result.deliveries)
+    assert any(event.event_type == "alignment.brief_persisted" for event in repository.list_events(mandate.mandate_id))

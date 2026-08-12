@@ -407,21 +407,29 @@ class InterviewCoordinator:
 
     def mark_delivery_failure(
         self, assignment_id: UUID, delivery_id: str, now: datetime
-    ) -> None:
-        """Record a gateway failure as a failure, never as silence or agreement."""
+    ) -> WorkflowResult:
+        """Advance one persisted retry-ladder step; gateway failure never implies silence."""
         assignment = self.repository.get_assignment(assignment_id)
         if assignment is None:
             raise KeyError(str(assignment_id))
+        key = f"delivery:{assignment_id}:failure:{delivery_id}"
+        if any(event.idempotency_key == key for event in self.repository.list_events(assignment.mandate_id)):
+            return WorkflowResult()
         if assignment.state in ASSIGNMENT_TERMINAL_STATES:
-            return
-        failed = self._transition(assignment, StakeholderState.DELIVERY_FAILED, "gateway_delivery_failed", now)
-        self._save_assignment_event(
-            failed,
-            assignment,
+            return WorkflowResult()
+        event = self._event(
             "outreach.delivery_failed",
+            assignment,
+            assignment,
             now,
+            key,
             {"message_id": delivery_id},
         )
+        retry = assignment.model_copy(update={"next_action_at": now})
+        with self.repository.transaction() as unit:
+            unit.save_assignment(retry)
+            unit.append_event(retry.mandate_id, event)
+        return self.process_due_assignment(retry, now)
 
     def _acknowledge(
         self,

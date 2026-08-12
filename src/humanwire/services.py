@@ -28,7 +28,7 @@ from humanwire.domain import (
 )
 from humanwire.evidence import EvidenceExtractor, private_blocker_count, shareable_evidence
 from humanwire.interviews import InterviewCoordinator
-from humanwire.messages import render_proposal
+from humanwire.messages import render_alignment_brief, render_proposal
 from humanwire.planning import MandatePlanner, PlanNeedsClarification
 from humanwire.repository import SqlAlchemyHumanWireRepository
 from humanwire.state_machine import MandateStateMachine, StakeholderStateMachine
@@ -128,8 +128,13 @@ class MandateService:
                     failure_reason="no_registered_route" if not routes else None,
                 )
             )
+        final_mandate = interviewing
+        if unavailable_required:
+            final_mandate = self.state_machine.transition(
+                interviewing, MandateState.PARTIAL, "required_stakeholder_unreachable", now
+            )
         with self.repository.transaction() as unit:
-            unit.add_mandate(interviewing)
+            unit.add_mandate(final_mandate)
             unit.append_event(mandate.mandate_id, _event("mandate.received", now, f"{key}:received", actor_id=initiator.person_id, new_state="received", channel=message.channel))
             unit.append_event(mandate.mandate_id, _event("mandate.planned", now, f"{key}:planned", actor_id=initiator.person_id, previous_state="received", new_state="planned"))
             unit.append_event(mandate.mandate_id, _event("mandate.interviewing", now, f"{key}:interviewing", actor_id=initiator.person_id, previous_state="planned", new_state="interviewing"))
@@ -139,11 +144,7 @@ class MandateService:
                 unit.add_assignment(assignment)
                 if assignment.state is StakeholderState.DELIVERY_FAILED:
                     unit.append_event(mandate.mandate_id, _event("outreach.delivery_failed", now, f"assignment:{assignment.assignment_id}:no-route", actor_id=initiator.person_id, metadata={"assignment_id": str(assignment.assignment_id), "reason_code": "no_registered_route"}))
-
-        if unavailable_required:
-            partial = self.state_machine.transition(interviewing, MandateState.PARTIAL, "required_stakeholder_unreachable", now)
-            with self.repository.transaction() as unit:
-                unit.save_mandate(partial)
+            if unavailable_required:
                 unit.append_event(mandate.mandate_id, _event("mandate.partial", now, f"{key}:partial", actor_id=initiator.person_id, previous_state="interviewing", new_state="partial", metadata={"reason_code": "required_stakeholder_unreachable"}))
 
         deliveries = self._reply(message, f"HumanWire mandate {token} is recorded.").deliveries
@@ -160,7 +161,10 @@ class MandateService:
 class SynthesisService:
     """Runs only after authenticated interview evidence is complete and durable."""
 
-    def __init__(self, repository: SqlAlchemyHumanWireRepository) -> None:
+    def __init__(
+        self, directory: OrganizationDirectory, repository: SqlAlchemyHumanWireRepository
+    ) -> None:
+        self.directory = directory
         self.repository = repository
         self.state_machine = MandateStateMachine()
 
@@ -184,17 +188,27 @@ class SynthesisService:
                 unit.add_issue(issue)
         if report.is_aligned:
             aligned = self.state_machine.transition(synthesizing, MandateState.ALIGNED, "alignment_complete", now)
+            public_evidence = shareable_evidence(evidence)
+            brief = render_alignment_brief(mandate.token, public_evidence)
             with self.repository.transaction() as unit:
                 unit.save_mandate(aligned)
+                unit.set_runtime_status(f"alignment-brief:{mandate_id}", brief, now)
                 unit.append_event(mandate_id, _event("mandate.aligned", now, f"aligned:{mandate_id}", actor_id=mandate.initiator_id, previous_state="synthesizing", new_state="aligned"))
-            return WorkflowResult()
+                unit.append_event(mandate_id, _event("alignment.brief_persisted", now, f"alignment-brief:{mandate_id}", actor_id=mandate.initiator_id))
+            recipients = [mandate.initiator_id, *(item.person_id for item in required)]
+            return WorkflowResult(deliveries=self._route_deliveries(recipients, brief, mandate.token))
         negotiating = self.state_machine.transition(synthesizing, MandateState.NEGOTIATING, "blocking_issues", now)
         coordinator = NegotiationCoordinator(self.repository)
         proposal = coordinator.create_proposal(synthesizing, report, 1, now)
         with self.repository.transaction() as unit:
             unit.save_mandate(negotiating)
             unit.append_event(mandate_id, _event("mandate.negotiating", now, f"negotiating:{mandate_id}", actor_id=mandate.initiator_id, previous_state="synthesizing", new_state="negotiating"))
-        return WorkflowResult(deliveries=[DeliveryInstruction(kind=DeliveryKind.SEND_TO_CONVERSATION, text=render_proposal(mandate.token, proposal, shareable_evidence(evidence)), mandate_token=mandate.token) ])
+        text = render_proposal(mandate.token, proposal, shareable_evidence(evidence))
+        return WorkflowResult(
+            deliveries=self._route_deliveries(
+                proposal.required_respondent_ids, text, mandate.token
+            )
+        )
 
     def _partial(self, mandate: Mandate, now: datetime) -> WorkflowResult:
         partial = self.state_machine.transition(mandate, MandateState.PARTIAL, "required_response_missing", now)
@@ -202,3 +216,32 @@ class SynthesisService:
             unit.save_mandate(partial)
             unit.append_event(mandate.mandate_id, _event("mandate.partial", now, f"partial:{mandate.mandate_id}", actor_id=mandate.initiator_id, previous_state="interviewing", new_state="partial", metadata={"reason_code": "required_response_missing"}))
         return WorkflowResult()
+
+    def _route_deliveries(
+        self, person_ids: list[str], text: str, token: str
+    ) -> list[DeliveryInstruction]:
+        deliveries: list[DeliveryInstruction] = []
+        for person_id in dict.fromkeys(person_ids):
+            routes = self.directory.ordered_routes(person_id)
+            if not routes:
+                continue
+            route = routes[0]
+            if route.channel is Channel.EMAIL:
+                deliveries.append(
+                    DeliveryInstruction(
+                        kind=DeliveryKind.INITIATE_EMAIL,
+                        text=text,
+                        mandate_token=token,
+                        recipient=route.recipient,
+                    )
+                )
+            else:
+                deliveries.append(
+                    DeliveryInstruction(
+                        kind=DeliveryKind.SEND_TO_CONVERSATION,
+                        text=text,
+                        mandate_token=token,
+                        conversation_id=route.conversation_id,
+                    )
+                )
+        return deliveries
