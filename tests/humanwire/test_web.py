@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -22,6 +24,13 @@ from humanwire.web import create_app
 from humanwire.workflow import json_windows
 
 NOW = datetime(2026, 8, 11, 18, 0, tzinfo=UTC)
+_CALENDAR_UID_NAMESPACE = b"humanwire:calendar:uid:v1:"
+
+
+def expected_private_uid(meeting_id: str) -> str:
+    digest = hashlib.sha256(_CALENDAR_UID_NAMESPACE + meeting_id.encode("ascii")).digest()
+    token = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return f"{token}@humanwire.local"
 
 
 @pytest.fixture
@@ -520,27 +529,21 @@ def test_private_token_and_meeting_id_are_removed_at_final_html_header_and_ics_b
     assert "DTSTART:20260814T200000Z" in ics_response.text
     assert "SUMMARY:Resolve the launch approval decision" in ics_response.text
     assert (
-        "UID:bc963698fd096d377e6d10d7c586c77676fd30634cd9875f3b619e5f2835fa19"
-        "@humanwire.local\r\n"
+        "UID:vJY2mP0JbTd-bRDXxYbHdnb9MGNM2YdfO2GeXyg1-hk@humanwire.local\r\n"
     ) in ics_response.text
 
 
-def test_denied_meeting_ids_have_stable_distinct_pseudonymous_calendar_uids() -> None:
+def test_denied_meeting_ids_have_unique_stable_rfc_safe_calendar_uids() -> None:
     first_id = "11111111-1111-4111-8111-111111111111"
     second_id = "22222222-2222-4222-8222-222222222222"
     first = web_projection._public_calendar_uid(first_id, frozenset({first_id}))
     repeated = web_projection._public_calendar_uid(first_id, frozenset({first_id}))
     second = web_projection._public_calendar_uid(second_id, frozenset({second_id}))
 
-    assert first == (
-        "60fa6dcb8d6f91c0f0f975dd59e51543f41470fa1cb5d271bff54654a26f2cdf"
-        "@humanwire.local"
-    )
+    assert len(f"UID:{first}".encode()) <= 75
+    assert first == expected_private_uid(first_id)
     assert repeated == first
-    assert second == (
-        "2879b44a3d7f4f154d42049e727fa6b8744426ab3ec37bf34a78577eeb2c9e9f"
-        "@humanwire.local"
-    )
+    assert second == expected_private_uid(second_id)
     assert second != first
     assert first_id not in first
     assert second_id not in second

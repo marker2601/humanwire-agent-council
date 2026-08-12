@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import html
@@ -126,8 +127,9 @@ def _public_calendar_uid(meeting_id: str, denied_values: frozenset[str]) -> str:
     public_uid = f"{meeting_id}@humanwire.local"
     if _scrub_known_private(public_uid, denied_values) == public_uid:
         return public_uid
-    digest = hashlib.sha256(_CALENDAR_UID_NAMESPACE + meeting_id.encode("ascii")).hexdigest()
-    return f"{digest}@humanwire.local"
+    digest = hashlib.sha256(_CALENDAR_UID_NAMESPACE + meeting_id.encode("ascii")).digest()
+    token = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return f"{token}@humanwire.local"
 
 
 def _public_projection(
