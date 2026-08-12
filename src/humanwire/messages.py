@@ -121,7 +121,7 @@ def render_meeting_reminder(token: str, package: MeetingPackage) -> str:
 
 
 def _slot_text(package: MeetingPackage) -> str:
-    if package.proposed_start is None or package.proposed_end is None:
+    if not package.slot_verified or package.proposed_start is None or package.proposed_end is None:
         return "awaiting confirmed availability"
     return (
         f"{package.proposed_start.astimezone(UTC).isoformat()} to "

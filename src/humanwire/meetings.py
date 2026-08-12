@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from uuid import NAMESPACE_URL, uuid5
 
@@ -39,6 +40,16 @@ _ISSUE_SEVERITY = {
 }
 
 
+@dataclass(frozen=True)
+class VerifiedOverlap:
+    """Opaque coordinator-issued proof that a complete attendee set shares a slot."""
+
+    start: datetime
+    end: datetime
+    required_attendee_ids: tuple[str, ...]
+    _issuer: object = field(repr=False, compare=False)
+
+
 class MeetingCoordinator:
     """Keeps confirmed availability and constructs local calendar-ready metadata."""
 
@@ -46,6 +57,7 @@ class MeetingCoordinator:
         self._initiator_id = initiator_id
         self._availability: dict[str, tuple[AvailabilityWindow, ...]] = {}
         self._required_attendee_ids: set[str] = set()
+        self._issuer = object()
         self.availability_retry: str | None = None
 
     def required_attendees(
@@ -86,19 +98,17 @@ class MeetingCoordinator:
         *,
         required_attendee_ids: Iterable[str] | None = None,
         duration: timedelta = _SLOT_DURATION,
-    ) -> AvailabilityWindow | None:
+    ) -> VerifiedOverlap | None:
         """Find the earliest fully-confirmed UTC slot on a 30-minute boundary."""
         if duration <= timedelta(0) or duration % _SLOT_DURATION:
             raise ValueError("meeting duration must be a positive 30-minute increment")
 
         source = self._availability if availability is None else availability
         attendee_ids = sorted(
-            required_attendee_ids
-            if required_attendee_ids is not None
-            else self._required_attendee_ids or source
+            required_attendee_ids if required_attendee_ids is not None else self._required_attendee_ids
         )
         if not attendee_ids:
-            self.availability_retry = "Awaiting confirmed availability from: no required attendees"
+            self.availability_retry = "Required attendee set is not established."
             return None
         normalized = {
             attendee_id: tuple(
@@ -126,7 +136,12 @@ class MeetingCoordinator:
                 for windows in normalized.values()
             ):
                 self.availability_retry = None
-                return AvailabilityWindow(start=candidate, end=candidate_end)
+                return VerifiedOverlap(
+                    start=candidate,
+                    end=candidate_end,
+                    required_attendee_ids=tuple(attendee_ids),
+                    _issuer=self._issuer,
+                )
             candidate += _SLOT_DURATION
 
         self.availability_retry = "No shared availability; request another availability window."
@@ -140,11 +155,12 @@ class MeetingCoordinator:
         decision_owner_id: str,
         evidence: Iterable[ShareableEvidence | EvidenceItem],
         *,
-        proposed_slot: AvailabilityWindow | None,
+        proposed_slot: VerifiedOverlap | None,
         created_at: datetime,
     ) -> MeetingPackage:
         """Build a local-only package from public evidence projections and confirmed slots."""
         attendees = sorted(self.required_attendees(report, assignments, decision_owner_id))
+        self._verify_slot(proposed_slot, attendees)
         shared_evidence = self._confirmed_shareable_evidence(evidence)
         issues = self._unresolved_blocking_issues(report)
         open_decisions = self._open_decisions(issues)
@@ -161,6 +177,7 @@ class MeetingCoordinator:
             open_decisions=open_decisions,
             agenda=list(_AGENDA),
             pre_read_evidence_ids=sorted((item.evidence_id for item in shared_evidence), key=str),
+            slot_verified=proposed_slot is not None,
             calendar_written=False,
             created_at=created_at.astimezone(UTC),
         )
@@ -176,6 +193,27 @@ class MeetingCoordinator:
         if remainder:
             value += timedelta(minutes=30 - remainder)
         return value
+
+    def _verify_slot(self, slot: VerifiedOverlap | None, attendees: list[str]) -> None:
+        if slot is None:
+            return
+        if not isinstance(slot, VerifiedOverlap) or slot._issuer is not self._issuer:
+            raise ValueError("proposed slot must be a verified overlap")
+        if slot.required_attendee_ids != tuple(attendees):
+            raise ValueError("verified overlap does not match the required attendee set")
+        if slot.start.tzinfo is not UTC or slot.end.tzinfo is not UTC:
+            raise ValueError("verified overlap must use UTC timestamps")
+        duration = slot.end - slot.start
+        if (
+            duration <= timedelta(0)
+            or duration % _SLOT_DURATION
+            or slot.start.minute % 30
+            or slot.start.second
+            or slot.start.microsecond
+            or slot.end.second
+            or slot.end.microsecond
+        ):
+            raise ValueError("verified overlap must use 30-minute boundaries and duration")
 
     @staticmethod
     def _unresolved_blocking_issues(report: AlignmentReport) -> list[AlignmentIssue]:
@@ -213,8 +251,8 @@ class MeetingCoordinator:
 
 def render_ics(package: MeetingPackage) -> bytes:
     """Create a local RFC 5545-style calendar download; it never writes to a calendar."""
-    if package.proposed_start is None or package.proposed_end is None:
-        raise ValueError("a proposed slot is required to render calendar content")
+    if not package.slot_verified or package.proposed_start is None or package.proposed_end is None:
+        raise ValueError("a verified proposed slot is required to render calendar content")
     start = package.proposed_start.astimezone(UTC)
     end = package.proposed_end.astimezone(UTC)
     created = package.created_at.astimezone(UTC)

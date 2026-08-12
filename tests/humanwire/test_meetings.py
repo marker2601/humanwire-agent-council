@@ -15,6 +15,7 @@ from humanwire.domain import (
     EvidenceType,
     EvidenceVisibility,
     MandatePlan,
+    MeetingPackage,
     StakeholderAssignment,
     StakeholderState,
 )
@@ -125,6 +126,29 @@ def windows_in_chicago_and_london() -> dict[str, list[AvailabilityWindow]]:
     }
 
 
+def record_required_overlap(
+    coordinator: MeetingCoordinator,
+    report: AlignmentReport,
+    assigned: list[StakeholderAssignment],
+    *,
+    decision_owner_id: str = "coo",
+):
+    coordinator.required_attendees(report, assigned, decision_owner_id=decision_owner_id)
+    for attendee_id in ("manager", "vp-people", "coo"):
+        coordinator.record_availability(
+            attendee_id,
+            [
+                AvailabilityWindow(
+                    start=datetime(2026, 8, 14, 20, 0, tzinfo=UTC),
+                    end=datetime(2026, 8, 14, 21, 0, tzinfo=UTC),
+                )
+            ],
+        )
+    slot = coordinator.find_overlap()
+    assert slot is not None
+    return slot
+
+
 def test_smallest_attendee_set_includes_issue_owners_and_decision_owner(
     coordinator: MeetingCoordinator,
 ) -> None:
@@ -134,11 +158,31 @@ def test_smallest_attendee_set_includes_issue_owners_and_decision_owner(
 
 
 def test_overlap_is_calculated_in_utc(coordinator: MeetingCoordinator) -> None:
-    slot = coordinator.find_overlap(windows_in_chicago_and_london())
+    slot = coordinator.find_overlap(
+        windows_in_chicago_and_london(), required_attendee_ids={"manager", "vp-people"}
+    )
 
     assert slot is not None
     assert slot.start.isoformat() == "2026-08-14T20:00:00+00:00"
     assert slot.end.isoformat() == "2026-08-14T20:30:00+00:00"
+
+
+def test_direct_overlap_without_required_attendees_returns_an_explicit_blocker(
+    coordinator: MeetingCoordinator,
+) -> None:
+    result = coordinator.find_overlap(
+        {
+            "manager": [
+                AvailabilityWindow(
+                    start=datetime(2026, 8, 14, 20, 0, tzinfo=UTC),
+                    end=datetime(2026, 8, 14, 21, 0, tzinfo=UTC),
+                )
+            ]
+        }
+    )
+
+    assert result is None
+    assert coordinator.availability_retry == "Required attendee set is not established."
 
 
 def test_missing_required_availability_is_a_blocker_and_never_invents_a_slot(
@@ -178,7 +222,8 @@ def test_non_overlapping_windows_return_one_explicit_retry_result(
                     end=datetime(2026, 8, 14, 15, 30, tzinfo=UTC),
                 )
             ],
-        }
+        },
+        required_attendee_ids={"manager", "vp-people"},
     )
 
     assert result is None
@@ -202,18 +247,22 @@ def test_overlap_rounds_up_to_a_30_minute_boundary_across_dst_offsets(
                     end=datetime.fromisoformat("2026-11-01T08:00:00+00:00"),
                 )
             ],
-        }
+        },
+        required_attendee_ids={"chicago", "london"},
     )
 
-    assert slot == AvailabilityWindow(
-        start=datetime(2026, 11, 1, 6, 30, tzinfo=UTC),
-        end=datetime(2026, 11, 1, 7, 0, tzinfo=UTC),
-    )
+    assert slot is not None
+    assert slot.start == datetime(2026, 11, 1, 6, 30, tzinfo=UTC)
+    assert slot.end == datetime(2026, 11, 1, 7, 0, tzinfo=UTC)
 
 
 def test_overlap_rejects_non_30_minute_duration(coordinator: MeetingCoordinator) -> None:
     with pytest.raises(ValueError, match="30-minute"):
-        coordinator.find_overlap(windows_in_chicago_and_london(), duration=datetime.resolution)
+        coordinator.find_overlap(
+            windows_in_chicago_and_london(),
+            required_attendee_ids={"manager", "vp-people"},
+            duration=datetime.resolution,
+        )
 
 
 def test_package_and_ics_are_deterministic_and_exclude_private_evidence(
@@ -243,15 +292,13 @@ def test_package_and_ics_are_deterministic_and_exclude_private_evidence(
         channel=Channel.EMAIL,
         created_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
     )
-    slot = AvailabilityWindow(
-        start=datetime(2026, 8, 14, 20, 0, tzinfo=UTC),
-        end=datetime(2026, 8, 14, 20, 30, tzinfo=UTC),
-    )
+    assigned = assignments()
+    slot = record_required_overlap(coordinator, report, assigned)
 
     package = coordinator.build_package(
         sample_plan(),
         report,
-        assignments(),
+        assigned,
         decision_owner_id="coo",
         evidence=[public_evidence, private_evidence],
         proposed_slot=slot,
@@ -273,6 +320,7 @@ def test_package_and_ics_are_deterministic_and_exclude_private_evidence(
     assert package.pre_read_evidence_ids == [public_evidence.evidence_id]
     assert package.proposed_start == slot.start
     assert package.proposed_end == slot.end
+    assert package.slot_verified is True
     assert package.calendar_written is False
     assert "BEGIN:VCALENDAR" in ics
     assert "DTSTART:20260814T200000Z" in ics
@@ -280,6 +328,75 @@ def test_package_and_ics_are_deterministic_and_exclude_private_evidence(
     assert "SUMMARY:Resolve the customer\\, launch\\; review\\nplan" in ics
     assert "employee medical leave details" not in ics
     assert "private@example.test" not in ics
+
+
+@pytest.mark.parametrize(
+    "raw_slot",
+    [
+        AvailabilityWindow(
+            start=datetime(2026, 8, 14, 20, 0, tzinfo=UTC),
+            end=datetime(2026, 8, 14, 20, 30, tzinfo=UTC),
+        ),
+        AvailabilityWindow(
+            start=datetime(2026, 8, 14, 20, 15, tzinfo=UTC),
+            end=datetime(2026, 8, 14, 20, 45, tzinfo=UTC),
+        ),
+    ],
+)
+def test_build_package_rejects_forged_or_non_boundary_raw_slots(
+    coordinator: MeetingCoordinator, raw_slot: AvailabilityWindow
+) -> None:
+    with pytest.raises(ValueError, match="verified overlap"):
+        coordinator.build_package(
+            sample_plan(),
+            sample_report(),
+            assignments(),
+            decision_owner_id="coo",
+            evidence=[],
+            proposed_slot=raw_slot,
+            created_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+        )
+
+
+def test_build_package_rejects_a_verified_slot_for_a_stale_required_set(
+    coordinator: MeetingCoordinator,
+) -> None:
+    report = sample_report()
+    slot = record_required_overlap(coordinator, report, assignments())
+    changed_report = report.model_copy(update={"issues": []})
+
+    with pytest.raises(ValueError, match="required attendee set"):
+        coordinator.build_package(
+            sample_plan(),
+            changed_report,
+            assignments(),
+            decision_owner_id="coo",
+            evidence=[],
+            proposed_slot=slot,
+            created_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+        )
+
+
+def test_ics_and_confirmation_fail_closed_for_an_unverified_package_slot() -> None:
+    package = MeetingPackage(
+        meeting_id=uuid4(),
+        mandate_id=uuid4(),
+        purpose="Resolve staffing",
+        decision_owner_id="coo",
+        required_attendee_ids=["coo"],
+        proposed_start=datetime(2026, 8, 14, 20, 0, tzinfo=UTC),
+        proposed_end=datetime(2026, 8, 14, 20, 30, tzinfo=UTC),
+        agreed_facts=[],
+        open_decisions=[],
+        agenda=[],
+        pre_read_evidence_ids=[],
+        created_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+    )
+
+    with pytest.raises(ValueError, match="verified"):
+        render_ics(package)
+
+    assert "awaiting confirmed availability" in render_meeting_confirmation("HW-AB12", package)
 
 
 def test_meeting_messages_do_not_disclose_private_evidence_or_destinations(

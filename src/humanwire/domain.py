@@ -296,6 +296,7 @@ class MeetingPackage(BaseModel):
     open_decisions: list[str]
     agenda: list[str]
     pre_read_evidence_ids: list[UUID]
+    slot_verified: bool = False
     calendar_written: bool = False
     created_at: datetime
 

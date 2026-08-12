@@ -336,6 +336,7 @@ def _package_record(value: MeetingPackage) -> MeetingPackageRecord:
         open_decisions=value.open_decisions,
         agenda=value.agenda,
         pre_read_evidence_ids=[str(item) for item in value.pre_read_evidence_ids],
+        slot_verified=value.slot_verified,
         calendar_written=value.calendar_written,
         created_at=value.created_at,
     )
@@ -356,6 +357,7 @@ def _package_value(record: MeetingPackageRecord) -> MeetingPackage:
         open_decisions=record.open_decisions,
         agenda=record.agenda,
         pre_read_evidence_ids=[UUID(item) for item in record.pre_read_evidence_ids],
+        slot_verified=record.slot_verified,
         calendar_written=record.calendar_written,
         created_at=_utc(record.created_at),
     )
