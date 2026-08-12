@@ -111,9 +111,12 @@ def _coerced_model_plan(field: str) -> dict[str, object]:
     return plan
 
 
-def _public_projection(*stakeholders: str) -> PublicMandateProjection:
+def _public_projection(
+    *stakeholders: str,
+    objective: str = "Coordinate weekend coverage",
+) -> PublicMandateProjection:
     return PublicMandateProjection(
-        objective="Coordinate weekend coverage",
+        objective=objective,
         stakeholder_references=list(stakeholders),
     )
 
@@ -213,6 +216,158 @@ def test_valid_model_plan_is_resolved_against_directory(planner, manager) -> Non
         stakeholder.engagement_type is EngagementType.QUICK_RESPONSE
         for stakeholder in result.plan.stakeholders
     )
+
+
+@pytest.mark.parametrize(
+    "model_roster",
+    [
+        [],
+        ["us-lead"],
+        ["us-lead", "apac-lead", "vp-people"],
+        ["us-lead", "vp-people"],
+        ["apac-lead", "us-lead"],
+        ["us-lead", "apac-lead", "apac-lead"],
+    ],
+)
+def test_model_roster_must_exactly_match_trusted_canonical_projection(
+    directory, manager, model_roster: list[str]
+) -> None:
+    client = _json_client(
+        lambda request: httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(_model_plan(*model_roster))}}]},
+        )
+    )
+    planner = FeatherlessMandatePlanner(client, directory, RuleBasedMandatePlanner(directory))
+
+    with pytest.raises(PlanNeedsClarification) as error:
+        planner.plan_public(_public_projection("us-lead", "apac-lead"), manager)
+
+    assert error.value.reason == "stakeholder_roster_mismatch"
+
+
+def test_projection_roster_is_locally_canonicalized_ordered_and_deduplicated(
+    directory, manager
+) -> None:
+    captured_user: list[str] = []
+
+    class CapturingClient:
+        def complete_json(self, system: str, user: str) -> dict:
+            captured_user.append(user)
+            return _model_plan("us-lead", "apac-lead")
+
+    result = FeatherlessMandatePlanner(CapturingClient(), directory).plan_public(
+        _public_projection("US Team Lead", "us-lead", "APAC Team Lead"), manager
+    )
+
+    assert json.loads(captured_user[0])["stakeholder_references"] == [
+        "us-lead",
+        "apac-lead",
+    ]
+    assert [person.person_id for person in result.people] == ["us-lead", "apac-lead"]
+
+
+def test_untrusted_projection_reference_is_rejected_before_model_or_fallback(
+    directory, manager
+) -> None:
+    transport_calls: list[httpx.Request] = []
+    client = _json_client(
+        lambda request: transport_calls.append(request)
+        or httpx.Response(503, json={"error": "unavailable"})
+    )
+
+    with pytest.raises(PlanNeedsClarification) as error:
+        FeatherlessMandatePlanner(client, directory).plan_public(
+            _public_projection("not-a-person"), manager
+        )
+
+    assert error.value.reason == "unknown_person"
+    assert transport_calls == []
+
+
+def test_model_cannot_erase_trusted_approval_authority(directory, manager) -> None:
+    plan = _model_plan("us-lead")
+    plan["objective"] = "Coordinate the launch"
+    plan["required_decisions"] = ["Complete the launch"]
+    stakeholder = plan["stakeholders"][0]
+    assert isinstance(stakeholder, dict)
+    stakeholder.update(
+        reason="Share awareness only",
+        required=False,
+        engagement_type="inform",
+        response_required=False,
+        questions=[],
+    )
+    client = _json_client(
+        lambda request: httpx.Response(
+            200, json={"choices": [{"message": {"content": json.dumps(plan)}}]}
+        )
+    )
+
+    result = FeatherlessMandatePlanner(client, directory).plan_public(
+        _public_projection("us-lead", objective="Approve the launch decision"), manager
+    )
+
+    assert result.plan.objective == "Approve the launch decision"
+    assert result.plan.required_decisions == ["Complete the requested mandate"]
+    assert result.plan.stakeholders[0].engagement_type is EngagementType.REVIEW_APPROVAL
+
+
+def test_model_cannot_invent_authority_from_plan_fields_or_reason(directory, manager) -> None:
+    plan = _model_plan("us-lead")
+    plan["objective"] = "Approve the launch"
+    plan["required_decisions"] = ["Authorize launch"]
+    stakeholder = plan["stakeholders"][0]
+    assert isinstance(stakeholder, dict)
+    stakeholder.update(
+        reason="Decision owner must approve launch",
+        required=True,
+        engagement_type="review_approval",
+        response_required=True,
+        questions=[],
+    )
+    client = _json_client(
+        lambda request: httpx.Response(
+            200, json={"choices": [{"message": {"content": json.dumps(plan)}}]}
+        )
+    )
+
+    result = FeatherlessMandatePlanner(client, directory).plan_public(
+        _public_projection("us-lead", objective="Notify stakeholders about the launch"), manager
+    )
+
+    assert result.plan.objective == "Notify stakeholders about the launch"
+    assert result.plan.required_decisions == ["Complete the requested mandate"]
+    assert result.plan.stakeholders[0].engagement_type is EngagementType.INFORM
+    assert "approve" not in result.plan.stakeholders[0].reason.casefold()
+    assert "decision owner" not in result.plan.stakeholders[0].reason.casefold()
+
+
+@pytest.mark.parametrize(
+    ("objective", "expected"),
+    [
+        ("Interview stakeholders about constraints", EngagementType.STRUCTURED_INTERVIEW),
+        ("Approve the launch decision", EngagementType.REVIEW_APPROVAL),
+        ("Notify stakeholders about the launch", EngagementType.INFORM),
+        ("Schedule the launch meeting", EngagementType.AVAILABILITY),
+    ],
+)
+def test_model_failure_fallback_preserves_trusted_explicit_action(
+    directory, manager, objective: str, expected: EngagementType
+) -> None:
+    class FailingClient:
+        def complete_json(self, system: str, user: str) -> dict:
+            raise ModelFailure("timeout")
+
+    result = FeatherlessMandatePlanner(FailingClient(), directory).plan_public(
+        _public_projection("US Team Lead", objective=objective), manager
+    )
+
+    stakeholder = result.plan.stakeholders[0]
+    assert result.planner == "rules"
+    assert result.fallback_reason == "timeout"
+    assert stakeholder.person_ref == "us-lead"
+    assert stakeholder.engagement_type is expected
 
 
 def test_raw_mandate_text_never_calls_the_model(directory, manager) -> None:
@@ -536,7 +691,7 @@ def test_model_advisory_inform_cannot_downgrade_explicit_approval(directory, man
     )
 
     result = FeatherlessMandatePlanner(client, directory).plan_public(
-        _public_projection("us-lead"), manager
+        _public_projection("us-lead", objective="Approve the launch decision"), manager
     )
 
     assert result.plan.stakeholders[0].engagement_type is EngagementType.REVIEW_APPROVAL
@@ -581,7 +736,7 @@ def test_optional_model_notification_remains_inform(directory, manager) -> None:
     )
 
     result = FeatherlessMandatePlanner(client, directory).plan_public(
-        _public_projection("us-lead"), manager
+        _public_projection("us-lead", objective="Notify stakeholders about the launch"), manager
     )
 
     assert result.planner == "featherless"
