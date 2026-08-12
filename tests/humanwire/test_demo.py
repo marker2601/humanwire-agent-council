@@ -9,8 +9,27 @@ def test_demo_is_deterministic_isolated_and_ready_without_local_configuration(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CASPIAN_API_KEY", "ambient-real-looking-secret")
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "ambient-telegram-secret")
+    ambient = {
+        "CASPIAN_API_KEY": "ambient-caspian-secret",
+        "CASPIAN_BASE_URL": "https://ambient-caspian.example.test",
+        "TELEGRAM_BOT_TOKEN": "ambient-telegram-secret",
+        "CASPIAN_EMAIL_USERNAME": "ambient-email-user",
+        "FEATHERLESS_API_KEY": "ambient-featherless-secret",
+        "ANALYTICS_READ_TOKEN": "ambient-read-secret",
+        "FEATHERLESS_BASE_URL": "https://ambient-model.example.test/v1",
+        "FEATHERLESS_MODEL": "ambient/model",
+        "DATABASE_URL": "sqlite:///ambient.db",
+        "ORGANIZATION_PATH": "ambient/organization.json",
+        "ACKNOWLEDGEMENT_SECONDS": "901",
+        "REMINDER_SECONDS": "902",
+        "MANDATE_TIMEOUT_SECONDS": "903",
+        "DUE_ACTION_POLL_SECONDS": "904",
+        "DASHBOARD_HOST": "198.51.100.44",
+        "DASHBOARD_PORT": "9999",
+        "PUBLIC_DEMO": "false",
+    }
+    for key, value in ambient.items():
+        monkeypatch.setenv(key, value)
     (tmp_path / ".env").write_text(
         "CASPIAN_API_KEY=real-looking-secret\nDATABASE_URL=sqlite:///local.db\n",
         encoding="utf-8",
@@ -18,7 +37,7 @@ def test_demo_is_deterministic_isolated_and_ready_without_local_configuration(
     data = tmp_path / "data"
     data.mkdir()
     (data / "organization.json").write_text(
-        '{"recipient":"owner@real-company.com","conversation_id":"real-chat"}',
+        '{"recipient":"owner@example.test","conversation_id":"fictional-chat"}',
         encoding="utf-8",
     )
 
@@ -35,7 +54,23 @@ def test_demo_is_deterministic_isolated_and_ready_without_local_configuration(
     assert first_app.state.repository is not second_app.state.repository
     assert first_app.state.settings.caspian_api_key is None
     assert first_app.state.settings.telegram_bot_token is None
+    assert first_app.state.settings.featherless_api_key is None
+    assert first_app.state.settings.analytics_read_token is None
+    assert first_app.state.settings.caspian_base_url == "https://api.trycaspianai.com"
+    assert first_app.state.settings.caspian_email_username == "humanwire"
+    assert first_app.state.settings.featherless_base_url == "https://api.featherless.ai/v1"
+    assert first_app.state.settings.featherless_model == "Qwen/Qwen2.5-7B-Instruct"
+    assert first_app.state.settings.database_url == "sqlite://"
+    assert str(first_app.state.settings.organization_path) == "demo-organization-not-loaded.json"
+    assert first_app.state.settings.acknowledgement_seconds == 300
+    assert first_app.state.settings.reminder_seconds == 300
+    assert first_app.state.settings.mandate_timeout_seconds == 86_400
+    assert first_app.state.settings.due_action_poll_seconds == 5
+    assert first_app.state.settings.dashboard_host == "127.0.0.1"
+    assert first_app.state.settings.dashboard_port == 8000
+    assert first_app.state.settings.public_demo is True
     assert not (tmp_path / "local.db").exists()
+    assert not (tmp_path / "ambient.db").exists()
 
 
 def test_exact_hw_2411_story_and_public_fixture_are_safe() -> None:
@@ -73,7 +108,7 @@ def test_exact_hw_2411_story_and_public_fixture_are_safe() -> None:
     assert "approval request" in serialized.lower()
 
     for forbidden in (
-        "owner@real-company.com",
+        "owner@example.test",
         "@example.com",
         "@example.test",
         "tg-priya",

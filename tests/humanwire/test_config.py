@@ -24,3 +24,8 @@ def test_analytics_read_token_is_secret_and_optional() -> None:
     assert configured.analytics_read_token is not None
     assert configured.analytics_read_token.get_secret_value() == "fictional-read-token"
     assert "fictional-read-token" not in repr(configured)
+
+
+@pytest.mark.parametrize("raw", ["", " ", "\t\r\n"])
+def test_blank_analytics_read_token_is_disabled(raw: str) -> None:
+    assert Settings(_env_file=None, analytics_read_token=raw).analytics_read_token is None

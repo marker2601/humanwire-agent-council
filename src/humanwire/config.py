@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pydantic import SecretStr
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,6 +24,14 @@ class Settings(BaseSettings):
     dashboard_host: str = "127.0.0.1"
     dashboard_port: int = 8000
     public_demo: bool = False
+
+    @field_validator("analytics_read_token", mode="before")
+    @classmethod
+    def disable_blank_analytics_read_token(cls, value):
+        if value is None:
+            return None
+        raw = value.get_secret_value() if isinstance(value, SecretStr) else str(value)
+        return None if not raw.strip() else value
 
     def require_listener_credentials(self) -> tuple[str, str]:
         missing = []

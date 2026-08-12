@@ -440,7 +440,8 @@ def _seed_meeting_ready(repository: SqlAlchemyHumanWireRepository) -> None:
     repository.add_evidence(evidence)
     report = AlignmentReport(mandate_id=mandate.mandate_id, issues=[issue], is_aligned=False)
     coordinator = MeetingCoordinator(mandate.initiator_id)
-    attendees = coordinator.required_attendees(report, [assignment], "maya-chen")
+    attendees = coordinator.required_attendees(report, [assignment], mandate.initiator_id)
+    package_created_at = mandate.created_at + timedelta(minutes=30)
     window = AvailabilityWindow(
         start=datetime(2026, 8, 14, 20, 0, tzinfo=UTC),
         end=datetime(2026, 8, 14, 21, 0, tzinfo=UTC),
@@ -450,7 +451,7 @@ def _seed_meeting_ready(repository: SqlAlchemyHumanWireRepository) -> None:
         repository.set_runtime_status(
             f"availability:{mandate.mandate_id}:{attendee_id}",
             json_windows(type("Command", (), {"windows": [window]})()),
-            DEMO_NOW,
+            package_created_at,
         )
     slot = coordinator.find_overlap()
     assert slot is not None
@@ -458,10 +459,10 @@ def _seed_meeting_ready(repository: SqlAlchemyHumanWireRepository) -> None:
         mandate.plan,
         report,
         [assignment],
-        "maya-chen",
+        mandate.initiator_id,
         shareable_evidence([evidence]),
         proposed_slot=slot,
-        created_at=mandate.created_at + timedelta(minutes=30),
+        created_at=package_created_at,
     )
     repository.save_meeting_package(package)
     repository.append_event(mandate.mandate_id, _event(mandate, 0, "mandate.created"))
@@ -482,15 +483,17 @@ def _seed_meeting_ready(repository: SqlAlchemyHumanWireRepository) -> None:
 
 def create_demo_app() -> FastAPI:
     """Construct a fresh in-memory app without environment, files, or network access."""
-    settings = Settings(
-        _env_file=None,
-        caspian_api_key=None,
-        telegram_bot_token=None,
-        featherless_api_key=None,
-        analytics_read_token=None,
-        database_url="sqlite://",
-        organization_path=Path("demo-organization-not-loaded.json"),
-        public_demo=True,
+    defaults = {
+        name: field.get_default(call_default_factory=True)
+        for name, field in Settings.model_fields.items()
+    }
+    settings = Settings.model_validate(
+        defaults
+        | {
+            "database_url": "sqlite://",
+            "organization_path": Path("demo-organization-not-loaded.json"),
+            "public_demo": True,
+        }
     )
     repository = SqlAlchemyHumanWireRepository(create_session_factory("sqlite://"))
     _seed_people(repository)

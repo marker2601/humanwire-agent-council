@@ -5,7 +5,8 @@ from __future__ import annotations
 import hmac
 import html
 import json
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -14,13 +15,57 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from humanwire.alignment import AlignmentReport
 from humanwire.config import Settings
-from humanwire.domain import Mandate, MandateState, StakeholderAssignment
+from humanwire.domain import (
+    Channel,
+    Direction,
+    EvidenceStatus,
+    EvidenceType,
+    Mandate,
+    MandateState,
+    StakeholderAssignment,
+    StakeholderState,
+)
 from humanwire.evidence import private_blocker_count, shareable_evidence
 from humanwire.meetings import MeetingCoordinator, render_ics
 from humanwire.redaction import redact_sensitive
 from humanwire.repository import SqlAlchemyHumanWireRepository
 
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_PRIVATE_PROJECTION_KEYS = frozenset(
+    {
+        "connection_id",
+        "conversation_id",
+        "current_conversation_id",
+        "current_route_id",
+        "idempotency_key",
+        "origin_conversation_id",
+        "origin_message_id",
+        "provider_body",
+        "recipient",
+        "route_id",
+        "route_ids",
+        "sender_address",
+        "sender_id",
+        "source_message_id",
+    }
+)
+_IDENTIFIER_FIELDS = frozenset(
+    {"actor_id", "evidence_id", "person_id", "stakeholder_id", "token"}
+)
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_SAFE_EVENT_TYPE = re.compile(r"^[a-z][a-z0-9_.-]{0,99}$")
+_SAFE_PUBLIC_KEY = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_ENUM_FIELDS = {
+    "channel": {item.value for item in Channel},
+    "direction": {item.value for item in Direction},
+    "evidence_type": {item.value for item in EvidenceType},
+    "interview_status": {"complete", "in_progress", "not_started"},
+    "state": {item.value for item in MandateState} | {item.value for item in StakeholderState},
+    "status": {item.value for item in EvidenceStatus},
+    "previous_state": {item.value for item in MandateState}
+    | {item.value for item in StakeholderState},
+    "new_state": {item.value for item in MandateState} | {item.value for item in StakeholderState},
+}
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -29,6 +74,29 @@ def _iso(value: datetime | None) -> str | None:
 
 def _redact(value: str | None) -> str | None:
     return redact_sensitive(value) if value is not None else None
+
+
+def _public_projection(value: Any, field: str | None = None) -> Any:
+    """Apply one recursive privacy boundary immediately before public serialization."""
+    if isinstance(value, Mapping):
+        return {
+            str(key): _public_projection(item, str(key))
+            for key, item in value.items()
+            if str(key) not in _PRIVATE_PROJECTION_KEYS
+            and _SAFE_PUBLIC_KEY.fullmatch(str(key))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_public_projection(item, field) for item in value]
+    if not isinstance(value, str):
+        return value
+    if field in _IDENTIFIER_FIELDS or (field is not None and field.endswith("_ids")):
+        return value if _SAFE_IDENTIFIER.fullmatch(value) else "[REDACTED]"
+    if field == "event_type":
+        return value if _SAFE_EVENT_TYPE.fullmatch(value) else "[REDACTED]"
+    allowed = _ENUM_FIELDS.get(field)
+    if allowed is not None:
+        return value if value in allowed else "[REDACTED]"
+    return redact_sensitive(value)
 
 
 def _name(person_id: str) -> str:
@@ -163,6 +231,7 @@ def _events(repository: Any, mandate: Mandate) -> list[dict[str, Any]]:
             "channel": event.channel.value if event.channel else None,
             "previous_state": event.previous_state,
             "new_state": event.new_state,
+            "metadata": event.metadata,
         }
         for event in repository.list_events(mandate.mandate_id)
     ]
@@ -226,15 +295,14 @@ def _verified_calendar(repository: Any, mandate: Mandate) -> bytes | None:
         is_aligned=False,
     )
     coordinator = MeetingCoordinator(mandate.initiator_id)
-    attendee_ids = coordinator.required_attendees(
-        report, assignments, package.decision_owner_id
-    )
+    decision_owner_id = mandate.initiator_id
+    attendee_ids = coordinator.required_attendees(report, assignments, decision_owner_id)
     try:
         for attendee_id in attendee_ids:
             stored = repository.get_runtime_status(
                 f"availability:{mandate.mandate_id}:{attendee_id}"
             )
-            if stored is None:
+            if stored is None or stored[1] > package.created_at:
                 return None
             windows = []
             for raw in stored[0].split("|"):
@@ -250,12 +318,20 @@ def _verified_calendar(repository: Any, mandate: Mandate) -> bytes | None:
         slot = coordinator.find_overlap()
         if slot is None:
             return None
+        evidence = repository.list_evidence(mandate.mandate_id)
+        by_evidence_id = {item.evidence_id: item for item in evidence}
+        if any(
+            evidence_id not in by_evidence_id
+            or by_evidence_id[evidence_id].created_at > package.created_at
+            for evidence_id in package.pre_read_evidence_ids
+        ):
+            return None
         rebuilt = coordinator.build_package(
             mandate.plan,
             report,
             assignments,
-            package.decision_owner_id,
-            shareable_evidence(repository.list_evidence(mandate.mandate_id)),
+            decision_owner_id,
+            shareable_evidence(evidence),
             proposed_slot=slot,
             created_at=package.created_at,
         )
@@ -267,8 +343,10 @@ def _verified_calendar(repository: Any, mandate: Mandate) -> bytes | None:
 
 
 def _html_page(title: str, payload: Any) -> HTMLResponse:
-    safe_title = html.escape(title)
-    safe_payload = html.escape(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    safe_title = html.escape(_public_projection(title))
+    safe_payload = html.escape(
+        json.dumps(_public_projection(payload), sort_keys=True, separators=(",", ":"))
+    )
     return HTMLResponse(
         "<!doctype html><html><head>"
         f"<title>{safe_title}</title></head><body><main><h1>{safe_title}</h1>"
@@ -318,7 +396,7 @@ def create_app(
 
     def safe_projection(operation: Callable[[], Any]) -> Any:
         try:
-            return operation()
+            return _public_projection(operation())
         except HTTPException:
             raise
         except Exception as error:
@@ -367,7 +445,10 @@ def create_app(
             content=content,
             media_type="text/calendar; charset=utf-8",
             headers={
-                "Content-Disposition": f'attachment; filename="{mandate.token}-meeting.ics"'
+                "Content-Disposition": (
+                    f'attachment; filename="{_public_projection(mandate.token, "token")}'
+                    '-meeting.ics"'
+                )
             },
         )
 
