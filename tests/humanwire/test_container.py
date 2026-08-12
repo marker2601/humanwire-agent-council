@@ -1,16 +1,30 @@
 import json
 import sys
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
+from caspian_sdk import CommError
 
 from humanwire import __main__ as cli
 from humanwire.config import Settings
 from humanwire.container import ApplicationContainer, DueActionWorker
-from humanwire.domain import DeliveryInstruction, DeliveryKind, WorkflowResult
+from humanwire.domain import (
+    Channel,
+    DeliveryInstruction,
+    DeliveryKind,
+    Direction,
+    IncomingMessage,
+    Mandate,
+    MandatePlan,
+    MandateState,
+    PlannedStakeholder,
+    StakeholderAssignment,
+    StakeholderState,
+    WorkflowResult,
+)
 from humanwire.evidence import FeatherlessEvidenceExtractor, RuleBasedEvidenceExtractor
 from humanwire.model_client import FeatherlessJsonClient
 from humanwire.planning import FeatherlessMandatePlanner, RuleBasedMandatePlanner
@@ -37,7 +51,23 @@ def write_organization(path) -> None:
                                 "conversation_id": "manager-conversation",
                             }
                         ],
-                    }
+                    },
+                    {
+                        "person_id": "team-lead",
+                        "display_name": "Riley Chen",
+                        "role": "Team Lead",
+                        "department": "Operations",
+                        "timezone": "America/Chicago",
+                        "manager_id": "manager",
+                        "routes": [
+                            {
+                                "route_id": "team-lead-email",
+                                "channel": "email",
+                                "sender_address": "team-lead@example.test",
+                                "recipient": "team-lead@example.test",
+                            }
+                        ],
+                    },
                 ],
                 "initiator_policies": [
                     {
@@ -62,6 +92,54 @@ def make_settings(tmp_path, **overrides) -> Settings:
     }
     values.update(overrides)
     return Settings(**values)
+
+
+def seed_complete_mandate(container, *, suffix: str) -> Mandate:
+    mandate_id = UUID(f"00000000-0000-0000-0000-{int(suffix):012d}")
+    assignment_id = UUID(f"10000000-0000-0000-0000-{int(suffix):012d}")
+    mandate = Mandate(
+        mandate_id=mandate_id,
+        token=f"HW-MODEL{suffix}",
+        initiator_id="manager",
+        origin_channel=Channel.TELEGRAM,
+        origin_conversation_id="manager-conversation",
+        origin_message_id=f"origin-{suffix}",
+        redacted_request="Coordinate an operations decision.",
+        objective="Coordinate an operations decision.",
+        plan=MandatePlan(
+            objective="Coordinate an operations decision.",
+            required_decisions=["Choose the operating date"],
+            stakeholders=[
+                PlannedStakeholder(
+                    person_ref="team-lead",
+                    reason="Owns the operating plan.",
+                    direction=Direction.DOWNWARD,
+                    questions=["Which date is viable?"],
+                )
+            ],
+            completion_conditions=["The required stakeholder responds."],
+        ),
+        state=MandateState.INTERVIEWING,
+        created_at=NOW,
+        updated_at=NOW,
+        expires_at=NOW + timedelta(days=1),
+        idempotency_key=f"seed:{suffix}",
+    )
+    assignment = StakeholderAssignment(
+        assignment_id=assignment_id,
+        mandate_id=mandate_id,
+        person_id="team-lead",
+        department="Operations",
+        direction=Direction.DOWNWARD,
+        reason="Owns the operating plan.",
+        required=True,
+        state=StakeholderState.COMPLETE,
+        route_ids=["team-lead-email"],
+    )
+    with container.repository.transaction() as unit:
+        unit.add_mandate(mandate)
+        unit.add_assignment(assignment)
+    return mandate
 
 
 def test_container_builds_offline_rule_fallbacks_without_creating_comm_client(
@@ -103,6 +181,77 @@ def test_configured_featherless_selects_real_json_adapters_without_opening_chann
     assert isinstance(container.evidence_extractor, FeatherlessEvidenceExtractor)
     assert container.workflow.mandates.planner is container.planner
     assert container.workflow.mandates.interviews.evidence_extractor is container.evidence_extractor
+
+
+def test_configured_model_is_invoked_by_container_workflow_synthesis_and_proposal(
+    tmp_path, monkeypatch
+) -> None:
+    container = ApplicationContainer.build(
+        make_settings(tmp_path, featherless_api_key="featherless-test-key")
+    )
+    mandate = seed_complete_mandate(container, suffix="1")
+    calls: list[tuple[str, str]] = []
+
+    def complete_json(system: str, user: str) -> dict:
+        calls.append((system, user))
+        if "Identify advisory issues" in system:
+            return {"issues": []}
+        return {"proposal": "Consider an alternate staffing handoff."}
+
+    monkeypatch.setattr(container.model_client, "complete_json", complete_json)
+
+    container.workflow.synthesis.run(mandate.mandate_id, NOW)
+
+    proposal = container.repository.get_active_proposal(mandate.mandate_id)
+    assert proposal is not None
+    assert "advisory drafting suggestion" in proposal.text
+    assert len(calls) == 2
+    assert all("private" not in user.casefold() for _, user in calls)
+
+
+def test_offline_container_workflow_uses_exact_deterministic_proposal_fallback(tmp_path) -> None:
+    container = ApplicationContainer.build(make_settings(tmp_path))
+    mandate = seed_complete_mandate(container, suffix="2")
+
+    container.workflow.synthesis.run(mandate.mandate_id, NOW)
+
+    proposal = container.repository.get_active_proposal(mandate.mandate_id)
+    assert proposal is not None
+    assert proposal.text == (
+        "HUMANWIRE DRAFT PROPOSAL\n"
+        "Review the proposed decision. Reply ACCEPT, REJECT, or CHANGE with a requested change."
+    )
+
+
+def test_container_meeting_factory_is_used_by_public_availability_workflow(
+    tmp_path, monkeypatch
+) -> None:
+    from humanwire.meetings import MeetingCoordinator
+
+    factory_calls: list[str] = []
+
+    def meeting_factory(initiator_id: str) -> MeetingCoordinator:
+        factory_calls.append(initiator_id)
+        return MeetingCoordinator(initiator_id)
+
+    monkeypatch.setattr("humanwire.container.MeetingCoordinator", meeting_factory)
+    container = ApplicationContainer.build(make_settings(tmp_path))
+    mandate = seed_complete_mandate(container, suffix="3")
+    with container.repository.transaction() as unit:
+        unit.save_mandate(mandate.model_copy(update={"state": MandateState.SCHEDULING}))
+    message = IncomingMessage(
+        message_id="availability-3",
+        conversation_id="manager-conversation",
+        connection_id="telegram-connection",
+        channel=Channel.TELEGRAM,
+        sender_address="manager-chat",
+        text="AVAILABLE HW-MODEL3 2026-08-12T09:00:00-05:00/2026-08-12T10:00:00-05:00",
+        received_at=NOW,
+    )
+
+    container.workflow.handle(message)
+
+    assert factory_calls == ["manager", "manager"]
 
 
 class RecordingRepository:
@@ -233,6 +382,38 @@ def test_due_worker_uses_named_thread_and_stops_cleanly() -> None:
     assert not thread.is_alive()
 
 
+def test_due_worker_stop_does_not_return_while_dispatch_is_still_in_flight() -> None:
+    entered_dispatch = threading.Event()
+    release_dispatch = threading.Event()
+    stop_returned = threading.Event()
+
+    class BlockingGateway(RecordingGateway):
+        def dispatch(self, instruction: DeliveryInstruction) -> None:
+            self.calls.append(instruction)
+            entered_dispatch.set()
+            release_dispatch.wait()
+
+    worker = DueActionWorker(
+        DueWorkflow(WorkflowResult(deliveries=due_deliveries()[:1])),
+        BlockingGateway(),
+        RecordingRepository(),
+        poll_seconds=0.01,
+        clock=lambda: NOW,
+    )
+    worker.start()
+    assert entered_dispatch.wait(timeout=1)
+    stopper = threading.Thread(target=lambda: (worker.stop(), stop_returned.set()))
+    stopper.start()
+
+    returned_before_dispatch = stop_returned.wait(timeout=2.2)
+    release_dispatch.set()
+    stopper.join(timeout=1)
+
+    assert not returned_before_dispatch
+    assert stop_returned.is_set()
+    assert worker.thread is not None and not worker.thread.is_alive()
+
+
 def test_cli_parser_exposes_required_commands_and_description() -> None:
     parser = cli.build_parser()
 
@@ -287,6 +468,11 @@ def test_listener_opens_channels_then_always_stops_worker_and_marks_channels_sto
             events.append("listen")
             raise KeyboardInterrupt
 
+        def close(self) -> None:
+            events.append("close")
+            repository.set_runtime_status("channel.email", "stopped", NOW)
+            repository.set_runtime_status("channel.telegram", "stopped", NOW)
+
     class ListenerWorker:
         def __init__(self, **kwargs) -> None:
             assert kwargs["workflow"] is container.workflow
@@ -302,15 +488,60 @@ def test_listener_opens_channels_then_always_stops_worker_and_marks_channels_sto
     monkeypatch.setattr(cli.ApplicationContainer, "build", lambda selected: container)
     monkeypatch.setattr(cli, "CaspianGateway", ListenerGateway)
     monkeypatch.setattr(cli, "DueActionWorker", ListenerWorker)
-    monkeypatch.setattr(cli, "_now", lambda: NOW)
-
     with pytest.raises(KeyboardInterrupt):
         cli.run_listener(settings)
 
-    assert events == ["connect", "start", "listen", "stop"]
+    assert events == ["connect", "start", "listen", "stop", "close"]
     assert repository.statuses == [
         ("channel.email", "stopped", NOW),
         ("channel.telegram", "stopped", NOW),
+    ]
+
+
+def test_listener_closes_partial_gateway_when_second_channel_connect_fails(
+    tmp_path, monkeypatch
+) -> None:
+    settings = make_settings(tmp_path)
+    events: list[str] = []
+    repository = RecordingRepository()
+    container = SimpleNamespace(workflow=object(), repository=repository)
+
+    class PartialGateway:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        def connect(self) -> None:
+            events.append("connect")
+            repository.set_runtime_status("channel.email", "ready", NOW)
+            repository.set_runtime_status("channel.telegram", "error", NOW)
+            raise CommError(401, "PRIVATE Telegram provider response")
+
+        def close(self) -> None:
+            events.append("close")
+            repository.set_runtime_status("channel.email", "stopped", NOW)
+
+    class IdleWorker:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        def start(self) -> None:
+            events.append("start")
+
+        def stop(self) -> None:
+            events.append("stop")
+
+    monkeypatch.setattr(cli.ApplicationContainer, "build", lambda selected: container)
+    monkeypatch.setattr(cli, "CaspianGateway", PartialGateway)
+    monkeypatch.setattr(cli, "DueActionWorker", IdleWorker)
+
+    with pytest.raises(CommError):
+        cli.run_listener(settings)
+
+    assert events == ["connect", "stop", "close"]
+    assert repository.statuses == [
+        ("channel.email", "ready", NOW),
+        ("channel.telegram", "error", NOW),
+        ("channel.email", "stopped", NOW),
     ]
 
 

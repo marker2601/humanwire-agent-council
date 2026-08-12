@@ -1,6 +1,8 @@
 import json
 import logging
 
+from caspian_sdk import CommError
+
 from humanwire.logging_config import configure_logging
 
 
@@ -45,5 +47,46 @@ def test_json_logging_emits_only_allowlisted_operational_metadata(capsys) -> Non
         "secret-key-value",
         "PRIVATE provider response",
         "not-allowlisted",
+    ):
+        assert private_value not in raw
+
+
+def test_caspian_sdk_logging_redacts_message_arguments_and_exception_details(capsys) -> None:
+    configure_logging()
+    logger = logging.getLogger("caspian_sdk")
+    try:
+        raise CommError(
+            503,
+            "PRIVATE provider body for private.person@example.test token=telegram-secret",
+        )
+    except CommError:
+        logger.warning(
+            "provider failure body=%s email=%s token=%s",
+            "PRIVATE provider response",
+            "destination@example.test",
+            "caspian-secret-token",
+            exc_info=True,
+            extra={
+                "reason": "provider_retry",
+                "provider_body": "PRIVATE extra body",
+                "recipient": "second-destination@example.test",
+            },
+        )
+
+    raw = capsys.readouterr().err
+    assert raw, "Caspian SDK logger was not routed through the safe JSON handler"
+    payload = json.loads(raw)
+    assert payload["event"] == "caspian_sdk_event"
+    assert payload["reason"] == "provider_retry"
+    for private_value in (
+        "PRIVATE provider response",
+        "destination@example.test",
+        "caspian-secret-token",
+        "PRIVATE provider body",
+        "private.person@example.test",
+        "telegram-secret",
+        "PRIVATE extra body",
+        "second-destination@example.test",
+        "CommError",
     ):
         assert private_value not in raw

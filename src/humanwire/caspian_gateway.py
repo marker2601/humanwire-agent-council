@@ -92,6 +92,7 @@ class CaspianGateway:
         self.email_connection_id: str | None = None
         self.telegram_connection_id: str | None = None
         self._handler_registered = False
+        self._closed = False
 
     @staticmethod
     def _connection_id(connection: Any) -> str:
@@ -109,6 +110,8 @@ class CaspianGateway:
         self.repository.set_runtime_status(f"channel.{channel.value}", value, self.clock())
 
     def connect(self) -> ConnectionSummary:
+        if self._closed:
+            raise RuntimeError("Caspian gateway is closed")
         api_key, telegram_bot_token = self.settings.require_listener_credentials()
         if self.client is None:
             self.client = CommClient(api_key=api_key, base_url=self.settings.caspian_base_url)
@@ -143,6 +146,28 @@ class CaspianGateway:
             email_connection_id=self.email_connection_id,
             telegram_connection_id=self.telegram_connection_id,
         )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        if self.client is None:
+            self._closed = True
+            return
+        try:
+            close = getattr(self.client, "close", None)
+            if close is not None:
+                _complete(close())
+        except Exception:
+            if self.email_connection_id is not None:
+                self._set_channel_status(Channel.EMAIL, "error")
+            if self.telegram_connection_id is not None:
+                self._set_channel_status(Channel.TELEGRAM, "error")
+            raise
+        if self.email_connection_id is not None:
+            self._set_channel_status(Channel.EMAIL, "stopped")
+        if self.telegram_connection_id is not None:
+            self._set_channel_status(Channel.TELEGRAM, "stopped")
+        self._closed = True
 
     def listen(self) -> None:
         if self.email_connection_id is None or self.telegram_connection_id is None:

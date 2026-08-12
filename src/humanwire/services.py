@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -237,11 +238,17 @@ class SynthesisService:
     """Runs only after authenticated interview evidence is complete and durable."""
 
     def __init__(
-        self, directory: OrganizationDirectory, repository: SqlAlchemyHumanWireRepository
+        self,
+        directory: OrganizationDirectory,
+        repository: SqlAlchemyHumanWireRepository,
+        alignment_engine_factory: Callable[[UUID], AlignmentEngine] | None = None,
+        negotiation_coordinator: NegotiationCoordinator | None = None,
     ) -> None:
         self.directory = directory
         self.repository = repository
         self.state_machine = MandateStateMachine()
+        self.alignment_engine_factory = alignment_engine_factory or AlignmentEngine
+        self.negotiation_coordinator = negotiation_coordinator or NegotiationCoordinator(repository)
 
     def run(self, mandate_id: UUID, now: datetime) -> WorkflowResult:
         mandate = next((item for item in self.repository.list_recent_mandates(1000) if item.mandate_id == mandate_id), None)
@@ -255,7 +262,7 @@ class SynthesisService:
             return self._partial(mandate, now)
         synthesizing = self.state_machine.transition(mandate, MandateState.SYNTHESIZING, "required_interviews_complete", now)
         evidence = self.repository.list_evidence(mandate_id)
-        report = AlignmentEngine(mandate_id).analyze(mandate.plan, shareable_evidence(evidence), assignments, private_blocker_count=private_blocker_count(evidence))
+        report = self.alignment_engine_factory(mandate_id).analyze(mandate.plan, shareable_evidence(evidence), assignments, private_blocker_count=private_blocker_count(evidence))
         with self.repository.transaction() as unit:
             unit.save_mandate(synthesizing)
             unit.append_event(mandate_id, _event("mandate.synthesizing", now, f"synthesis:{mandate_id}", actor_id=mandate.initiator_id, previous_state="interviewing", new_state="synthesizing"))
@@ -273,7 +280,7 @@ class SynthesisService:
             recipients = [mandate.initiator_id, *(item.person_id for item in required)]
             return WorkflowResult(deliveries=self._route_deliveries(recipients, brief, mandate.token))
         negotiating = self.state_machine.transition(synthesizing, MandateState.NEGOTIATING, "blocking_issues", now)
-        coordinator = NegotiationCoordinator(self.repository)
+        coordinator = self.negotiation_coordinator
         proposal = coordinator.create_proposal(synthesizing, report, 1, now)
         with self.repository.transaction() as unit:
             unit.save_mandate(negotiating)

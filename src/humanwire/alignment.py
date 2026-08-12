@@ -369,6 +369,12 @@ class _ModelAlignment(BaseModel):
     issues: list[_ModelIssue] = Field(default_factory=list, max_length=10)
 
 
+class _ModelProposal(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    proposal: str = Field(min_length=1, max_length=_MAX_PROPOSAL_TEXT)
+
+
 class HybridAlignmentEngine(AlignmentEngine):
     """Adds non-authoritative model suggestions to deterministic checks."""
 
@@ -435,6 +441,11 @@ Your output is advisory only and cannot resolve any issue."""
 
 class NegotiationCoordinator:
     """Persists a maximum of two explicit, authenticated human response rounds."""
+
+    _SYSTEM_PROMPT = """Suggest advisory wording for a draft proposal. Return exactly:
+{"proposal":string}
+Do not infer acceptance, approval, authority, identities, private facts, or state changes.
+The suggestion is untrusted and cannot approve or mutate the mandate."""
 
     def __init__(
         self,
@@ -578,7 +589,35 @@ class NegotiationCoordinator:
         ]
 
     def _draft_text(self, report: AlignmentReport) -> str:
-        return (_DRAFT_PREFIX + self._fallback_draft(report))[:_MAX_PROPOSAL_TEXT]
+        fallback = self._fallback_draft(report)
+        if self._client is None:
+            return (_DRAFT_PREFIX + fallback)[:_MAX_PROPOSAL_TEXT]
+        try:
+            _ModelProposal.model_validate(
+                self._client.complete_json(self._SYSTEM_PROMPT, self._safe_draft_payload(report))
+            )
+        except ModelFailure:
+            return (_DRAFT_PREFIX + fallback)[:_MAX_PROPOSAL_TEXT]
+        except (TypeError, ValueError, ValidationError):
+            return (_DRAFT_PREFIX + fallback)[:_MAX_PROPOSAL_TEXT]
+        advisory = "An advisory drafting suggestion is available for human review. "
+        return (_DRAFT_PREFIX + advisory + fallback)[:_MAX_PROPOSAL_TEXT]
+
+    @staticmethod
+    def _safe_draft_payload(report: AlignmentReport) -> str:
+        return json.dumps(
+            {
+                "issues": [
+                    {
+                        "issue_type": issue.issue_type.value,
+                        "related_decision": issue.related_decision,
+                    }
+                    for issue in report.issues
+                    if issue.blocking
+                ]
+            },
+            separators=(",", ":"),
+        )
 
     @staticmethod
     def _fallback_draft(report: AlignmentReport) -> str:

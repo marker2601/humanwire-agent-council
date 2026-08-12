@@ -53,6 +53,7 @@ class FakeClient:
         self.sent: list[tuple[str, str]] = []
         self.listen_calls: list[str] = []
         self.failures: dict[str, CommError] = {}
+        self.close_calls = 0
 
     @property
     def on_message_registration_count(self) -> int:
@@ -94,6 +95,9 @@ class FakeClient:
 
     def listen(self, *, concurrency: str):
         self.listen_calls.append(concurrency)
+
+    def close(self) -> None:
+        self.close_calls += 1
 
 
 class AwaitableClient(FakeClient):
@@ -420,5 +424,21 @@ def test_connect_marks_channel_error_before_reraising(
     with pytest.raises(CommError):
         gateway.connect()
 
-    assert repository.get_runtime_status("channel.email") == ("ready", NOW)
+    gateway.close()
+
+    assert repository.get_runtime_status("channel.email") == ("stopped", NOW)
     assert repository.get_runtime_status("channel.telegram") == ("error", NOW)
+    assert fake_client.close_calls == 1
+
+
+def test_close_stops_open_channels_closes_client_once_and_is_idempotent(
+    gateway, fake_client, repository
+) -> None:
+    gateway.connect()
+
+    gateway.close()
+    gateway.close()
+
+    assert fake_client.close_calls == 1
+    assert repository.get_runtime_status("channel.email") == ("stopped", NOW)
+    assert repository.get_runtime_status("channel.telegram") == ("stopped", NOW)

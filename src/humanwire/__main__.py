@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
-from datetime import UTC, datetime
 
 import uvicorn
 from sqlalchemy.engine import make_url
@@ -14,10 +13,6 @@ from humanwire.config import Settings
 from humanwire.container import ApplicationContainer, DueActionWorker
 from humanwire.database import create_session_factory
 from humanwire.logging_config import configure_logging
-
-
-def _now() -> datetime:
-    return datetime.now(UTC)
 
 
 def _safe_database_url(database_url: str) -> str:
@@ -42,18 +37,15 @@ def run_listener(settings: Settings) -> None:
         repository=container.repository,
         poll_seconds=settings.due_action_poll_seconds,
     )
-    connected = False
     try:
         gateway.connect()
-        connected = True
         worker.start()
         gateway.listen()
     finally:
-        worker.stop()
-        if connected:
-            stopped_at = _now()
-            container.repository.set_runtime_status("channel.email", "stopped", stopped_at)
-            container.repository.set_runtime_status("channel.telegram", "stopped", stopped_at)
+        try:
+            worker.stop()
+        finally:
+            gateway.close()
 
 
 def run_web(settings: Settings) -> None:

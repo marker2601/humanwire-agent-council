@@ -89,19 +89,24 @@ class ApplicationContainer:
                 model_client, fallback=rule_evidence_extractor
             )
 
-        workflow = HumanWireWorkflow(
-            directory=directory,
-            repository=repository,
-            planner=planner,
-            evidence_extractor=evidence_extractor,
-            settings=settings,
-        )
         if model_client is None:
             alignment_engine_factory: Callable[[UUID], AlignmentEngine] = AlignmentEngine
         else:
             alignment_engine_factory = lambda mandate_id: HybridAlignmentEngine(
                 mandate_id, model_client
             )
+        negotiation_coordinator = NegotiationCoordinator(repository, model_client)
+        meeting_coordinator_factory = MeetingCoordinator
+        workflow = HumanWireWorkflow(
+            directory=directory,
+            repository=repository,
+            planner=planner,
+            evidence_extractor=evidence_extractor,
+            settings=settings,
+            alignment_engine_factory=alignment_engine_factory,
+            negotiation_coordinator=negotiation_coordinator,
+            meeting_coordinator_factory=meeting_coordinator_factory,
+        )
 
         return cls(
             settings=settings,
@@ -117,9 +122,9 @@ class ApplicationContainer:
             stakeholder_state_machine=workflow.mandates.interviews.state_machine,
             interview_coordinator=workflow.mandates.interviews,
             synthesis_service=workflow.synthesis,
-            negotiation_coordinator=NegotiationCoordinator(repository, model_client),
+            negotiation_coordinator=negotiation_coordinator,
             alignment_engine_factory=alignment_engine_factory,
-            meeting_coordinator_factory=MeetingCoordinator,
+            meeting_coordinator_factory=meeting_coordinator_factory,
             workflow=workflow,
         )
 
@@ -187,4 +192,4 @@ class DueActionWorker:
     def stop(self) -> None:
         self._stop_event.set()
         if self._thread is not None:
-            self._thread.join(timeout=max(self.poll_seconds + 1, 2))
+            self._thread.join()

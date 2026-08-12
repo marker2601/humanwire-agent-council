@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from datetime import datetime
+from uuid import UUID
 
+from humanwire.alignment import AlignmentEngine, NegotiationCoordinator
 from humanwire.commands import (
     AcknowledgeCommand,
     AvailabilityCommand,
@@ -42,12 +45,19 @@ from humanwire.state_machine import (
 
 
 class HumanWireWorkflow:
-    def __init__(self, directory: OrganizationDirectory, repository: SqlAlchemyHumanWireRepository, planner, evidence_extractor: EvidenceExtractor, settings: Settings) -> None:
+    def __init__(self, directory: OrganizationDirectory, repository: SqlAlchemyHumanWireRepository, planner, evidence_extractor: EvidenceExtractor, settings: Settings, *, alignment_engine_factory: Callable[[UUID], AlignmentEngine] | None = None, negotiation_coordinator: NegotiationCoordinator | None = None, meeting_coordinator_factory: Callable[[str], MeetingCoordinator] | None = None) -> None:
         self.directory = directory
         self.repository = repository
         self.settings = settings
         self.mandates = MandateService(directory, repository, planner, evidence_extractor, settings)
-        self.synthesis = SynthesisService(directory, repository)
+        self.negotiation_coordinator = negotiation_coordinator or NegotiationCoordinator(repository)
+        self.meeting_coordinator_factory = meeting_coordinator_factory or MeetingCoordinator
+        self.synthesis = SynthesisService(
+            directory,
+            repository,
+            alignment_engine_factory=alignment_engine_factory,
+            negotiation_coordinator=self.negotiation_coordinator,
+        )
 
     def handle(self, message: IncomingMessage) -> WorkflowResult:
         command = parse_command(message.text)
@@ -262,11 +272,10 @@ class HumanWireWorkflow:
             person = self.directory.person_for_sender(message)
             from humanwire.alignment import (
                 AlignmentReport,
-                NegotiationCoordinator,
                 NegotiationOutcome,
             )
 
-            coordinator = NegotiationCoordinator(self.repository)
+            coordinator = self.negotiation_coordinator
             coordinator.record_response(
                 proposal,
                 person.person_id,
@@ -358,7 +367,7 @@ class HumanWireWorkflow:
         from humanwire.domain import AvailabilityWindow
 
         report = AlignmentReport(mandate_id=mandate.mandate_id, issues=self.repository.list_issues(mandate.mandate_id), is_aligned=False)
-        coordinator = MeetingCoordinator(mandate.initiator_id)
+        coordinator = self.meeting_coordinator_factory(mandate.initiator_id)
         attendee_ids = coordinator.required_attendees(report, assignments, mandate.initiator_id)
         for attendee_id in attendee_ids:
             stored = self.repository.get_runtime_status(f"availability:{mandate.mandate_id}:{attendee_id}")
@@ -397,7 +406,7 @@ class HumanWireWorkflow:
             is_aligned=False,
         )
         return sorted(
-            MeetingCoordinator(mandate.initiator_id).required_attendees(
+            self.meeting_coordinator_factory(mandate.initiator_id).required_attendees(
                 report, self.repository.list_assignments(mandate.mandate_id), mandate.initiator_id
             )
         )
