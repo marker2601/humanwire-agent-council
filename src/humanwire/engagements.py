@@ -234,10 +234,21 @@ class EngagementCoordinator:
             or assignment.active_route_index != entry.route_index
         ):
             return None
-        routes = self._assignment_routes(assignment)
-        if not routes:
+        if not 0 <= entry.route_index < len(assignment.route_ids):
             return None
-        route = routes[entry.route_index]
+        persisted_route_id = assignment.route_ids[entry.route_index]
+        try:
+            registered_routes = self.directory.ordered_routes(assignment.person_id)
+        except (AmbiguousPersonError, UnknownPersonError):
+            return None
+        matching_routes = [
+            route
+            for route in registered_routes
+            if route.route_id == persisted_route_id
+        ]
+        if len(matching_routes) != 1:
+            return None
+        route = matching_routes[0]
         session = None
         if assignment.engagement_type in {
             EngagementType.QUICK_RESPONSE,
@@ -1022,11 +1033,17 @@ class EngagementCoordinator:
         return True
 
     def _assignment_routes(self, assignment: StakeholderAssignment) -> list[ContactRoute]:
-        allowed = set(assignment.route_ids)
+        registered_by_id: dict[str, ContactRoute] = {}
+        duplicate_ids: set[str] = set()
+        for route in self.directory.ordered_routes(assignment.person_id):
+            if route.route_id in registered_by_id:
+                duplicate_ids.add(route.route_id)
+                continue
+            registered_by_id[route.route_id] = route
         return [
-            route
-            for route in self.directory.ordered_routes(assignment.person_id)
-            if route.route_id in allowed
+            registered_by_id[route_id]
+            for route_id in assignment.route_ids
+            if route_id in registered_by_id and route_id not in duplicate_ids
         ]
 
     def _active_message_route(

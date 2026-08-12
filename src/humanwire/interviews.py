@@ -959,9 +959,17 @@ class InterviewCoordinator:
         return WorkflowResult()
 
     def _assignment_routes(self, assignment: StakeholderAssignment) -> list[ContactRoute]:
-        allowed = set(assignment.route_ids)
+        registered_by_id: dict[str, ContactRoute] = {}
+        duplicate_ids: set[str] = set()
+        for route in self.directory.ordered_routes(assignment.person_id):
+            if route.route_id in registered_by_id:
+                duplicate_ids.add(route.route_id)
+                continue
+            registered_by_id[route.route_id] = route
         return [
-            route for route in self.directory.ordered_routes(assignment.person_id) if route.route_id in allowed
+            registered_by_id[route_id]
+            for route_id in assignment.route_ids
+            if route_id in registered_by_id and route_id not in duplicate_ids
         ]
 
     def _message_route(

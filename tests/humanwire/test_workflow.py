@@ -168,8 +168,13 @@ class MixedEngagementPlanner:
         )
 
 
-def _mixed_directory(*, missing_routes: set[str] | None = None) -> tuple[OrganizationDirectory, list[Person]]:
+def _mixed_directory(
+    *,
+    missing_routes: set[str] | None = None,
+    route_overrides: dict[str, list[ContactRoute]] | None = None,
+) -> tuple[OrganizationDirectory, list[Person]]:
     missing_routes = missing_routes or set()
+    route_overrides = route_overrides or {}
     manager = Person(
         person_id="manager",
         display_name="Morgan Lee",
@@ -213,6 +218,8 @@ def _mixed_directory(*, missing_routes: set[str] | None = None) -> tuple[Organiz
                     conversation_id=f"{person_id}-private-conversation",
                 ),
             ]
+        if person_id in route_overrides:
+            routes = route_overrides[person_id]
         people.append(
             Person(
                 person_id=person_id,
@@ -249,8 +256,12 @@ def _build_mixed_workflow(
     *,
     settings: Settings | None = None,
     missing_routes: set[str] | None = None,
+    route_overrides: dict[str, list[ContactRoute]] | None = None,
 ) -> HumanWireWorkflow:
-    directory, people = _mixed_directory(missing_routes=missing_routes)
+    directory, people = _mixed_directory(
+        missing_routes=missing_routes,
+        route_overrides=route_overrides,
+    )
     return HumanWireWorkflow(
         directory,
         repository,
@@ -1403,6 +1414,75 @@ def test_restart_recovers_release_commit_after_crash_before_any_dispatch(
     } == {"completed"}
 
 
+def test_restart_reconstructs_initial_release_by_persisted_route_id_after_reorder(
+    tmp_path, incoming_message_factory, now
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'release-route-reorder.db').as_posix()}"
+    settings = Settings(_env_file=None, engagement_require_go=True)
+    repository = SqlAlchemyHumanWireRepository(create_session_factory(database_url))
+    first = _build_mixed_workflow(repository, settings=settings)
+    message, mandate, _ = _mixed_preview(
+        first,
+        incoming_message_factory,
+        message_id="release-route-reorder-create",
+        received_at=now,
+    )
+    released = first.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": "release-route-reorder-go",
+                "received_at": now + timedelta(seconds=1),
+            }
+        )
+    )
+    selected = next(
+        delivery
+        for delivery in released.deliveries
+        if repository.get_assignment(delivery.assignment_id).person_id
+        == "inform-person"
+    )
+    assert selected.kind is DeliveryKind.INITIATE_EMAIL
+    assert selected.recipient == "inform-person@private.example.test"
+
+    original_routes = _mixed_directory()[0].resolve_person("inform-person").routes
+    reordered_routes = [
+        original_routes[0].model_copy(update={"preferred": False}),
+        original_routes[1].model_copy(update={"preferred": True}),
+    ]
+    restarted_repository = SqlAlchemyHumanWireRepository(
+        create_session_factory(database_url)
+    )
+    restarted = _build_mixed_workflow(
+        restarted_repository,
+        settings=settings,
+        route_overrides={"inform-person": reordered_routes},
+    )
+
+    recovered = restarted.process_due(now + timedelta(seconds=32))
+
+    selected_recovery = next(
+        delivery
+        for delivery in recovered.deliveries
+        if delivery.assignment_id == selected.assignment_id
+    )
+    assert selected_recovery.message_id == selected.message_id
+    assert selected_recovery.kind is DeliveryKind.INITIATE_EMAIL
+    assert selected_recovery.recipient == "inform-person@private.example.test"
+    assert selected_recovery.conversation_id is None
+    restarted.mark_delivery_result(
+        selected_recovery,
+        succeeded=True,
+        now=now + timedelta(seconds=33),
+    )
+    selected_row = next(
+        row
+        for row in restarted_repository.list_release_outbox(mandate.mandate_id)
+        if row.assignment_id == selected.assignment_id
+    )
+    assert selected_row.state == "completed"
+
+
 def test_restart_after_ack_deadline_recovers_primary_before_any_response_ladder(
     tmp_path, incoming_message_factory, now
 ) -> None:
@@ -1692,6 +1772,151 @@ def test_failed_primary_alternate_is_recovered_after_callback_dispatch_crash(
         for row in repository.list_release_outbox(mandate.mandate_id)
         if row.assignment_id == failed.assignment_id
     } == {"completed"}
+
+
+def test_restart_reconstructs_failed_primary_alternate_by_persisted_route_id(
+    tmp_path, incoming_message_factory, now
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'alternate-route-reorder.db').as_posix()}"
+    settings = Settings(_env_file=None, engagement_require_go=True)
+    repository = SqlAlchemyHumanWireRepository(create_session_factory(database_url))
+    first = _build_mixed_workflow(repository, settings=settings)
+    message, mandate, _ = _mixed_preview(
+        first,
+        incoming_message_factory,
+        message_id="alternate-route-reorder-create",
+        received_at=now,
+    )
+    released = first.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": "alternate-route-reorder-go",
+                "received_at": now + timedelta(seconds=1),
+            }
+        )
+    )
+    failed = next(
+        delivery
+        for delivery in released.deliveries
+        if repository.get_assignment(delivery.assignment_id).person_id
+        == "structured-person"
+    )
+    for delivery in released.deliveries:
+        if delivery.assignment_id != failed.assignment_id:
+            first.mark_delivery_result(
+                delivery,
+                succeeded=True,
+                now=now + timedelta(seconds=2),
+            )
+    alternate = first.mark_delivery_result(
+        failed,
+        succeeded=False,
+        now=now + timedelta(seconds=2),
+    ).deliveries[0]
+    assert alternate.kind is DeliveryKind.SEND_TO_CONVERSATION
+    assert alternate.conversation_id == "structured-person-private-conversation"
+
+    original_routes = _mixed_directory()[0].resolve_person("structured-person").routes
+    reordered_routes = [
+        original_routes[0].model_copy(update={"preferred": False}),
+        original_routes[1].model_copy(update={"preferred": True}),
+    ]
+    restarted_repository = SqlAlchemyHumanWireRepository(
+        create_session_factory(database_url)
+    )
+    restarted = _build_mixed_workflow(
+        restarted_repository,
+        settings=settings,
+        route_overrides={"structured-person": reordered_routes},
+    )
+
+    recovered = restarted.process_due(now + timedelta(seconds=34))
+
+    assert len(recovered.deliveries) == 1
+    assert recovered.deliveries[0].message_id == alternate.message_id
+    assert recovered.deliveries[0].kind is DeliveryKind.SEND_TO_CONVERSATION
+    assert (
+        recovered.deliveries[0].conversation_id
+        == "structured-person-private-conversation"
+    )
+    assert recovered.deliveries[0].recipient is None
+    restarted.mark_delivery_result(
+        recovered.deliveries[0],
+        succeeded=True,
+        now=now + timedelta(seconds=35),
+    )
+    alternate_row = next(
+        row
+        for row in restarted_repository.list_release_outbox(mandate.mandate_id)
+        if row.assignment_id == failed.assignment_id and row.attempt_count > 1
+    )
+    assert alternate_row.state == "completed"
+
+
+def test_restart_skips_failed_primary_alternate_when_saved_route_was_removed(
+    tmp_path, incoming_message_factory, now
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'alternate-route-removed.db').as_posix()}"
+    settings = Settings(_env_file=None, engagement_require_go=True)
+    repository = SqlAlchemyHumanWireRepository(create_session_factory(database_url))
+    first = _build_mixed_workflow(repository, settings=settings)
+    message, mandate, _ = _mixed_preview(
+        first,
+        incoming_message_factory,
+        message_id="alternate-route-removed-create",
+        received_at=now,
+    )
+    released = first.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mandate.token}",
+                "message_id": "alternate-route-removed-go",
+                "received_at": now + timedelta(seconds=1),
+            }
+        )
+    )
+    failed = next(
+        delivery
+        for delivery in released.deliveries
+        if repository.get_assignment(delivery.assignment_id).person_id
+        == "structured-person"
+    )
+    for delivery in released.deliveries:
+        if delivery.assignment_id != failed.assignment_id:
+            first.mark_delivery_result(
+                delivery,
+                succeeded=True,
+                now=now + timedelta(seconds=2),
+            )
+    alternate = first.mark_delivery_result(
+        failed,
+        succeeded=False,
+        now=now + timedelta(seconds=2),
+    ).deliveries[0]
+    before_recovery = repository.get_assignment(failed.assignment_id)
+    before_events = repository.list_events(mandate.mandate_id)
+
+    original_routes = _mixed_directory()[0].resolve_person("structured-person").routes
+    restarted_repository = SqlAlchemyHumanWireRepository(
+        create_session_factory(database_url)
+    )
+    restarted = _build_mixed_workflow(
+        restarted_repository,
+        settings=settings,
+        route_overrides={"structured-person": [original_routes[0]]},
+    )
+
+    recovered = restarted.process_due(now + timedelta(seconds=34))
+
+    assert recovered == WorkflowResult()
+    assert alternate.conversation_id not in repr(recovered)
+    saved = restarted_repository.get_assignment(failed.assignment_id)
+    assert saved == before_recovery
+    assert restarted_repository.list_events(mandate.mandate_id) == before_events
+    assert saved is not None
+    assert saved.active_route_index == 1
+    assert saved.route_ids[1] == "structured-person-telegram-route"
 
 
 def test_concurrent_restart_drains_claim_each_initial_release_entry_once(
