@@ -520,6 +520,55 @@ def test_private_token_and_meeting_id_are_removed_at_final_html_header_and_ics_b
     assert "SUMMARY:Resolve the launch approval decision" in ics_response.text
 
 
+def test_private_corpus_cannot_replace_ics_structure_or_property_names(demo_app) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2413")
+    assert mandate is not None
+    evidence = repository.list_evidence(mandate.mandate_id)
+    assignments = repository.list_assignments(mandate.mandate_id)
+    assert evidence and assignments
+    repository.add_evidence(
+        evidence[0].model_copy(
+            update={
+                "evidence_id": uuid4(),
+                "assignment_id": assignments[0].assignment_id,
+                "visibility": EvidenceVisibility.PRIVATE,
+                "statement": "BEGIN:VCALENDAR",
+                "related_decision": "VERSION:2.0",
+                "resource": "BEGIN:VEVENT",
+                "source_message_id": "END:VEVENT",
+            }
+        )
+    )
+    repository.add_evidence(
+        evidence[0].model_copy(
+            update={
+                "evidence_id": uuid4(),
+                "assignment_id": assignments[0].assignment_id,
+                "visibility": EvidenceVisibility.PRIVATE,
+                "statement": "END:VCALENDAR",
+                "related_decision": "UID",
+                "resource": "SUMMARY",
+                "source_message_id": "DTSTART",
+            }
+        )
+    )
+
+    response = TestClient(demo_app).get("/mandates/HW-2413/meeting.ics")
+
+    assert response.status_code == 200
+    assert response.content.startswith(b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\n")
+    assert response.content.endswith(b"END:VEVENT\r\nEND:VCALENDAR\r\n")
+    assert response.text.count("BEGIN:VCALENDAR\r\n") == 1
+    assert response.text.count("BEGIN:VEVENT\r\n") == 1
+    assert response.text.count("END:VEVENT\r\n") == 1
+    assert response.text.count("END:VCALENDAR\r\n") == 1
+    assert "\r\nUID:" in response.text
+    assert "\r\nSUMMARY:" in response.text
+    assert "\r\nDTSTART:" in response.text
+    assert "\n" not in response.text.replace("\r\n", "")
+
+
 def test_list_filter_stakeholders_events_evidence_and_reach_are_persisted_projections(
     web_client,
 ) -> None:
@@ -564,8 +613,46 @@ def test_unknown_tokens_return_safe_404(path, web_client) -> None:
     response = web_client.get(path)
 
     assert response.status_code == 404
+    assert response.content == b""
     assert "HW-UNKNOWN" not in response.text
     assert "sql" not in response.text.lower()
+
+
+def test_known_private_error_phrase_cannot_collide_with_bodyless_404_routes(demo_app) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assert mandate is not None
+    private = next(
+        item
+        for item in repository.list_evidence(mandate.mandate_id)
+        if item.visibility == EvidenceVisibility.PRIVATE
+    )
+    with repository._session_factory() as session:
+        session.execute(
+            update(EvidenceItemRecord)
+            .where(EvidenceItemRecord.evidence_id == str(private.evidence_id))
+            .values(statement="Not found")
+        )
+        session.commit()
+
+    client = TestClient(demo_app)
+    paths = [
+        "/mandates/HW-2411/meeting.ics",
+        "/mandates/HW-UNKNOWN",
+        "/mandates/HW-UNKNOWN/reach",
+        "/mandates/HW-UNKNOWN/data",
+        "/mandates/HW-UNKNOWN/meeting.ics",
+        "/api/v1/mandates/HW-UNKNOWN",
+        "/api/v1/mandates/HW-UNKNOWN/stakeholders",
+        "/api/v1/mandates/HW-UNKNOWN/outreach-events",
+        "/api/v1/mandates/HW-UNKNOWN/evidence-summary",
+    ]
+    responses = [client.get(path) for path in paths]
+
+    assert all(response.status_code == 404 for response in responses)
+    assert all(response.content == b"" for response in responses)
+    assert all("content-type" not in response.headers for response in responses)
+    assert "Not found" not in "".join(response.text for response in responses)
 
 
 def test_health_separates_liveness_from_production_readiness(demo_app) -> None:

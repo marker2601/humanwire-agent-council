@@ -289,7 +289,13 @@ class MeetingCoordinator:
         return decisions
 
 
-def render_ics(package: MeetingPackage, coordinator: MeetingCoordinator) -> bytes:
+def render_ics(
+    package: MeetingPackage,
+    coordinator: MeetingCoordinator,
+    *,
+    public_uid: str | None = None,
+    public_summary: str | None = None,
+) -> bytes:
     """Create a local RFC 5545-style calendar download; it never writes to a calendar."""
     if not coordinator.has_current_verified_package(package):
         raise ValueError("a verified proposed slot is required to render calendar content")
@@ -303,11 +309,11 @@ def render_ics(package: MeetingPackage, coordinator: MeetingCoordinator) -> byte
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
         "BEGIN:VEVENT",
-        f"UID:{package.meeting_id}@humanwire.local",
+        f"UID:{_ics_escape(public_uid or f'{package.meeting_id}@humanwire.local')}",
         f"DTSTAMP:{_ics_time(created)}",
         f"DTSTART:{_ics_time(start)}",
         f"DTEND:{_ics_time(end)}",
-        f"SUMMARY:{_ics_escape(redact_sensitive(package.purpose))}",
+        f"SUMMARY:{_ics_escape(public_summary or redact_sensitive(package.purpose))}",
         "END:VEVENT",
         "END:VCALENDAR",
         "",

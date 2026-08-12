@@ -419,10 +419,17 @@ def _verified_calendar(repository: Any, mandate: Mandate, current_time: datetime
             proposed_slot=slot,
             created_at=creation_event.created_at,
         )
-    calendar = render_ics(rebuilt, coordinator).decode("utf-8")
-    return "\r\n".join(
-        _scrub_known_private(line, denied_values) for line in calendar.split("\r\n")
-    ).encode("utf-8")
+    public_uid = _scrub_known_private(
+        f"{rebuilt.meeting_id}@humanwire.local",
+        denied_values,
+    )
+    public_summary = _scrub_known_private(rebuilt.purpose, denied_values)
+    return render_ics(
+        rebuilt,
+        coordinator,
+        public_uid=public_uid,
+        public_summary=public_summary,
+    )
 
 
 def _html_page(
@@ -468,6 +475,10 @@ def create_app(
     app.state.repository = repository
     app.state.settings = settings
     app.state.demo_mode = demo_mode
+
+    @app.exception_handler(404)
+    async def bodyless_not_found(_request: Request, _error: HTTPException):
+        return Response(status_code=404)
 
     @app.middleware("http")
     async def reject_mutations(request: Request, call_next):
