@@ -297,6 +297,49 @@ def _terminal_snapshot(repository, mandate):
     }
 
 
+def _correlation_snapshot(repository, mandates):
+    mandate_ids = [mandate.mandate_id for mandate in mandates]
+    proposals = {
+        mandate_id: repository.get_active_proposal(mandate_id)
+        for mandate_id in mandate_ids
+    }
+    return {
+        "mandates": repository.list_recent_mandates(1000),
+        "assignments": {
+            mandate_id: repository.list_assignments(mandate_id)
+            for mandate_id in mandate_ids
+        },
+        "interviews": {
+            mandate_id: repository.list_interviews(mandate_id)
+            for mandate_id in mandate_ids
+        },
+        "evidence": {
+            mandate_id: repository.list_evidence(mandate_id)
+            for mandate_id in mandate_ids
+        },
+        "proposals": proposals,
+        "proposal_responses": {
+            mandate_id: (
+                repository.list_proposal_responses(proposal.proposal_id)
+                if proposal is not None
+                else []
+            )
+            for mandate_id, proposal in proposals.items()
+        },
+        "availability": {
+            (mandate_id, person_id): repository.get_runtime_status(
+                f"availability:{mandate_id}:{person_id}"
+            )
+            for mandate_id in mandate_ids
+            for person_id in ("manager", "team-lead")
+        },
+        "events": {
+            mandate_id: repository.list_events(mandate_id)
+            for mandate_id in mandate_ids
+        },
+    }
+
+
 def _late_terminal_message(workflow, incoming_message_factory, mandate, input_kind: str):
     if input_kind == "ack":
         return _message_for(
@@ -554,6 +597,115 @@ def test_late_reply_and_unknown_sender_fail_closed_without_mutation(
     assert repository.list_assignments(newer.mandate_id)[0].state is StakeholderState.COMPLETE
     assert len(repository.list_evidence(newer.mandate_id)) == 1
     assert legitimate.deliveries
+
+
+def test_terminal_thread_requires_newer_interview_ack_before_tokenless_answer(
+    repository, incoming_message_factory
+) -> None:
+    """Break caught: terminal thread history implicitly selects one newer unacknowledged interview."""
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    terminal, _ = _create_mandate(
+        workflow, incoming_message_factory, message_id="terminal-thread-create"
+    )
+    workflow.handle(
+        incoming_message_factory(
+            text=f"/cancel {terminal.token}",
+            message_id="terminal-thread-cancel",
+        )
+    )
+    newer, _ = _create_mandate(
+        workflow, incoming_message_factory, message_id="newer-thread-create"
+    )
+    newer_assignment = repository.list_assignments(newer.mandate_id)[0]
+    newer_interview = repository.list_interviews(newer.mandate_id)[0]
+    assert repository.get_mandate_by_token(terminal.token).state is MandateState.CANCELLED
+    assert newer_assignment.state is StakeholderState.AWAITING_ACKNOWLEDGEMENT
+    assert newer_interview.current_conversation_id == "lead-thread"
+    assert newer_interview.acknowledged_at is None
+    before = _correlation_snapshot(repository, (terminal, newer))
+
+    guarded = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            "Tokenless text must not select the newer interview.",
+            message_id="newer-thread-tokenless-before-ack",
+        )
+    )
+
+    assert len(guarded.deliveries) == 1
+    assert guarded.deliveries[0].kind is DeliveryKind.REPLY_TO_MESSAGE
+    assert "ACK <token>" in guarded.deliveries[0].text
+    assert _correlation_snapshot(repository, (terminal, newer)) == before
+
+    selected = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"ACK {newer.token}",
+            message_id="newer-thread-explicit-ack",
+        )
+    )
+    continued = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            "The acknowledged exact-thread interview may continue.",
+            message_id="newer-thread-tokenless-after-ack",
+        )
+    )
+
+    assert selected.deliveries[0].text.startswith("Question 1 of 1")
+    assert repository.list_assignments(newer.mandate_id)[0].state is StakeholderState.COMPLETE
+    assert len(repository.list_evidence(newer.mandate_id)) == 1
+    assert continued.deliveries
+
+
+def test_explicit_ack_selects_newer_interview_across_registered_channels(
+    repository, incoming_message_factory
+) -> None:
+    """Break caught: exact-thread history prevents a valid token from switching registered routes."""
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    terminal, _ = _create_mandate(
+        workflow, incoming_message_factory, message_id="cross-channel-terminal-create"
+    )
+    workflow.handle(
+        incoming_message_factory(
+            text=f"/cancel {terminal.token}",
+            message_id="cross-channel-terminal-cancel",
+        )
+    )
+    newer, _ = _create_mandate(
+        workflow, incoming_message_factory, message_id="cross-channel-newer-create"
+    )
+
+    selected = workflow.handle(
+        incoming_message_factory(
+            text=f"ACK {newer.token}",
+            channel=Channel.TELEGRAM,
+            sender_address="lead-chat",
+            conversation_id="lead-conversation",
+            message_id="cross-channel-newer-ack",
+        )
+    )
+    continued = workflow.handle(
+        incoming_message_factory(
+            text="The explicitly selected Telegram interview may continue.",
+            channel=Channel.TELEGRAM,
+            sender_address="lead-chat",
+            conversation_id="lead-conversation",
+            message_id="cross-channel-newer-answer",
+        )
+    )
+
+    session = repository.list_interviews(newer.mandate_id)[0]
+    assert selected.deliveries[0].text.startswith("Question 1 of 1")
+    assert session.current_route_id == "lead-telegram"
+    assert session.current_conversation_id == "lead-conversation"
+    assert session.acknowledged_at is not None
+    assert repository.list_assignments(newer.mandate_id)[0].state is StakeholderState.COMPLETE
+    assert len(repository.list_evidence(newer.mandate_id)) == 1
+    assert continued.deliveries
 
 
 def test_multiple_active_interviews_require_token_and_correct_ack_disambiguates(

@@ -34,7 +34,11 @@ from humanwire.services import (
     _event,
     incoming_idempotency_key,
 )
-from humanwire.state_machine import MANDATE_TERMINAL_STATES, MandateStateMachine
+from humanwire.state_machine import (
+    ASSIGNMENT_TERMINAL_STATES,
+    MANDATE_TERMINAL_STATES,
+    MandateStateMachine,
+)
 
 
 class HumanWireWorkflow:
@@ -128,10 +132,16 @@ class HumanWireWorkflow:
         terminal_match = False
         for mandate in self.repository.list_recent_mandates(1000):
             interview = self.repository.find_active_interview(mandate.mandate_id, person.person_id)
-            if interview is not None and (interview.current_conversation_id in {None, message.conversation_id}):
+            if interview is not None and (
+                isinstance(command, AcknowledgeCommand)
+                or interview.current_conversation_id in {None, message.conversation_id}
+            ):
                 assignment = self.repository.get_assignment(interview.assignment_id)
                 if assignment is not None:
-                    if mandate.state in {MandateState.CANCELLED, MandateState.EXPIRED}:
+                    if (
+                        mandate.state in MANDATE_TERMINAL_STATES
+                        or assignment.state in ASSIGNMENT_TERMINAL_STATES
+                    ):
                         terminal_match = True
                         continue
                     candidates.append(assignment)
@@ -164,9 +174,14 @@ class HumanWireWorkflow:
                     and interview.current_channel is message.channel
                     and interview.current_conversation_id == message.conversation_id
                 ):
-                    if interview.completed_at is None and interview.acknowledged_at is not None:
+                    terminal = (
+                        mandate.state in MANDATE_TERMINAL_STATES
+                        or assignment.state in ASSIGNMENT_TERMINAL_STATES
+                        or interview.completed_at is not None
+                    )
+                    if not terminal and interview.acknowledged_at is not None:
                         return False
-                    completed_match = completed_match or interview.completed_at is not None
+                    completed_match = completed_match or terminal
         return completed_match
 
     def _mandate_for_assignment(self, assignment):
