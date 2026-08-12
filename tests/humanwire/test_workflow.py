@@ -118,7 +118,7 @@ class MixedEngagementPlanner:
         ),
         (
             "approval-person",
-            "Approve the registered launch decision.",
+            "Complete the registered launch mandate",
             Direction.UPWARD,
             True,
             EngagementType.REVIEW_APPROVAL,

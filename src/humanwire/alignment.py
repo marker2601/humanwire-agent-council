@@ -186,8 +186,14 @@ class AlignmentEngine:
         ]
         statuses: dict[UUID, ContributionStatus] | None = None
         valid_assignment_ids: set[UUID] | None = None
+        review_decision_bindings: dict[UUID, str] = {}
         if contribution_evidence is not None:
             valid_assignment_ids = self._valid_assignment_ids(plan, assignment_values)
+            review_decision_bindings = self._review_decision_bindings(
+                plan,
+                assignment_values,
+                valid_assignment_ids,
+            )
             statuses = {
                 assignment.assignment_id: contribution_status(
                     assignment,
@@ -214,6 +220,7 @@ class AlignmentEngine:
             assignments=assignment_values,
             contribution_statuses=statuses,
             valid_assignment_ids=valid_assignment_ids,
+            review_decision_bindings=review_decision_bindings,
         )
         if private_blocker_count:
             issues.append(
@@ -232,6 +239,7 @@ class AlignmentEngine:
                 decisions,
                 statuses or {},
                 valid_assignment_ids or set(),
+                review_decision_bindings,
             )
             if contribution_evidence is not None
             else self._covered_decisions(plan, public_evidence)
@@ -303,6 +311,7 @@ class AlignmentEngine:
         assignments: list[StakeholderAssignment] | None = None,
         contribution_statuses: dict[UUID, ContributionStatus] | None = None,
         valid_assignment_ids: set[UUID] | None = None,
+        review_decision_bindings: dict[UUID, str] | None = None,
     ) -> list[AlignmentIssue]:
         issues: list[AlignmentIssue] = []
         planned_required_ids = {
@@ -337,9 +346,21 @@ class AlignmentEngine:
                         )
                     )
                 else:
-                    issue = self._contribution_issue(
-                        assignment,
-                        contribution_statuses[assignment.assignment_id],
+                    issue = (
+                        self._issue(
+                            AlignmentIssueType.AUTHORITY_GAP,
+                            "A required approval assignment has no unique trusted decision contract.",
+                            stakeholder_ids=[assignment.person_id],
+                            blocking=True,
+                        )
+                        if assignment.engagement_type
+                        is EngagementType.REVIEW_APPROVAL
+                        and assignment.assignment_id
+                        not in (review_decision_bindings or {})
+                        else self._contribution_issue(
+                            assignment,
+                            contribution_statuses[assignment.assignment_id],
+                        )
                     )
                     if issue is not None:
                         issues.append(issue)
@@ -369,6 +390,12 @@ class AlignmentEngine:
             for assignment in assignments or []:
                 if assignment.required or assignment.assignment_id not in (
                     valid_assignment_ids or set()
+                ):
+                    continue
+                if (
+                    assignment.engagement_type is EngagementType.REVIEW_APPROVAL
+                    and assignment.assignment_id
+                    not in (review_decision_bindings or {})
                 ):
                     continue
                 issue = self._contribution_issue(
@@ -484,6 +511,36 @@ class AlignmentEngine:
             and item.stakeholder_id == assignment.person_id
         }
 
+    @staticmethod
+    def _review_decision_bindings(
+        plan: MandatePlan,
+        assignments: Sequence[StakeholderAssignment],
+        valid_assignment_ids: set[UUID],
+    ) -> dict[UUID, str]:
+        candidates: dict[UUID, str] = {}
+        for assignment in assignments:
+            if (
+                assignment.assignment_id not in valid_assignment_ids
+                or assignment.engagement_type is not EngagementType.REVIEW_APPROVAL
+            ):
+                continue
+            matching = [
+                decision
+                for decision in plan.required_decisions
+                if decision == assignment.reason
+            ]
+            if len(matching) == 1:
+                candidates[assignment.assignment_id] = matching[0]
+
+        counts: dict[str, int] = {}
+        for decision in candidates.values():
+            counts[decision] = counts.get(decision, 0) + 1
+        return {
+            assignment_id: decision
+            for assignment_id, decision in candidates.items()
+            if counts[decision] == 1
+        }
+
     def _covered_contribution_decisions(
         self,
         plan: MandatePlan,
@@ -492,18 +549,21 @@ class AlignmentEngine:
         decisions: Sequence[EngagementDecision],
         statuses: dict[UUID, ContributionStatus],
         valid_assignment_ids: set[UUID],
+        review_decision_bindings: dict[UUID, str],
     ) -> list[str]:
         by_id = {assignment.assignment_id: assignment for assignment in assignments}
-        approved = any(
-            decision.response is EngagementDecisionKind.APPROVE
+        approved_decisions = {
+            review_decision_bindings[decision.assignment_id]
+            for decision in decisions
+            if decision.response is EngagementDecisionKind.APPROVE
             and decision.assignment_id in valid_assignment_ids
+            and decision.assignment_id in review_decision_bindings
             and (assignment := by_id.get(decision.assignment_id)) is not None
             and assignment.engagement_type is EngagementType.REVIEW_APPROVAL
             and statuses[assignment.assignment_id].state is ContributionState.COMPLETE
             and decision.mandate_id == assignment.mandate_id
             and decision.stakeholder_id == assignment.person_id
-            for decision in decisions
-        )
+        }
         covered: list[str] = []
         for required_decision in plan.required_decisions:
             evidence_covers = any(
@@ -524,7 +584,7 @@ class AlignmentEngine:
                 and item.stakeholder_id == assignment.person_id
                 for item in evidence
             )
-            if approved or evidence_covers:
+            if required_decision in approved_decisions or evidence_covers:
                 covered.append(required_decision)
         return covered
 

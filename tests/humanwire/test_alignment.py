@@ -162,14 +162,16 @@ def _contribution_assignment(
     *,
     state: StakeholderState = StakeholderState.COMPLETE,
     required: bool = True,
+    person_id: str = "contributor",
+    reason: str = "Supply the trusted contribution",
 ) -> StakeholderAssignment:
     return StakeholderAssignment(
         assignment_id=uuid4(),
         mandate_id=mandate.mandate_id,
-        person_id="contributor",
+        person_id=person_id,
         department="Operations",
         direction=Direction.LATERAL,
-        reason="Supply the trusted contribution",
+        reason=reason,
         required=required,
         engagement_type=engagement_type,
         response_required=engagement_type is not EngagementType.INFORM,
@@ -215,6 +217,33 @@ def _approval_decision(
         source_message_id="approval-message",
         created_at=now,
         idempotency_key=f"approval:{assignment.assignment_id}",
+    )
+
+
+def _contribution_plan(
+    assignments: list[StakeholderAssignment],
+    required_decisions: list[str],
+) -> MandatePlan:
+    return MandatePlan(
+        objective="Resolve the registered decisions",
+        required_decisions=required_decisions,
+        stakeholders=[
+            PlannedStakeholder(
+                person_ref=assignment.person_id,
+                reason=assignment.reason,
+                direction=assignment.direction,
+                required=assignment.required,
+                engagement_type=assignment.engagement_type,
+                response_required=assignment.response_required,
+                questions=(
+                    ["What is your response?"]
+                    if assignment.engagement_type is EngagementType.QUICK_RESPONSE
+                    else []
+                ),
+            )
+            for assignment in assignments
+        ],
+        completion_conditions=["Resolve every registered decision"],
     )
 
 
@@ -391,6 +420,172 @@ def test_contribution_approval_and_availability_fail_closed_without_exact_record
     assert approval_result.blocking is True
     assert availability_result.state is ContributionState.MISSING_RESPONSE
     assert availability_result.blocking is True
+
+
+def test_one_approval_covers_only_its_exact_required_decision_contract(
+    mandate, now
+) -> None:
+    assignment = _contribution_assignment(
+        mandate,
+        EngagementType.REVIEW_APPROVAL,
+        person_id="budget-owner",
+        reason="Approve the budget",
+    )
+    plan = _contribution_plan(
+        [assignment],
+        ["Approve the budget", "Approve the date"],
+    )
+
+    report = AlignmentEngine(mandate.mandate_id).analyze(
+        plan,
+        [],
+        [assignment],
+        contribution_evidence=[],
+        decisions=[
+            _approval_decision(assignment, now, EngagementDecisionKind.APPROVE)
+        ],
+    )
+
+    assert report.covered_decisions == ["Approve the budget"]
+    assert report.is_aligned is False
+    assert {
+        issue.related_decision
+        for issue in report.issues
+        if issue.issue_type is AlignmentIssueType.AUTHORITY_GAP
+    } == {"Approve the date"}
+
+
+def test_distinct_approvers_cover_only_their_own_exact_decision_contracts(
+    mandate, now
+) -> None:
+    budget = _contribution_assignment(
+        mandate,
+        EngagementType.REVIEW_APPROVAL,
+        person_id="budget-owner",
+        reason="Approve the budget",
+    )
+    date = _contribution_assignment(
+        mandate,
+        EngagementType.REVIEW_APPROVAL,
+        person_id="date-owner",
+        reason="Approve the date",
+    )
+    plan = _contribution_plan(
+        [budget, date],
+        ["Approve the budget", "Approve the date"],
+    )
+
+    report = AlignmentEngine(mandate.mandate_id).analyze(
+        plan,
+        [],
+        [budget, date],
+        contribution_evidence=[],
+        decisions=[
+            _approval_decision(budget, now, EngagementDecisionKind.APPROVE),
+            _approval_decision(date, now, EngagementDecisionKind.APPROVE),
+        ],
+    )
+
+    assert report.covered_decisions == ["Approve the budget", "Approve the date"]
+    assert report.is_aligned is True
+
+
+@pytest.mark.parametrize(
+    "required_decisions",
+    [
+        ["Approve the budget", "Approve the budget"],
+        ["Approve the budget"],
+    ],
+    ids=["duplicate-decision-contract", "multiple-authorities"],
+)
+def test_ambiguous_review_authority_mapping_fails_closed(
+    mandate, now, required_decisions
+) -> None:
+    assignments = [
+        _contribution_assignment(
+            mandate,
+            EngagementType.REVIEW_APPROVAL,
+            person_id=person_id,
+            reason="Approve the budget",
+        )
+        for person_id in (
+            ["budget-owner"]
+            if len(required_decisions) == 2
+            else ["budget-owner", "backup-owner"]
+        )
+    ]
+    plan = _contribution_plan(assignments, required_decisions)
+
+    report = AlignmentEngine(mandate.mandate_id).analyze(
+        plan,
+        [],
+        assignments,
+        contribution_evidence=[],
+        decisions=[
+            _approval_decision(assignment, now, EngagementDecisionKind.APPROVE)
+            for assignment in assignments
+        ],
+    )
+
+    assert report.covered_decisions == []
+    assert report.is_aligned is False
+
+
+def test_unmapped_review_approval_cannot_supply_required_authority(
+    mandate, now
+) -> None:
+    assignment = _contribution_assignment(
+        mandate,
+        EngagementType.REVIEW_APPROVAL,
+        person_id="budget-owner",
+        reason="Approve the budget",
+    )
+    plan = _contribution_plan([assignment], ["Approve the date"])
+
+    report = AlignmentEngine(mandate.mandate_id).analyze(
+        plan,
+        [],
+        [assignment],
+        contribution_evidence=[],
+        decisions=[
+            _approval_decision(assignment, now, EngagementDecisionKind.APPROVE)
+        ],
+    )
+
+    assert report.covered_decisions == []
+    assert report.is_aligned is False
+
+
+@pytest.mark.parametrize("response", list(EngagementDecisionKind))
+def test_irrelevant_optional_review_response_has_no_decision_authority_or_veto(
+    mandate, now, response
+) -> None:
+    optional_reviewer = _contribution_assignment(
+        mandate,
+        EngagementType.REVIEW_APPROVAL,
+        required=False,
+        person_id="optional-reviewer",
+        reason="Approve the budget",
+    )
+    plan = _contribution_plan(
+        [optional_reviewer],
+        ["Approve the date"],
+    )
+
+    report = AlignmentEngine(mandate.mandate_id).analyze(
+        plan,
+        [],
+        [optional_reviewer],
+        contribution_evidence=[],
+        decisions=[_approval_decision(optional_reviewer, now, response)],
+    )
+
+    assert report.covered_decisions == []
+    assert report.is_aligned is False
+    assert all(
+        optional_reviewer.person_id not in issue.stakeholder_ids
+        for issue in report.issues
+    )
 
 
 @pytest.mark.parametrize(

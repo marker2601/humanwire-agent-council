@@ -218,6 +218,26 @@ def _assignment_projection(
     decisions: dict[Any, Any],
 ) -> dict[str, Any]:
     interview = interviews.get(assignment.interview_id)
+    if not (
+        assignment.engagement_type
+        in {
+            EngagementType.QUICK_RESPONSE,
+            EngagementType.STRUCTURED_INTERVIEW,
+        }
+        and interview is not None
+        and interview.mandate_id == assignment.mandate_id
+        and interview.assignment_id == assignment.assignment_id
+    ):
+        interview = None
+    decision = decisions.get(assignment.assignment_id)
+    if not (
+        assignment.engagement_type is EngagementType.REVIEW_APPROVAL
+        and decision is not None
+        and decision.mandate_id == assignment.mandate_id
+        and decision.assignment_id == assignment.assignment_id
+        and decision.stakeholder_id == assignment.person_id
+    ):
+        decision = None
     if interview is None:
         interview_status = "not_started"
         question = None
@@ -232,7 +252,7 @@ def _assignment_projection(
         assignment,
         interview,
         planned,
-        decisions.get(assignment.assignment_id),
+        decision,
     )
     return {
         **_person(repository, assignment.person_id),

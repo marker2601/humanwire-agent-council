@@ -141,3 +141,70 @@ commitment could appear as an agreement, and a declined interview lost its truth
 question progress. Focused RED/GREEN tests now cover each. The review found no remaining
 model-authority path, raw decision/private exposure, stale synthesis write, universal-session
 assumption, Task 6 invariant regression, Task 8/deployment change, or open Task 7 concern.
+
+## Review round 1
+
+Official review found two important trust-boundary gaps. Both were reproduced with tests
+before production changes and fixed in one scoped follow-up commit. The resulting commit SHA
+is recorded in the final handoff because a Git commit cannot contain its own hash.
+
+### Approval authority
+
+Observed RED:
+
+```text
+Authority contract slice: 6 failed, 2 passed; exit 1
+```
+
+The failures proved that one exact APPROVE covered unrelated required decisions, duplicate
+decision contracts and multiple authorities did not fail closed, an unmapped approval still
+supplied authority, and irrelevant optional REJECT/CHANGE responses vetoed alignment.
+
+REVIEW_APPROVAL assignments now bind only when the trusted assignment reason exactly equals
+one and only one registered required decision and no second assignment claims the same
+decision. Coverage is local to that binding. Duplicate, multiple, or absent mappings have no
+approval authority. Required unmapped approval work yields a deterministic authority gap;
+irrelevant optional APPROVE/REJECT/CHANGE records neither cover nor veto. No model output or
+raw `change_text` participates in mapping.
+
+### Public projection identity and privacy
+
+Observed RED:
+
+```text
+Projection/identity/privacy slice: 7 failed, 1 passed; exit 1
+```
+
+The failures proved that cross-mandate and cross-assignment sessions could project interview
+progress, a session could project onto a non-question engagement, and cross-mandate,
+cross-assignment, or cross-person decisions could project approval state. The all-route raw
+change-text regression also showed the mismatched stakeholder decision as authoritative.
+
+Public progress now accepts an interview only for QUICK_RESPONSE or STRUCTURED_INTERVIEW with
+exact mandate and assignment identity. It accepts a decision only for REVIEW_APPROVAL with
+exact mandate, assignment, and stakeholder identity. Every mismatch projects safely as no
+interview progress or pending approval. Raw change text remains absent across all public
+HTML, JSON, and ICS routes even when the rejected decision is present in storage.
+
+The valid mixed-workflow fixture and deterministic demo plans were made internally coherent:
+each REVIEW reason now exactly matches that plan's registered required decision while the
+exact `HW-2411` approval-request story remains unchanged publicly.
+
+### Fresh verification
+
+All commands below were run after the final production edit:
+
+```text
+Required focused alignment/workflow gate (-v): 158 passed, 203 deselected; exit 0
+Required four focused files (-v):              423 passed; exit 0
+HumanWire suite (-q):                          942 passed; exit 0
+Complete repository suite (-q):               1032 passed; exit 0
+Ruff scoped gate:                              All checks passed; exit 0
+git diff --check:                              exit 0
+git diff --cached --check:                     exit 0
+```
+
+The only warning remains the pre-existing Starlette/httpx TestClient deprecation warning.
+Final diff, privacy, authority, and race review found no residual concern, Task 6 regression,
+Task 8/deployment change, model-authority path, raw private-text exposure, or stale-write
+change.

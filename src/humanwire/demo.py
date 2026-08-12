@@ -47,10 +47,15 @@ def _id(kind: str, value: str) -> UUID:
     return uuid5(NAMESPACE_URL, f"humanwire:demo:{kind}:{value}")
 
 
-def _plan(objective: str, stakeholders: list[PlannedStakeholder]) -> MandatePlan:
+def _plan(
+    objective: str,
+    stakeholders: list[PlannedStakeholder],
+    *,
+    required_decision: str = "Approve the smallest safe coverage plan",
+) -> MandatePlan:
     return MandatePlan(
         objective=objective,
-        required_decisions=["Approve the smallest safe coverage plan"],
+        required_decisions=[required_decision],
         stakeholders=stakeholders,
         deadline=DEMO_NOW + timedelta(days=3),
         completion_conditions=["Required stakeholders respond", "Decision owner reviews"],
@@ -280,7 +285,11 @@ def _seed_primary(repository: SqlAlchemyHumanWireRepository) -> None:
         "arun-patel",
         MandateState.INTERVIEWING,
         "Prepare approved weekend launch coverage",
-        _plan("Prepare approved weekend launch coverage", planned),
+        _plan(
+            "Prepare approved weekend launch coverage",
+            planned,
+            required_decision="Review the approval request",
+        ),
         DEMO_NOW - timedelta(hours=3),
     )
     repository.add_mandate(mandate)
@@ -449,6 +458,7 @@ def _seed_aligned(repository: SqlAlchemyHumanWireRepository) -> None:
                 questions=[],
             )
         ],
+        required_decision="Confirm ownership",
     )
     mandate = _mandate(
         "HW-2412",
@@ -465,7 +475,7 @@ def _seed_aligned(repository: SqlAlchemyHumanWireRepository) -> None:
         "Support Leadership",
         Direction.UPWARD,
         StakeholderState.COMPLETE,
-        "Confirm incident review ownership",
+        "Confirm ownership",
         2,
         engagement_type=EngagementType.REVIEW_APPROVAL,
         interview=False,
@@ -499,6 +509,7 @@ def _seed_meeting_ready(repository: SqlAlchemyHumanWireRepository) -> None:
                 questions=[],
             )
         ],
+        required_decision="Make the approval decision",
     )
     mandate = _mandate(
         "HW-2413",

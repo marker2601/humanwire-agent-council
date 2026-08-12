@@ -234,6 +234,77 @@ def test_missing_legacy_interview_fails_safe_without_inventing_progress(demo_app
     assert (row["progress_current"], row["progress_total"]) == (0, 3)
 
 
+@pytest.mark.parametrize(
+    "identity_mutation",
+    [
+        {"mandate_id": uuid4()},
+        {"assignment_id": uuid4()},
+    ],
+    ids=["cross-mandate", "cross-assignment"],
+)
+def test_question_progress_requires_exact_interview_aggregate_identity(
+    demo_app, identity_mutation
+) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assignment = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.person_id == "priya-shah"
+    )
+    interview = repository.get_interview(assignment.interview_id).model_copy(
+        update=identity_mutation
+    )
+    planned = next(
+        item
+        for item in mandate.plan.stakeholders
+        if item.person_ref == assignment.person_id
+    )
+
+    row = web_projection._assignment_projection(
+        repository,
+        assignment,
+        {assignment.interview_id: interview},
+        planned,
+        {},
+    )
+
+    assert row["engagement_status"] == "awaiting response"
+    assert (row["progress_current"], row["progress_total"]) == (0, 3)
+    assert row["interview_status"] == "not_started"
+    assert row["current_question"] is None
+    assert row["channel"] is None
+
+
+def test_non_question_engagement_never_projects_an_interview_session(demo_app) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    question_assignment = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.person_id == "priya-shah"
+    )
+    assignment = question_assignment.model_copy(
+        update={
+            "engagement_type": EngagementType.INFORM,
+            "response_required": False,
+        }
+    )
+    interview = repository.get_interview(assignment.interview_id)
+
+    row = web_projection._assignment_projection(
+        repository,
+        assignment,
+        {assignment.interview_id: interview},
+        None,
+        {},
+    )
+
+    assert row["interview_status"] == "not_started"
+    assert row["current_question"] is None
+    assert row["channel"] is None
+
+
 def test_availability_progress_requires_the_exact_persisted_record(demo_app) -> None:
     repository = demo_app.state.repository
     mandate = repository.get_mandate_by_token("HW-2411")
@@ -276,7 +347,7 @@ def test_raw_engagement_change_text_is_denied_on_every_public_route(demo_app) ->
             decision_id=uuid4(),
             mandate_id=mandate.mandate_id,
             assignment_id=assignment.assignment_id,
-            stakeholder_id=assignment.person_id,
+            stakeholder_id="unrelated-reviewer",
             response=EngagementDecisionKind.CHANGE,
             change_text="PRIVATE-DECISION-CHANGE-SENTINEL",
             source_message_id="private-change-source",
@@ -299,8 +370,16 @@ def test_raw_engagement_change_text_is_denied_on_every_public_route(demo_app) ->
     )
 
     responses = [client.get(path) for path in paths]
+    stakeholder_rows = client.get(
+        "/api/v1/mandates/HW-2411/stakeholders"
+    ).json()
+    reviewer = next(
+        item for item in stakeholder_rows if item["person_id"] == assignment.person_id
+    )
 
     assert all(response.status_code == 200 for response in responses)
+    assert reviewer["engagement_status"] == "pending"
+    assert (reviewer["progress_current"], reviewer["progress_total"]) == (0, 1)
     assert "PRIVATE-DECISION-CHANGE-SENTINEL" not in "".join(
         response.text for response in responses
     )
@@ -345,6 +424,82 @@ def test_review_progress_comes_only_from_the_exact_persisted_decision(
 
     assert row["engagement_status"] == status
     assert (row["progress_current"], row["progress_total"]) == (1, 1)
+
+
+@pytest.mark.parametrize(
+    "identity_mutation",
+    [
+        {"mandate_id": uuid4()},
+        {"assignment_id": uuid4()},
+        {"stakeholder_id": "unrelated-reviewer"},
+    ],
+    ids=["cross-mandate", "cross-assignment", "cross-person"],
+)
+def test_review_progress_requires_exact_decision_aggregate_identity(
+    demo_app, identity_mutation
+) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assignment = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.person_id == "maya-brooks"
+    )
+    decision = EngagementDecision(
+        decision_id=uuid4(),
+        mandate_id=mandate.mandate_id,
+        assignment_id=assignment.assignment_id,
+        stakeholder_id=assignment.person_id,
+        response=EngagementDecisionKind.APPROVE,
+        source_message_id="mismatched-review-source",
+        created_at=NOW,
+        idempotency_key="mismatched-review-decision",
+    ).model_copy(update=identity_mutation)
+
+    row = web_projection._assignment_projection(
+        repository,
+        assignment,
+        {},
+        None,
+        {assignment.assignment_id: decision},
+    )
+
+    assert row["engagement_status"] == "pending"
+    assert (row["progress_current"], row["progress_total"]) == (0, 1)
+
+
+def test_non_review_engagement_never_projects_an_approval_decision(demo_app) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    review_assignment = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.person_id == "maya-brooks"
+    )
+    assignment = review_assignment.model_copy(
+        update={"engagement_type": EngagementType.ACKNOWLEDGE}
+    )
+    decision = EngagementDecision(
+        decision_id=uuid4(),
+        mandate_id=assignment.mandate_id,
+        assignment_id=assignment.assignment_id,
+        stakeholder_id=assignment.person_id,
+        response=EngagementDecisionKind.APPROVE,
+        source_message_id="wrong-type-review-source",
+        created_at=NOW,
+        idempotency_key="wrong-type-review-decision",
+    )
+
+    row = web_projection._assignment_projection(
+        repository,
+        assignment,
+        {},
+        None,
+        {assignment.assignment_id: decision},
+    )
+
+    assert row["engagement_status"] == "awaiting acknowledgement"
+    assert (row["progress_current"], row["progress_total"]) == (0, 1)
 
 
 def test_public_projection_redacts_a_destination_even_if_it_reaches_persisted_text(
