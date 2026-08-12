@@ -425,11 +425,69 @@ class InterviewCoordinator:
             key,
             {"message_id": delivery_id},
         )
-        retry = assignment.model_copy(update={"next_action_at": now})
+        routes = self._assignment_routes(assignment)
+        next_index = assignment.active_route_index + 1
+        if next_index < len(routes):
+            route = routes[next_index]
+            session = self._session(assignment)
+            alternate = self._transition(
+                assignment, StakeholderState.ALTERNATE_CHANNEL, "gateway_primary_failed", now
+            ).model_copy(
+                update={
+                    "active_route_index": next_index,
+                    "attempt_count": max(assignment.attempt_count, 3),
+                    "last_delivery_at": now,
+                    "next_action_at": now + timedelta(seconds=self.settings.acknowledgement_seconds),
+                }
+            )
+            updated_session = self._activate_route(session, route, route.conversation_id, now)
+            with self.repository.transaction() as unit:
+                unit.save_assignment(alternate)
+                unit.save_interview(updated_session)
+                unit.append_event(alternate.mandate_id, event)
+                unit.append_event(
+                    alternate.mandate_id,
+                    self._event(
+                        "outreach.alternate_sent",
+                        alternate,
+                        assignment,
+                        now,
+                        f"delivery:{assignment_id}:alternate:{delivery_id}",
+                        {"route_id": route.route_id},
+                    ),
+                )
+            return WorkflowResult(
+                deliveries=[
+                    self._route_delivery(
+                        route,
+                        render_channel_switch(
+                            self._token(assignment),
+                            self._summary(assignment),
+                            assignment.reason,
+                            len(session.questions),
+                        ),
+                        alternate,
+                    )
+                ]
+            )
+        failed = self._transition(
+            assignment, StakeholderState.DELIVERY_FAILED, "registered_routes_exhausted", now
+        )
         with self.repository.transaction() as unit:
-            unit.save_assignment(retry)
-            unit.append_event(retry.mandate_id, event)
-        return self.process_due_assignment(retry, now)
+            unit.save_assignment(failed)
+            unit.append_event(failed.mandate_id, event)
+            unit.append_event(
+                failed.mandate_id,
+                self._event(
+                    "stakeholder.delivery_failed",
+                    failed,
+                    assignment,
+                    now,
+                    f"delivery:{assignment_id}:exhausted:{delivery_id}",
+                    {"reason_code": "registered_routes_exhausted"},
+                ),
+            )
+        return WorkflowResult(deliveries=self._owner_notice(failed))
 
     def _acknowledge(
         self,

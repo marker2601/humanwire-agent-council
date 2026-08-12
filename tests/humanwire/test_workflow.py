@@ -70,7 +70,7 @@ def repository() -> SqlAlchemyHumanWireRepository:
 def workflow(repository: SqlAlchemyHumanWireRepository) -> HumanWireWorkflow:
     manager = Person(person_id="manager", display_name="Morgan Lee", role="Manager", department="Operations", timezone="UTC", routes=[ContactRoute(route_id="manager-tg", channel=Channel.TELEGRAM, sender_address="manager-chat", conversation_id="manager-conversation", preferred=True)])
     people = [
-        Person(person_id="team-lead", display_name="Riley Chen", role="Lead", department="Operations", timezone="UTC", manager_id="manager", routes=[ContactRoute(route_id="lead-email", channel=Channel.EMAIL, sender_address="lead@example.test", recipient="lead@example.test", preferred=True)]),
+        Person(person_id="team-lead", display_name="Riley Chen", role="Lead", department="Operations", timezone="UTC", manager_id="manager", routes=[ContactRoute(route_id="lead-email", channel=Channel.EMAIL, sender_address="lead@example.test", recipient="lead@example.test", preferred=True), ContactRoute(route_id="lead-telegram", channel=Channel.TELEGRAM, sender_address="lead-chat", conversation_id="lead-conversation")]),
         Person(person_id="vp-people", display_name="Avery Patel", role="VP", department="People", timezone="UTC", routes=[ContactRoute(route_id="people-email", channel=Channel.EMAIL, sender_address="people@example.test", recipient="people@example.test", preferred=True)]),
         Person(person_id="coo", display_name="Casey Nguyen", role="COO", department="Executive", timezone="UTC", routes=[ContactRoute(route_id="coo-email", channel=Channel.EMAIL, sender_address="coo@example.test", recipient="coo@example.test", preferred=True)]),
         Person(person_id="vp-support", display_name="Jordan Brooks", role="VP", department="Support", timezone="UTC", routes=[ContactRoute(route_id="support-email", channel=Channel.EMAIL, sender_address="support@example.test", recipient="support@example.test", preferred=True)]),
@@ -164,3 +164,19 @@ def test_aligned_synthesis_persists_public_brief_and_routes_it_to_required_peopl
     }
     assert any(delivery.conversation_id == "manager-conversation" for delivery in result.deliveries)
     assert any(event.event_type == "alignment.brief_persisted" for event in repository.list_events(mandate.mandate_id))
+
+
+def test_primary_delivery_failure_immediately_uses_the_next_registered_route(
+    workflow, telegram_mandate, repository, now
+) -> None:
+    """Break caught: a failed primary delivery produces a reminder on that same route."""
+    created = workflow.handle(telegram_mandate)
+    primary = next(item for item in created.deliveries if item.assignment_id is not None and item.recipient == "lead@example.test")
+
+    retry = workflow.mark_delivery_result(primary, succeeded=False, now=now)
+
+    assert len(retry.deliveries) == 1
+    assert retry.deliveries[0].conversation_id == "lead-conversation"
+    assignment = repository.get_assignment(primary.assignment_id)
+    assert assignment is not None
+    assert assignment.active_route_index == 1

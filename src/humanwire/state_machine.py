@@ -103,6 +103,7 @@ ASSIGNMENT_TRANSITIONS: dict[StakeholderState, frozenset[StakeholderState]] = {
             StakeholderState.ACKNOWLEDGED,
             StakeholderState.FOLLOW_UP_DUE,
             StakeholderState.DECLINED,
+            StakeholderState.ALTERNATE_CHANNEL,
             StakeholderState.DELIVERY_FAILED,
         }
     ),

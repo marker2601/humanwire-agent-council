@@ -17,7 +17,6 @@ from humanwire.commands import (
 from humanwire.config import Settings
 from humanwire.directory import AmbiguousPersonError, OrganizationDirectory, UnknownPersonError
 from humanwire.domain import (
-    Channel,
     DeliveryInstruction,
     DeliveryKind,
     IncomingMessage,
@@ -78,7 +77,8 @@ class HumanWireWorkflow:
             failed = self.mandates.interviews.mark_delivery_failure(
                 instruction.assignment_id, delivery_id, now
             )
-            return WorkflowResult(deliveries=failed.deliveries)
+            synthesis = self.synthesis.run(instruction.assignment_id, now)
+            return WorkflowResult(deliveries=[*failed.deliveries, *synthesis.deliveries])
         return WorkflowResult()
 
     def _interview(self, message: IncomingMessage, command: FreeTextCommand | AcknowledgeCommand) -> WorkflowResult:
@@ -93,12 +93,29 @@ class HumanWireWorkflow:
                 assignment = self.repository.get_assignment(interview.assignment_id)
                 if assignment is not None:
                     candidates.append(assignment)
+        if isinstance(command, AcknowledgeCommand):
+            candidates = [
+                assignment
+                for assignment in candidates
+                if (mandate := self._mandate_for_assignment(assignment)) is not None
+                and mandate.token == command.token
+            ]
         if len(candidates) != 1:
             return self._reply(message, "Reply ACK <token> to select an active interview." if candidates else "Use /mandate to start a request.")
         assignment = candidates[0]
         result = self.mandates.interviews.acknowledge(message, assignment, message.received_at) if isinstance(command, AcknowledgeCommand) else self.mandates.interviews.record_answer(message, assignment, message.received_at)
         synthesis = self.synthesis.run(assignment.mandate_id, message.received_at)
         return WorkflowResult(deliveries=[*result.deliveries, *synthesis.deliveries])
+
+    def _mandate_for_assignment(self, assignment):
+        return next(
+            (
+                mandate
+                for mandate in self.repository.list_recent_mandates(1000)
+                if mandate.mandate_id == assignment.mandate_id
+            ),
+            None,
+        )
 
     def _status(self, message: IncomingMessage, token: str) -> WorkflowResult:
         mandate = self.repository.get_mandate_by_token(token)
@@ -257,7 +274,7 @@ class HumanWireWorkflow:
         return any(
             route.channel is message.channel
             and route.sender_address.casefold() == message.sender_address.casefold()
-            and (route.channel is not Channel.TELEGRAM or route.conversation_id == message.conversation_id)
+            and (route.conversation_id is None or route.conversation_id == message.conversation_id)
             for route in self.directory.ordered_routes(person_id)
         )
 
