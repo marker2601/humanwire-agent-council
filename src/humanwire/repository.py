@@ -384,6 +384,15 @@ def _engagement_decision_exists_or_conflicts(
     raise ValueError("assignment already has a decision")
 
 
+def _ensure_sqlite_write_transaction(session: Session) -> None:
+    connection = session.connection()
+    if connection.dialect.name != "sqlite":
+        return
+    driver_connection = connection.connection.driver_connection
+    if not driver_connection.in_transaction:
+        connection.exec_driver_sql("BEGIN")
+
+
 def _package_record(value: MeetingPackage) -> MeetingPackageRecord:
     return MeetingPackageRecord(
         meeting_id=str(value.meeting_id),
@@ -621,11 +630,13 @@ class RepositoryUnitOfWork:
     def add_engagement_decision(self, decision: EngagementDecision) -> None:
         if _engagement_decision_exists_or_conflicts(self._session, decision):
             return
-        self._session.add(_engagement_decision_record(decision))
+        _ensure_sqlite_write_transaction(self._session)
         try:
-            self._session.flush()
+            with self._session.begin_nested():
+                self._session.add(_engagement_decision_record(decision))
+                self._session.flush()
         except IntegrityError:
-            self._session.rollback()
+            self._session.expire_all()
             if _engagement_decision_exists_or_conflicts(self._session, decision):
                 return
             raise ValueError("engagement decision conflicts") from None

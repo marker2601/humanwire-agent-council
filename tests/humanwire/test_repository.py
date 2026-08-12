@@ -7,6 +7,7 @@ from pydantic import ValidationError
 from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 
+import humanwire.repository as repository_module
 from humanwire import domain
 from humanwire.database import (
     EngagementDecisionRecord,
@@ -487,6 +488,57 @@ def test_exact_duplicate_decision_race_is_inert_and_session_remains_usable(
     assert raced
     assert repository.get_engagement_decision(assignment.assignment_id) == decision
     assert repository.get_runtime_status("race.session") == ("usable", now)
+
+
+def test_exact_duplicate_race_preserves_earlier_unit_of_work_sibling_write(
+    tmp_path, sample_mandate, make_assignment, now, monkeypatch
+) -> None:
+    database_path = tmp_path / "engagement-race-sibling.db"
+    factory = create_session_factory(f"sqlite:///{database_path.as_posix()}")
+    repository = SqlAlchemyHumanWireRepository(factory)
+    repository.add_mandate(sample_mandate)
+    assignment = make_assignment()
+    repository.add_assignment(assignment)
+    decision = domain.EngagementDecision(
+        decision_id=uuid4(),
+        mandate_id=sample_mandate.mandate_id,
+        assignment_id=assignment.assignment_id,
+        stakeholder_id=assignment.person_id,
+        response=domain.EngagementDecisionKind.APPROVE,
+        source_message_id="message-race-sibling",
+        created_at=now,
+        idempotency_key="engagement-decision:race-sibling",
+    )
+    original_check = repository_module._engagement_decision_exists_or_conflicts
+    losing_session = None
+    raced = False
+
+    def interleave_winner(session, value):
+        nonlocal raced
+        result = original_check(session, value)
+        if session is losing_session and not result and not raced:
+            raced = True
+            with factory() as winning_session:
+                winning_session.add(repository_module._engagement_decision_record(value))
+                winning_session.commit()
+        return result
+
+    monkeypatch.setattr(
+        repository_module,
+        "_engagement_decision_exists_or_conflicts",
+        interleave_winner,
+    )
+    with factory() as session:
+        losing_session = session
+        unit = RepositoryUnitOfWork(session)
+        unit.set_runtime_status("race.earlier-sibling", "preserved", now)
+        with session.no_autoflush:
+            unit.add_engagement_decision(decision)
+        session.commit()
+
+    assert raced
+    assert repository.get_engagement_decision(assignment.assignment_id) == decision
+    assert repository.get_runtime_status("race.earlier-sibling") == ("preserved", now)
 
 
 def test_engagement_decisions_are_ordered_by_created_at_then_decision_id(
