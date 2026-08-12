@@ -20,6 +20,7 @@ from humanwire.domain import (
     Direction,
     EvidenceStatus,
     EvidenceType,
+    EvidenceVisibility,
     Mandate,
     MandateState,
     StakeholderAssignment,
@@ -66,6 +67,7 @@ _ENUM_FIELDS = {
     | {item.value for item in StakeholderState},
     "new_state": {item.value for item in MandateState} | {item.value for item in StakeholderState},
 }
+_PRIVATE_MARKER = "[PRIVATE]"
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -76,19 +78,48 @@ def _redact(value: str | None) -> str | None:
     return redact_sensitive(value) if value is not None else None
 
 
-def _public_projection(value: Any, field: str | None = None) -> Any:
+def _scrub_known_private(value: str, denied_values: frozenset[str]) -> str:
+    for private_value in sorted(denied_values, key=len, reverse=True):
+        value = value.replace(private_value, _PRIVATE_MARKER)
+    return value
+
+
+def _private_deny_values(repository: Any, mandate: Mandate) -> frozenset[str]:
+    denied: set[str] = set()
+    for item in repository.list_evidence(mandate.mandate_id):
+        if item.visibility is not EvidenceVisibility.PRIVATE:
+            continue
+        denied.update(
+            value
+            for value in (
+                item.statement,
+                item.related_decision,
+                item.resource,
+                item.source_message_id,
+            )
+            if value
+        )
+    return frozenset(denied)
+
+
+def _public_projection(
+    value: Any,
+    field: str | None = None,
+    denied_values: frozenset[str] = frozenset(),
+) -> Any:
     """Apply one recursive privacy boundary immediately before public serialization."""
     if isinstance(value, Mapping):
         return {
-            str(key): _public_projection(item, str(key))
+            str(key): _public_projection(item, str(key), denied_values)
             for key, item in value.items()
             if str(key) not in _PRIVATE_PROJECTION_KEYS
             and _SAFE_PUBLIC_KEY.fullmatch(str(key))
         }
     if isinstance(value, (list, tuple)):
-        return [_public_projection(item, field) for item in value]
+        return [_public_projection(item, field, denied_values) for item in value]
     if not isinstance(value, str):
         return value
+    value = _scrub_known_private(value, denied_values)
     if field in _IDENTIFIER_FIELDS or (field is not None and field.endswith("_ids")):
         return value if _SAFE_IDENTIFIER.fullmatch(value) else "[REDACTED]"
     if field == "event_type":
@@ -282,11 +313,28 @@ def _meeting_projection(repository: Any, package: Any) -> dict[str, Any]:
     }
 
 
-def _verified_calendar(repository: Any, mandate: Mandate) -> bytes | None:
+def _verified_calendar(repository: Any, mandate: Mandate, current_time: datetime) -> bytes | None:
     if mandate.state is not MandateState.MEETING_READY:
         return None
     package = repository.get_meeting_package(mandate.mandate_id)
     if package is None or package.proposed_start is None or package.proposed_end is None:
+        return None
+    creation_events = [
+        event
+        for event in repository.list_events(mandate.mandate_id)
+        if event.event_type == "meeting.package_created"
+    ]
+    if len(creation_events) != 1:
+        return None
+    creation_event = creation_events[0]
+    if (
+        creation_event.actor_id != mandate.initiator_id
+        or creation_event.metadata != {"meeting_id": str(package.meeting_id)}
+        or creation_event.created_at != package.created_at
+        or creation_event.created_at < mandate.created_at
+        or creation_event.created_at > mandate.updated_at
+        or creation_event.created_at > current_time.astimezone(UTC)
+    ):
         return None
     assignments = repository.list_assignments(mandate.mandate_id)
     report = AlignmentReport(
@@ -339,6 +387,18 @@ def _verified_calendar(repository: Any, mandate: Mandate) -> bytes | None:
         return None
     if rebuilt.model_dump(mode="json") != package.model_dump(mode="json"):
         return None
+    denied_values = _private_deny_values(repository, mandate)
+    public_objective = _scrub_known_private(mandate.plan.objective, denied_values)
+    if public_objective != mandate.plan.objective:
+        rebuilt = coordinator.build_package(
+            mandate.plan.model_copy(update={"objective": public_objective}),
+            report,
+            assignments,
+            decision_owner_id,
+            shareable_evidence(evidence),
+            proposed_slot=slot,
+            created_at=creation_event.created_at,
+        )
     return render_ics(rebuilt, coordinator)
 
 
@@ -394,9 +454,14 @@ def create_app(
             raise HTTPException(status_code=404, detail="Not found")
         return mandate
 
-    def safe_projection(operation: Callable[[], Any]) -> Any:
+    def safe_projection(operation: Callable[[], Any], mandate: Mandate | None = None) -> Any:
         try:
-            return _public_projection(operation())
+            denied_values = (
+                _private_deny_values(repository, mandate)
+                if mandate is not None
+                else frozenset()
+            )
+            return _public_projection(operation(), denied_values=denied_values)
         except HTTPException:
             raise
         except Exception as error:
@@ -404,9 +469,16 @@ def create_app(
 
     @app.get("/", response_class=HTMLResponse)
     def home():
-        mandates = safe_projection(
-            lambda: [_mandate_summary(repository, item) for item in repository.list_recent_mandates()]
-        )
+        def project():
+            return [
+                _public_projection(
+                    _mandate_summary(repository, item),
+                    denied_values=_private_deny_values(repository, item),
+                )
+                for item in repository.list_recent_mandates()
+            ]
+
+        mandates = safe_projection(project)
         return _html_page("HumanWire", mandates)
 
     @app.get("/mandates/{token}", response_class=HTMLResponse)
@@ -414,13 +486,13 @@ def create_app(
         mandate = load_mandate(token)
         return _html_page(
             f"HumanWire {mandate.token}",
-            safe_projection(lambda: _mandate_detail(repository, mandate)),
+            safe_projection(lambda: _mandate_detail(repository, mandate), mandate),
         )
 
     @app.get("/mandates/{token}/reach", response_class=HTMLResponse)
     def reach(token: str):
         mandate = load_mandate(token)
-        rows = safe_projection(lambda: _stakeholders(repository, mandate))
+        rows = safe_projection(lambda: _stakeholders(repository, mandate), mandate)
         lanes = {
             direction: [row for row in rows if row["direction"] == direction]
             for direction in ("downward", "lateral", "upward", "external")
@@ -432,13 +504,13 @@ def create_app(
         mandate = load_mandate(token)
         return _html_page(
             f"HumanWire {mandate.token} Data",
-            safe_projection(lambda: _events(repository, mandate)),
+            safe_projection(lambda: _events(repository, mandate), mandate),
         )
 
     @app.get("/mandates/{token}/meeting.ics")
     def meeting_ics(token: str):
         mandate = load_mandate(token)
-        content = safe_projection(lambda: _verified_calendar(repository, mandate))
+        content = safe_projection(lambda: _verified_calendar(repository, mandate, now()), mandate)
         if content is None:
             raise HTTPException(status_code=404, detail="Not found")
         return Response(
@@ -506,28 +578,34 @@ def create_app(
             mandates = repository.list_recent_mandates()
             if state is not None:
                 mandates = [mandate for mandate in mandates if mandate.state.value == state]
-            return [_mandate_summary(repository, mandate) for mandate in mandates]
+            return [
+                _public_projection(
+                    _mandate_summary(repository, mandate),
+                    denied_values=_private_deny_values(repository, mandate),
+                )
+                for mandate in mandates
+            ]
 
         return safe_projection(project)
 
     @app.get("/api/v1/mandates/{token}")
     def mandate_detail(token: str):
         mandate = load_mandate(token)
-        return safe_projection(lambda: _mandate_detail(repository, mandate))
+        return safe_projection(lambda: _mandate_detail(repository, mandate), mandate)
 
     @app.get("/api/v1/mandates/{token}/stakeholders")
     def mandate_stakeholders(token: str):
         mandate = load_mandate(token)
-        return safe_projection(lambda: _stakeholders(repository, mandate))
+        return safe_projection(lambda: _stakeholders(repository, mandate), mandate)
 
     @app.get("/api/v1/mandates/{token}/outreach-events")
     def mandate_events(token: str):
         mandate = load_mandate(token)
-        return safe_projection(lambda: _events(repository, mandate))
+        return safe_projection(lambda: _events(repository, mandate), mandate)
 
     @app.get("/api/v1/mandates/{token}/evidence-summary")
     def mandate_evidence(token: str):
         mandate = load_mandate(token)
-        return safe_projection(lambda: _evidence_summary(repository, mandate))
+        return safe_projection(lambda: _evidence_summary(repository, mandate), mandate)
 
     return app

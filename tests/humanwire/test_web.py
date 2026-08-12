@@ -1,5 +1,6 @@
 import json
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,7 +16,7 @@ from humanwire.database import (
     StakeholderAssignmentRecord,
 )
 from humanwire.demo import create_demo_app
-from humanwire.domain import AvailabilityWindow
+from humanwire.domain import AvailabilityWindow, DomainEvent, EvidenceVisibility
 from humanwire.web import create_app
 from humanwire.workflow import json_windows
 
@@ -268,6 +269,136 @@ def test_every_public_surface_applies_one_recursive_sanitization_boundary(demo_a
     }
 
 
+def test_private_evidence_text_is_denied_on_every_surface_but_public_text_remains(
+    demo_app,
+) -> None:
+    repository = demo_app.state.repository
+    primary = repository.get_mandate_by_token("HW-2411")
+    meeting = repository.get_mandate_by_token("HW-2413")
+    assert primary is not None and meeting is not None
+    private_statement = "The north conference room will be unavailable on Friday."
+    private_decision = "Move the review to the quiet room."
+    private_resource = "Blue binder reference seven."
+    public_statement = "Approved public coverage remains available."
+
+    primary_evidence = repository.list_evidence(primary.mandate_id)
+    private_primary = next(
+        item for item in primary_evidence if item.visibility == EvidenceVisibility.PRIVATE
+    )
+    shareable_primary = next(
+        item for item in primary_evidence if item.visibility == EvidenceVisibility.SHAREABLE
+    )
+    repository.add_evidence(
+        private_primary.model_copy(
+            update={
+                "evidence_id": uuid4(),
+                "mandate_id": meeting.mandate_id,
+                "assignment_id": repository.list_assignments(meeting.mandate_id)[0].assignment_id,
+                "statement": private_statement,
+                "related_decision": private_decision,
+                "resource": private_resource,
+                "source_message_id": "private-source-ordinary-phrase",
+            }
+        )
+    )
+
+    meeting_plan = meeting.plan.model_dump(mode="json")
+    meeting_plan["objective"] = private_statement
+    with repository._session_factory() as session:
+        session.execute(
+            update(EvidenceItemRecord)
+            .where(EvidenceItemRecord.evidence_id == str(private_primary.evidence_id))
+            .values(
+                statement=private_statement,
+                related_decision=private_decision,
+                resource=private_resource,
+            )
+        )
+        session.execute(
+            update(EvidenceItemRecord)
+            .where(EvidenceItemRecord.evidence_id == str(shareable_primary.evidence_id))
+            .values(statement=public_statement)
+        )
+        session.execute(
+            update(MandateRecord)
+            .where(MandateRecord.mandate_id == str(primary.mandate_id))
+            .values(objective=private_statement)
+        )
+        session.execute(
+            update(MandateRecord)
+            .where(MandateRecord.mandate_id == str(meeting.mandate_id))
+            .values(objective=private_statement, plan=meeting_plan)
+        )
+        assignment_id = session.scalar(
+            StakeholderAssignmentRecord.__table__.select()
+            .with_only_columns(StakeholderAssignmentRecord.assignment_id)
+            .where(StakeholderAssignmentRecord.mandate_id == str(primary.mandate_id))
+            .limit(1)
+        )
+        session.execute(
+            update(StakeholderAssignmentRecord)
+            .where(StakeholderAssignmentRecord.assignment_id == assignment_id)
+            .values(reason=private_decision)
+        )
+        event_id = session.scalar(
+            DomainEventRecord.__table__.select()
+            .with_only_columns(DomainEventRecord.event_id)
+            .where(DomainEventRecord.mandate_id == str(primary.mandate_id))
+            .limit(1)
+        )
+        session.execute(
+            update(DomainEventRecord)
+            .where(DomainEventRecord.event_id == event_id)
+            .values(
+                department=private_resource,
+                event_metadata={"references": [{"status": private_statement}]},
+            )
+        )
+        session.execute(
+            update(MeetingPackageRecord)
+            .where(MeetingPackageRecord.mandate_id == str(meeting.mandate_id))
+            .values(purpose=private_statement)
+        )
+        session.execute(
+            update(RuntimeStatusRecord)
+            .where(RuntimeStatusRecord.key == "public.person:maya-chen")
+            .values(value=json.dumps({"name": "Maya Chen", "role": private_decision}))
+        )
+        session.commit()
+
+    client = TestClient(demo_app)
+    paths = [
+        "/",
+        "/mandates/HW-2411",
+        "/mandates/HW-2411/reach",
+        "/mandates/HW-2411/data",
+        "/mandates/HW-2413",
+        "/mandates/HW-2413/meeting.ics",
+        "/api/v1/mandates",
+        "/api/v1/mandates/HW-2411",
+        "/api/v1/mandates/HW-2411/stakeholders",
+        "/api/v1/mandates/HW-2411/outreach-events",
+        "/api/v1/mandates/HW-2411/evidence-summary",
+    ]
+    responses = [client.get(path) for path in paths]
+    serialized = "\n".join(
+        response.text + json.dumps(dict(response.headers)) for response in responses
+    )
+
+    assert all(response.status_code == 200 for response in responses)
+    assert private_statement not in serialized
+    assert private_decision not in serialized
+    assert private_resource not in serialized
+    assert "[PRIVATE]" in serialized
+    assert public_statement in serialized
+    anonymous = client.get("/api/v1/mandates/HW-2411/evidence-summary").json()
+    anonymous_item = next(
+        item for item in anonymous["items"] if item["stakeholder_id"] is None
+    )
+    assert anonymous_item["statement"]
+    assert anonymous_item["stakeholder_id"] is None
+
+
 def test_list_filter_stakeholders_events_evidence_and_reach_are_persisted_projections(
     web_client,
 ) -> None:
@@ -444,6 +575,61 @@ def test_ics_fails_closed_when_persisted_verification_is_missing(demo_app) -> No
 
     assert response.status_code == 404
     assert "malformed" not in response.text
+
+
+def test_ics_rejects_package_creation_timestamp_not_proven_by_event(demo_app) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2413")
+    assert mandate is not None
+    package = repository.get_meeting_package(mandate.mandate_id)
+    assert package is not None
+    repository.save_meeting_package(
+        package.model_copy(update={"created_at": package.created_at + timedelta(hours=2)})
+    )
+
+    response = TestClient(demo_app).get("/mandates/HW-2413/meeting.ics")
+
+    assert response.status_code == 404
+
+
+def test_ics_rejects_missing_package_creation_event(demo_app) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2413")
+    assert mandate is not None
+    with repository._session_factory() as session:
+        session.execute(
+            delete(DomainEventRecord).where(
+                DomainEventRecord.mandate_id == str(mandate.mandate_id),
+                DomainEventRecord.event_type == "meeting.package_created",
+            )
+        )
+        session.commit()
+
+    response = TestClient(demo_app).get("/mandates/HW-2413/meeting.ics")
+
+    assert response.status_code == 404
+
+
+def test_ics_rejects_duplicate_conflicting_package_creation_events(demo_app) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2413")
+    assert mandate is not None
+    package = repository.get_meeting_package(mandate.mandate_id)
+    assert package is not None
+    repository.append_event(
+        mandate.mandate_id,
+        DomainEvent(
+            event_type="meeting.package_created",
+            created_at=package.created_at + timedelta(minutes=1),
+            idempotency_key="duplicate-package-creation-proof",
+            actor_id=mandate.initiator_id,
+            metadata={"meeting_id": str(package.meeting_id)},
+        ),
+    )
+
+    response = TestClient(demo_app).get("/mandates/HW-2413/meeting.ics")
+
+    assert response.status_code == 404
 
 
 def test_ics_rejects_package_owner_substitution_even_with_matching_attendees_and_availability(

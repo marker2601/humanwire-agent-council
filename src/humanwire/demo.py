@@ -159,18 +159,21 @@ def _event(
     channel: Channel | None = None,
     previous_state: str | None = None,
     new_state: str | None = None,
+    actor_id: str | None = None,
+    metadata: dict[str, str] | None = None,
 ) -> DomainEvent:
     return DomainEvent(
         event_type=event_type,
         created_at=mandate.created_at + timedelta(minutes=index),
         idempotency_key=f"demo-event-{mandate.token.lower()}-{index:02d}",
-        actor_id=mandate.initiator_id if index == 0 else None,
+        actor_id=mandate.initiator_id if index == 0 else actor_id,
         person_id=person_id,
         department=department,
         direction=direction,
         channel=channel,
         previous_state=previous_state,
         new_state=new_state,
+        metadata=metadata or {},
     )
 
 
@@ -477,6 +480,8 @@ def _seed_meeting_ready(repository: SqlAlchemyHumanWireRepository) -> None:
             direction=Direction.UPWARD,
             previous_state="scheduling",
             new_state="meeting_ready",
+            actor_id=mandate.initiator_id,
+            metadata={"meeting_id": str(package.meeting_id)},
         ),
     )
 
