@@ -80,6 +80,63 @@ class InterviewCoordinator:
             saved = updated
         return self.process_due_assignment(saved, now)
 
+    def prepare_assignment_start(
+        self,
+        assignment: StakeholderAssignment,
+        questions: list[str],
+        token: str,
+        summary: str,
+        now: datetime,
+    ) -> tuple[StakeholderAssignment, InterviewSession, DomainEvent, DeliveryInstruction]:
+        """Prepare initial outreach records for a caller-owned creation transaction."""
+        bounded_questions = questions[:5]
+        if not bounded_questions:
+            raise ValueError("interview questions are required")
+        routes = self._assignment_routes(assignment)
+        if not routes:
+            raise ValueError("assignment has no registered route")
+        session = InterviewSession(
+            session_id=uuid4(),
+            mandate_id=assignment.mandate_id,
+            assignment_id=assignment.assignment_id,
+            questions=bounded_questions,
+            started_at=now,
+            updated_at=now,
+        )
+        pending = assignment.model_copy(update={"interview_id": session.session_id})
+        queued = self._transition(pending, StakeholderState.CONTACT_QUEUED, "primary_outreach", now)
+        delivered = self._transition(queued, StakeholderState.DELIVERED, "primary_outreach", now)
+        updated = self._transition(
+            delivered,
+            StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+            "primary_outreach",
+            now,
+        ).model_copy(
+            update={
+                "attempt_count": 1,
+                "active_route_index": 0,
+                "first_contact_at": now,
+                "last_delivery_at": now,
+                "next_action_at": now + timedelta(seconds=self.settings.acknowledgement_seconds),
+            }
+        )
+        route = routes[0]
+        active_session = self._activate_route(session, route, route.conversation_id, now)
+        event = self._event(
+            "outreach.primary_sent",
+            updated,
+            assignment,
+            now,
+            f"interview:{updated.assignment_id}:outreach.primary_sent:{updated.attempt_count}",
+            {"attempt": 0},
+        )
+        delivery = self._route_delivery(
+            route,
+            render_interview_intro(token, summary, assignment.reason, len(bounded_questions)),
+            updated,
+        )
+        return updated, active_session, event, delivery
+
     def process_due_assignment(self, assignment: StakeholderAssignment, now: datetime) -> WorkflowResult:
         """Advance exactly one persisted response-ladder step when an assignment is due."""
         saved = self.repository.get_assignment(assignment.assignment_id)

@@ -26,7 +26,7 @@ from humanwire.domain import (
 )
 from humanwire.evidence import EvidenceExtractor, shareable_evidence
 from humanwire.meetings import MeetingCoordinator
-from humanwire.messages import render_meeting_confirmation, render_proposal
+from humanwire.messages import render_alignment_brief, render_meeting_confirmation, render_proposal
 from humanwire.repository import SqlAlchemyHumanWireRepository
 from humanwire.services import MandateService, SynthesisService, _event
 from humanwire.state_machine import MandateStateMachine
@@ -100,6 +100,10 @@ class HumanWireWorkflow:
             person = self.directory.person_for_sender(message)
         except (UnknownPersonError, AmbiguousPersonError):
             return self._reply(message, "Use /mandate to start a request.")
+        if isinstance(command, FreeTextCommand) and self._is_stale_interview_conversation(
+            person.person_id, message
+        ):
+            return self._reply(message, "Reply ACK <token> to select an active interview.")
         candidates = []
         for mandate in self.repository.list_recent_mandates(1000):
             interview = self.repository.find_active_interview(mandate.mandate_id, person.person_id)
@@ -120,6 +124,24 @@ class HumanWireWorkflow:
         result = self.mandates.interviews.acknowledge(message, assignment, message.received_at) if isinstance(command, AcknowledgeCommand) else self.mandates.interviews.record_answer(message, assignment, message.received_at)
         synthesis = self.synthesis.run(assignment.mandate_id, message.received_at)
         return WorkflowResult(deliveries=[*result.deliveries, *synthesis.deliveries])
+
+    def _is_stale_interview_conversation(
+        self, person_id: str, message: IncomingMessage
+    ) -> bool:
+        completed_match = False
+        for mandate in self.repository.list_recent_mandates(1000):
+            for interview in self.repository.list_interviews(mandate.mandate_id):
+                assignment = self.repository.get_assignment(interview.assignment_id)
+                if (
+                    assignment is not None
+                    and assignment.person_id == person_id
+                    and interview.current_channel is message.channel
+                    and interview.current_conversation_id == message.conversation_id
+                ):
+                    if interview.completed_at is None and interview.acknowledged_at is not None:
+                        return False
+                    completed_match = completed_match or interview.completed_at is not None
+        return completed_match
 
     def _mandate_for_assignment(self, assignment):
         return next(
@@ -188,14 +210,43 @@ class HumanWireWorkflow:
             )
         except (UnknownPersonError, AmbiguousPersonError, ValueError):
             return self._reply(message, "That proposal response is not authorized or is no longer active.")
+        respondents = {
+            response.stakeholder_id
+            for response in self.repository.list_proposal_responses(proposal.proposal_id)
+        }
+        if not set(proposal.required_respondent_ids).issubset(respondents):
+            return WorkflowResult()
         outcome = coordinator.evaluate_round(proposal)
         if outcome is NegotiationOutcome.ALIGNED:
             aligned = MandateStateMachine().transition(
                 mandate, MandateState.ALIGNED, "proposal_accepted", message.received_at
             )
+            brief = render_alignment_brief(
+                mandate.token,
+                shareable_evidence(self.repository.list_evidence(mandate.mandate_id)),
+            )
             with self.repository.transaction() as unit:
                 unit.save_mandate(aligned)
+                unit.set_runtime_status(
+                    f"alignment-brief:{mandate.mandate_id}", brief, message.received_at
+                )
                 unit.append_event(mandate.mandate_id, _event("mandate.aligned", message.received_at, f"proposal:aligned:{proposal.proposal_id}", actor_id=person.person_id, previous_state="negotiating", new_state="aligned"))
+                unit.append_event(
+                    mandate.mandate_id,
+                    _event(
+                        "alignment.brief_persisted",
+                        message.received_at,
+                        f"alignment-brief:{mandate.mandate_id}",
+                        actor_id=mandate.initiator_id,
+                    ),
+                )
+            return WorkflowResult(
+                deliveries=self.synthesis._route_deliveries(
+                    [mandate.initiator_id, *proposal.required_respondent_ids],
+                    brief,
+                    mandate.token,
+                )
+            )
         elif outcome is NegotiationOutcome.NEXT_ROUND:
             report = AlignmentReport(mandate_id=mandate.mandate_id, issues=self.repository.list_issues(mandate.mandate_id), is_aligned=False)
             next_proposal = coordinator.create_proposal(mandate, report, 2, message.received_at)

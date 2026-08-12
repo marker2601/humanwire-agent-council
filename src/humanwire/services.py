@@ -133,6 +133,21 @@ class MandateService:
             final_mandate = self.state_machine.transition(
                 interviewing, MandateState.PARTIAL, "required_stakeholder_unreachable", now
             )
+        prepared_outreach = []
+        if not unavailable_required:
+            prepared_outreach = [
+                self.interviews.prepare_assignment_start(
+                    assignment,
+                    stakeholder.questions,
+                    token,
+                    mandate.objective,
+                    now,
+                )
+                for assignment, stakeholder in zip(
+                    assignments, resolved.plan.stakeholders, strict=True
+                )
+            ]
+            assignments = [item[0] for item in prepared_outreach]
         with self.repository.transaction() as unit:
             unit.add_mandate(final_mandate)
             unit.append_event(mandate.mandate_id, _event("mandate.received", now, f"{key}:received", actor_id=initiator.person_id, new_state="received", channel=message.channel))
@@ -144,13 +159,14 @@ class MandateService:
                 unit.add_assignment(assignment)
                 if assignment.state is StakeholderState.DELIVERY_FAILED:
                     unit.append_event(mandate.mandate_id, _event("outreach.delivery_failed", now, f"assignment:{assignment.assignment_id}:no-route", actor_id=initiator.person_id, metadata={"assignment_id": str(assignment.assignment_id), "reason_code": "no_registered_route"}))
+            for _, interview, event, _ in prepared_outreach:
+                unit.add_interview(interview)
+                unit.append_event(mandate.mandate_id, event)
             if unavailable_required:
                 unit.append_event(mandate.mandate_id, _event("mandate.partial", now, f"{key}:partial", actor_id=initiator.person_id, previous_state="interviewing", new_state="partial", metadata={"reason_code": "required_stakeholder_unreachable"}))
 
         deliveries = self._reply(message, f"HumanWire mandate {token} is recorded.").deliveries
-        if not unavailable_required:
-            for assignment, stakeholder in zip(assignments, resolved.plan.stakeholders, strict=True):
-                deliveries.extend(self.interviews.start_assignment(assignment, stakeholder.questions, now).deliveries)
+        deliveries.extend(item[3] for item in prepared_outreach)
         return WorkflowResult(deliveries=deliveries)
 
     @staticmethod
@@ -212,10 +228,23 @@ class SynthesisService:
 
     def _partial(self, mandate: Mandate, now: datetime) -> WorkflowResult:
         partial = self.state_machine.transition(mandate, MandateState.PARTIAL, "required_response_missing", now)
+        missing_names = [
+            self.directory.resolve_person(assignment.person_id).display_name
+            for assignment in self.repository.list_assignments(mandate.mandate_id)
+            if assignment.required and assignment.state is not StakeholderState.COMPLETE
+        ]
         with self.repository.transaction() as unit:
             unit.save_mandate(partial)
             unit.append_event(mandate.mandate_id, _event("mandate.partial", now, f"partial:{mandate.mandate_id}", actor_id=mandate.initiator_id, previous_state="interviewing", new_state="partial", metadata={"reason_code": "required_response_missing"}))
-        return WorkflowResult()
+        missing = ", ".join(missing_names) if missing_names else "a required stakeholder"
+        text = (
+            f"HUMANWIRE PARTIAL · {mandate.token}\n\n"
+            f"Required response missing from: {missing}. "
+            "No agreement or approval was inferred."
+        )
+        return WorkflowResult(
+            deliveries=self._route_deliveries([mandate.initiator_id], text, mandate.token)
+        )
 
     def _route_deliveries(
         self, person_ids: list[str], text: str, token: str

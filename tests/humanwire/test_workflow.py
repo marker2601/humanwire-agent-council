@@ -1,9 +1,16 @@
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import func, select
 
 from humanwire.config import Settings
-from humanwire.database import create_session_factory
+from humanwire.database import (
+    DomainEventRecord,
+    InterviewSessionRecord,
+    MandateRecord,
+    StakeholderAssignmentRecord,
+    create_session_factory,
+)
 from humanwire.directory import InitiatorPolicy, OrganizationDirectory, OrganizationDocument
 from humanwire.domain import (
     Channel,
@@ -14,6 +21,7 @@ from humanwire.domain import (
     EvidenceStatus,
     EvidenceType,
     EvidenceVisibility,
+    IncomingMessage,
     MandatePlan,
     MandateState,
     Person,
@@ -22,13 +30,23 @@ from humanwire.domain import (
 )
 from humanwire.evidence import RuleBasedEvidenceExtractor
 from humanwire.planning import ResolvedPlan
-from humanwire.repository import SqlAlchemyHumanWireRepository
+from humanwire.repository import RepositoryUnitOfWork, SqlAlchemyHumanWireRepository
 from humanwire.workflow import HumanWireWorkflow
 
 
 class DeterministicPlanner:
-    def __init__(self, people: list[Person]) -> None:
+    def __init__(
+        self,
+        people: list[Person],
+        *,
+        question_count: int = 1,
+        optional_people: set[str] | None = None,
+        fallback_reason: str | None = None,
+    ) -> None:
         self.people = people
+        self.question_count = question_count
+        self.optional_people = optional_people or set()
+        self.fallback_reason = fallback_reason
 
     def plan(self, text: str, initiator: Person) -> ResolvedPlan:
         del text, initiator
@@ -38,27 +56,223 @@ class DeterministicPlanner:
                 required_decisions=["Approve coverage"],
                 stakeholders=[
                     PlannedStakeholder(
-                        person_ref="team-lead", reason="Delivery input", direction=Direction.DOWNWARD,
-                        questions=["What is needed?"],
-                    ),
-                    PlannedStakeholder(
-                        person_ref="vp-people", reason="People input", direction=Direction.LATERAL,
-                        questions=["What policy applies?"],
-                    ),
-                    PlannedStakeholder(
-                        person_ref="coo", reason="Executive input", direction=Direction.UPWARD,
-                        questions=["What decision is required?"],
-                    ),
-                    PlannedStakeholder(
-                        person_ref="vp-support", reason="Support input", direction=Direction.LATERAL,
-                        questions=["What support constraint applies?"],
-                    ),
+                        person_ref=person.person_id,
+                        reason=f"{person.display_name} input",
+                        direction={
+                            "team-lead": Direction.DOWNWARD,
+                            "coo": Direction.UPWARD,
+                        }.get(person.person_id, Direction.LATERAL),
+                        required=person.person_id not in self.optional_people,
+                        questions=[f"Question {index + 1}?" for index in range(self.question_count)],
+                    )
+                    for person in self.people
                 ],
                 completion_conditions=["All required interviews complete"],
             ),
             people=self.people,
-            planner="deterministic",
+            planner="rules" if self.fallback_reason else "deterministic",
+            fallback_reason=self.fallback_reason,
         )
+
+
+def _people(*, lead_email_thread: str | None = None) -> tuple[Person, list[Person]]:
+    manager = Person(
+        person_id="manager",
+        display_name="Morgan Lee",
+        role="Manager",
+        department="Operations",
+        timezone="UTC",
+        routes=[
+            ContactRoute(
+                route_id="manager-tg",
+                channel=Channel.TELEGRAM,
+                sender_address="manager-chat",
+                conversation_id="manager-conversation",
+                preferred=True,
+            )
+        ],
+    )
+    people = [
+        Person(
+            person_id="team-lead",
+            display_name="Riley Chen",
+            role="Lead",
+            department="Operations",
+            timezone="UTC",
+            manager_id="manager",
+            routes=[
+                ContactRoute(
+                    route_id="lead-email",
+                    channel=Channel.EMAIL,
+                    sender_address="lead@example.test",
+                    recipient="lead@example.test",
+                    conversation_id=lead_email_thread,
+                    preferred=True,
+                ),
+                ContactRoute(
+                    route_id="lead-telegram",
+                    channel=Channel.TELEGRAM,
+                    sender_address="lead-chat",
+                    conversation_id="lead-conversation",
+                ),
+            ],
+        ),
+        Person(
+            person_id="vp-people",
+            display_name="Avery Patel",
+            role="VP",
+            department="People",
+            timezone="UTC",
+            routes=[
+                ContactRoute(
+                    route_id="people-email",
+                    channel=Channel.EMAIL,
+                    sender_address="people@example.test",
+                    recipient="people@example.test",
+                    preferred=True,
+                )
+            ],
+        ),
+        Person(
+            person_id="coo",
+            display_name="Casey Nguyen",
+            role="COO",
+            department="Executive",
+            timezone="UTC",
+            routes=[
+                ContactRoute(
+                    route_id="coo-email",
+                    channel=Channel.EMAIL,
+                    sender_address="coo@example.test",
+                    recipient="coo@example.test",
+                    preferred=True,
+                )
+            ],
+        ),
+        Person(
+            person_id="vp-support",
+            display_name="Jordan Brooks",
+            role="VP",
+            department="Support",
+            timezone="UTC",
+            routes=[
+                ContactRoute(
+                    route_id="support-email",
+                    channel=Channel.EMAIL,
+                    sender_address="support@example.test",
+                    recipient="support@example.test",
+                    preferred=True,
+                )
+            ],
+        ),
+    ]
+    return manager, people
+
+
+def _directory(*, lead_email_thread: str | None = None) -> tuple[OrganizationDirectory, list[Person]]:
+    manager, people = _people(lead_email_thread=lead_email_thread)
+    directory = OrganizationDirectory(
+        OrganizationDocument(
+            people=[manager, *people],
+            initiator_policies=[
+                InitiatorPolicy(
+                    person_id="manager",
+                    allowed_directions={Direction.DOWNWARD, Direction.LATERAL, Direction.UPWARD},
+                    allowed_departments={"Operations", "People", "Executive", "Support"},
+                )
+            ],
+        )
+    )
+    return directory, people
+
+
+def _build_workflow(
+    repository: SqlAlchemyHumanWireRepository,
+    *,
+    person_ids: tuple[str, ...] = ("team-lead",),
+    question_count: int = 1,
+    optional_people: set[str] | None = None,
+    fallback_reason: str | None = None,
+    lead_email_thread: str | None = None,
+) -> HumanWireWorkflow:
+    directory, all_people = _directory(lead_email_thread=lead_email_thread)
+    selected = [person for person in all_people if person.person_id in person_ids]
+    return HumanWireWorkflow(
+        directory,
+        repository,
+        DeterministicPlanner(
+            selected,
+            question_count=question_count,
+            optional_people=optional_people,
+            fallback_reason=fallback_reason,
+        ),
+        RuleBasedEvidenceExtractor(),
+        Settings(),
+    )
+
+
+def _message_for(
+    incoming_message_factory,
+    person_id: str,
+    text: str,
+    *,
+    message_id: str,
+    conversation_id: str | None = None,
+) -> IncomingMessage:
+    routes = {
+        "manager": (Channel.TELEGRAM, "manager-chat", "manager-conversation"),
+        "team-lead": (Channel.EMAIL, "lead@example.test", "lead-thread"),
+        "vp-people": (Channel.EMAIL, "people@example.test", "people-thread"),
+    }
+    channel, sender, default_conversation = routes[person_id]
+    return incoming_message_factory(
+        text=text,
+        channel=channel,
+        sender_address=sender,
+        conversation_id=default_conversation if conversation_id is None else conversation_id,
+        message_id=message_id,
+    )
+
+
+def _create_mandate(workflow, incoming_message_factory, *, message_id: str = "create-1"):
+    result = workflow.handle(
+        incoming_message_factory(
+            text="/mandate\nCoordinate launch coverage",
+            message_id=message_id,
+        )
+    )
+    return workflow.repository.list_recent_mandates(1)[0], result
+
+
+def _complete_interview(
+    workflow,
+    incoming_message_factory,
+    mandate,
+    person_id: str,
+    *,
+    prefix: str,
+    answer: str = "We cannot approve this yet.",
+):
+    workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            person_id,
+            f"ACK {mandate.token}",
+            message_id=f"{prefix}-ack",
+        )
+    )
+    return workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            person_id,
+            answer,
+            message_id=f"{prefix}-answer",
+        )
+    )
+
+
+def _event_types(repository, mandate_id) -> set[str]:
+    return {event.event_type for event in repository.list_events(mandate_id)}
 
 
 @pytest.fixture
@@ -68,18 +282,10 @@ def repository() -> SqlAlchemyHumanWireRepository:
 
 @pytest.fixture
 def workflow(repository: SqlAlchemyHumanWireRepository) -> HumanWireWorkflow:
-    manager = Person(person_id="manager", display_name="Morgan Lee", role="Manager", department="Operations", timezone="UTC", routes=[ContactRoute(route_id="manager-tg", channel=Channel.TELEGRAM, sender_address="manager-chat", conversation_id="manager-conversation", preferred=True)])
-    people = [
-        Person(person_id="team-lead", display_name="Riley Chen", role="Lead", department="Operations", timezone="UTC", manager_id="manager", routes=[ContactRoute(route_id="lead-email", channel=Channel.EMAIL, sender_address="lead@example.test", recipient="lead@example.test", preferred=True), ContactRoute(route_id="lead-telegram", channel=Channel.TELEGRAM, sender_address="lead-chat", conversation_id="lead-conversation")]),
-        Person(person_id="vp-people", display_name="Avery Patel", role="VP", department="People", timezone="UTC", routes=[ContactRoute(route_id="people-email", channel=Channel.EMAIL, sender_address="people@example.test", recipient="people@example.test", preferred=True)]),
-        Person(person_id="coo", display_name="Casey Nguyen", role="COO", department="Executive", timezone="UTC", routes=[ContactRoute(route_id="coo-email", channel=Channel.EMAIL, sender_address="coo@example.test", recipient="coo@example.test", preferred=True)]),
-        Person(person_id="vp-support", display_name="Jordan Brooks", role="VP", department="Support", timezone="UTC", routes=[ContactRoute(route_id="support-email", channel=Channel.EMAIL, sender_address="support@example.test", recipient="support@example.test", preferred=True)]),
-    ]
-    directory = OrganizationDirectory(OrganizationDocument(
-        people=[manager, *people],
-        initiator_policies=[InitiatorPolicy(person_id="manager", allowed_directions={Direction.DOWNWARD, Direction.LATERAL, Direction.UPWARD}, allowed_departments={"Operations", "People", "Executive", "Support"})],
-    ))
-    return HumanWireWorkflow(directory, repository, DeterministicPlanner(people), RuleBasedEvidenceExtractor(), Settings())
+    return _build_workflow(
+        repository,
+        person_ids=("team-lead", "vp-people", "coo", "vp-support"),
+    )
 
 
 @pytest.fixture
@@ -114,12 +320,634 @@ def test_duplicate_incoming_mandate_returns_existing_state_without_second_outrea
     assert second.deliveries == []
 
 
+def test_model_planning_failure_uses_persisted_fallback_and_duplicate_is_inert(
+    repository, incoming_message_factory
+) -> None:
+    """Break caught: planner fallback is silent or duplicate creation repeats outreach."""
+    workflow = _build_workflow(repository, fallback_reason="provider_timeout")
+    message = incoming_message_factory(
+        text="/mandate\nCoordinate launch coverage",
+        message_id="fallback-create",
+    )
+
+    first = workflow.handle(message)
+    mandate = repository.list_recent_mandates(1)[0]
+    events_before = repository.list_events(mandate.mandate_id)
+    duplicate = workflow.handle(message)
+
+    fallback = next(event for event in events_before if event.event_type == "model.fallback")
+    assert mandate.objective == "Coordinate launch coverage"
+    assert fallback.metadata == {"reason_code": "provider_timeout"}
+    assert len(first.deliveries) == 2
+    assert duplicate.deliveries == []
+    assert len(repository.list_recent_mandates()) == 1
+    assert repository.list_events(mandate.mandate_id) == events_before
+
+
 def test_unknown_sender_cannot_create_mandate(workflow, incoming_message_factory, repository) -> None:
     """Break caught: unauthenticated senders gain mandate authority."""
     result = workflow.handle(incoming_message_factory(text="/mandate\nCoordinate Riley", sender_address="unknown"))
 
     assert result.deliveries[0].kind is DeliveryKind.REPLY_TO_MESSAGE
     assert repository.list_recent_mandates() == []
+
+
+def test_late_reply_and_unknown_sender_fail_closed_without_mutation(
+    repository, incoming_message_factory
+) -> None:
+    """Break caught: stale or unauthenticated free text becomes interview evidence."""
+    workflow = _build_workflow(repository)
+    mandate, _ = _create_mandate(workflow, incoming_message_factory)
+    _complete_interview(
+        workflow,
+        incoming_message_factory,
+        mandate,
+        "team-lead",
+        prefix="complete",
+    )
+    newer, _ = _create_mandate(workflow, incoming_message_factory, message_id="newer-create")
+    events_before = repository.list_events(newer.mandate_id)
+    evidence_before = repository.list_evidence(newer.mandate_id)
+    assignment_before = repository.list_assignments(newer.mandate_id)[0]
+
+    late = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            "A late answer must not count.",
+            message_id="late-answer",
+        )
+    )
+    unknown = workflow.handle(
+        incoming_message_factory(
+            text="An unknown answer must not count.",
+            channel=Channel.EMAIL,
+            sender_address="unknown@example.test",
+            conversation_id="lead-thread",
+            message_id="unknown-answer",
+        )
+    )
+
+    assert late.deliveries[0].kind is DeliveryKind.REPLY_TO_MESSAGE
+    assert unknown.deliveries[0].kind is DeliveryKind.REPLY_TO_MESSAGE
+    assert repository.list_events(newer.mandate_id) == events_before
+    assert repository.list_evidence(newer.mandate_id) == evidence_before
+    assert repository.list_assignments(newer.mandate_id)[0] == assignment_before
+
+    workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"ACK {newer.token}",
+            message_id="newer-ack",
+        )
+    )
+    legitimate = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            "The explicitly selected interview may continue.",
+            message_id="newer-answer",
+        )
+    )
+
+    assert repository.list_assignments(newer.mandate_id)[0].state is StakeholderState.COMPLETE
+    assert len(repository.list_evidence(newer.mandate_id)) == 1
+    assert legitimate.deliveries
+
+
+def test_multiple_active_interviews_require_token_and_correct_ack_disambiguates(
+    repository, incoming_message_factory
+) -> None:
+    """Break caught: ambiguous free text or a wrong ACK token mutates one active interview."""
+    workflow = _build_workflow(repository)
+    first, _ = _create_mandate(workflow, incoming_message_factory, message_id="first-create")
+    second, _ = _create_mandate(workflow, incoming_message_factory, message_id="second-create")
+    before = {
+        assignment.mandate_id: assignment
+        for mandate in (first, second)
+        for assignment in repository.list_assignments(mandate.mandate_id)
+    }
+    events_before = {
+        mandate.mandate_id: repository.list_events(mandate.mandate_id)
+        for mandate in (first, second)
+    }
+
+    ambiguous = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            "This answer has no token.",
+            message_id="ambiguous-answer",
+        )
+    )
+    wrong = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            "ACK HW-FFFFFFFF",
+            message_id="wrong-ack",
+        )
+    )
+    assert "ACK <token>" in ambiguous.deliveries[0].text
+    assert wrong.deliveries[0].kind is DeliveryKind.REPLY_TO_MESSAGE
+    for mandate in (first, second):
+        assert repository.list_assignments(mandate.mandate_id) == [before[mandate.mandate_id]]
+        assert repository.list_events(mandate.mandate_id) == events_before[mandate.mandate_id]
+
+    selected = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"ACK {first.token}",
+            message_id="correct-ack",
+        )
+    )
+
+    first_assignment = repository.list_assignments(first.mandate_id)[0]
+    second_assignment = repository.list_assignments(second.mandate_id)[0]
+    assert first_assignment.state is StakeholderState.INTERVIEWING
+    assert second_assignment == before[second.mandate_id]
+    assert selected.deliveries[0].text.startswith("Question 1 of 1")
+    assert "stakeholder.acknowledged" in _event_types(repository, first.mandate_id)
+    assert repository.list_evidence(first.mandate_id) == []
+    assert repository.list_evidence(second.mandate_id) == []
+
+
+def test_workflow_advances_answers_and_explicit_decline_produces_routed_partial(
+    repository, incoming_message_factory
+) -> None:
+    """Break caught: answers skip questions or DECLINE is recorded as evidence/agreement."""
+    workflow = _build_workflow(repository, question_count=2)
+    mandate, _ = _create_mandate(workflow, incoming_message_factory)
+    workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"ACK {mandate.token}",
+            message_id="progress-ack",
+        )
+    )
+
+    progressed = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            "The launch needs a checklist.",
+            message_id="answer-one",
+        )
+    )
+    declined = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"DECLINE {mandate.token}",
+            message_id="explicit-decline",
+        )
+    )
+
+    assignment = repository.list_assignments(mandate.mandate_id)[0]
+    interview = repository.get_interview(assignment.interview_id)
+    assert progressed.deliveries[0].text.startswith("Question 2 of 2")
+    assert interview is not None and interview.current_question_index == 1
+    assert assignment.state is StakeholderState.DECLINED
+    assert repository.get_mandate_by_token(mandate.token).state is MandateState.PARTIAL
+    assert len(repository.list_evidence(mandate.mandate_id)) == 1
+    assert {"interview.answer_recorded", "stakeholder.declined", "mandate.partial"} <= _event_types(
+        repository, mandate.mandate_id
+    )
+    assert len(declined.deliveries) == 1
+    assert declined.deliveries[0].conversation_id == "manager-conversation"
+    assert "missing" in declined.deliveries[0].text.casefold()
+
+
+def test_completed_interview_enters_negotiating_with_routed_proposal_and_events(
+    repository, incoming_message_factory
+) -> None:
+    """Break caught: completed but unresolved evidence skips durable negotiation."""
+    workflow = _build_workflow(repository)
+    mandate, _ = _create_mandate(workflow, incoming_message_factory)
+
+    result = _complete_interview(
+        workflow,
+        incoming_message_factory,
+        mandate,
+        "team-lead",
+        prefix="negotiate",
+    )
+
+    saved = repository.get_mandate_by_token(mandate.token)
+    proposal = repository.get_active_proposal(mandate.mandate_id)
+    assert saved is not None and saved.state is MandateState.NEGOTIATING
+    assert proposal is not None and proposal.round_number == 1
+    assert len(result.deliveries) == 1
+    assert result.deliveries[0].recipient == "lead@example.test"
+    assert result.deliveries[0].text.startswith("HUMANWIRE DRAFT PROPOSAL")
+    assert {"mandate.synthesizing", "proposal.created", "mandate.negotiating"} <= _event_types(
+        repository, mandate.mandate_id
+    )
+
+
+def test_authenticated_proposal_acceptance_persists_and_routes_public_alignment_brief(
+    repository, incoming_message_factory
+) -> None:
+    """Break caught: proposal acceptance becomes ALIGNED without a durable routed brief."""
+    workflow = _build_workflow(repository)
+    mandate, _ = _create_mandate(workflow, incoming_message_factory)
+    _complete_interview(
+        workflow,
+        incoming_message_factory,
+        mandate,
+        "team-lead",
+        prefix="accept",
+    )
+
+    accepted = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"ACCEPT {mandate.token}",
+            message_id="proposal-accepted",
+        )
+    )
+
+    saved = repository.get_mandate_by_token(mandate.token)
+    brief = repository.get_runtime_status(f"alignment-brief:{mandate.mandate_id}")
+    assert saved is not None and saved.state is MandateState.ALIGNED
+    assert brief is not None and brief[0].startswith("HUMANWIRE ALIGNMENT BRIEF")
+    assert len(accepted.deliveries) == 2
+    assert {delivery.recipient for delivery in accepted.deliveries if delivery.recipient} == {
+        "lead@example.test"
+    }
+    assert any(
+        delivery.conversation_id == "manager-conversation"
+        for delivery in accepted.deliveries
+    )
+    assert {"proposal.response_recorded", "mandate.aligned", "alignment.brief_persisted"} <= (
+        _event_types(repository, mandate.mandate_id)
+    )
+
+
+def test_proposals_require_all_authenticated_respondents_and_cap_after_round_two(
+    repository, incoming_message_factory
+) -> None:
+    """Break caught: one response advances a multi-party round or round two exceeds its cap."""
+    workflow = _build_workflow(repository, person_ids=("team-lead", "vp-people"))
+    mandate, _ = _create_mandate(workflow, incoming_message_factory)
+    _complete_interview(
+        workflow,
+        incoming_message_factory,
+        mandate,
+        "team-lead",
+        prefix="lead",
+    )
+    proposal_result = _complete_interview(
+        workflow,
+        incoming_message_factory,
+        mandate,
+        "vp-people",
+        prefix="people",
+    )
+    round_one = repository.get_active_proposal(mandate.mandate_id)
+    assert round_one is not None and round_one.round_number == 1
+    assert {delivery.recipient for delivery in proposal_result.deliveries} == {
+        "lead@example.test",
+        "people@example.test",
+    }
+
+    responses_before = repository.list_proposal_responses(round_one.proposal_id)
+    wrong_token = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            "ACCEPT HW-FFFFFFFF",
+            message_id="wrong-proposal-token",
+        )
+    )
+    unauthorized = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "manager",
+            f"ACCEPT {mandate.token}",
+            message_id="unauthorized-proposal-sender",
+        )
+    )
+    first_required = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"ACCEPT {mandate.token}",
+            message_id="round-one-lead",
+        )
+    )
+
+    assert wrong_token.deliveries[0].kind is DeliveryKind.REPLY_TO_MESSAGE
+    assert unauthorized.deliveries[0].kind is DeliveryKind.REPLY_TO_MESSAGE
+    assert repository.list_proposal_responses(round_one.proposal_id) != responses_before
+    assert len(repository.list_proposal_responses(round_one.proposal_id)) == 1
+    assert first_required.deliveries == []
+    assert repository.get_active_proposal(mandate.mandate_id).proposal_id == round_one.proposal_id
+
+    round_two_result = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "vp-people",
+            f"CHANGE {mandate.token} Move the launch date",
+            message_id="round-one-people",
+        )
+    )
+    round_two = repository.get_active_proposal(mandate.mandate_id)
+    assert round_two is not None and round_two.round_number == 2
+    assert {delivery.recipient for delivery in round_two_result.deliveries} == {
+        "lead@example.test",
+        "people@example.test",
+    }
+
+    waiting = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"ACCEPT {mandate.token}",
+            message_id="round-two-lead",
+        )
+    )
+    capped = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "vp-people",
+            f"REJECT {mandate.token}",
+            message_id="round-two-people",
+        )
+    )
+
+    assert waiting.deliveries == []
+    assert repository.get_mandate_by_token(mandate.token).state is MandateState.SCHEDULING
+    assert repository.get_active_proposal(mandate.mandate_id) is None
+    assert {"mandate.meeting_required", "mandate.scheduling"} <= _event_types(
+        repository, mandate.mandate_id
+    )
+    assert sum(
+        event.event_type == "proposal.response_recorded"
+        for event in repository.list_events(mandate.mandate_id)
+    ) == 4
+    assert {delivery.recipient for delivery in capped.deliveries if delivery.recipient} == set()
+    assert any(delivery.conversation_id == "manager-conversation" for delivery in capped.deliveries)
+    assert all("AVAILABLE" in delivery.text for delivery in capped.deliveries)
+
+
+def test_availability_email_and_telegram_routes_survive_workflow_restart(
+    tmp_path, incoming_message_factory
+) -> None:
+    """Break caught: scheduling trusts a wrong thread or in-memory proof lost on restart."""
+    database_url = f"sqlite:///{(tmp_path / 'restart.sqlite3').as_posix()}"
+    repository = SqlAlchemyHumanWireRepository(create_session_factory(database_url))
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _create_mandate(workflow, incoming_message_factory)
+    assignment = repository.list_assignments(mandate.mandate_id)[0]
+    with repository.transaction() as unit:
+        unit.add_evidence(
+            EvidenceItem(
+                evidence_id=uuid4(),
+                mandate_id=mandate.mandate_id,
+                assignment_id=assignment.assignment_id,
+                stakeholder_id=assignment.person_id,
+                evidence_type=EvidenceType.CONSTRAINT,
+                statement="PRIVATE-SENTINEL-42 private-contact@example.test",
+                visibility=EvidenceVisibility.PRIVATE,
+                status=EvidenceStatus.CONFIRMED,
+                source_message_id="private-source",
+                channel=Channel.EMAIL,
+                created_at=mandate.created_at,
+                related_decision="Approve coverage",
+            )
+        )
+        unit.add_evidence(
+            EvidenceItem(
+                evidence_id=uuid4(),
+                mandate_id=mandate.mandate_id,
+                assignment_id=assignment.assignment_id,
+                stakeholder_id=assignment.person_id,
+                evidence_type=EvidenceType.CONSTRAINT,
+                statement="We cannot launch until coverage is staffed.",
+                visibility=EvidenceVisibility.SHAREABLE,
+                status=EvidenceStatus.CONFIRMED,
+                source_message_id="confirmed-blocker",
+                channel=Channel.EMAIL,
+                created_at=mandate.created_at,
+                related_decision="Approve coverage",
+            )
+        )
+    proposal_result = _complete_interview(
+        workflow,
+        incoming_message_factory,
+        mandate,
+        "team-lead",
+        prefix="restart",
+    )
+    workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"REJECT {mandate.token}",
+            message_id="restart-round-one",
+        )
+    )
+    availability_request = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"REJECT {mandate.token}",
+            message_id="restart-round-two",
+        )
+    )
+    assert {delivery.recipient for delivery in availability_request.deliveries if delivery.recipient} == {
+        "lead@example.test"
+    }
+    assert any(
+        delivery.conversation_id == "manager-conversation"
+        for delivery in availability_request.deliveries
+    )
+
+    window = "2026-08-12T15:00:00+00:00/2026-08-12T16:00:00+00:00"
+    events_before = repository.list_events(mandate.mandate_id)
+    wrong_email = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"AVAILABLE {mandate.token} {window}",
+            message_id="wrong-email-thread",
+            conversation_id="wrong-thread",
+        )
+    )
+    missing_email = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"AVAILABLE {mandate.token} {window}",
+            message_id="missing-email-thread",
+            conversation_id="",
+        )
+    )
+    wrong_telegram = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "manager",
+            f"AVAILABLE {mandate.token} {window}",
+            message_id="wrong-telegram-thread",
+            conversation_id="wrong-manager-conversation",
+        )
+    )
+
+    assert all(
+        result.deliveries[0].kind is DeliveryKind.REPLY_TO_MESSAGE
+        for result in (wrong_email, missing_email, wrong_telegram)
+    )
+    assert repository.list_events(mandate.mandate_id) == events_before
+    assert repository.get_runtime_status(
+        f"availability:{mandate.mandate_id}:team-lead"
+    ) is None
+    assert repository.get_runtime_status(f"availability:{mandate.mandate_id}:manager") is None
+
+    manager_recorded = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "manager",
+            f"AVAILABLE {mandate.token} {window}",
+            message_id="manager-availability",
+        )
+    )
+    assert manager_recorded.deliveries == []
+    assert repository.get_runtime_status(f"availability:{mandate.mandate_id}:manager") is not None
+    assert repository.get_meeting_package(mandate.mandate_id) is None
+
+    restarted_repository = SqlAlchemyHumanWireRepository(create_session_factory(database_url))
+    restarted = _build_workflow(restarted_repository, lead_email_thread="lead-thread")
+    ready = restarted.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"AVAILABLE {mandate.token} {window}",
+            message_id="lead-availability-after-restart",
+        )
+    )
+
+    saved = restarted_repository.get_mandate_by_token(mandate.token)
+    package = restarted_repository.get_meeting_package(mandate.mandate_id)
+    assert saved is not None and saved.state is MandateState.MEETING_READY
+    assert package is not None
+    assert package.required_attendee_ids == ["manager", "team-lead"]
+    assert {delivery.recipient for delivery in ready.deliveries if delivery.recipient} == {
+        "lead@example.test"
+    }
+    assert any(delivery.conversation_id == "manager-conversation" for delivery in ready.deliveries)
+    assert all("PROPOSED MEETING" in delivery.text for delivery in ready.deliveries)
+    assert {"availability.recorded", "meeting.package_created", "mandate.meeting_ready"} <= _event_types(
+        restarted_repository, mandate.mandate_id
+    )
+    public_text = "\n".join(
+        delivery.text
+        for result in (proposal_result, availability_request, ready)
+        for delivery in result.deliveries
+    )
+    event_text = "\n".join(
+        event.model_dump_json()
+        for event in restarted_repository.list_events(mandate.mandate_id)
+    )
+    for private_value in (
+        "PRIVATE-SENTINEL-42",
+        "private-contact@example.test",
+        "lead@example.test",
+        "manager-chat",
+    ):
+        assert private_value not in public_text
+        assert private_value not in event_text
+
+
+def test_process_due_merges_ladder_and_synthesis_deliveries_at_workflow_boundary(
+    repository, incoming_message_factory, now
+) -> None:
+    """Break caught: due processing drops either its reminder or synthesis output."""
+    workflow = _build_workflow(
+        repository,
+        person_ids=("team-lead", "vp-people"),
+        optional_people={"vp-people"},
+    )
+    mandate, _ = _create_mandate(workflow, incoming_message_factory)
+    assignments = {
+        assignment.person_id: assignment
+        for assignment in repository.list_assignments(mandate.mandate_id)
+    }
+    required = assignments["team-lead"].model_copy(
+        update={"state": StakeholderState.COMPLETE, "next_action_at": None}
+    )
+    optional = assignments["vp-people"].model_copy(
+        update={
+            "state": StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+            "attempt_count": 1,
+            "next_action_at": now,
+        }
+    )
+    with repository.transaction() as unit:
+        unit.save_assignment(required)
+        unit.save_assignment(optional)
+        unit.add_evidence(
+            EvidenceItem(
+                evidence_id=uuid4(),
+                mandate_id=mandate.mandate_id,
+                assignment_id=required.assignment_id,
+                stakeholder_id=required.person_id,
+                evidence_type=EvidenceType.COMMITMENT,
+                statement="I will support the coverage decision.",
+                visibility=EvidenceVisibility.SHAREABLE,
+                status=EvidenceStatus.CONFIRMED,
+                source_message_id="confirmed-required",
+                channel=Channel.EMAIL,
+                created_at=now,
+                related_decision="Approve coverage",
+            )
+        )
+
+    result = workflow.process_due(now)
+
+    assert repository.get_mandate_by_token(mandate.token).state is MandateState.ALIGNED
+    assert repository.get_assignment(optional.assignment_id).attempt_count == 2
+    assert {delivery.recipient for delivery in result.deliveries if delivery.recipient} == {
+        "lead@example.test",
+        "people@example.test",
+    }
+    assert any(delivery.conversation_id == "manager-conversation" for delivery in result.deliveries)
+    assert any("Please acknowledge" in delivery.text for delivery in result.deliveries)
+    assert any("ALIGNMENT BRIEF" in delivery.text for delivery in result.deliveries)
+    assert {"outreach.reminder_sent", "mandate.aligned", "alignment.brief_persisted"} <= _event_types(
+        repository, mandate.mandate_id
+    )
+
+
+def test_creation_transaction_rolls_back_every_row_when_event_persistence_fails(
+    repository, incoming_message_factory, monkeypatch
+) -> None:
+    """Break caught: a failed creation event leaves an orphan mandate or assignment."""
+    workflow = _build_workflow(repository)
+    original = RepositoryUnitOfWork.add_interview
+
+    def fail_after_interview_is_staged(self, interview):
+        original(self, interview)
+        raise RuntimeError("injected interview persistence failure")
+
+    monkeypatch.setattr(RepositoryUnitOfWork, "add_interview", fail_after_interview_is_staged)
+    with pytest.raises(RuntimeError, match="injected interview persistence failure"):
+        workflow.handle(
+            incoming_message_factory(
+                text="/mandate\nCoordinate launch coverage",
+                message_id="rollback-create",
+            )
+        )
+
+    with repository._session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(MandateRecord)) == 0
+        assert session.scalar(select(func.count()).select_from(StakeholderAssignmentRecord)) == 0
+        assert session.scalar(select(func.count()).select_from(InterviewSessionRecord)) == 0
+        assert session.scalar(select(func.count()).select_from(DomainEventRecord)) == 0
 
 
 def test_only_originating_initiator_can_cancel(workflow, telegram_mandate, incoming_message_factory, repository) -> None:
@@ -155,6 +983,21 @@ def test_aligned_synthesis_persists_public_brief_and_routes_it_to_required_peopl
                     created_at=now, related_decision="Approve coverage",
                 )
             )
+        unit.add_evidence(
+            EvidenceItem(
+                evidence_id=uuid4(),
+                mandate_id=mandate.mandate_id,
+                assignment_id=assignments[0].assignment_id,
+                stakeholder_id=assignments[0].person_id,
+                evidence_type=EvidenceType.FACT,
+                statement="PRIVATE-BRIEF-SENTINEL private-brief@example.test",
+                visibility=EvidenceVisibility.PRIVATE,
+                status=EvidenceStatus.CONFIRMED,
+                source_message_id="private-brief-source",
+                channel=Channel.EMAIL,
+                created_at=now,
+            )
+        )
 
     result = workflow.synthesis.run(mandate.mandate_id, now)
 
@@ -164,6 +1007,18 @@ def test_aligned_synthesis_persists_public_brief_and_routes_it_to_required_peopl
     }
     assert any(delivery.conversation_id == "manager-conversation" for delivery in result.deliveries)
     assert any(event.event_type == "alignment.brief_persisted" for event in repository.list_events(mandate.mandate_id))
+    public_text = "\n".join(delivery.text for delivery in result.deliveries)
+    event_text = "\n".join(
+        event.model_dump_json() for event in repository.list_events(mandate.mandate_id)
+    )
+    for private_value in (
+        "PRIVATE-BRIEF-SENTINEL",
+        "private-brief@example.test",
+        "lead@example.test",
+        "manager-chat",
+    ):
+        assert private_value not in public_text
+        assert private_value not in event_text
 
 
 def test_primary_delivery_failure_immediately_uses_the_next_registered_route(
@@ -180,6 +1035,9 @@ def test_primary_delivery_failure_immediately_uses_the_next_registered_route(
     assignment = repository.get_assignment(primary.assignment_id)
     assert assignment is not None
     assert assignment.active_route_index == 1
+    assert {"outreach.delivery_failed", "outreach.alternate_sent"} <= _event_types(
+        repository, assignment.mandate_id
+    )
 
 
 def test_final_delivery_failure_synthesizes_required_mandate_and_replay_is_inert(
@@ -208,7 +1066,12 @@ def test_final_delivery_failure_synthesizes_required_mandate_and_replay_is_inert
 
     assert assignment is not None and assignment.state is StakeholderState.DELIVERY_FAILED
     assert repository.get_mandate_by_token(mandate.token).state is MandateState.PARTIAL
-    assert any(event.event_type == "mandate.partial" for event in events)
+    assert {
+        "outreach.delivery_failed",
+        "outreach.alternate_sent",
+        "stakeholder.delivery_failed",
+        "mandate.partial",
+    } <= {event.event_type for event in events}
     assert exhausted.deliveries
     assert replay.deliveries == []
     assert repository.list_events(mandate.mandate_id) == events
