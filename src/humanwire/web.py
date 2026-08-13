@@ -1533,6 +1533,29 @@ _REPLAY_EVENT_EXPLANATIONS = {
     "mandate.expired": ("Outcome", "Mandate expired"),
 }
 
+_MANDATE_SCOPED_REPLAY_EVENT_TYPES = frozenset(
+    {
+        "mandate.created",
+        "mandate.received",
+        "engagement.plan_previewed",
+        "engagement.plan_released",
+        "mandate.planned",
+        "mandate.interviewing",
+        "proposal.response_recorded",
+        "proposal.created",
+        "mandate.negotiating",
+        "mandate.meeting_required",
+        "mandate.scheduling",
+        "availability.recorded",
+        "meeting.package_created",
+        "mandate.meeting_ready",
+        "mandate.aligned",
+        "mandate.partial",
+        "mandate.cancelled",
+        "mandate.expired",
+    }
+)
+
 
 def _replay_explanation(
     event_type: Any, bound_row: Mapping[str, Any] | None
@@ -1692,7 +1715,11 @@ def _reach_page_view(
             and event_mandate_id == expected_mandate_id
         )
         can_explain = event_type in _REPLAY_EVENT_EXPLANATIONS and (
-            has_exact_binding or has_exact_mandate_identity
+            has_exact_binding
+            or (
+                has_exact_mandate_identity
+                and event_type in _MANDATE_SCOPED_REPLAY_EVENT_TYPES
+            )
         )
         explanation = _replay_explanation(
             event_type if can_explain else "", bound_row if has_exact_binding else None
@@ -1705,6 +1732,8 @@ def _reach_page_view(
         if bound_person_id:
             highlight = bound_person_id
         elif (
+            can_explain
+            and
             not assignment_id
             and not person_id
             and event_mandate_id == expected_mandate_id

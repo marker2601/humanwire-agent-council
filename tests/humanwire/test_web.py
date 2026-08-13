@@ -1849,6 +1849,74 @@ def test_reach_replay_unknown_and_cross_assignment_events_are_neutral(demo_app) 
         assert "attempt_count" not in serialized
 
 
+def test_reach_replay_missing_identity_assignment_event_is_neutral(demo_app) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assert mandate is not None
+    event = DomainEvent(
+        event_type="engagement.quick_response_sent",
+        created_at=NOW + timedelta(minutes=1),
+        idempotency_key="reach-missing-identity-event",
+    )
+    repository.append_event(mandate.mandate_id, event)
+
+    item = next(
+        item
+        for item in _internal_reach_view(repository, mandate)["replay"]
+        if item["created_at"] == event.created_at.isoformat()
+    )
+
+    assert (
+        item["stage_label"],
+        item["source_label"],
+        item["destination_label"],
+        item["data_point_label"],
+        item["highlight"],
+        item["person_id"],
+    ) == (
+        "Saved event",
+        "HumanWire",
+        "Decision Room",
+        "No public data point",
+        "none",
+        None,
+    )
+
+
+def test_reach_replay_unsupported_mandate_event_is_neutral_and_not_origin(demo_app) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assert mandate is not None
+    event = DomainEvent(
+        event_type="alignment.brief_persisted",
+        created_at=NOW + timedelta(minutes=1),
+        idempotency_key="reach-unsupported-mandate-event",
+    )
+    repository.append_event(mandate.mandate_id, event)
+
+    item = next(
+        item
+        for item in _internal_reach_view(repository, mandate)["replay"]
+        if item["created_at"] == event.created_at.isoformat()
+    )
+
+    assert (
+        item["stage_label"],
+        item["source_label"],
+        item["destination_label"],
+        item["data_point_label"],
+        item["highlight"],
+        item["person_id"],
+    ) == (
+        "Saved event",
+        "HumanWire",
+        "Decision Room",
+        "No public data point",
+        "none",
+        None,
+    )
+
+
 def _internal_reach_view(repository, mandate, rows=None, events=None):
     return web_projection._reach_page_view(
         web_projection._mandate_detail(repository, mandate),
