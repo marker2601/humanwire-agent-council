@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -507,3 +509,149 @@ def test_all_persona_inbound_uses_one_gateway_handler_and_orchestrator_identity(
         assert envelope.sender_address == f"{envelope.persona_id}@example.test"
         assert envelope.connection_id == f"offline-{envelope.channel.value}-connection"
         assert envelope.conversation_id == f"synthetic-{envelope.persona_id}-conversation"
+
+
+def _write_transcript(path: Path, transcript: SyntheticTranscript) -> None:
+    path.write_text(transcript.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+
+def test_generated_and_replayed_runs_have_the_same_semantic_trace_hash(tmp_path) -> None:
+    generated_path = tmp_path / "generated.json"
+    generated = generate_scenario(
+        make_generation_scenario(),
+        generated_path,
+        tmp_path / "generate-run",
+    )
+
+    replayed = synthetic_module.replay_transcript(
+        generated_path,
+        tmp_path / "replay-run",
+    )
+
+    assert synthetic_module.semantic_trace_hash(generated) == (
+        synthetic_module.semantic_trace_hash(replayed)
+    )
+
+
+def test_semantic_trace_hash_is_independent_of_uuids_and_temporary_paths(tmp_path) -> None:
+    first = generate_scenario(
+        make_generation_scenario(),
+        tmp_path / "first.json",
+        tmp_path / "first-run",
+    )
+    second = generate_scenario(
+        make_generation_scenario(),
+        tmp_path / "second.json",
+        tmp_path / "second-run",
+    )
+
+    assert first.database_path != second.database_path
+    assert first.database_path.read_bytes() != second.database_path.read_bytes()
+    assert synthetic_module.semantic_trace_hash(first) == (
+        synthetic_module.semantic_trace_hash(second)
+    )
+
+
+def test_replay_never_builds_or_calls_persona_policies(tmp_path, monkeypatch) -> None:
+    generated_path = tmp_path / "generated.json"
+    generate_scenario(
+        make_generation_scenario(),
+        generated_path,
+        tmp_path / "generate-run",
+    )
+
+    def policy_use_is_a_failure(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("replay invoked persona generation")
+
+    monkeypatch.setattr(synthetic_module, "_build_policy", policy_use_is_a_failure)
+
+    replayed = synthetic_module.replay_transcript(
+        generated_path,
+        tmp_path / "replay-run",
+    )
+
+    assert replayed.gateway_handler_count == 1
+    assert replayed.inbound_envelopes
+
+
+def test_frozen_replay_hash_is_equal_after_a_fresh_replay_restart(tmp_path) -> None:
+    fixture = Path("tests/fixtures/humanwire/synthetic_launch_v1.json")
+
+    first = synthetic_module.replay_transcript(fixture, tmp_path / "restart-a")
+    second = synthetic_module.replay_transcript(fixture, tmp_path / "restart-b")
+
+    assert synthetic_module.semantic_trace_hash(first) == (
+        synthetic_module.semantic_trace_hash(second)
+    )
+
+
+def test_semantic_trace_hash_changes_for_a_material_action_change(tmp_path) -> None:
+    original_path = tmp_path / "original.json"
+    original = generate_scenario(
+        make_generation_scenario(),
+        original_path,
+        tmp_path / "generate-run",
+    )
+    changed_actions = list(original.transcript.actions)
+    changed_actions[0] = changed_actions[0].model_copy(
+        update={"content": "Acknowledged with a safe material change."}
+    )
+    changed_transcript = SyntheticTranscript.create(
+        scenario=original.transcript.scenario,
+        outbound_digests=original.transcript.outbound_digests,
+        actions=changed_actions,
+    )
+    changed_path = tmp_path / "changed.json"
+    _write_transcript(changed_path, changed_transcript)
+
+    changed = synthetic_module.replay_transcript(
+        changed_path,
+        tmp_path / "changed-run",
+    )
+
+    assert synthetic_module.semantic_trace_hash(original) != (
+        synthetic_module.semantic_trace_hash(changed)
+    )
+
+
+def test_duplicate_inbound_attempt_remains_visible_in_semantic_hash(tmp_path) -> None:
+    result = _generate(tmp_path)
+    duplicated = replace(
+        result,
+        inbound_envelopes=(result.inbound_envelopes[0], *result.inbound_envelopes),
+    )
+
+    assert synthetic_module.semantic_trace_hash(result) != (
+        synthetic_module.semantic_trace_hash(duplicated)
+    )
+
+
+def test_replay_fails_closed_on_ambiguous_synthetic_identity_mapping(tmp_path) -> None:
+    generated_path = tmp_path / "generated.json"
+    generated = generate_scenario(
+        make_generation_scenario(),
+        generated_path,
+        tmp_path / "generate-run",
+    )
+    personas = list(generated.transcript.scenario.personas)
+    ack = next(persona for persona in personas if persona.persona_id == "ack")
+    approval_index = next(
+        index for index, persona in enumerate(personas) if persona.persona_id == "approval"
+    )
+    personas[approval_index] = personas[approval_index].model_copy(
+        update={"email": ack.email}
+    )
+    ambiguous_scenario = generated.transcript.scenario.model_copy(
+        update={"personas": personas}
+    )
+    ambiguous_transcript = SyntheticTranscript.create(
+        scenario=ambiguous_scenario,
+        outbound_digests=generated.transcript.outbound_digests,
+        actions=list(generated.transcript.actions),
+    )
+    ambiguous_path = tmp_path / "ambiguous.json"
+    _write_transcript(ambiguous_path, ambiguous_transcript)
+
+    with pytest.raises(ValueError, match="ambiguous synthetic identity"):
+        synthetic_module.replay_transcript(ambiguous_path, tmp_path / "replay-run")

@@ -1,0 +1,263 @@
+{
+  "scenario": {
+    "schema_version": "humanwire.synthetic/v1",
+    "scenario_id": "launch-v1",
+    "personas": [
+      {
+        "persona_id": "inform",
+        "display_name": "Inform Persona",
+        "role": "Delivery owner",
+        "email": "inform@example.test",
+        "channels": [
+          "email"
+        ],
+        "allowed_intents": [
+          "silence"
+        ],
+        "private_fact_digests": []
+      },
+      {
+        "persona_id": "ack",
+        "display_name": "Acknowledge Persona",
+        "role": "Executive owner",
+        "email": "ack@example.test",
+        "channels": [
+          "email"
+        ],
+        "allowed_intents": [
+          "acknowledge"
+        ],
+        "private_fact_digests": []
+      },
+      {
+        "persona_id": "quick",
+        "display_name": "Quick Persona",
+        "role": "Program owner",
+        "email": "quick@example.test",
+        "channels": [
+          "email"
+        ],
+        "allowed_intents": [
+          "acknowledge",
+          "answer",
+          "confirm_evidence"
+        ],
+        "private_fact_digests": []
+      },
+      {
+        "persona_id": "structured",
+        "display_name": "Structured Persona",
+        "role": "People owner",
+        "email": "structured@example.test",
+        "channels": [
+          "email",
+          "telegram"
+        ],
+        "allowed_intents": [
+          "acknowledge",
+          "interview_response",
+          "confirm_evidence"
+        ],
+        "private_fact_digests": [
+          "80399b2136673ca66ff3614f8446333ad7afd54b0e9bb745029545c653071adf"
+        ]
+      },
+      {
+        "persona_id": "approval",
+        "display_name": "Approval Persona",
+        "role": "Approval owner",
+        "email": "approval@example.test",
+        "channels": [
+          "email"
+        ],
+        "allowed_intents": [
+          "approve",
+          "change"
+        ],
+        "private_fact_digests": []
+      },
+      {
+        "persona_id": "availability",
+        "display_name": "Availability Persona",
+        "role": "Scheduling owner",
+        "email": "availability@example.test",
+        "channels": [
+          "email"
+        ],
+        "allowed_intents": [
+          "availability"
+        ],
+        "private_fact_digests": []
+      }
+    ],
+    "provenance": {
+      "proof_class": "synthetic_multi_persona",
+      "actor_type": "simulated_persona",
+      "identity_source": "synthetic_fixture",
+      "transport": "fake_caspian",
+      "human_attested": false,
+      "live_provider_verified": false
+    }
+  },
+  "outbound_digests": {
+    "outbound-1": "b5440ef8ae4e14a72b377766e1090b364e02a90f94f28ee1270b5882acc36f40",
+    "outbound-2": "457e339d3a84e5317f7ac221c5b9ffc31230aa2cac81b12823024cc8a9e478f5",
+    "outbound-3": "9c9c481215017b2c1ed25ad554fbe27565829b17b8929ea7452a37b0bf546027",
+    "outbound-4": "321bf174b0d450c3cef7eb2d47b4ca3d1a738d6ff77f9a86a5c8804576ed3748",
+    "outbound-5": "d31c0f7413b2c0d19e632fba5fd2055da80b21dd1aac55a2c40bef16abd917a2",
+    "outbound-6": "c6ca2ee7151329ee7c43dda92585152d665e8bf2621f77c4f234fa11af1dac56",
+    "outbound-7": "307681e6f27639ca27bce1975b952a8787d6db73f40d7a048128b6b312b493c9",
+    "outbound-8": "30945090ad472587ee1bbf98f00bf7f9ed341a12682cdd5bb62400f596d519ff",
+    "outbound-9": "a974a5d2cb5dc39ef44b170a31af14c99a7294c6f24ff159b625887774328e45",
+    "outbound-10": "f557653e8150a26ce665b96fd50b9e495727d7a72eefffe4f756c4ae70b8aee7",
+    "outbound-11": "5b1032e7ff4b463618aaab6175cd1c796c00073666327eb5bafb111dc847e1db",
+    "outbound-12": "a974a5d2cb5dc39ef44b170a31af14c99a7294c6f24ff159b625887774328e45"
+  },
+  "actions": [
+    {
+      "schema_version": "humanwire.synthetic/v1",
+      "action_id": "ack-1",
+      "persona_id": "ack",
+      "channel": "email",
+      "timestamp": "2026-08-13T12:00:01Z",
+      "local_sequence": 1,
+      "trigger_id": "outbound-2",
+      "trigger_digest": "457e339d3a84e5317f7ac221c5b9ffc31230aa2cac81b12823024cc8a9e478f5",
+      "intent": "acknowledge",
+      "content": "Acknowledged."
+    },
+    {
+      "schema_version": "humanwire.synthetic/v1",
+      "action_id": "approval-1",
+      "persona_id": "approval",
+      "channel": "email",
+      "timestamp": "2026-08-13T12:00:01Z",
+      "local_sequence": 1,
+      "trigger_id": "outbound-5",
+      "trigger_digest": "d31c0f7413b2c0d19e632fba5fd2055da80b21dd1aac55a2c40bef16abd917a2",
+      "intent": "approve",
+      "content": "Approved."
+    },
+    {
+      "schema_version": "humanwire.synthetic/v1",
+      "action_id": "availability-1",
+      "persona_id": "availability",
+      "channel": "email",
+      "timestamp": "2026-08-13T12:00:01Z",
+      "local_sequence": 1,
+      "trigger_id": "outbound-6",
+      "trigger_digest": "c6ca2ee7151329ee7c43dda92585152d665e8bf2621f77c4f234fa11af1dac56",
+      "intent": "availability",
+      "content": "2026-08-13T15:00:00+00:00/2026-08-13T16:00:00+00:00"
+    },
+    {
+      "schema_version": "humanwire.synthetic/v1",
+      "action_id": "inform-1",
+      "persona_id": "inform",
+      "channel": "email",
+      "timestamp": "2026-08-13T12:00:01Z",
+      "local_sequence": 1,
+      "trigger_id": "outbound-1",
+      "trigger_digest": "b5440ef8ae4e14a72b377766e1090b364e02a90f94f28ee1270b5882acc36f40",
+      "intent": "silence",
+      "content": "synthetic_silence"
+    },
+    {
+      "schema_version": "humanwire.synthetic/v1",
+      "action_id": "quick-1",
+      "persona_id": "quick",
+      "channel": "email",
+      "timestamp": "2026-08-13T12:00:01Z",
+      "local_sequence": 1,
+      "trigger_id": "outbound-3",
+      "trigger_digest": "9c9c481215017b2c1ed25ad554fbe27565829b17b8929ea7452a37b0bf546027",
+      "intent": "acknowledge",
+      "content": "Acknowledged."
+    },
+    {
+      "schema_version": "humanwire.synthetic/v1",
+      "action_id": "structured-1",
+      "persona_id": "structured",
+      "channel": "email",
+      "timestamp": "2026-08-13T12:00:01Z",
+      "local_sequence": 1,
+      "trigger_id": "outbound-4",
+      "trigger_digest": "321bf174b0d450c3cef7eb2d47b4ca3d1a738d6ff77f9a86a5c8804576ed3748",
+      "intent": "acknowledge",
+      "content": "Acknowledged."
+    },
+    {
+      "schema_version": "humanwire.synthetic/v1",
+      "action_id": "quick-2",
+      "persona_id": "quick",
+      "channel": "email",
+      "timestamp": "2026-08-13T12:00:02Z",
+      "local_sequence": 2,
+      "trigger_id": "outbound-7",
+      "trigger_digest": "307681e6f27639ca27bce1975b952a8787d6db73f40d7a048128b6b312b493c9",
+      "intent": "answer",
+      "content": "Launch date is 2026-09-01."
+    },
+    {
+      "schema_version": "humanwire.synthetic/v1",
+      "action_id": "structured-2",
+      "persona_id": "structured",
+      "channel": "email",
+      "timestamp": "2026-08-13T12:00:02Z",
+      "local_sequence": 2,
+      "trigger_id": "outbound-8",
+      "trigger_digest": "30945090ad472587ee1bbf98f00bf7f9ed341a12682cdd5bb62400f596d519ff",
+      "intent": "interview_response",
+      "content": "PRIVATE: sha256:80399b2136673ca66ff3614f8446333ad7afd54b0e9bb745029545c653071adf"
+    },
+    {
+      "schema_version": "humanwire.synthetic/v1",
+      "action_id": "quick-3",
+      "persona_id": "quick",
+      "channel": "email",
+      "timestamp": "2026-08-13T12:00:03Z",
+      "local_sequence": 3,
+      "trigger_id": "outbound-9",
+      "trigger_digest": "a974a5d2cb5dc39ef44b170a31af14c99a7294c6f24ff159b625887774328e45",
+      "intent": "confirm_evidence",
+      "content": "Confirmed."
+    },
+    {
+      "schema_version": "humanwire.synthetic/v1",
+      "action_id": "structured-3",
+      "persona_id": "structured",
+      "channel": "email",
+      "timestamp": "2026-08-13T12:00:03Z",
+      "local_sequence": 3,
+      "trigger_id": "outbound-10",
+      "trigger_digest": "f557653e8150a26ce665b96fd50b9e495727d7a72eefffe4f756c4ae70b8aee7",
+      "intent": "interview_response",
+      "content": "The team can support a reviewed launch."
+    },
+    {
+      "schema_version": "humanwire.synthetic/v1",
+      "action_id": "structured-4",
+      "persona_id": "structured",
+      "channel": "email",
+      "timestamp": "2026-08-13T12:00:04Z",
+      "local_sequence": 4,
+      "trigger_id": "outbound-11",
+      "trigger_digest": "5b1032e7ff4b463618aaab6175cd1c796c00073666327eb5bafb111dc847e1db",
+      "intent": "interview_response",
+      "content": "The team can support a reviewed launch."
+    },
+    {
+      "schema_version": "humanwire.synthetic/v1",
+      "action_id": "structured-5",
+      "persona_id": "structured",
+      "channel": "email",
+      "timestamp": "2026-08-13T12:00:05Z",
+      "local_sequence": 5,
+      "trigger_id": "outbound-12",
+      "trigger_digest": "a974a5d2cb5dc39ef44b170a31af14c99a7294c6f24ff159b625887774328e45",
+      "intent": "confirm_evidence",
+      "content": "Confirmed."
+    }
+  ],
+  "digest": "ea1d7bdced533fcb21620188b3b43fda3c8b5e40787ef6299e0b17f8588a128b"
+}
