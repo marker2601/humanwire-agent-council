@@ -13,6 +13,7 @@ from sqlalchemy import (
     create_engine,
     event,
     text,
+    true,
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -67,7 +68,7 @@ class StakeholderAssignmentRecord(Base):
         Boolean,
         nullable=False,
         default=True,
-        server_default=text("1"),
+        server_default=true(),
     )
     state: Mapped[str] = mapped_column(String(40), index=True)
     route_ids: Mapped[list[str]] = mapped_column(JSON)
@@ -133,6 +134,7 @@ class InterviewSessionRecord(Base):
             "stakeholder_person_id",
             unique=True,
             sqlite_where=text("completed_at IS NULL"),
+            postgresql_where=text("completed_at IS NULL"),
         ),
     )
 
