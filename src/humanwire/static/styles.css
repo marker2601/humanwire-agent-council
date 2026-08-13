@@ -2460,6 +2460,52 @@ progress::-moz-progress-bar {
   color: var(--slate);
 }
 
+.replay-flow-strip {
+  display: grid;
+  margin: 0;
+  padding: 12px 0;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: center;
+  gap: 28px;
+  border-top: 1px solid var(--border-soft);
+  border-bottom: 1px solid var(--border-soft);
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity 180ms ease, transform 180ms ease;
+}
+
+.replay-flow-strip.is-changing {
+  opacity: 0.72;
+  transform: translateY(3px);
+}
+
+.replay-flow-step {
+  position: relative;
+  min-width: 0;
+}
+
+.replay-flow-step + .replay-flow-step::before {
+  position: absolute;
+  top: 50%;
+  left: -20px;
+  color: var(--cyan-soft);
+  content: "→";
+  font-size: 16px;
+  transform: translateY(-50%);
+}
+
+.replay-flow-step dt {
+  color: var(--slate);
+  font-size: 14px;
+}
+
+.replay-flow-step dd {
+  margin: 2px 0 0;
+  color: var(--ice);
+  font-size: 14px;
+  font-weight: 550;
+}
+
 .replay-current {
   display: flex;
   min-height: 48px;
@@ -2721,6 +2767,28 @@ progress::-moz-progress-bar {
 
   .replay-controls {
     justify-content: space-between;
+  }
+}
+
+@media (max-width: 759px) {
+  .replay-flow-strip {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .replay-flow-step + .replay-flow-step::before {
+    content: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .replay-flow-strip {
+    transition: none;
+  }
+
+  .replay-flow-strip.is-changing {
+    opacity: 1;
+    transform: none;
   }
 }
 

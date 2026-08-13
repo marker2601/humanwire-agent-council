@@ -196,7 +196,10 @@
               data-replay-event
               data-created-at="{{ event.created_at }}"
               data-highlight="{{ event.highlight }}"
-              data-event-index="{{ loop.index0 }}"
+              data-replay-stage="{{ event.stage_label }}"
+              data-replay-source="{{ event.source_label }}"
+              data-replay-destination="{{ event.destination_label }}"
+              data-replay-data-point="{{ event.data_point_label }}"
               {% if not loop.first %}aria-hidden="true"{% endif %}
             >
               <span class="replay-number">{{ loop.index }}</span>
@@ -205,6 +208,20 @@
             </li>
           {% endfor %}
         </ol>
+        <dl class="replay-flow-strip" data-replay-flow aria-label="Saved event provenance">
+          <div class="replay-flow-step">
+            <dt>From</dt>
+            <dd data-replay-source>{{ reach.first_event.source_label }}</dd>
+          </div>
+          <div class="replay-flow-step">
+            <dt>To</dt>
+            <dd data-replay-destination>{{ reach.first_event.destination_label }}</dd>
+          </div>
+          <div class="replay-flow-step">
+            <dt>Generated</dt>
+            <dd data-replay-data-point>{{ reach.first_event.data_point_label }}</dd>
+          </div>
+        </dl>
         <div class="replay-current">
           <p class="replay-progress" role="status" aria-live="off" data-replay-progress>Event 1 of {{ reach.event_count }}</p>
           <p class="replay-description"><strong data-replay-description>{{ reach.first_event.description }}</strong><time datetime="{{ reach.first_event.created_at }}" data-replay-time>{{ reach.first_event.created_display }}</time></p>

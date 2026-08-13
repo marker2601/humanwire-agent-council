@@ -1732,6 +1732,76 @@ def test_reach_replay_uses_every_saved_event_in_persisted_order(web_client) -> N
     assert "synthesized event" not in html.lower()
 
 
+def test_replay_flow_renders_safe_static_provenance_for_event_one(web_client) -> None:
+    html = web_client.get("/mandates/HW-2411/reach").text
+    hidden_events = re.findall(
+        r'<li(?P<attributes>[^>]*data-replay-event[^>]*)aria-hidden="true"[^>]*>',
+        html,
+    )
+
+    assert re.search(
+        r'<dl class="replay-flow-strip"[^>]*>.*?<dt>From</dt>.*?'
+        r'<dd data-replay-source>HumanWire</dd>.*?<dt>To</dt>.*?'
+        r'<dd data-replay-destination>Decision Room</dd>.*?<dt>Generated</dt>.*?'
+        r'<dd data-replay-data-point>Mandate created</dd>',
+        html,
+        re.DOTALL,
+    )
+    assert hidden_events
+    allowed = {
+        "data-replay-event",
+        "data-created-at",
+        "data-highlight",
+        "data-replay-stage",
+        "data-replay-source",
+        "data-replay-destination",
+        "data-replay-data-point",
+    }
+    for attributes in hidden_events:
+        assert set(re.findall(r"\s(data-[\w-]+)(?:=|\s|$)", attributes)) <= allowed
+
+
+def test_replay_flow_updates_only_from_selected_event_and_preserves_motion_guards(
+    web_client,
+) -> None:
+    script = web_client.get("/static/app.js").text
+
+    for hook, dataset in (
+        ("[data-replay-source]", "replaySource"),
+        ("[data-replay-destination]", "replayDestination"),
+        ("[data-replay-data-point]", "replayDataPoint"),
+    ):
+        assert hook in script
+        assert f"current.dataset.{dataset}" in script
+    assert "matching.length === 1" in script
+    assert "document.visibilityState !== \"visible\"" in script
+    assert 'window.matchMedia("(prefers-reduced-motion: reduce)").matches' in script
+    assert re.search(
+        r"initializeReachReplay\(\);\s+initializeVisibility\(\);\s+startCountdown\(\);",
+        script,
+    )
+
+
+def test_replay_flow_has_causal_step_transition_and_no_motion_override(web_client) -> None:
+    css = web_client.get("/static/styles.css").text
+
+    assert ".replay-flow-strip" in css
+    assert "transition: opacity" in css
+    assert "transform: translateY" in css
+    assert re.search(
+        r"@media \(max-width: 759px\).*?\.replay-flow-strip\s*\{[^}]*"
+        r"grid-template-columns:\s*1fr",
+        css,
+        re.DOTALL,
+    )
+    assert re.search(
+        r"@media \(prefers-reduced-motion: reduce\).*?\.replay-flow-strip\s*\{[^}]*"
+        r"transition:\s*none",
+        css,
+        re.DOTALL,
+    )
+
+
 def test_reach_replay_explains_allowlisted_persisted_events(demo_app) -> None:
     repository = demo_app.state.repository
     mandate = repository.get_mandate_by_token("HW-2411")

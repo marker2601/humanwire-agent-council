@@ -422,6 +422,7 @@
       return;
     }
     const index = Math.min(Math.max(nextIndex, 0), events.length - 1);
+    const changed = index !== reachReplayState.index;
     reachReplayState.index = index;
     const current = events[index];
     events.forEach((event, eventIndex) => {
@@ -451,6 +452,13 @@
     const time = document.querySelector("[data-replay-time]");
     const progress = document.querySelector("[data-replay-progress]");
     const live = document.querySelector("[data-replay-live]");
+    const flow = document.querySelector("[data-replay-flow]");
+    const source = document.querySelector("[data-replay-source]");
+    const destination = document.querySelector("[data-replay-destination]");
+    const dataPoint = document.querySelector("[data-replay-data-point]");
+    const sourceLabel = current.dataset.replaySource || "";
+    const destinationLabel = current.dataset.replayDestination || "";
+    const dataPointLabel = current.dataset.replayDataPoint || "";
     if (description && sourceDescription) {
       description.textContent = sourceDescription.textContent;
     }
@@ -458,12 +466,33 @@
       time.textContent = sourceTime.textContent;
       time.dateTime = sourceTime.dateTime;
     }
+    if (source) {
+      source.textContent = sourceLabel;
+    }
+    if (destination) {
+      destination.textContent = destinationLabel;
+    }
+    if (dataPoint) {
+      dataPoint.textContent = dataPointLabel;
+    }
+    if (
+      changed &&
+      flow &&
+      !window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    ) {
+      flow.classList.remove("is-changing");
+      void flow.offsetWidth;
+      flow.classList.add("is-changing");
+      window.setTimeout(function settleReplayFlow() {
+        flow.classList.remove("is-changing");
+      }, 180);
+    }
     const progressText = `Event ${index + 1} of ${events.length}`;
     if (progress) {
       progress.textContent = progressText;
     }
-    if (announce && live && sourceDescription) {
-      live.textContent = `${progressText}: ${sourceDescription.textContent}`;
+    if ((announce || changed) && live && sourceDescription) {
+      live.textContent = `${progressText}: From ${sourceLabel}; To ${destinationLabel}; Generated ${dataPointLabel}. ${sourceDescription.textContent}`;
     }
     if (index === events.length - 1) {
       stopReachReplay();
