@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -85,6 +86,339 @@ def test_read_only_route_surface_and_html_placeholders(web_client, demo_app) -> 
         response = web_client.get(path)
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("text/html")
+
+
+def test_dashboard_templates_and_static_assets_are_package_local(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(create_demo_app())
+
+    dashboard = client.get("/")
+    stylesheet = client.get("/static/styles.css")
+    script = client.get("/static/app.js")
+
+    assert dashboard.status_code == 200
+    assert stylesheet.status_code == 200
+    assert script.status_code == 200
+    assert dashboard.headers["content-type"].startswith("text/html")
+    assert stylesheet.headers["content-type"].startswith("text/css")
+    assert "javascript" in script.headers["content-type"]
+    assert 'href="/static/styles.css"' in dashboard.text
+    assert 'src="/static/app.js"' in dashboard.text
+    assert not re.search(r'(?:href|src)=["\'](?:https?:)?//', dashboard.text)
+    assert "<style" not in dashboard.text.lower()
+    assert not re.search(r"<script(?![^>]+src=|[^>]+type=\"application/json\")", dashboard.text)
+
+
+@pytest.mark.parametrize(
+    ("state_filter", "expected_tokens"),
+    [
+        ("active", {"HW-2411"}),
+        ("aligned", {"HW-2412"}),
+        ("meeting-ready", {"HW-2413"}),
+        ("partial", set()),
+        ("failed", set()),
+    ],
+)
+def test_dashboard_truthfully_filters_persisted_mandates(
+    web_client, state_filter, expected_tokens
+) -> None:
+    response = web_client.get("/", params={"state": state_filter})
+
+    assert response.status_code == 200
+    assert 'data-testid="dashboard"' in response.text
+    rendered_tokens = set(
+        re.findall(r'data-mandate-token="(HW-[0-9]+)"', response.text)
+    )
+    assert rendered_tokens == expected_tokens
+    for name in ("Active", "Aligned", "Meeting ready", "Partial", "Failed"):
+        assert name in response.text
+
+
+def test_dashboard_lists_only_persisted_demo_rows(web_client) -> None:
+    response = web_client.get("/")
+
+    assert response.status_code == 200
+    assert set(re.findall(r'data-mandate-token="(HW-[0-9]+)"', response.text)) == {
+        "HW-2411",
+        "HW-2412",
+        "HW-2413",
+    }
+    assert "Prepare approved weekend launch coverage" in response.text
+    assert "Confirm incident review ownership" in response.text
+    assert "Resolve the launch approval decision" in response.text
+    assert "Q4 customer migration" not in response.text
+    assert re.search(r"Meeting ready\s*<span>1</span>", response.text)
+
+
+def test_decision_room_uses_coordination_and_adaptive_engagements(web_client) -> None:
+    html = web_client.get("/mandates/HW-2411").text
+
+    assert 'data-testid="decision-room"' in html
+    assert 'data-testid="workflow-step-coordinating"' in html
+    assert 'aria-current="step"' in html
+    assert 'data-testid="next-action"' in html
+    assert 'data-testid="stakeholders"' in html
+    assert 'data-testid="engagement-ladder"' in html
+    assert 'data-testid="activity-timeline"' in html
+    assert 'data-testid="human-evidence"' in html
+    assert 'data-testid="ai-draft"' in html
+    assert 'data-testid="reach-preview"' in html
+    assert 'data-testid="technical-data"' in html
+    assert 'data-testid="live-refresh"' in html
+    assert "Engagement progress" in html
+    assert "Structured interview" in html
+    assert "Quick response" in html
+    assert "Acknowledgement" in html
+    assert "Approval review" in html
+    assert "Inform only" in html
+    assert "Interview progress" not in html
+    assert "Interviewing" not in html
+
+
+def test_decision_room_renders_exact_persisted_hw_2411_rows(web_client) -> None:
+    html = web_client.get("/mandates/HW-2411").text
+
+    expected = {
+        "priya-shah": ("Priya Shah", "Structured interview", "1 of 3", "In progress"),
+        "eli-torres": ("Eli Torres", "Quick response", "1 of 1", "Complete"),
+        "sora-kim": ("Sora Kim", "Quick response", "1 of 1", "Complete"),
+        "nora-chen": ("Nora Chen", "Acknowledgement", "1 of 1", "Acknowledged"),
+        "maya-brooks": ("Maya Brooks", "Approval review", "0 of 1", "Pending"),
+        "inez-ward": ("Inez Ward", "Inform only", "1 of 1", "Delivered"),
+    }
+    for person_id, values in expected.items():
+        row = re.search(
+            rf'<tr[^>]+data-person="{person_id}".*?</tr>', html, re.DOTALL
+        )
+        assert row is not None
+        assert all(value in row.group(0) for value in values)
+    assert "Daniel Kim" not in html
+    assert "Luis Alvarez" not in html
+    assert re.findall(r'<tr[^>]+data-person="([^"]+)"', html) == [
+        "priya-shah",
+        "eli-torres",
+        "sora-kim",
+        "nora-chen",
+        "maya-brooks",
+        "inez-ward",
+    ]
+
+
+def test_decision_room_has_no_projection_key_collision_placeholders(web_client) -> None:
+    html = web_client.get("/mandates/HW-2411").text
+
+    assert "[REDACTED]" not in html
+    assert "Lateral" in html
+    assert "In progress" in html
+
+
+def _ladder_row(engagement_type: str, **updates) -> dict[str, object]:
+    row: dict[str, object] = {
+        "engagement_type": engagement_type,
+        "engagement_status": "pending",
+        "state": "awaiting_acknowledgement",
+        "attempt_count": 1,
+        "channel": "email",
+        "channel_is_alternate": False,
+        "progress_current": 0,
+        "progress_total": 1,
+        "first_contact_at": "2026-08-11T15:04:00+00:00",
+        "last_delivery_at": "2026-08-11T15:06:00+00:00",
+        "acknowledged_at": None,
+        "completed_at": None,
+    }
+    row.update(updates)
+    return row
+
+
+@pytest.mark.parametrize(
+    ("row", "labels", "forbidden"),
+    [
+        (
+            _ladder_row(
+                "inform", state="complete", engagement_status="delivered",
+                completed_at="2026-08-11T15:12:00+00:00",
+            ),
+            ["Primary", "Delivered"],
+            ["Reminder", "Acknowledged", "Interview", "Decision"],
+        ),
+        (
+            _ladder_row(
+                "acknowledge", state="complete", engagement_status="acknowledged",
+                acknowledged_at="2026-08-11T15:10:00+00:00",
+                completed_at="2026-08-11T15:10:00+00:00",
+            ),
+            ["Primary", "Acknowledged"],
+            ["Quick response", "Interview", "Confirmation", "Decision"],
+        ),
+        (
+            _ladder_row(
+                "quick_response", state="complete", engagement_status="complete",
+                progress_current=1, acknowledged_at="2026-08-11T15:10:00+00:00",
+                completed_at="2026-08-11T15:12:00+00:00",
+            ),
+            ["Primary", "Acknowledged", "Quick response", "Confirmation"],
+            ["Interview", "Decision", "Availability"],
+        ),
+        (
+            _ladder_row(
+                "structured_interview", state="interviewing",
+                engagement_status="in progress", attempt_count=2,
+                channel="telegram", channel_is_alternate=True,
+                progress_current=1, progress_total=3,
+                acknowledged_at="2026-08-11T15:09:00+00:00",
+            ),
+            [
+                "Primary", "Reminder", "Alternate Telegram", "Acknowledged",
+                "Interview", "Confirmation",
+            ],
+            ["Quick response", "Decision", "Availability"],
+        ),
+        (
+            _ladder_row("review_approval"),
+            ["Primary", "Decision"],
+            ["Quick response", "Interview", "Confirmation", "Availability"],
+        ),
+        (
+            _ladder_row("availability", engagement_status="missing"),
+            ["Primary", "Availability"],
+            ["Quick response", "Interview", "Confirmation", "Decision"],
+        ),
+    ],
+    ids=["inform", "acknowledge", "quick", "structured", "review", "availability"],
+)
+def test_engagement_ladder_matrix_uses_only_type_specific_steps(row, labels, forbidden) -> None:
+    ladder = web_projection._engagement_ladder(row)
+    rendered_labels = [step["label"] for step in ladder]
+
+    assert rendered_labels == labels
+    assert all(label not in rendered_labels for label in forbidden)
+    assert sum(step["status"] == "current" for step in ladder) <= 1
+    assert all(step["status"] in {"complete", "current", "pending"} for step in ladder)
+
+
+def test_engagement_ladder_has_only_the_earliest_current_step() -> None:
+    ladder = web_projection._engagement_ladder(
+        _ladder_row("acknowledge", attempt_count=2)
+    )
+
+    assert [(step["label"], step["status"]) for step in ladder] == [
+        ("Primary", "complete"),
+        ("Reminder", "current"),
+        ("Acknowledged", "pending"),
+    ]
+
+
+def test_decision_room_defaults_to_safe_priya_action_and_ladder(web_client) -> None:
+    html = web_client.get("/mandates/HW-2411").text
+
+    assert 'data-selected-person="priya-shah"' in html
+    assert "Selected: Priya Shah" in html
+    assert "Contact Priya through registered Telegram" in html
+    assert "Alternate Telegram" in html
+    assert "Interview" in html
+    for forbidden in (
+        "demo-route-priya-shah-alternate",
+        "demo-conversation-priya-shah",
+        "route_id",
+        "connection_id",
+        "conversation_id",
+        "sender_id",
+        "recipient",
+        "@example",
+    ):
+        assert forbidden not in html
+
+
+def test_decision_room_local_controls_and_links_are_read_only(web_client) -> None:
+    html = web_client.get("/mandates/HW-2411").text
+
+    for state in ("all", "in-progress", "completed", "pending", "delivered"):
+        assert f'data-filter="{state}"' in html
+    assert re.search(r"In progress\s*<span>1</span>", html)
+    assert 'aria-pressed="true"' in html
+    assert 'href="/mandates/HW-2411/reach"' in html
+    assert 'href="/mandates/HW-2411/data"' in html
+    assert "<form" not in html.lower()
+    assert "contenteditable" not in html.lower()
+    assert "javascript:" not in html.lower()
+    assert not re.search(r"on(?:click|change|submit|keydown)=", html, re.IGNORECASE)
+
+
+def test_decision_room_separates_human_evidence_from_persisted_ai_truth(web_client) -> None:
+    html = web_client.get("/mandates/HW-2411").text
+    human = re.search(r'data-testid="human-evidence".*?</section>', html, re.DOTALL)
+    ai = re.search(r'data-testid="ai-draft".*?</section>', html, re.DOTALL)
+
+    assert human is not None and ai is not None
+    assert "3" in human.group(0)
+    assert "Evidence items saved" in human.group(0)
+    assert "Missing responses" in human.group(0)
+    assert "Assumptions" in ai.group(0)
+    assert re.search(r"Assumptions.*?>0<", ai.group(0), re.DOTALL)
+    assert "Not ready" in ai.group(0)
+
+
+def test_decision_room_has_semantic_accessible_structure_and_hardening(web_client) -> None:
+    response = web_client.get("/mandates/HW-2411")
+    html = response.text
+
+    assert html.count("<h1") == 1
+    assert html.index('class="skip-link"') < html.index("<header")
+    for landmark in ("<header", "<nav", "<main", "<section", "<aside", "<footer"):
+        assert landmark in html
+    assert 'aria-label="Primary"' in html
+    assert 'aria-live="polite"' in html
+    assert 'type="button"' in html
+    assert 'scope="col"' in html
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["referrer-policy"] == "no-referrer"
+    assert "script-src 'self'" in response.headers["content-security-policy"]
+
+
+def test_decision_room_css_reflows_without_a_fixed_desktop_table(web_client) -> None:
+    css = web_client.get("/static/styles.css").text
+
+    assert ":focus-visible" in css
+    assert re.search(r"font-size:\s*(?:14px|0\.875rem)", css)
+    assert "@media (max-width: 759px)" in css
+    assert re.search(
+        r"@media \(max-width: 759px\).*?\.decision-layout\s*\{[^}]*grid-template-columns:\s*1fr",
+        css,
+        re.DOTALL,
+    )
+    assert re.search(
+        r"@media \(max-width: 759px\).*?\.stakeholder-row\s*\{[^}]*display:\s*grid",
+        css,
+        re.DOTALL,
+    )
+    assert "overflow-x: clip" in css
+    assert "min-width: 760px" not in css
+    assert "@media (prefers-reduced-motion: reduce)" in css
+    assert re.search(r"\.stakeholder-row td\s*\{[^}]*font-size:\s*14px", css, re.DOTALL)
+    assert re.search(r"\.state-filters button\s*\{[^}]*font-size:\s*14px", css, re.DOTALL)
+
+
+def test_decision_room_javascript_polls_persisted_state_only(web_client) -> None:
+    script = web_client.get("/static/app.js").text
+
+    assert "window.HumanWire" in script
+    assert "refreshMandate" in script
+    assert "/api/v1/mandates/${encodeURIComponent(token)}" in script
+    assert 'method: "GET"' in script
+    assert "document.visibilityState" in script
+    assert "visibilitychange" in script
+    assert "5000" in script
+    assert "updated_at" in script
+    assert "window.location.reload" in script
+    assert "countdown" in script
+    assert "clearInterval" in script or "clearTimeout" in script
+    for forbidden in ('"POST"', '"PUT"', '"PATCH"', '"DELETE"'):
+        assert forbidden not in script
+    for forbidden in ("ANALYTICS_READ_TOKEN", "provider_body", "synthesized event"):
+        assert forbidden not in script
 
 
 def test_public_demo_has_no_mutating_routes_or_hidden_mutation(web_client) -> None:

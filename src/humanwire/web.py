@@ -10,10 +10,13 @@ import json
 import re
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
 from humanwire.alignment import AlignmentReport
 from humanwire.config import Settings
@@ -86,7 +89,7 @@ _ENUM_FIELDS = {
     "evidence_type": {item.value for item in EvidenceType},
     "interview_status": {"complete", "in_progress", "not_started"},
     "state": {item.value for item in MandateState} | {item.value for item in StakeholderState},
-    "status": {item.value for item in EvidenceStatus},
+    "status": {item.value for item in EvidenceStatus} | {"complete", "current", "pending"},
     "previous_state": {item.value for item in MandateState}
     | {item.value for item in StakeholderState},
     "new_state": {item.value for item in MandateState} | {item.value for item in StakeholderState},
@@ -94,6 +97,55 @@ _ENUM_FIELDS = {
 }
 _PRIVATE_MARKER = "[PRIVATE]"
 _CALENDAR_UID_NAMESPACE = b"humanwire:calendar:uid:v1:"
+_PACKAGE_DIR = Path(__file__).resolve().parent
+_ENGAGEMENT_LABELS = {
+    "inform": "Inform only",
+    "acknowledge": "Acknowledgement",
+    "quick_response": "Quick response",
+    "structured_interview": "Structured interview",
+    "review_approval": "Approval review",
+    "availability": "Availability",
+}
+_STATUS_LABELS = {
+    "acknowledged": "Acknowledged",
+    "approved": "Approved",
+    "awaiting acknowledgement": "Awaiting acknowledgement",
+    "awaiting response": "Awaiting response",
+    "change requested": "Change requested",
+    "complete": "Complete",
+    "declined": "Declined",
+    "delivered": "Delivered",
+    "delivery failed": "Delivery failed",
+    "in progress": "In progress",
+    "missing": "Missing",
+    "pending": "Pending",
+    "recorded": "Recorded",
+    "rejected": "Rejected",
+    "unreachable": "Unreachable",
+}
+_DASHBOARD_STATE_GROUPS = {
+    "active": {
+        "received",
+        "planned",
+        "interviewing",
+        "synthesizing",
+        "negotiating",
+        "meeting_required",
+        "scheduling",
+    },
+    "aligned": {"aligned"},
+    "meeting-ready": {"meeting_ready"},
+    "partial": {"partial"},
+    "failed": {"expired", "cancelled", "delivery_failed"},
+}
+_WORKFLOW_STEPS = (
+    ("received", "Received"),
+    ("planned", "Planned"),
+    ("coordinating", "Coordinating"),
+    ("synthesizing", "Synthesizing"),
+    ("negotiating", "Negotiating"),
+    ("meeting-ready", "Meeting Ready"),
+)
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -216,6 +268,7 @@ def _assignment_projection(
     interviews: dict[Any, Any],
     planned: PlannedStakeholder | None,
     decisions: dict[Any, Any],
+    event_channel: Channel | None = None,
 ) -> dict[str, Any]:
     interview = interviews.get(assignment.interview_id)
     if not (
@@ -267,7 +320,12 @@ def _assignment_projection(
         "progress_total": progress_total,
         "state": assignment.state.value,
         "attempt_count": assignment.attempt_count,
-        "channel": interview.current_channel.value if interview and interview.current_channel else None,
+        "channel": (
+            interview.current_channel.value
+            if interview and interview.current_channel
+            else event_channel.value if event_channel else None
+        ),
+        "channel_is_alternate": assignment.active_route_index > 0,
         "interview_status": interview_status,
         "current_question": question,
         "first_contact_at": _iso(assignment.first_contact_at),
@@ -435,6 +493,10 @@ def _stakeholders(repository: Any, mandate: Mandate) -> list[dict[str, Any]]:
         item.assignment_id: item
         for item in repository.list_engagement_decisions(mandate.mandate_id)
     }
+    event_channels: dict[str, Channel] = {}
+    for event in repository.list_events(mandate.mandate_id):
+        if event.person_id is not None and event.channel is not None:
+            event_channels[event.person_id] = event.channel
     return [
         _assignment_projection(
             repository,
@@ -442,6 +504,7 @@ def _stakeholders(repository: Any, mandate: Mandate) -> list[dict[str, Any]]:
             interviews,
             planned.get(assignment.person_id),
             decisions,
+            event_channels.get(assignment.person_id),
         )
         for assignment in sorted(
             assignments,
@@ -490,6 +553,516 @@ def _evidence_summary(repository: Any, mandate: Mandate) -> dict[str, Any]:
             }
             for item in public
         ],
+    }
+
+
+def _short_datetime(value: str | None) -> str:
+    if not value:
+        return "—"
+    try:
+        moment = datetime.fromisoformat(value).astimezone(UTC)
+    except (TypeError, ValueError):
+        return "—"
+    return f"{moment.strftime('%b')} {moment.day}, {moment.strftime('%H:%M')}"
+
+
+def _long_date(value: str | None) -> str:
+    if not value:
+        return "—"
+    try:
+        moment = datetime.fromisoformat(value).astimezone(UTC)
+    except (TypeError, ValueError):
+        return "—"
+    return f"{moment.strftime('%b')} {moment.day}, {moment.year}"
+
+
+def _relative_deadline(value: str | None, current_time: datetime) -> str:
+    if not value:
+        return ""
+    try:
+        deadline = datetime.fromisoformat(value).astimezone(UTC)
+    except (TypeError, ValueError):
+        return ""
+    seconds = int((deadline - current_time.astimezone(UTC)).total_seconds())
+    if seconds <= 0:
+        return "due"
+    days = seconds // 86_400
+    if days:
+        return f"in {days} day{'s' if days != 1 else ''}"
+    hours = max(seconds // 3_600, 1)
+    return f"in {hours} hour{'s' if hours != 1 else ''}"
+
+
+def _countdown(value: str | None, current_time: datetime) -> str:
+    if not value:
+        return "--:--:--"
+    try:
+        deadline = datetime.fromisoformat(value).astimezone(UTC)
+    except (TypeError, ValueError):
+        return "--:--:--"
+    remaining = max(int((deadline - current_time.astimezone(UTC)).total_seconds()), 0)
+    hours, remainder = divmod(remaining, 3_600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _engagement_ladder(row: Mapping[str, Any]) -> list[dict[str, str]]:
+    """Build one type-specific ladder strictly from safe persisted projection fields."""
+    engagement_type = str(row.get("engagement_type") or "")
+    engagement_status = str(row.get("engagement_status") or "")
+    state = str(row.get("state") or "")
+    attempts = max(int(row.get("attempt_count") or 0), 0)
+    first_contact = bool(row.get("first_contact_at")) or attempts > 0
+    acknowledged = bool(row.get("acknowledged_at"))
+    completed = bool(row.get("completed_at")) or state == "complete"
+    progressed = int(row.get("progress_current") or 0) > 0
+    alternate = bool(row.get("channel_is_alternate"))
+    channel = str(row.get("channel") or "").capitalize()
+    terminal_failure = state in {"declined", "unreachable", "delivery_failed"}
+    steps: list[dict[str, str]] = []
+
+    def add(label: str, status: str, detail: str = "") -> None:
+        steps.append({"label": label, "status": status, "detail": detail})
+
+    def finish() -> list[dict[str, str]]:
+        current_seen = False
+        for step in steps:
+            if step["status"] != "current":
+                continue
+            if current_seen:
+                step["status"] = "pending"
+            else:
+                current_seen = True
+        return steps
+
+    later_outreach = attempts > 1 or alternate or acknowledged or progressed or completed
+    add(
+        "Primary",
+        "complete" if first_contact else "current",
+        _short_datetime(row.get("first_contact_at")),
+    )
+    if attempts > 1:
+        reminder_done = alternate or acknowledged or progressed or completed
+        add(
+            "Reminder",
+            "complete" if reminder_done else "current",
+            _short_datetime(row.get("last_delivery_at")),
+        )
+    if alternate:
+        alternate_done = acknowledged or progressed or completed
+        add(
+            f"Alternate {channel}" if channel else "Alternate",
+            "complete" if alternate_done else "current",
+            _short_datetime(row.get("last_delivery_at")),
+        )
+
+    outreach_waiting = (
+        (not first_contact)
+        or (attempts > 1 and not later_outreach)
+        or (alternate and not (acknowledged or progressed or completed))
+    )
+    if engagement_type == "inform":
+        delivered = completed or engagement_status == "delivered"
+        add("Delivered", "complete" if delivered else "pending" if outreach_waiting else "current")
+        return finish()
+
+    if engagement_type == "acknowledge":
+        add(
+            "Acknowledged",
+            "complete"
+            if acknowledged or completed or engagement_status == "acknowledged"
+            else "pending" if outreach_waiting or terminal_failure else "current",
+            _short_datetime(row.get("acknowledged_at")),
+        )
+        return finish()
+
+    if engagement_type in {"quick_response", "structured_interview"}:
+        add(
+            "Acknowledged",
+            "complete"
+            if acknowledged or progressed or completed
+            else "pending" if outreach_waiting or terminal_failure else "current",
+            _short_datetime(row.get("acknowledged_at")),
+        )
+        response_label = (
+            "Quick response" if engagement_type == "quick_response" else "Interview"
+        )
+        response_complete = completed or engagement_status == "complete"
+        response_current = progressed and not response_complete and not terminal_failure
+        add(
+            response_label,
+            "complete" if response_complete else "current" if response_current else "pending",
+            (
+                f"{row.get('progress_current', 0)} of {row.get('progress_total', 0)}"
+                if progressed or response_complete
+                else "Pending"
+            ),
+        )
+        add(
+            "Confirmation",
+            "complete" if response_complete else "pending",
+            _short_datetime(row.get("completed_at")) if response_complete else "Pending",
+        )
+        return finish()
+
+    if engagement_type == "review_approval":
+        decided = engagement_status in {"approved", "rejected", "change requested"}
+        add(
+            "Decision",
+            "complete"
+            if decided
+            else "pending" if outreach_waiting or terminal_failure else "current",
+            _STATUS_LABELS.get(engagement_status, "Pending"),
+        )
+        return finish()
+
+    if engagement_type == "availability":
+        recorded = engagement_status == "recorded"
+        add(
+            "Availability",
+            "complete"
+            if recorded
+            else "pending" if outreach_waiting or terminal_failure else "current",
+            "Recorded" if recorded else "Missing",
+        )
+        return finish()
+
+    return finish()
+
+
+def _filter_groups(row: Mapping[str, Any]) -> str:
+    status = str(row.get("engagement_status") or "")
+    groups: list[str] = []
+    if status in {"in progress", "awaiting response", "awaiting acknowledgement"}:
+        groups.append("in-progress")
+    if status in {"complete", "acknowledged", "approved", "recorded", "delivered"}:
+        groups.append("completed")
+    if status in {"pending", "missing"}:
+        groups.append("pending")
+    if status == "delivered":
+        groups.append("delivered")
+    return " ".join(groups)
+
+
+def _present_stakeholder(row: Mapping[str, Any]) -> dict[str, Any]:
+    channel = str(row.get("channel") or "")
+    channel_label = channel.capitalize() if channel else "Not available"
+    if channel and row.get("channel_is_alternate"):
+        channel_label += " (alternate)"
+    engagement_type = str(row.get("engagement_type") or "")
+    status = str(row.get("engagement_status") or "")
+    direction_labels = {
+        "downward": "Gather input",
+        "lateral": "Coordinate policy",
+        "upward": "Get approval",
+        "external": "External",
+    }
+    presented = dict(row)
+    presented.update(
+        {
+            "engagement_label": _ENGAGEMENT_LABELS.get(
+                engagement_type, engagement_type.replace("_", " ").capitalize()
+            ),
+            "status_label": _STATUS_LABELS.get(status, status.capitalize()),
+            "channel_label": channel_label,
+            "direction_label": direction_labels.get(
+                str(row.get("direction") or ""), "External"
+            ),
+            "last_contact_display": _short_datetime(
+                row.get("last_delivery_at") or row.get("first_contact_at")
+            ),
+            "filter_groups": _filter_groups(row),
+            "ladder": _engagement_ladder(row),
+        }
+    )
+    return presented
+
+
+def _selected_stakeholder(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not rows:
+        return None
+    active_states = {"acknowledged", "alternate_channel", "follow_up_due", "interviewing"}
+    terminal_statuses = {
+        "acknowledged",
+        "approved",
+        "change requested",
+        "complete",
+        "declined",
+        "delivered",
+        "delivery failed",
+        "recorded",
+        "rejected",
+        "unreachable",
+    }
+
+    def priority(indexed: tuple[int, dict[str, Any]]) -> tuple[int, int]:
+        index, row = indexed
+        if row.get("required") and row.get("state") in active_states:
+            return 0, index
+        if row.get("required") and row.get("engagement_status") not in terminal_statuses:
+            return 1, index
+        return 2, index
+
+    return min(enumerate(rows), key=priority)[1]
+
+
+def _workflow_view(mandate: Mapping[str, Any]) -> list[dict[str, str]]:
+    state = str(mandate.get("state") or "")
+    current_index = {
+        "received": 0,
+        "planned": 1,
+        "interviewing": 2,
+        "synthesizing": 3,
+        "negotiating": 4,
+        "aligned": 4,
+        "meeting_required": 5,
+        "scheduling": 5,
+        "meeting_ready": 5,
+    }.get(state, 2)
+    created = _short_datetime(mandate.get("created_at"))
+    updated = _short_datetime(mandate.get("updated_at"))
+    steps = []
+    for index, (key, label) in enumerate(_WORKFLOW_STEPS):
+        if index < current_index:
+            status = "complete"
+        elif index == current_index:
+            status = "current"
+        else:
+            status = "pending"
+        if index < 2:
+            detail = created.split(",", 1)[0]
+        elif index == current_index:
+            detail = updated
+        else:
+            detail = "Pending"
+        steps.append({"key": key, "label": label, "status": status, "detail": detail})
+    return steps
+
+
+def _event_description(event: Mapping[str, Any]) -> str:
+    event_type = str(event.get("event_type") or "")
+    person = event.get("person") or {}
+    name = person.get("name") if isinstance(person, Mapping) else None
+    subject = str(name or "Mandate")
+    labels = {
+        "mandate.created": "Mandate received",
+        "engagement.plan_previewed": "Engagement plan previewed",
+        "engagement.plan_released": "Engagement plan released",
+        "mandate.interviewing": "Coordination started",
+        "engagement.quick_response_sent": f"Quick response sent to {subject}",
+        "engagement.structured_interview_sent": f"Structured interview sent to {subject}",
+        "engagement.acknowledgement_sent": f"Acknowledgement sent to {subject}",
+        "engagement.approval_pending": f"{subject} approval review is pending",
+        "engagement.inform_delivered": f"{subject} received the coordination update",
+        "engagement.quick_response_completed": f"{subject} completed a quick response",
+        "engagement.acknowledged": f"{subject} acknowledged the request",
+        "engagement.structured_interview_reminder": f"Reminder sent to {subject}",
+        "engagement.structured_interview_alternate_selected": (
+            f"Alternate channel selected for {subject}"
+        ),
+        "engagement.structured_interview_progressed": (
+            f"{subject} structured interview progressed"
+        ),
+    }
+    return labels.get(event_type, event_type.replace(".", " ").replace("_", " ").capitalize())
+
+
+def _reach_view(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    definitions = (
+        (
+            "gather",
+            "Gather input",
+            {"quick_response", "structured_interview"},
+            lambda row: bool(row.get("required")),
+        ),
+        ("coordinate", "Coordinate policy", {"acknowledge", "availability"}, lambda row: True),
+        ("approval", "Get approval", {"review_approval"}, lambda row: True),
+        ("optional", "Optional", {"inform"}, lambda row: not bool(row.get("required"))),
+    )
+    complete_statuses = {"acknowledged", "approved", "complete", "delivered", "recorded"}
+    lanes: list[dict[str, Any]] = []
+    for key, label, types, predicate in definitions:
+        lane_rows = [
+            row
+            for row in rows
+            if row.get("engagement_type") in types and predicate(row)
+        ]
+        if not lane_rows:
+            continue
+        complete = sum(row.get("engagement_status") in complete_statuses for row in lane_rows)
+        pending = any(row.get("engagement_status") in {"pending", "missing"} for row in lane_rows)
+        status = "pending" if pending else "complete" if complete == len(lane_rows) else "in progress"
+        lanes.append(
+            {
+                "key": key,
+                "label": label,
+                "count": len(lane_rows),
+                "complete": complete,
+                "state_label": status,
+            }
+        )
+    return lanes
+
+
+def _decision_room_view(
+    repository: Any, mandate: Mandate, current_time: datetime
+) -> dict[str, Any]:
+    detail = _mandate_detail(repository, mandate)
+    safe_rows = _stakeholders(repository, mandate)
+    plan_order = {
+        planned.person_ref: index
+        for index, planned in enumerate(mandate.plan.stakeholders)
+    }
+    safe_rows.sort(
+        key=lambda row: plan_order.get(str(row.get("person_id")), len(plan_order))
+    )
+    selected = _selected_stakeholder(safe_rows)
+    presented_rows = [_present_stakeholder(row) for row in safe_rows]
+    selected_id = selected.get("person_id") if selected is not None else None
+    presented_rows.sort(
+        key=lambda row: (
+            row.get("person_id") != selected_id,
+            plan_order.get(str(row.get("person_id")), len(plan_order)),
+        )
+    )
+    selected_view = next(
+        (
+            row
+            for row in presented_rows
+            if selected is not None and row.get("person_id") == selected.get("person_id")
+        ),
+        None,
+    )
+    evidence = _evidence_summary(repository, mandate)
+    public_evidence_count = evidence["counts"]["shareable"] + evidence["counts"]["anonymous"]
+    missing_responses = sum(
+        bool(row.get("required"))
+        and row.get("engagement_status")
+        not in {
+            "acknowledged",
+            "approved",
+            "change requested",
+            "complete",
+            "declined",
+            "delivered",
+            "delivery failed",
+            "recorded",
+            "rejected",
+            "unreachable",
+        }
+        for row in safe_rows
+    )
+    proposal = repository.get_active_proposal(mandate.mandate_id)
+    ai_draft = {
+        "count": 1 if proposal is not None else 0,
+        "readiness": "Ready for human review" if proposal is not None else "Not ready",
+        "assumptions": 0,
+        "open_questions": len(proposal.issue_ids) if proposal is not None else 0,
+    }
+    events = _events(repository, mandate)
+    timeline = [
+        {
+            "created_at": event.get("created_at"),
+            "created_display": _short_datetime(event.get("created_at")),
+            "description": _event_description(event),
+            "context_label": " · ".join(
+                value
+                for value in (
+                    str(event.get("channel") or "").capitalize(),
+                    str(event.get("direction") or "").replace("_", " ").capitalize(),
+                )
+                if value
+            ),
+        }
+        for event in reversed(events)
+    ]
+    next_due = (
+        selected_view.get("next_action_at") if selected_view is not None else None
+    ) or (detail.get("next_action") or {}).get("scheduled_at") or detail.get("deadline")
+    if selected_view is not None:
+        selected_name = str(selected_view.get("name") or "Stakeholder")
+        first_name = selected_name.split()[0]
+        channel = str(selected_view.get("channel") or "")
+        channel_name = channel.capitalize() if channel else "channel"
+        channel_phrase = f"registered {channel_name}"
+        next_action_label = f"Contact {first_name} through {channel_phrase}"
+        alternate_phrase = " alternate" if selected_view.get("channel_is_alternate") else ""
+        why = (
+            f"{selected_name}'s {selected_view['engagement_label'].lower()} is "
+            f"{selected_view['status_label'].lower()}. The registered{alternate_phrase} "
+            "channel keeps this engagement moving."
+        )
+    else:
+        next_action_label = "No pending action"
+        why = "All persisted engagement work is complete."
+    filter_counts = {
+        "all": len(presented_rows),
+        "in_progress": sum("in-progress" in row["filter_groups"] for row in presented_rows),
+        "completed": sum("completed" in row["filter_groups"] for row in presented_rows),
+        "pending": sum("pending" in row["filter_groups"] for row in presented_rows),
+        "delivered": sum("delivered" in row["filter_groups"] for row in presented_rows),
+    }
+    return {
+        "mandate": {
+            **detail,
+            "state_label": str(detail.get("phase_label") or "").capitalize(),
+            "deadline_display": _long_date(detail.get("deadline")),
+            "deadline_relative": _relative_deadline(detail.get("deadline"), current_time),
+            "updated_display": _short_datetime(detail.get("updated_at")),
+            "updated_time": (
+                _short_datetime(detail.get("updated_at")).rsplit(" ", 1)[-1]
+                if detail.get("updated_at")
+                else "—"
+            ),
+            "progress_label": (
+                f"{detail.get('complete_count', 0)} of {detail.get('stakeholder_count', 0)} "
+                "engagements in progress"
+            ),
+        },
+        "workflow": _workflow_view(detail),
+        "stakeholders": presented_rows,
+        "selected": selected_view,
+        "filter_counts": filter_counts,
+        "next_action": {
+            "label": next_action_label,
+            "why": why,
+            "due_at": next_due,
+            "countdown": _countdown(next_due, current_time),
+        },
+        "human_evidence": {
+            "saved": public_evidence_count,
+            "unresolved": detail.get("open_issue_count", 0),
+            "missing": missing_responses,
+        },
+        "ai_draft": ai_draft,
+        "timeline": timeline,
+        "reach": _reach_view(presented_rows),
+    }
+
+
+def _dashboard_view(rows: list[dict[str, Any]], state_filter: str | None) -> dict[str, Any]:
+    selected_filter = state_filter if state_filter in _DASHBOARD_STATE_GROUPS else "all"
+    counts = {
+        key.replace("-", "_"): sum(row.get("state") in states for row in rows)
+        for key, states in _DASHBOARD_STATE_GROUPS.items()
+    }
+    visible = (
+        rows
+        if selected_filter == "all"
+        else [row for row in rows if row.get("state") in _DASHBOARD_STATE_GROUPS[selected_filter]]
+    )
+    presented = [
+        {
+            **row,
+            "phase_display": str(row.get("phase_label") or "").replace("_", " ").capitalize(),
+            "updated_display": _short_datetime(row.get("updated_at")),
+        }
+        for row in visible
+    ]
+    return {
+        "mandates": presented,
+        "filter": selected_filter,
+        "counts": {"all": len(rows), **counts},
     }
 
 
@@ -648,7 +1221,13 @@ def create_app(
 ) -> FastAPI:
     """Build the read-only web surface over an injected source-of-truth repository."""
     now = clock or (lambda: datetime.now(UTC))
+    templates = Jinja2Templates(directory=str(_PACKAGE_DIR / "templates"))
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    app.mount(
+        "/static",
+        StaticFiles(directory=str(_PACKAGE_DIR / "static")),
+        name="static",
+    )
     app.state.repository = repository
     app.state.settings = settings
     app.state.demo_mode = demo_mode
@@ -673,7 +1252,16 @@ def create_app(
                     content={"detail": "Unauthorized"},
                     headers={"WWW-Authenticate": "Bearer"},
                 )
-        return await call_next(request)
+        response = await call_next(request)
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self'; style-src 'self'; "
+            "img-src 'self' data:; object-src 'none'; base-uri 'none'; "
+            "frame-ancestors 'none'; form-action 'none'"
+        )
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        return response
 
     def load_mandate(token: str) -> Mandate:
         try:
@@ -698,7 +1286,7 @@ def create_app(
             raise HTTPException(status_code=503, detail="Service unavailable") from error
 
     @app.get("/", response_class=HTMLResponse)
-    def home():
+    def home(request: Request, state: str | None = Query(default=None)):
         def project():
             mandates = repository.list_recent_mandates()
             corpora = {
@@ -712,20 +1300,40 @@ def create_app(
                 )
                 for item in mandates
             ]
-            return rows, frozenset().union(*corpora.values()) if corpora else frozenset()
+            denied_values = frozenset().union(*corpora.values()) if corpora else frozenset()
+            return _public_projection(
+                _dashboard_view(rows, state),
+                denied_values=denied_values,
+            )
 
-        mandates, denied_values = safe_projection(project)
-        return _html_page("HumanWire", mandates, denied_values)
+        dashboard = safe_projection(project)
+        return templates.TemplateResponse(
+            request=request,
+            name="dashboard.html",
+            context={
+                "dashboard": dashboard,
+                "demo_mode": demo_mode,
+                "current_nav": "mandates",
+                "nav_token": None,
+            },
+        )
 
     @app.get("/mandates/{token}", response_class=HTMLResponse)
-    def decision_room(token: str):
+    def decision_room(request: Request, token: str):
         mandate = load_mandate(token)
-        denied_values = _private_deny_values(repository, mandate)
-        public_token = _scrub_known_private(mandate.token, denied_values)
-        return _html_page(
-            f"HumanWire {public_token}",
-            safe_projection(lambda: _mandate_detail(repository, mandate), mandate),
-            denied_values,
+        room = safe_projection(
+            lambda: _decision_room_view(repository, mandate, now()),
+            mandate,
+        )
+        return templates.TemplateResponse(
+            request=request,
+            name="mandate.html",
+            context={
+                "room": room,
+                "demo_mode": demo_mode,
+                "current_nav": "mandates",
+                "nav_token": room["mandate"]["token"],
+            },
         )
 
     @app.get("/mandates/{token}/reach", response_class=HTMLResponse)

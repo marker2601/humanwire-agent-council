@@ -1,0 +1,289 @@
+{% extends "base.html" %}
+
+{% macro icon(name, class_name="icon") -%}
+  <svg class="{{ class_name }}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    {% if name == "send" %}
+      <path d="m21 3-7.7 18-3.8-7.1L3 10.7 21 3Z"></path><path d="m9.5 13.9 4.4-4.4"></path>
+    {% elif name == "quick" %}
+      <path d="M13 2 5.5 13H11l-1 9 8.5-12H13l0-8Z"></path>
+    {% elif name == "mail" %}
+      <rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="m4 7 8 6 8-6"></path>
+    {% elif name == "shield" %}
+      <path d="M12 3 5 6v5c0 4.6 2.9 8.2 7 10 4.1-1.8 7-5.4 7-10V6l-7-3Z"></path>
+    {% elif name == "info" %}
+      <circle cx="12" cy="12" r="9"></circle><path d="M12 11v6M12 7.5h.01"></path>
+    {% elif name == "check" %}
+      <path d="m6 12 4 4 8-9"></path>
+    {% elif name == "clock" %}
+      <circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path>
+    {% elif name == "users" %}
+      <path d="M16 20v-1.5c0-2.5-2-4.5-4.5-4.5h-4C5 14 3 16 3 18.5V20"></path><circle cx="9.5" cy="7.5" r="3.5"></circle><path d="M17 4.5a3.5 3.5 0 0 1 0 6.8M18 14c1.8.7 3 2.4 3 4.5V20"></path>
+    {% elif name == "coordinate" %}
+      <path d="M4 7h15M16 4l3 3-3 3M20 17H5M8 14l-3 3 3 3"></path>
+    {% elif name == "chevron" %}
+      <path d="m9 5 7 7-7 7"></path>
+    {% else %}
+      <circle cx="12" cy="12" r="9"></circle>
+    {% endif %}
+  </svg>
+{%- endmacro %}
+
+{% block title %}HumanWire {{ room.mandate.token }}{% endblock %}
+{% block page_name %}decision-room{% endblock %}
+
+{% block main %}
+  <main
+    id="main-content"
+    class="decision-room shell"
+    data-testid="decision-room"
+    data-mandate-token="{{ room.mandate.token }}"
+    data-baseline-updated="{{ room.mandate.updated_at }}"
+    data-deadline="{{ room.next_action.due_at or '' }}"
+  >
+    <section class="mandate-summary" aria-labelledby="mandate-title">
+      <h1 id="mandate-title">{{ room.mandate.objective }}</h1>
+      <dl class="mandate-meta">
+        <div>
+          <dt>Mandate</dt>
+          <dd><span class="token">{{ room.mandate.token }}</span></dd>
+        </div>
+        <div>
+          <dt>Initiated by</dt>
+          <dd>{{ room.mandate.initiator.name }}</dd>
+        </div>
+        <div>
+          <dt>State</dt>
+          <dd><span class="status-dot"></span>{{ room.mandate.state_label }}</dd>
+        </div>
+        <div>
+          <dt>Deadline</dt>
+          <dd>{{ room.mandate.deadline_display }} <small>({{ room.mandate.deadline_relative }})</small></dd>
+        </div>
+        <div>
+          <dt>Progress</dt>
+          <dd>{{ room.mandate.progress_label }}</dd>
+        </div>
+      </dl>
+    </section>
+
+    <section class="workflow" aria-labelledby="workflow-heading">
+      <h2 id="workflow-heading" class="sr-only">Mandate lifecycle</h2>
+      <ol>
+        {% for step in room.workflow %}
+          <li
+            class="workflow-step is-{{ step.status }}"
+            data-testid="workflow-step-{{ step.key }}"
+            {% if step.status == "current" %}aria-current="step"{% endif %}
+          >
+            <span class="step-marker">
+              {% if step.status == "complete" %}{{ icon("check") }}{% else %}{{ loop.index }}{% endif %}
+            </span>
+            <span class="step-copy"><strong>{{ step.label }}</strong><small>{{ step.detail }}</small></span>
+          </li>
+        {% endfor %}
+      </ol>
+    </section>
+
+    <div class="decision-layout">
+      <aside class="panel next-action" data-testid="next-action" aria-labelledby="next-action-heading">
+        <h2 id="next-action-heading">Next action</h2>
+        <div class="action-callout">
+          <div class="action-summary">
+            <span class="action-icon">{{ icon("send") }}</span>
+            <h3>{{ room.next_action.label }}</h3>
+          </div>
+          <div class="countdown-wrap">
+            <span>Due in</span>
+            <strong class="countdown" data-countdown aria-hidden="true">{{ room.next_action.countdown }}</strong>
+            <span class="countdown-units"><span>hrs</span><span>min</span><span>sec</span></span>
+            <span class="sr-only" data-countdown-live aria-live="polite">Due time available</span>
+          </div>
+          <div class="why">
+            <h3>Why this matters</h3>
+            <p>{{ room.next_action.why }}</p>
+          </div>
+        </div>
+      </aside>
+
+      <section
+        class="panel stakeholders"
+        data-testid="stakeholders"
+        data-selected-person="{{ room.selected.person_id if room.selected else '' }}"
+        aria-labelledby="stakeholders-heading"
+      >
+        <div class="section-heading stakeholders-heading">
+          <h2 id="stakeholders-heading">Stakeholders <small>(<span data-filter-count>{{ room.filter_counts.all }}</span>)</small></h2>
+          <div class="state-filters" aria-label="Stakeholder state filters">
+            {% set filters = [
+              ("all", "All", "all"),
+              ("in-progress", "In progress", "in_progress"),
+              ("completed", "Completed", "completed"),
+              ("pending", "Pending", "pending"),
+              ("delivered", "Delivered", "delivered")
+            ] %}
+            {% for key, label, count_key in filters %}
+              <button
+                type="button"
+                data-filter="{{ key }}"
+                aria-pressed="{{ 'true' if key == 'all' else 'false' }}"
+              >{{ label }} <span>{{ room.filter_counts[count_key] }}</span></button>
+            {% endfor %}
+          </div>
+        </div>
+        <div class="stakeholder-table-wrap">
+          <table class="stakeholder-table" aria-label="Stakeholder engagement progress">
+            <thead>
+              <tr>
+                <th scope="col">Stakeholder</th>
+                <th scope="col">Department</th>
+                <th scope="col" class="col-direction">Direction</th>
+                <th scope="col">Safe channel</th>
+                <th scope="col">Engagement</th>
+                <th scope="col">Engagement progress</th>
+                <th scope="col">Last contact</th>
+                <th scope="col">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for stakeholder in room.stakeholders %}
+                <tr
+                  class="stakeholder-row{% if room.selected and stakeholder.person_id == room.selected.person_id %} is-selected{% endif %}"
+                  data-person="{{ stakeholder.person_id }}"
+                  data-filter-groups="{{ stakeholder.filter_groups }}"
+                  data-name="{{ stakeholder.name }}"
+                  data-engagement="{{ stakeholder.engagement_label }}"
+                  data-ladder='{{ stakeholder.ladder | tojson }}'
+                  {% if room.selected and stakeholder.person_id == room.selected.person_id %}data-selected="true"{% endif %}
+                >
+                  <td data-label="Stakeholder">
+                    <button
+                      class="stakeholder-select"
+                      type="button"
+                      aria-pressed="{{ 'true' if room.selected and stakeholder.person_id == room.selected.person_id else 'false' }}"
+                      aria-label="Select {{ stakeholder.name }}"
+                    >
+                      <span class="selection-ring" aria-hidden="true"></span>
+                      <span><strong>{{ stakeholder.name }}</strong>{% if room.selected and stakeholder.person_id == room.selected.person_id %}<small>Selected</small>{% endif %}</span>
+                    </button>
+                  </td>
+                  <td data-label="Department">{{ stakeholder.department }}</td>
+                  <td data-label="Direction" class="col-direction">{{ stakeholder.direction_label }}</td>
+                  <td data-label="Safe channel" class="channel-cell">
+                    {% if stakeholder.engagement_type == "quick_response" %}{{ icon("quick") }}
+                    {% elif stakeholder.engagement_type == "review_approval" %}{{ icon("shield") }}
+                    {% elif stakeholder.engagement_type == "inform" %}{{ icon("info") }}
+                    {% elif stakeholder.engagement_type == "acknowledge" %}{{ icon("mail") }}
+                    {% else %}{{ icon("send") }}{% endif %}
+                    <span>{{ stakeholder.channel_label }}</span>
+                  </td>
+                  <td data-label="Engagement">{{ stakeholder.engagement_label }}</td>
+                  <td data-label="Engagement progress" class="progress-cell">
+                    <span>{{ stakeholder.progress_current }} of {{ stakeholder.progress_total }}</span>
+                    <progress
+                      max="{{ stakeholder.progress_total if stakeholder.progress_total else 1 }}"
+                      value="{{ stakeholder.progress_current }}"
+                      aria-label="{{ stakeholder.name }} engagement progress"
+                    ></progress>
+                  </td>
+                  <td data-label="Last contact">{{ stakeholder.last_contact_display }}</td>
+                  <td data-label="Status">
+                    <span class="engagement-status status-{{ stakeholder.engagement_status | replace(' ', '-') }}">
+                      {% if stakeholder.engagement_status in ["pending", "missing"] %}{{ icon("clock") }}{% else %}{{ icon("check") }}{% endif %}
+                      {{ stakeholder.status_label }}
+                    </span>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel engagement-ladder" data-testid="engagement-ladder" aria-labelledby="selected-ladder-title">
+        <h2 id="selected-ladder-title">Selected: {{ room.selected.name if room.selected else 'None' }} <small>— {{ room.selected.engagement_label if room.selected else 'No engagement' }}</small></h2>
+        <ol id="engagement-ladder-list">
+          {% if room.selected %}
+            {% for step in room.selected.ladder %}
+              <li class="ladder-step is-{{ step.status }}">
+                <span class="ladder-marker">{{ loop.index }}</span>
+                <span><strong>{{ step.label }}</strong><small>{{ step.detail }}</small></span>
+              </li>
+            {% endfor %}
+          {% endif %}
+        </ol>
+      </section>
+
+      <section class="panel evidence-analysis" aria-labelledby="evidence-heading">
+        <h2 id="evidence-heading">Evidence &amp; analysis</h2>
+        <div class="analysis-grid">
+          <section class="analysis-card human-evidence" data-testid="human-evidence" aria-labelledby="human-evidence-heading">
+            <h3 id="human-evidence-heading">Human evidence</h3>
+            <div class="metric-grid">
+              <div><strong>{{ room.human_evidence.saved }}</strong><span>Evidence items saved</span></div>
+              <div><strong>{{ room.human_evidence.unresolved }}</strong><span>Unresolved issues</span></div>
+              <div><strong>{{ room.human_evidence.missing }}</strong><span>Missing responses</span></div>
+            </div>
+          </section>
+          <section class="analysis-card ai-draft" data-testid="ai-draft" aria-labelledby="ai-draft-heading">
+            <div class="analysis-title"><h3 id="ai-draft-heading">AI draft</h3><span>{{ room.ai_draft.readiness }}</span></div>
+            <div class="metric-grid">
+              <div><span>Draft insights</span><strong>{{ room.ai_draft.count }}</strong></div>
+              <div><span>Assumptions</span><strong>{{ room.ai_draft.assumptions }}</strong></div>
+              <div><span>Open questions</span><strong>{{ room.ai_draft.open_questions }}</strong></div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="panel activity-timeline" data-testid="activity-timeline" aria-labelledby="timeline-heading">
+        <div class="section-heading">
+          <h2 id="timeline-heading">Activity timeline <small>(append-only)</small></h2>
+          <span>Most recent first</span>
+        </div>
+        <ol>
+          {% for event in room.timeline %}
+            <li>
+              <span class="timeline-node" aria-hidden="true"></span>
+              <time datetime="{{ event.created_at }}">{{ event.created_display }}</time>
+              <strong>{{ event.description }}</strong>
+              <span class="timeline-context">{{ event.context_label }}</span>
+            </li>
+          {% endfor %}
+        </ol>
+      </section>
+
+      <section class="panel reach-preview" data-testid="reach-preview" aria-labelledby="reach-heading">
+        <div class="section-heading">
+          <h2 id="reach-heading">Reach preview</h2>
+          <a class="text-link" href="/mandates/{{ room.mandate.token }}/reach">Open Reach {{ icon("chevron") }}</a>
+        </div>
+        <ul>
+          {% for lane in room.reach %}
+            <li>
+              <span class="reach-icon">{% if lane.key == "gather" %}{{ icon("users") }}{% elif lane.key == "coordinate" %}{{ icon("coordinate") }}{% elif lane.key == "approval" %}{{ icon("shield") }}{% else %}{{ icon("info") }}{% endif %}</span>
+              <span><strong>{{ lane.label }}</strong><small>{{ lane.state_label }}</small></span>
+              <b>{{ lane.count }}</b>
+            </li>
+          {% endfor %}
+        </ul>
+      </section>
+
+      <section class="panel technical-data" data-testid="technical-data" aria-labelledby="technical-heading">
+        <h2 id="technical-heading">Technical data</h2>
+        <a class="text-link" href="/mandates/{{ room.mandate.token }}/data">Open Data view {{ icon("chevron") }}</a>
+      </section>
+    </div>
+  </main>
+{% endblock %}
+
+{% block footer %}
+  <footer
+    class="live-footer"
+    data-testid="live-refresh"
+    data-refresh-token="{{ room.mandate.token }}"
+    data-refresh-baseline="{{ room.mandate.updated_at }}"
+  >
+    <span class="live-state"><i aria-hidden="true"></i><span data-refresh-status>Live refresh every 5s</span></span>
+    <span>Last updated: <time datetime="{{ room.mandate.updated_at }}" data-last-updated>{{ room.mandate.updated_time }}</time></span>
+  </footer>
+{% endblock %}

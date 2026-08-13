@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#001428">
+    <title>{% block title %}HumanWire{% endblock %}</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body data-page="{% block page_name %}humanwire{% endblock %}">
+    <a class="skip-link" href="#main-content">Skip to main content</a>
+    <header class="site-header">
+      <div class="header-shell">
+        <a class="brand" href="/" aria-label="HumanWire home">HumanWire</a>
+        <button
+          class="nav-toggle"
+          type="button"
+          aria-controls="primary-navigation"
+          aria-expanded="false"
+          aria-label="Open navigation"
+          data-nav-toggle
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 6h16M4 12h16M4 18h16"></path>
+          </svg>
+        </button>
+        <nav id="primary-navigation" class="primary-nav" aria-label="Primary" data-navigation>
+          <a href="/"{% if current_nav == "mandates" %} aria-current="page"{% endif %}>Mandates</a>
+          <a
+            href="{% if nav_token %}/mandates/{{ nav_token }}/reach{% else %}/#mandates{% endif %}"
+            {% if current_nav == "reach" %}aria-current="page"{% endif %}
+          >Reach</a>
+          <a
+            href="{% if nav_token %}/mandates/{{ nav_token }}/data{% else %}/#mandates{% endif %}"
+            {% if current_nav == "data" %}aria-current="page"{% endif %}
+          >Data</a>
+        </nav>
+        {% if demo_mode %}
+          <p class="demo-notice"><span aria-hidden="true"></span>Interactive fixture — live channel proof is shown in the recorded demo</p>
+        {% endif %}
+      </div>
+    </header>
+    {% block main %}{% endblock %}
+    {% block footer %}{% endblock %}
+  </body>
+</html>

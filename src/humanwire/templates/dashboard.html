@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+
+{% block title %}HumanWire — Mandates{% endblock %}
+{% block page_name %}dashboard{% endblock %}
+
+{% block main %}
+  <main id="main-content" class="dashboard shell" data-testid="dashboard">
+    <section class="dashboard-heading" aria-labelledby="mandates-heading">
+      <div>
+        <h1 id="mandates-heading">Mandates</h1>
+      </div>
+      <nav class="dashboard-filters" aria-label="Mandate state filters">
+        {% set filters = [
+          ("all", "All", "all"),
+          ("active", "Active", "active"),
+          ("aligned", "Aligned", "aligned"),
+          ("meeting-ready", "Meeting ready", "meeting_ready"),
+          ("partial", "Partial", "partial"),
+          ("failed", "Failed", "failed")
+        ] %}
+        {% for key, label, count_key in filters %}
+          <a
+            href="/{% if key != 'all' %}?state={{ key }}{% endif %}"
+            {% if dashboard.filter == key %}aria-current="page"{% endif %}
+          >{{ label }} <span>{{ dashboard.counts[count_key] }}</span></a>
+        {% endfor %}
+      </nav>
+    </section>
+
+    <section id="mandates" class="mandate-list" aria-label="Open mandates">
+      {% if dashboard.mandates %}
+        {% for mandate in dashboard.mandates %}
+          <article class="mandate-row" data-mandate-token="{{ mandate.token }}">
+            <div class="mandate-row-main">
+              <a class="token-link" href="/mandates/{{ mandate.token }}">{{ mandate.token }}</a>
+              <h2><a href="/mandates/{{ mandate.token }}">{{ mandate.objective }}</a></h2>
+            </div>
+            <dl>
+              <div><dt>Initiated by</dt><dd>{{ mandate.initiator.name }}</dd></div>
+              <div><dt>State</dt><dd><span class="status-dot"></span>{{ mandate.phase_display }}</dd></div>
+              <div><dt>Engagement progress</dt><dd>{{ mandate.complete_count }} of {{ mandate.stakeholder_count }}</dd></div>
+              <div><dt>Last updated</dt><dd>{{ mandate.updated_display }}</dd></div>
+            </dl>
+          </article>
+        {% endfor %}
+      {% else %}
+        <p class="empty-state">No mandates in this state.</p>
+      {% endif %}
+    </section>
+  </main>
+{% endblock %}
