@@ -87,21 +87,23 @@
     <div class="decision-layout">
       <aside class="panel next-action" data-testid="next-action" aria-labelledby="next-action-heading">
         <h2 id="next-action-heading">Next action</h2>
-        <div class="action-callout">
-          <div class="action-summary">
-            <span class="action-icon">{{ icon("send") }}</span>
+        <div class="action-callout{% if not room.next_action.is_actionable %} is-empty{% endif %}">
+          <div class="action-summary" aria-live="polite">
+            <span class="action-icon">{{ icon("send" if room.next_action.is_actionable else "check") }}</span>
             <h3>{{ room.next_action.label }}</h3>
           </div>
-          <div class="countdown-wrap">
-            <span>Due in</span>
-            <strong class="countdown" data-countdown aria-hidden="true">{{ room.next_action.countdown }}</strong>
-            <span class="countdown-units"><span>hrs</span><span>min</span><span>sec</span></span>
-            <span class="sr-only" data-countdown-live aria-live="polite">Due time available</span>
-          </div>
-          <div class="why">
-            <h3>Why this matters</h3>
-            <p>{{ room.next_action.why }}</p>
-          </div>
+          {% if room.next_action.is_actionable %}
+            <div class="countdown-wrap">
+              <span>Due in</span>
+              <strong class="countdown" data-countdown aria-hidden="true">{{ room.next_action.countdown }}</strong>
+              <span class="countdown-units"><span>hrs</span><span>min</span><span>sec</span></span>
+              <span class="sr-only" data-countdown-live aria-live="polite">Due time available</span>
+            </div>
+            <div class="why">
+              <h3>Why this matters</h3>
+              <p>{{ room.next_action.why }}</p>
+            </div>
+          {% endif %}
         </div>
       </aside>
 

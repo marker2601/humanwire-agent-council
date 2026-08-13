@@ -28,6 +28,7 @@ from humanwire.domain import (
     EngagementDecisionKind,
     EngagementType,
     EvidenceVisibility,
+    MandateState,
     StakeholderState,
 )
 from humanwire.web import create_app
@@ -311,12 +312,17 @@ def test_engagement_ladder_has_only_the_earliest_current_step() -> None:
     ]
 
 
-def test_decision_room_defaults_to_safe_priya_action_and_ladder(web_client) -> None:
+def test_decision_room_defaults_to_safe_priya_selection_without_inventing_action(
+    web_client,
+) -> None:
     html = web_client.get("/mandates/HW-2411").text
 
     assert 'data-selected-person="priya-shah"' in html
     assert "Selected: Priya Shah" in html
-    assert "Contact Priya through registered Telegram" in html
+    assert "No pending action" in html
+    assert "Contact Priya through registered Telegram" not in html
+    assert "data-countdown" not in html
+    assert 'data-deadline=""' in html
     assert "Alternate Telegram" in html
     assert "Interview" in html
     for forbidden in (
@@ -399,6 +405,49 @@ def test_decision_room_css_reflows_without_a_fixed_desktop_table(web_client) -> 
     assert "@media (prefers-reduced-motion: reduce)" in css
     assert re.search(r"\.stakeholder-row td\s*\{[^}]*font-size:\s*14px", css, re.DOTALL)
     assert re.search(r"\.state-filters button\s*\{[^}]*font-size:\s*14px", css, re.DOTALL)
+
+
+def test_decision_room_stylesheet_never_shrinks_meaningful_text_below_14px(
+    web_client,
+) -> None:
+    css = web_client.get("/static/styles.css").text
+    numeric_sizes = re.findall(r"font-size:\s*([0-9.]+)(px|rem)", css)
+
+    assert numeric_sizes
+    too_small = [
+        f"{value}{unit}"
+        for value, unit in numeric_sizes
+        if (float(value) if unit == "px" else float(value) * 14) < 14
+    ]
+    assert too_small == []
+
+
+def test_typography_floor_reflows_dense_content_instead_of_clipping_it(web_client) -> None:
+    css = web_client.get("/static/styles.css").text
+
+    assert re.search(r"\.next-action\s*\{[^}]*align-self:\s*start", css, re.DOTALL)
+    assert re.search(
+        r"\.stakeholder-table th:nth-child\(8\)\s*\{\s*width:\s*13%",
+        css,
+    )
+    assert re.search(
+        r"@media \(max-width: 759px\).*?\.engagement-ladder ol\s*\{[^}]*"
+        r"grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)",
+        css,
+        re.DOTALL,
+    )
+    assert re.search(
+        r"@media \(max-width: 759px\).*?\.activity-timeline strong\s*\{[^}]*"
+        r"white-space:\s*normal",
+        css,
+        re.DOTALL,
+    )
+    assert re.search(
+        r"@media \(max-width: 479px\).*?\.engagement-ladder ol\s*\{[^}]*"
+        r"grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)",
+        css,
+        re.DOTALL,
+    )
 
 
 def test_decision_room_javascript_polls_persisted_state_only(web_client) -> None:
@@ -518,6 +567,179 @@ def test_terminal_assignment_progress_is_truthful(demo_app, state, status) -> No
 
     assert row["engagement_status"] == status
     assert (row["progress_current"], row["progress_total"]) == (0, 1)
+
+
+@pytest.mark.parametrize(
+    (
+        "state",
+        "expected_status",
+        "expected_progress",
+        "expected_ladder",
+    ),
+    [
+        (
+            StakeholderState.CONTACT_QUEUED,
+            "pending",
+            (0, 1),
+            [("Primary", "current"), ("Delivered", "pending")],
+        ),
+        (
+            StakeholderState.DELIVERED,
+            "pending",
+            (0, 1),
+            [("Primary", "complete"), ("Delivered", "current")],
+        ),
+        (
+            StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+            "pending",
+            (0, 1),
+            [("Primary", "complete"), ("Delivered", "pending")],
+        ),
+        (
+            StakeholderState.COMPLETE,
+            "delivered",
+            (1, 1),
+            [("Primary", "complete"), ("Delivered", "complete")],
+        ),
+        (
+            StakeholderState.DELIVERY_FAILED,
+            "delivery failed",
+            (0, 1),
+            [("Primary", "complete"), ("Delivered", "pending")],
+        ),
+        (
+            StakeholderState.UNREACHABLE,
+            "unreachable",
+            (0, 1),
+            [("Primary", "complete"), ("Delivered", "pending")],
+        ),
+    ],
+    ids=[
+        "contact-queued",
+        "delivered-without-completion-proof",
+        "invalid-awaiting-state-fails-safe",
+        "delivery-confirmed-complete",
+        "delivery-failed",
+        "unreachable",
+    ],
+)
+def test_inform_projection_and_ladder_require_delivery_confirmed_completion(
+    demo_app,
+    state,
+    expected_status,
+    expected_progress,
+    expected_ladder,
+) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assignment = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.person_id == "inez-ward"
+    )
+    no_outreach = state is StakeholderState.CONTACT_QUEUED
+    repository.save_assignment(
+        assignment.model_copy(
+            update={
+                "state": state,
+                "attempt_count": 0 if no_outreach else 1,
+                "first_contact_at": None if no_outreach else assignment.first_contact_at,
+                "last_delivery_at": None if no_outreach else assignment.last_delivery_at,
+                "completed_at": (
+                    assignment.completed_at if state is StakeholderState.COMPLETE else None
+                ),
+            }
+        )
+    )
+
+    rows = TestClient(demo_app).get(
+        "/api/v1/mandates/HW-2411/stakeholders"
+    ).json()
+    row = next(item for item in rows if item["person_id"] == "inez-ward")
+    ladder = web_projection._engagement_ladder(row)
+
+    assert row["engagement_status"] == expected_status
+    assert (row["progress_current"], row["progress_total"]) == expected_progress
+    assert [(step["label"], step["status"]) for step in ladder] == expected_ladder
+
+
+def _next_action_region(html: str) -> str:
+    match = re.search(r'data-testid="next-action".*?</aside>', html, re.DOTALL)
+    assert match is not None
+    return match.group(0)
+
+
+@pytest.mark.parametrize("state", list(MandateState), ids=lambda state: state.value)
+def test_decision_room_never_invents_action_without_exact_persisted_next_action(
+    demo_app,
+    state,
+) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    repository.save_mandate(
+        mandate.model_copy(
+            update={
+                "state": state,
+                "next_action_at": None,
+                "completed_at": NOW if state in {
+                    MandateState.ALIGNED,
+                    MandateState.MEETING_READY,
+                    MandateState.PARTIAL,
+                    MandateState.EXPIRED,
+                    MandateState.CANCELLED,
+                    MandateState.DELIVERY_FAILED,
+                } else None,
+            }
+        )
+    )
+    for assignment in repository.list_assignments(mandate.mandate_id):
+        repository.save_assignment(assignment.model_copy(update={"next_action_at": None}))
+
+    html = TestClient(demo_app).get("/mandates/HW-2411").text
+    action = _next_action_region(html)
+    expected_state = "Coordinating" if state is MandateState.INTERVIEWING else (
+        state.value.replace("_", " ").capitalize()
+    )
+
+    assert expected_state in html
+    assert "No pending action" in action
+    assert "Contact " not in action
+    assert "Due in" not in action
+    assert "Why this matters" not in action
+    assert "data-countdown" not in action
+    assert 'data-deadline=""' in html
+
+
+@pytest.mark.parametrize("state", list(MandateState), ids=lambda state: state.value)
+def test_decision_room_renders_only_live_coordinating_exact_assignment_action(
+    demo_app,
+    state,
+) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    repository.save_mandate(mandate.model_copy(update={"state": state}))
+    assignments = repository.list_assignments(mandate.mandate_id)
+    maya = next(item for item in assignments if item.person_id == "maya-brooks")
+    scheduled_at = NOW + timedelta(minutes=20)
+    repository.save_assignment(maya.model_copy(update={"next_action_at": scheduled_at}))
+
+    html = TestClient(demo_app).get("/mandates/HW-2411").text
+    action = _next_action_region(html)
+
+    assert 'data-selected-person="priya-shah"' in html
+    assert "Selected: Priya Shah" in html
+    if state is MandateState.INTERVIEWING:
+        assert "Contact Maya through registered Email" in action
+        assert "data-countdown" in action
+        assert scheduled_at.isoformat() in html
+        assert "Contact Priya" not in action
+        assert "Review the approval request" in action
+    else:
+        assert "No pending action" in action
+        assert "Contact " not in action
+        assert "Why this matters" not in action
+        assert "data-countdown" not in action
+        assert 'data-deadline=""' in html
 
 
 def test_declined_structured_interview_preserves_truthful_question_progress(

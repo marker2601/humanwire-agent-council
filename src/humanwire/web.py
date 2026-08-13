@@ -146,6 +146,17 @@ _WORKFLOW_STEPS = (
     ("negotiating", "Negotiating"),
     ("meeting-ready", "Meeting Ready"),
 )
+_ACTIONABLE_ASSIGNMENT_STATES = frozenset(
+    {
+        StakeholderState.CONTACT_QUEUED,
+        StakeholderState.DELIVERED,
+        StakeholderState.AWAITING_ACKNOWLEDGEMENT,
+        StakeholderState.ACKNOWLEDGED,
+        StakeholderState.INTERVIEWING,
+        StakeholderState.FOLLOW_UP_DUE,
+        StakeholderState.ALTERNATE_CHANNEL,
+    }
+)
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -371,7 +382,12 @@ def _engagement_progress(
         )
 
     if engagement_type is EngagementType.INFORM:
-        return "delivered", int(assignment.state is StakeholderState.COMPLETE), 1
+        delivery_confirmed = (
+            assignment.state is StakeholderState.COMPLETE
+            and assignment.completed_at is not None
+            and assignment.last_delivery_at is not None
+        )
+        return ("delivered" if delivery_confirmed else "pending"), int(delivery_confirmed), 1
     if engagement_type is EngagementType.ACKNOWLEDGE:
         complete = assignment.state is StakeholderState.COMPLETE
         return ("acknowledged" if complete else "awaiting acknowledgement"), int(complete), 1
@@ -427,7 +443,12 @@ def _has_exact_availability(repository: Any, assignment: StakeholderAssignment) 
 
 
 def _next_action(assignments: list[StakeholderAssignment]) -> dict[str, Any] | None:
-    scheduled = [assignment for assignment in assignments if assignment.next_action_at is not None]
+    scheduled = [
+        assignment
+        for assignment in assignments
+        if assignment.next_action_at is not None
+        and assignment.state in _ACTIONABLE_ASSIGNMENT_STATES
+    ]
     if not scheduled:
         return None
     assignment = min(scheduled, key=lambda item: (item.next_action_at, str(item.assignment_id)))
@@ -606,6 +627,10 @@ def _countdown(value: str | None, current_time: datetime) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def _public_label(value: Any) -> str:
+    return str(value or "").replace("_", " ").capitalize()
+
+
 def _engagement_ladder(row: Mapping[str, Any]) -> list[dict[str, str]]:
     """Build one type-specific ladder strictly from safe persisted projection fields."""
     engagement_type = str(row.get("engagement_type") or "")
@@ -662,8 +687,21 @@ def _engagement_ladder(row: Mapping[str, Any]) -> list[dict[str, str]]:
         or (alternate and not (acknowledged or progressed or completed))
     )
     if engagement_type == "inform":
-        delivered = completed or engagement_status == "delivered"
-        add("Delivered", "complete" if delivered else "pending" if outreach_waiting else "current")
+        delivery_confirmed = (
+            state == "complete"
+            and bool(row.get("completed_at"))
+            and engagement_status == "delivered"
+        )
+        delivery_in_progress = state == "delivered" and not terminal_failure
+        add(
+            "Delivered",
+            (
+                "complete"
+                if delivery_confirmed
+                else "current" if delivery_in_progress else "pending"
+            ),
+            _short_datetime(row.get("completed_at")) if delivery_confirmed else "Pending",
+        )
         return finish()
 
     if engagement_type == "acknowledge":
@@ -806,6 +844,28 @@ def _selected_stakeholder(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     return min(enumerate(rows), key=priority)[1]
 
 
+def _actionable_stakeholder(
+    mandate_state: str,
+    next_action: Mapping[str, Any] | None,
+    rows: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if mandate_state != MandateState.INTERVIEWING.value or not next_action:
+        return None
+    person_id = next_action.get("person_id")
+    scheduled_at = next_action.get("scheduled_at")
+    if not person_id or not scheduled_at:
+        return None
+    matches = [
+        row
+        for row in rows
+        if row.get("person_id") == person_id
+        and row.get("next_action_at") == scheduled_at
+        and row.get("state") in {state.value for state in _ACTIONABLE_ASSIGNMENT_STATES}
+        and row.get("channel") in {channel.value for channel in Channel}
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _workflow_view(mandate: Mapping[str, Any]) -> list[dict[str, str]]:
     state = str(mandate.get("state") or "")
     current_index = {
@@ -933,6 +993,11 @@ def _decision_room_view(
         ),
         None,
     )
+    action_view = _actionable_stakeholder(
+        str(detail.get("state") or ""),
+        detail.get("next_action"),
+        presented_rows,
+    )
     evidence = _evidence_summary(repository, mandate)
     public_evidence_count = evidence["counts"]["shareable"] + evidence["counts"]["anonymous"]
     missing_responses = sum(
@@ -976,25 +1041,25 @@ def _decision_room_view(
         }
         for event in reversed(events)
     ]
-    next_due = (
-        selected_view.get("next_action_at") if selected_view is not None else None
-    ) or (detail.get("next_action") or {}).get("scheduled_at") or detail.get("deadline")
-    if selected_view is not None:
-        selected_name = str(selected_view.get("name") or "Stakeholder")
-        first_name = selected_name.split()[0]
-        channel = str(selected_view.get("channel") or "")
-        channel_name = channel.capitalize() if channel else "channel"
-        channel_phrase = f"registered {channel_name}"
-        next_action_label = f"Contact {first_name} through {channel_phrase}"
-        alternate_phrase = " alternate" if selected_view.get("channel_is_alternate") else ""
-        why = (
-            f"{selected_name}'s {selected_view['engagement_label'].lower()} is "
-            f"{selected_view['status_label'].lower()}. The registered{alternate_phrase} "
-            "channel keeps this engagement moving."
-        )
+    if action_view is not None:
+        action_name = str(action_view.get("name") or "Stakeholder")
+        first_name = action_name.split()[0]
+        channel_name = _public_label(action_view.get("channel"))
+        next_action = {
+            "is_actionable": True,
+            "label": f"Contact {first_name} through registered {channel_name}",
+            "why": str(action_view.get("reason") or ""),
+            "due_at": action_view.get("next_action_at"),
+            "countdown": _countdown(action_view.get("next_action_at"), current_time),
+        }
     else:
-        next_action_label = "No pending action"
-        why = "All persisted engagement work is complete."
+        next_action = {
+            "is_actionable": False,
+            "label": "No pending action",
+            "why": None,
+            "due_at": None,
+            "countdown": None,
+        }
     filter_counts = {
         "all": len(presented_rows),
         "in_progress": sum("in-progress" in row["filter_groups"] for row in presented_rows),
@@ -1005,7 +1070,7 @@ def _decision_room_view(
     return {
         "mandate": {
             **detail,
-            "state_label": str(detail.get("phase_label") or "").capitalize(),
+            "state_label": _public_label(detail.get("phase_label")),
             "deadline_display": _long_date(detail.get("deadline")),
             "deadline_relative": _relative_deadline(detail.get("deadline"), current_time),
             "updated_display": _short_datetime(detail.get("updated_at")),
@@ -1023,12 +1088,7 @@ def _decision_room_view(
         "stakeholders": presented_rows,
         "selected": selected_view,
         "filter_counts": filter_counts,
-        "next_action": {
-            "label": next_action_label,
-            "why": why,
-            "due_at": next_due,
-            "countdown": _countdown(next_due, current_time),
-        },
+        "next_action": next_action,
         "human_evidence": {
             "saved": public_evidence_count,
             "unresolved": detail.get("open_issue_count", 0),
