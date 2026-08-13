@@ -1440,35 +1440,41 @@ def _workflow_view(mandate: Mapping[str, Any]) -> list[dict[str, str]]:
     return steps
 
 
-def _event_description(event: Mapping[str, Any]) -> str:
+def _event_description(
+    event: Mapping[str, Any], bound_row: Mapping[str, Any] | None = None
+) -> str:
     event_type = str(event.get("event_type") or "")
-    person = event.get("person") or {}
-    name = person.get("name") if isinstance(person, Mapping) else None
-    subject = str(name or "Mandate")
-    labels = {
+    name = (
+        str(bound_row.get("name") or "").strip()
+        if isinstance(bound_row, Mapping)
+        else ""
+    )
+    mandate_labels = {
         "mandate.created": "Mandate received",
         "engagement.plan_previewed": "Engagement plan previewed",
         "engagement.plan_released": "Engagement plan released",
         "mandate.interviewing": "Coordination started",
-        "engagement.quick_response_sent": f"Quick response sent to {subject}",
-        "engagement.structured_interview_sent": f"Structured interview sent to {subject}",
-        "engagement.acknowledgement_sent": f"Acknowledgement sent to {subject}",
-        "engagement.approval_pending": f"{subject} approval review is pending",
-        "engagement.inform_delivered": f"{subject} received the coordination update",
-        "engagement.quick_response_completed": f"{subject} completed a quick response",
-        "engagement.acknowledged": f"{subject} acknowledged the request",
-        "engagement.structured_interview_reminder": f"Reminder sent to {subject}",
+    }
+    person_labels = {
+        "engagement.quick_response_sent": "Quick response sent to {name}",
+        "engagement.structured_interview_sent": "Structured interview sent to {name}",
+        "engagement.acknowledgement_sent": "Acknowledgement sent to {name}",
+        "engagement.approval_pending": "{name} approval review is pending",
+        "engagement.inform_delivered": "{name} received the coordination update",
+        "engagement.quick_response_completed": "{name} completed a quick response",
+        "engagement.acknowledged": "{name} acknowledged the request",
+        "engagement.structured_interview_reminder": "Reminder sent to {name}",
         "engagement.structured_interview_alternate_selected": (
-            f"Alternate channel selected for {subject}"
+            "Alternate channel selected for {name}"
         ),
         "engagement.structured_interview_progressed": (
-            f"{subject} structured interview progressed"
+            "{name} structured interview progressed"
         ),
     }
-    return labels.get(
-        event_type,
-        "Saved engagement event" if name else "Saved mandate event",
-    )
+    person_label = person_labels.get(event_type)
+    if person_label is not None:
+        return person_label.format(name=name) if name else "Saved event"
+    return mandate_labels.get(event_type, "Saved event")
 
 
 _REACH_FILTERS = frozenset({"all", "in-progress", "completed", "pending", "unreachable"})
@@ -1503,64 +1509,44 @@ _MANDATE_LEVEL_EVENT_TYPES = frozenset(
 )
 
 _REPLAY_EVENT_EXPLANATIONS = {
-    "mandate.created": ("Mandate", "Mandate created"),
-    "mandate.received": ("Mandate", "Mandate received"),
-    "engagement.plan_previewed": ("Plan", "Plan previewed"),
-    "engagement.plan_released": ("Plan", "Plan released"),
-    "mandate.planned": ("Plan", "Plan prepared"),
-    "mandate.interviewing": ("Outreach", "Coordination started"),
-    "engagement.quick_response_sent": ("Outreach", "Outreach sent"),
-    "engagement.structured_interview_sent": ("Outreach", "Interview requested"),
-    "engagement.acknowledgement_sent": ("Outreach", "Acknowledgement requested"),
-    "engagement.inform_delivered": ("Outreach", "Update delivered"),
-    "engagement.structured_interview_reminder": ("Outreach", "Reminder sent"),
+    "mandate.created": ("Mandate", "Mandate created", "HumanWire", "Decision Room"),
+    "mandate.received": ("Mandate", "Mandate received", "HumanWire", "Decision Room"),
+    "engagement.plan_previewed": ("Plan", "Plan previewed", "HumanWire", "Decision Room"),
+    "engagement.plan_released": ("Plan", "Plan released", "HumanWire", "Decision Room"),
+    "mandate.planned": ("Plan", "Plan prepared", "HumanWire", "Decision Room"),
+    "mandate.interviewing": ("Outreach", "Coordination started", "HumanWire", "Decision Room"),
+    "engagement.quick_response_sent": ("Outreach", "Outreach sent", "HumanWire", "person"),
+    "engagement.structured_interview_sent": ("Outreach", "Interview requested", "HumanWire", "person"),
+    "engagement.acknowledgement_sent": ("Outreach", "Acknowledgement requested", "HumanWire", "person"),
+    "engagement.inform_delivered": ("Outreach", "Update delivered", "HumanWire", "person"),
+    "engagement.structured_interview_reminder": ("Outreach", "Reminder sent", "HumanWire", "person"),
     "engagement.structured_interview_alternate_selected": (
         "Outreach",
         "Alternate channel selected",
+        "HumanWire",
+        "person",
     ),
-    "engagement.quick_response_completed": ("Response", "Response completed"),
-    "engagement.acknowledged": ("Response", "Acknowledgement received"),
-    "engagement.structured_interview_progressed": ("Response", "Interview progressed"),
-    "interview.answer_recorded": ("Response", "Answer recorded"),
-    "interview.evidence_confirmed": ("Evidence", "Evidence confirmed"),
-    "engagement.approval_pending": ("Decision", "Decision requested"),
-    "engagement.override_recorded": ("Decision", "Decision updated"),
-    "proposal.response_recorded": ("Decision", "Proposal response recorded"),
-    "proposal.created": ("Proposal", "Proposal prepared"),
-    "mandate.negotiating": ("Proposal", "Proposal review started"),
-    "mandate.meeting_required": ("Scheduling", "Meeting required"),
-    "mandate.scheduling": ("Scheduling", "Scheduling started"),
-    "availability.recorded": ("Scheduling", "Availability recorded"),
-    "meeting.package_created": ("Scheduling", "Meeting prepared"),
-    "mandate.meeting_ready": ("Scheduling", "Meeting ready"),
-    "mandate.aligned": ("Outcome", "Outcome recorded"),
-    "mandate.partial": ("Outcome", "Partial outcome recorded"),
-    "mandate.cancelled": ("Outcome", "Mandate cancelled"),
-    "mandate.expired": ("Outcome", "Mandate expired"),
+    "engagement.quick_response_completed": ("Response", "Response completed", "person", "HumanWire"),
+    "engagement.acknowledged": ("Response", "Acknowledgement received", "person", "HumanWire"),
+    "engagement.structured_interview_progressed": ("Response", "Interview progressed", "person", "HumanWire"),
+    "interview.answer_recorded": ("Response", "Answer recorded", "person", "HumanWire"),
+    "interview.evidence_confirmed": ("Evidence", "Evidence confirmed", "person", "HumanWire"),
+    "engagement.approval_pending": ("Decision", "Decision requested", "HumanWire", "person"),
+    "engagement.override_recorded": ("Decision", "Decision updated", "HumanWire", "person"),
+    "engagement.decision_recorded": ("Decision", "Decision recorded", "person", "HumanWire"),
+    "proposal.response_recorded": ("Decision", "Proposal response recorded", "person", "HumanWire"),
+    "proposal.created": ("Proposal", "Proposal prepared", "HumanWire", "Decision Room"),
+    "mandate.negotiating": ("Proposal", "Proposal review started", "HumanWire", "Decision Room"),
+    "mandate.meeting_required": ("Scheduling", "Meeting required", "HumanWire", "Decision Room"),
+    "mandate.scheduling": ("Scheduling", "Scheduling started", "HumanWire", "Decision Room"),
+    "availability.recorded": ("Scheduling", "Availability recorded", "person", "HumanWire"),
+    "meeting.package_created": ("Scheduling", "Meeting prepared", "HumanWire", "Decision Room"),
+    "mandate.meeting_ready": ("Scheduling", "Meeting ready", "HumanWire", "Decision Room"),
+    "mandate.aligned": ("Outcome", "Outcome recorded", "HumanWire", "Decision Room"),
+    "mandate.partial": ("Outcome", "Partial outcome recorded", "HumanWire", "Decision Room"),
+    "mandate.cancelled": ("Outcome", "Mandate cancelled", "HumanWire", "Decision Room"),
+    "mandate.expired": ("Outcome", "Mandate expired", "HumanWire", "Decision Room"),
 }
-
-_MANDATE_SCOPED_REPLAY_EVENT_TYPES = frozenset(
-    {
-        "mandate.created",
-        "mandate.received",
-        "engagement.plan_previewed",
-        "engagement.plan_released",
-        "mandate.planned",
-        "mandate.interviewing",
-        "proposal.response_recorded",
-        "proposal.created",
-        "mandate.negotiating",
-        "mandate.meeting_required",
-        "mandate.scheduling",
-        "availability.recorded",
-        "meeting.package_created",
-        "mandate.meeting_ready",
-        "mandate.aligned",
-        "mandate.partial",
-        "mandate.cancelled",
-        "mandate.expired",
-    }
-)
 
 
 def _replay_explanation(
@@ -1575,15 +1561,19 @@ def _replay_explanation(
             "destination_label": "Decision Room",
             "data_point_label": "No public data point",
         }
-    destination = (
+    person_name = (
         str(bound_row.get("name") or "").strip()
         if isinstance(bound_row, Mapping)
         else ""
     )
+    source = person_name if explanation[2] == "person" else explanation[2]
+    destination = person_name if explanation[3] == "person" else explanation[3]
+    if not source or not destination:
+        return _replay_explanation("", None)
     return {
         "stage_label": explanation[0],
-        "source_label": "HumanWire",
-        "destination_label": destination or "Decision Room",
+        "source_label": source,
+        "destination_label": destination,
         "data_point_label": explanation[1],
     }
 
@@ -1720,12 +1710,17 @@ def _reach_page_view(
             and not person_id
             and event_mandate_id == expected_mandate_id
         )
-        can_explain = event_type in _REPLAY_EVENT_EXPLANATIONS and (
-            has_exact_binding
-            or (
-                has_exact_mandate_identity
-                and event_type in _MANDATE_SCOPED_REPLAY_EVENT_TYPES
-            )
+        explanation_definition = _REPLAY_EVENT_EXPLANATIONS.get(event_type)
+        person_scoped = bool(
+            explanation_definition and "person" in explanation_definition[2:]
+        )
+        mandate_scoped = bool(
+            explanation_definition
+            and explanation_definition[2:] == ("HumanWire", "Decision Room")
+        )
+        can_explain = bool(
+            (person_scoped and has_exact_binding)
+            or (mandate_scoped and has_exact_mandate_identity)
         )
         explanation = _replay_explanation(
             event_type if can_explain else "", bound_row if has_exact_binding else None
@@ -1737,14 +1732,7 @@ def _reach_page_view(
         )
         if bound_person_id:
             highlight = bound_person_id
-        elif (
-            can_explain
-            and
-            not assignment_id
-            and not person_id
-            and event_mandate_id == expected_mandate_id
-            and str(event.get("event_type") or "") in _MANDATE_LEVEL_EVENT_TYPES
-        ):
+        elif can_explain and mandate_scoped:
             highlight = "origin"
         else:
             highlight = "none"
@@ -1761,7 +1749,9 @@ def _reach_page_view(
                 "index": event_index,
                 "created_at": event.get("created_at"),
                 "created_display": _short_datetime(event.get("created_at")),
-                "description": _event_description(event),
+                "description": _event_description(
+                    event, bound_row if has_exact_binding and can_explain else None
+                ),
                 "context_label": context,
                 "channel_label": (
                     _public_label(event.get("channel")) if event.get("channel") else ""

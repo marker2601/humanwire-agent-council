@@ -2047,6 +2047,10 @@ const intervals = new Map();
 let nextInterval = 1;
 const documentListeners = {};
 
+function dispatchDocumentEvent(name) {
+  (documentListeners[name] || []).forEach((listener) => listener());
+}
+
 global.document = {
   documentElement: new Element(),
   visibilityState: visible ? "visible" : "hidden",
@@ -2076,7 +2080,10 @@ global.document = {
     }
     return [];
   },
-  addEventListener(name, listener) { documentListeners[name] = listener; },
+  addEventListener(name, listener) {
+    if (!documentListeners[name]) documentListeners[name] = [];
+    documentListeners[name].push(listener);
+  },
 };
 global.window = {
   matchMedia() { return { matches: reduced }; },
@@ -2092,7 +2099,7 @@ global.window = {
 };
 
 eval(fs.readFileSync(scriptPath, "utf8"));
-documentListeners.DOMContentLoaded();
+dispatchDocumentEvent("DOMContentLoaded");
 function replayIntervals() {
   return [...intervals.values()].filter((listener) => listener.name === "advanceSavedEvent");
 }
@@ -2120,9 +2127,18 @@ expect([origin, card].filter((node) => node.classList.contains("is-replay-curren
 play.click();
 if (mode === "normal") {
   expect(replayIntervals().length, 1, "play starts one replay interval");
-  replayIntervals()[0]();
+  document.visibilityState = "hidden";
+  dispatchDocumentEvent("visibilitychange");
+  expect(replayIntervals().length, 0, "visibility change stops replay interval");
+  expect(play.getAttribute("aria-pressed"), "false", "hidden replay is not pressed");
+  expect(play.getAttribute("aria-label"), "Play saved events", "hidden replay label resets");
+  expect(action.textContent, "Play", "hidden replay action resets");
+  next.click();
+  expect(source.textContent, "HumanWire", "manual source remains truthful while hidden");
   expect(destination.textContent, "Eli Torres", "play advances visible destination");
-  expect(live.textContent, "Event 2 of 2: From HumanWire; To Eli Torres; Generated Outreach sent. Second saved event", "live copy after play");
+  expect(dataPoint.textContent, "Outreach sent", "manual data point remains truthful while hidden");
+  expect(description.textContent, "Second saved event", "manual description remains truthful while hidden");
+  expect(live.textContent, "Event 2 of 2: From HumanWire; To Eli Torres; Generated Outreach sent. Second saved event", "live copy after hidden manual step");
 } else {
   expect(replayIntervals().length, 0, "reduced-motion and hidden pages do not start playback");
   expect(play.getAttribute("aria-pressed"), "false", "blocked play remains stopped");
@@ -2143,12 +2159,17 @@ def test_reach_replay_explains_allowlisted_persisted_events(demo_app) -> None:
     repository = demo_app.state.repository
     mandate = repository.get_mandate_by_token("HW-2411")
     assert mandate is not None
-    for index, event_type in enumerate(
+    assignment = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.person_id == "eli-torres"
+    )
+    for index, (event_type, person_scoped) in enumerate(
         (
-            "proposal.created",
-            "availability.recorded",
-            "meeting.package_created",
-            "mandate.aligned",
+            ("proposal.created", False),
+            ("availability.recorded", True),
+            ("meeting.package_created", False),
+            ("mandate.aligned", False),
         ),
         start=1,
     ):
@@ -2158,6 +2179,8 @@ def test_reach_replay_explains_allowlisted_persisted_events(demo_app) -> None:
                 event_type=event_type,
                 created_at=NOW + timedelta(minutes=index),
                 idempotency_key=f"reach-explanation-{event_type}",
+                assignment_id=assignment.assignment_id if person_scoped else None,
+                person_id=assignment.person_id if person_scoped else None,
             ),
         )
 
@@ -2174,11 +2197,11 @@ def test_reach_replay_explains_allowlisted_persisted_events(demo_app) -> None:
         ("engagement.plan_released", None, "Plan", "HumanWire", "Decision Room", "Plan released"),
         ("engagement.quick_response_sent", "eli-torres", "Outreach", "HumanWire", "Eli Torres", "Outreach sent"),
         ("engagement.acknowledgement_sent", "nora-chen", "Outreach", "HumanWire", "Nora Chen", "Acknowledgement requested"),
-        ("interview.answer_recorded", "eli-torres", "Response", "HumanWire", "Eli Torres", "Answer recorded"),
-        ("interview.evidence_confirmed", "eli-torres", "Evidence", "HumanWire", "Eli Torres", "Evidence confirmed"),
+        ("interview.answer_recorded", "eli-torres", "Response", "Eli Torres", "HumanWire", "Answer recorded"),
+        ("interview.evidence_confirmed", "eli-torres", "Evidence", "Eli Torres", "HumanWire", "Evidence confirmed"),
         ("engagement.approval_pending", "maya-brooks", "Decision", "HumanWire", "Maya Brooks", "Decision requested"),
         ("proposal.created", None, "Proposal", "HumanWire", "Decision Room", "Proposal prepared"),
-        ("availability.recorded", None, "Scheduling", "HumanWire", "Decision Room", "Availability recorded"),
+        ("availability.recorded", "eli-torres", "Scheduling", "Eli Torres", "HumanWire", "Availability recorded"),
         ("meeting.package_created", None, "Scheduling", "HumanWire", "Decision Room", "Meeting prepared"),
         ("mandate.aligned", None, "Outcome", "HumanWire", "Decision Room", "Outcome recorded"),
     )
@@ -2200,6 +2223,167 @@ def test_reach_replay_explains_allowlisted_persisted_events(demo_app) -> None:
                 "data_point_label",
             )
         )
+
+
+def test_final_replay_endpoint_direction_matrix(demo_app) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assert mandate is not None
+    assignment = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.person_id == "eli-torres"
+    )
+    classes = (
+        (
+            "outbound",
+            (
+                "engagement.quick_response_sent",
+                "engagement.structured_interview_sent",
+                "engagement.acknowledgement_sent",
+                "engagement.inform_delivered",
+                "engagement.structured_interview_reminder",
+                "engagement.structured_interview_alternate_selected",
+                "engagement.approval_pending",
+                "engagement.override_recorded",
+            ),
+            "HumanWire",
+            "Eli Torres",
+            "eli-torres",
+        ),
+        (
+            "inbound",
+            (
+                "engagement.quick_response_completed",
+                "engagement.acknowledged",
+                "engagement.structured_interview_progressed",
+                "interview.answer_recorded",
+                "interview.evidence_confirmed",
+                "engagement.decision_recorded",
+                "proposal.response_recorded",
+                "availability.recorded",
+            ),
+            "Eli Torres",
+            "HumanWire",
+            "eli-torres",
+        ),
+        (
+            "system",
+            (
+                "mandate.created",
+                "mandate.received",
+                "engagement.plan_previewed",
+                "engagement.plan_released",
+                "mandate.planned",
+                "mandate.interviewing",
+                "proposal.created",
+                "mandate.negotiating",
+                "mandate.meeting_required",
+                "mandate.scheduling",
+                "meeting.package_created",
+                "mandate.meeting_ready",
+                "mandate.aligned",
+                "mandate.partial",
+                "mandate.cancelled",
+                "mandate.expired",
+            ),
+            "HumanWire",
+            "Decision Room",
+            "origin",
+        ),
+    )
+    expected_by_time = {}
+    offset = 1
+    for class_name, event_types, source, destination, highlight in classes:
+        for event_type in event_types:
+            event = DomainEvent(
+                event_type=event_type,
+                created_at=NOW + timedelta(hours=1, minutes=offset),
+                idempotency_key=f"final-replay-direction-{class_name}-{offset}",
+                assignment_id=(
+                    assignment.assignment_id if class_name != "system" else None
+                ),
+                person_id=assignment.person_id if class_name != "system" else None,
+            )
+            repository.append_event(mandate.mandate_id, event)
+            expected_by_time[event.created_at.isoformat()] = (
+                source,
+                destination,
+                highlight,
+            )
+            offset += 1
+
+    replay_by_time = {
+        item["created_at"]: item for item in _internal_reach_view(repository, mandate)["replay"]
+    }
+    for created_at, expected in expected_by_time.items():
+        item = replay_by_time[created_at]
+        assert (
+            item["source_label"],
+            item["destination_label"],
+            item["highlight"],
+        ) == expected
+        assert item["stage_label"] != "Saved event"
+
+
+def test_final_replay_unbound_and_cross_assignment_human_events_are_neutral(
+    demo_app,
+) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assert mandate is not None
+    assignments = {
+        item.person_id: item
+        for item in repository.list_assignments(mandate.mandate_id)
+    }
+    probes = (
+        DomainEvent(
+            event_type="proposal.response_recorded",
+            created_at=NOW + timedelta(hours=2, minutes=1),
+            idempotency_key="final-replay-unbound-proposal-response",
+            actor_id="eli-torres",
+        ),
+        DomainEvent(
+            event_type="availability.recorded",
+            created_at=NOW + timedelta(hours=2, minutes=2),
+            idempotency_key="final-replay-unbound-availability",
+            actor_id="eli-torres",
+        ),
+        DomainEvent(
+            event_type="engagement.quick_response_completed",
+            created_at=NOW + timedelta(hours=2, minutes=3),
+            idempotency_key="final-replay-cross-assignment-description",
+            assignment_id=assignments["eli-torres"].assignment_id,
+            person_id="priya-shah",
+        ),
+    )
+    for event in probes:
+        repository.append_event(mandate.mandate_id, event)
+
+    replay_by_time = {
+        item["created_at"]: item for item in _internal_reach_view(repository, mandate)["replay"]
+    }
+    for event in probes:
+        item = replay_by_time[event.created_at.isoformat()]
+        assert (
+            item["stage_label"],
+            item["source_label"],
+            item["destination_label"],
+            item["data_point_label"],
+            item["highlight"],
+            item["person_id"],
+            item["description"],
+        ) == (
+            "Saved event",
+            "HumanWire",
+            "Decision Room",
+            "No public data point",
+            "none",
+            None,
+            "Saved event",
+        )
+        assert "Eli Torres" not in item["description"]
+        assert "Priya Shah" not in item["description"]
 
 
 def test_reach_replay_unknown_and_cross_assignment_events_are_neutral(demo_app) -> None:
@@ -2449,14 +2633,16 @@ def test_reach_duplicate_rendered_identity_fails_event_binding_closed(
         rows=rows,
         events=events,
     )
-    eli_events = [
-        item
-        for item in view["replay"]
-        if "Eli Torres" in item["description"]
-    ]
+    eli_event_times = {
+        event["created_at"]
+        for event in events
+        if (event.get("person") or {}).get("person_id") == "eli-torres"
+    }
+    eli_events = [item for item in view["replay"] if item["created_at"] in eli_event_times]
 
     assert eli_events
     assert {item["highlight"] for item in eli_events} == {"none"}
+    assert {item["description"] for item in eli_events} == {"Saved event"}
     assert all(
         not row["history"]
         for lane in view["lanes"]
@@ -2544,7 +2730,7 @@ def test_reach_escapes_malicious_presentation_fields_and_links(demo_app) -> None
     assert "&lt;script&gt;alert" in html
     assert "&lt;img src=x" in html
     assert "&lt;b&gt;Role&lt;/b&gt;" in html
-    assert "Saved engagement event" in html
+    assert "Saved event" in html
     assert "safe-looking-unknown" not in html
     assert 'href="/mandates/HW-2411/data?person_id=priya-shah"' in html
     assert 'data-reach-filter="completed"' in html
