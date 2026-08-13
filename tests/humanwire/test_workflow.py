@@ -1190,6 +1190,92 @@ def test_file_concurrent_evidence_confirmation_promotes_once(
     assert sum(bool(result.deliveries) for result in results) == 1
 
 
+def test_due_reconciles_a_committed_confirmation_after_restart_once(
+    tmp_path, incoming_message_factory, now, monkeypatch
+) -> None:
+    """Break caught: a crash after confirmation commit strands synthesis forever."""
+    database_path = tmp_path / "confirmation-synthesis-restart.sqlite3"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    factory = create_session_factory(database_url)
+    with factory.kw["bind"].begin() as connection:
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        connection.exec_driver_sql("PRAGMA busy_timeout=5000")
+    repository = SqlAlchemyHumanWireRepository(factory)
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _completed_asserted_interview(
+        workflow,
+        incoming_message_factory,
+        prefix="confirmation-synthesis-restart",
+    )
+    confirmation = _message_for(
+        incoming_message_factory,
+        "team-lead",
+        f"CONFIRM {mandate.token}",
+        message_id="confirmation-synthesis-restart-confirm",
+    )
+
+    def crash_after_confirmation_commit(*_args, **_kwargs):
+        raise RuntimeError("simulated process exit after confirmation commit")
+
+    monkeypatch.setattr(workflow.synthesis, "run", crash_after_confirmation_commit)
+    with pytest.raises(RuntimeError, match="simulated process exit"):
+        workflow.handle(confirmation)
+
+    persisted = repository.list_evidence(mandate.mandate_id)
+    confirmation_events = [
+        event
+        for event in repository.list_events(mandate.mandate_id)
+        if event.event_type == "interview.evidence_confirmed"
+    ]
+    assert len(persisted) == 1 and persisted[0].status is EvidenceStatus.CONFIRMED
+    assert len(confirmation_events) == 1
+    assert repository.get_mandate_by_token(mandate.token).state is MandateState.INTERVIEWING
+
+    restarted = [
+        _build_workflow(
+            SqlAlchemyHumanWireRepository(create_session_factory(database_url)),
+            lead_email_thread="lead-thread",
+        )
+        for _ in range(2)
+    ]
+    replay_snapshot = _terminal_snapshot(repository, mandate)
+    replay = restarted[0].handle(confirmation)
+    assert replay == WorkflowResult()
+    assert _terminal_snapshot(repository, mandate) == replay_snapshot
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        recovered = list(
+            executor.map(
+                lambda active: active.process_due(now + timedelta(seconds=1)),
+                restarted,
+            )
+        )
+
+    recovered_deliveries = [
+        delivery for result in recovered for delivery in result.deliveries
+    ]
+    assert len(recovered_deliveries) == 1
+    assert "HUMANWIRE DRAFT PROPOSAL" in recovered_deliveries[0].text
+    assert "EVIDENCE CONFIRMATION" not in recovered_deliveries[0].text
+    assert repository.get_mandate_by_token(mandate.token).state is MandateState.NEGOTIATING
+    assert len(repository.list_evidence(mandate.mandate_id)) == 1
+    event_types = [
+        event.event_type for event in repository.list_events(mandate.mandate_id)
+    ]
+    for event_type in (
+        "interview.evidence_confirmed",
+        "mandate.synthesizing",
+        "proposal.created",
+        "mandate.negotiating",
+    ):
+        assert event_types.count(event_type) == 1
+
+    recovered_snapshot = _terminal_snapshot(repository, mandate)
+    repeated = restarted[0].process_due(now + timedelta(seconds=2))
+    assert repeated == WorkflowResult()
+    assert _terminal_snapshot(repository, mandate) == recovered_snapshot
+
+
 @pytest.mark.parametrize(
     "terminal_state", [MandateState.CANCELLED, MandateState.EXPIRED]
 )
@@ -1440,6 +1526,10 @@ def test_latest_required_answer_must_be_confirmed_before_synthesis(
     assert repository.get_mandate_by_token(mandate.token).state is MandateState.INTERVIEWING
     assert repository.get_active_proposal(mandate.mandate_id) is None
     assert completed.deliveries[0].text.endswith(f"CONFIRM {mandate.token}.")
+    pending_snapshot = _terminal_snapshot(repository, mandate)
+    pending_due = workflow.process_due(mandate.created_at + timedelta(seconds=1))
+    assert pending_due == WorkflowResult()
+    assert _terminal_snapshot(repository, mandate) == pending_snapshot
 
     workflow.handle(
         _message_for(

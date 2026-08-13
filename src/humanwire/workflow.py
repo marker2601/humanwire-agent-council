@@ -142,6 +142,9 @@ class HumanWireWorkflow:
             result = self.engagements.process_due_assignment(assignment, now)
             deliveries.extend(result.deliveries)
             deliveries.extend(self.synthesis.run(assignment.mandate_id, now).deliveries)
+        for mandate in self.repository.list_recent_mandates(1000):
+            if mandate.state is MandateState.INTERVIEWING:
+                deliveries.extend(self.synthesis.run(mandate.mandate_id, now).deliveries)
         return WorkflowResult(deliveries=deliveries)
 
     def renew_delivery_claim(
