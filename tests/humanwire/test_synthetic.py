@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 
 import pytest
 from pydantic import ValidationError
@@ -267,6 +269,97 @@ def test_generation_runs_six_distinct_deterministic_persona_policies(tmp_path) -
     assert intents["availability"] == [SyntheticIntent.AVAILABILITY]
 
 
+def _policy_object_graph(policy) -> tuple[set[str], list[object]]:
+    names: set[str] = set()
+    values: list[object] = []
+    pending = [policy, policy.respond, policy._choose]
+    seen: set[int] = set()
+    while pending:
+        value = pending.pop()
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        values.append(value)
+        if isinstance(value, (str, bytes, int, float, bool, type(None), Enum, type)):
+            continue
+        if isinstance(value, dict):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+            continue
+        if isinstance(value, (list, tuple, set, frozenset)):
+            pending.extend(value)
+            continue
+        attributes = vars(value) if hasattr(value, "__dict__") else {}
+        names.update(attributes)
+        pending.extend(attributes.values())
+        function = value.__func__ if inspect.ismethod(value) else value
+        closure = getattr(function, "__closure__", None) or ()
+        pending.extend(cell.cell_contents for cell in closure)
+    return names, values
+
+
+def test_policy_instances_expose_only_sanitized_profile_and_local_state() -> None:
+    scenario = make_generation_scenario()
+    forbidden_names = {
+        "persona",
+        "persona_id",
+        "email",
+        "channels",
+        "display_name",
+        "route",
+        "sender_address",
+        "connection_id",
+        "conversation_id",
+        "message_id",
+        "database",
+        "repository",
+        "system_log",
+        "expected_state",
+        "outcome",
+        "directory",
+        "scenario",
+        "people",
+    }
+
+    for persona in scenario.personas:
+        policy = synthetic_module._build_policy(persona)
+        attribute_names, reachable = _policy_object_graph(policy)
+        primitive_values = {
+            value for value in reachable if isinstance(value, (str, bytes, Enum))
+        }
+
+        assert set(vars(policy)) == {"profile", "complete"}
+        assert set(vars(policy.profile)) == {
+            "role",
+            "private_facts",
+            "allowed_intents",
+            "engagement_contract",
+        }
+        assert policy.profile.model_config["frozen"] is True
+        assert forbidden_names.isdisjoint(attribute_names)
+        assert not any(isinstance(value, SyntheticPersona) for value in reachable)
+        assert persona.email not in primitive_values
+        assert persona.display_name not in primitive_values
+        assert all(channel not in primitive_values for channel in persona.channels)
+
+
+def test_each_engagement_contract_uses_a_distinct_policy_strategy() -> None:
+    policies = [
+        synthetic_module._build_policy(persona)
+        for persona in make_generation_scenario().personas
+    ]
+
+    assert len({type(policy) for policy in policies}) == 6
+    assert [type(policy).__name__ for policy in policies] == [
+        "_InformPolicy",
+        "_AcknowledgePolicy",
+        "_QuickResponsePolicy",
+        "_StructuredInterviewPolicy",
+        "_ReviewApprovalPolicy",
+        "_AvailabilityPolicy",
+    ]
+
+
 def test_persona_context_contains_only_its_own_inbox_transcript_and_private_fixture(
     tmp_path, monkeypatch
 ) -> None:
@@ -274,7 +367,7 @@ def test_persona_context_contains_only_its_own_inbox_transcript_and_private_fixt
     original = synthetic_module._DeterministicPersonaPolicy.respond
 
     def inspect_context(self, context):
-        observed.append(context)
+        observed.append((self, context))
         return original(self, context)
 
     monkeypatch.setattr(
@@ -299,17 +392,32 @@ def test_persona_context_contains_only_its_own_inbox_transcript_and_private_fixt
         "token",
         "outcome",
     }
-    for context in observed:
+    for policy, context in observed:
         assert forbidden.isdisjoint(type(context).model_fields)
-        assert all(item.persona_id == context.persona_id for item in context.own_transcript)
         assert context.delivered_message == context.own_inbox[-1]
         assert all("@example.test" not in item for item in context.own_inbox)
-    structured = next(item for item in observed if item.persona_id == "structured")
-    assert structured.private_facts == ("PRIVATE-PERSONA-SENTINEL",)
+        assert set(type(context).model_fields) == {
+            "delivered_message",
+            "own_inbox",
+            "own_transcript",
+            "virtual_time",
+        }
+        assert set(vars(policy.profile)) == {
+            "role",
+            "private_facts",
+            "allowed_intents",
+            "engagement_contract",
+        }
+    structured = next(
+        policy
+        for policy, _ in observed
+        if policy.profile.engagement_contract == "structured_interview"
+    )
+    assert structured.profile.private_facts == ("PRIVATE-PERSONA-SENTINEL",)
     assert all(
-        "PRIVATE-PERSONA-SENTINEL" not in item.delivered_message
-        for item in observed
-        if item.persona_id != "structured"
+        "PRIVATE-PERSONA-SENTINEL" not in context.delivered_message
+        for policy, context in observed
+        if policy.profile.engagement_contract != "structured_interview"
     )
 
 

@@ -237,32 +237,31 @@ def load_transcript(path: str | Path) -> SyntheticTranscript:
 
 
 class _PersonaTranscriptEntry(_StrictModel):
-    persona_id: str = Field(pattern=_STABLE_ID_PATTERN)
     timestamp: datetime
     local_sequence: int = Field(ge=1)
     intent: SyntheticIntent
     content: str = Field(min_length=1, max_length=MAX_CONTENT_LENGTH)
 
 
-class _PersonaContext(_StrictModel):
-    """The complete and deliberately narrow view supplied to one policy."""
+class _PolicyProfile(_StrictModel):
+    """The only scenario-derived data retained by a persona policy."""
 
-    persona_id: str = Field(pattern=_STABLE_ID_PATTERN)
     role: str = Field(min_length=1, max_length=200)
     private_facts: tuple[str, ...] = Field(max_length=8)
     allowed_intents: tuple[SyntheticIntent, ...] = Field(min_length=1, max_length=8)
-    engagement_contract: str = Field(min_length=1, max_length=64)
+    engagement_contract: EngagementType
+
+
+class _PersonaContext(_StrictModel):
+    """The complete and deliberately narrow view supplied to one policy."""
+
     delivered_message: str = Field(min_length=1, max_length=MAX_CONTENT_LENGTH)
     own_inbox: tuple[str, ...] = Field(min_length=1, max_length=64)
     own_transcript: tuple[_PersonaTranscriptEntry, ...] = Field(max_length=64)
     virtual_time: datetime
 
 
-class _PersonaOutput(_StrictModel):
-    schema_version: Literal["humanwire.synthetic/v1"]
-    persona_id: str = Field(pattern=_STABLE_ID_PATTERN)
-    action_id: str = Field(pattern=_STABLE_ID_PATTERN)
-    trigger_digest: str = Field(pattern=_DIGEST_PATTERN)
+class _PersonaDecision(_StrictModel):
     time_offset_seconds: int = Field(ge=1, le=60)
     intent: SyntheticIntent
     content: str = Field(min_length=1, max_length=MAX_CONTENT_LENGTH)
@@ -290,65 +289,89 @@ class SyntheticRunResult:
 
 
 class _DeterministicPersonaPolicy:
-    """A stateful policy that can inspect only its explicit persona context."""
+    """Shared mechanics for a policy isolated to a sanitized frozen profile."""
 
-    def __init__(self, persona: SyntheticPersona, engagement_contract: EngagementType) -> None:
-        self.persona = persona
-        self.engagement_contract = engagement_contract
+    def __init__(self, profile: _PolicyProfile) -> None:
+        self.profile = profile
         self.complete = False
 
-    def respond(self, context: _PersonaContext) -> _PersonaOutput:
-        sequence = len(context.own_transcript) + 1
+    def respond(self, context: _PersonaContext) -> _PersonaDecision:
         intent, content = self._choose(context)
-        return _PersonaOutput(
-            schema_version=SUPPORTED_SCHEMA_VERSION,
-            persona_id=context.persona_id,
-            action_id=f"{context.persona_id}-{sequence}",
-            trigger_digest=_sha256(context.delivered_message),
+        if intent not in self.profile.allowed_intents:
+            raise ValueError("persona strategy chose an intent outside its profile")
+        return _PersonaDecision(
             time_offset_seconds=1,
             intent=intent,
             content=content,
         )
 
     def _choose(self, context: _PersonaContext) -> tuple[SyntheticIntent, str]:
+        raise NotImplementedError
+
+
+class _InformPolicy(_DeterministicPersonaPolicy):
+    def _choose(self, context: _PersonaContext) -> tuple[SyntheticIntent, str]:
+        del context
+        self.complete = True
+        return SyntheticIntent.SILENCE, "synthetic_silence"
+
+
+class _AcknowledgePolicy(_DeterministicPersonaPolicy):
+    def _choose(self, context: _PersonaContext) -> tuple[SyntheticIntent, str]:
+        del context
+        self.complete = True
+        return SyntheticIntent.ACKNOWLEDGE, "Acknowledged."
+
+
+class _QuickResponsePolicy(_DeterministicPersonaPolicy):
+    def _choose(self, context: _PersonaContext) -> tuple[SyntheticIntent, str]:
         prompt = context.delivered_message.casefold()
-        if self.engagement_contract is EngagementType.INFORM:
-            self.complete = True
-            return SyntheticIntent.SILENCE, "synthetic_silence"
         if "evidence confirmation" in prompt and "evidence confirmed" not in prompt:
             self.complete = True
             return SyntheticIntent.CONFIRM_EVIDENCE, "Confirmed."
         if prompt.startswith("question "):
-            if self.engagement_contract is EngagementType.QUICK_RESPONSE:
-                return SyntheticIntent.ANSWER, "Launch date is 2026-09-01."
+            return SyntheticIntent.ANSWER, "Launch date is 2026-09-01."
+        return SyntheticIntent.ACKNOWLEDGE, "Acknowledged."
+
+
+class _StructuredInterviewPolicy(_DeterministicPersonaPolicy):
+    def _choose(self, context: _PersonaContext) -> tuple[SyntheticIntent, str]:
+        prompt = context.delivered_message.casefold()
+        if "evidence confirmation" in prompt and "evidence confirmed" not in prompt:
+            self.complete = True
+            return SyntheticIntent.CONFIRM_EVIDENCE, "Confirmed."
+        if prompt.startswith("question "):
             prior_answers = sum(
                 item.intent is SyntheticIntent.INTERVIEW_RESPONSE
                 for item in context.own_transcript
             )
-            if prior_answers == 0 and context.private_facts:
-                digest = _sha256(context.private_facts[0])
+            if prior_answers == 0 and self.profile.private_facts:
+                digest = _sha256(self.profile.private_facts[0])
                 return SyntheticIntent.INTERVIEW_RESPONSE, f"PRIVATE: sha256:{digest}"
             return (
                 SyntheticIntent.INTERVIEW_RESPONSE,
                 "The team can support a reviewed launch.",
             )
-        if "approval review" in prompt:
-            self.complete = True
-            if SyntheticIntent.APPROVE in context.allowed_intents:
-                return SyntheticIntent.APPROVE, "Approved."
-            return SyntheticIntent.CHANGE, "Use the reviewed launch plan."
-        if "availability request" in prompt:
-            self.complete = True
-            return (
-                SyntheticIntent.AVAILABILITY,
-                "2026-08-13T15:00:00+00:00/2026-08-13T16:00:00+00:00",
-            )
-        if "reply ack" in prompt or "acknowledgement" in prompt:
-            if self.engagement_contract is EngagementType.ACKNOWLEDGE:
-                self.complete = True
-            return SyntheticIntent.ACKNOWLEDGE, "Acknowledged."
+        return SyntheticIntent.ACKNOWLEDGE, "Acknowledged."
+
+
+class _ReviewApprovalPolicy(_DeterministicPersonaPolicy):
+    def _choose(self, context: _PersonaContext) -> tuple[SyntheticIntent, str]:
+        del context
         self.complete = True
-        return SyntheticIntent.SILENCE, "synthetic_silence"
+        if SyntheticIntent.APPROVE in self.profile.allowed_intents:
+            return SyntheticIntent.APPROVE, "Approved."
+        return SyntheticIntent.CHANGE, "Use the reviewed launch plan."
+
+
+class _AvailabilityPolicy(_DeterministicPersonaPolicy):
+    def _choose(self, context: _PersonaContext) -> tuple[SyntheticIntent, str]:
+        del context
+        self.complete = True
+        return (
+            SyntheticIntent.AVAILABILITY,
+            "2026-08-13T15:00:00+00:00/2026-08-13T16:00:00+00:00",
+        )
 
 
 def _contract_for(persona: SyntheticPersona) -> EngagementType:
@@ -367,7 +390,22 @@ def _contract_for(persona: SyntheticPersona) -> EngagementType:
 
 
 def _build_policy(persona: SyntheticPersona) -> _DeterministicPersonaPolicy:
-    return _DeterministicPersonaPolicy(persona, _contract_for(persona))
+    contract = _contract_for(persona)
+    strategies: dict[EngagementType, type[_DeterministicPersonaPolicy]] = {
+        EngagementType.INFORM: _InformPolicy,
+        EngagementType.ACKNOWLEDGE: _AcknowledgePolicy,
+        EngagementType.QUICK_RESPONSE: _QuickResponsePolicy,
+        EngagementType.STRUCTURED_INTERVIEW: _StructuredInterviewPolicy,
+        EngagementType.REVIEW_APPROVAL: _ReviewApprovalPolicy,
+        EngagementType.AVAILABILITY: _AvailabilityPolicy,
+    }
+    profile = _PolicyProfile(
+        role=persona.role,
+        private_facts=tuple(persona.private_facts),
+        allowed_intents=tuple(persona.allowed_intents),
+        engagement_contract=contract,
+    )
+    return strategies[contract](profile)
 
 
 class _SyntheticPlanner:
@@ -587,19 +625,12 @@ def _delivery_persona(
 
 
 def _persona_context(
-    persona: SyntheticPersona,
-    contract: EngagementType,
     visible_delivery: str,
     inbox: list[str],
     history: list[_PersonaTranscriptEntry],
     now: datetime,
 ) -> _PersonaContext:
     return _PersonaContext(
-        persona_id=persona.persona_id,
-        role=persona.role,
-        private_facts=tuple(persona.private_facts),
-        allowed_intents=tuple(persona.allowed_intents),
-        engagement_contract=contract.value,
         delivered_message=visible_delivery,
         own_inbox=(*inbox, visible_delivery),
         own_transcript=tuple(history),
@@ -696,8 +727,6 @@ def generate_scenario(
             local_sequences[persona_id] += 1
             local_sequence = local_sequences[persona_id]
             context = _persona_context(
-                persona,
-                _contract_for(persona),
                 visible,
                 inboxes[persona_id],
                 histories[persona_id],
@@ -705,27 +734,21 @@ def generate_scenario(
             )
             try:
                 raw_output = policy.respond(context)
-                output_value = _PersonaOutput.model_validate(raw_output)
-                expected_action_id = f"{persona_id}-{local_sequence}"
-                if (
-                    output_value.persona_id != persona_id
-                    or output_value.action_id != expected_action_id
-                    or output_value.trigger_digest != trigger_digest
-                    or output_value.intent not in persona.allowed_intents
-                ):
+                decision = _PersonaDecision.model_validate(raw_output)
+                if decision.intent not in persona.allowed_intents:
                     raise ValueError("persona output violated its response contract")
-                action_time = now + timedelta(seconds=output_value.time_offset_seconds)
+                action_time = now + timedelta(seconds=decision.time_offset_seconds)
                 action = SyntheticAction(
                     schema_version=SUPPORTED_SCHEMA_VERSION,
-                    action_id=output_value.action_id,
+                    action_id=f"{persona_id}-{local_sequence}",
                     persona_id=persona_id,
                     channel=channel,
                     timestamp=action_time,
                     local_sequence=local_sequence,
                     trigger_id=trigger_id,
                     trigger_digest=trigger_digest,
-                    intent=output_value.intent,
-                    content=output_value.content,
+                    intent=decision.intent,
+                    content=decision.content,
                 )
             except TimeoutError:
                 policy.complete = True
@@ -781,7 +804,6 @@ def generate_scenario(
         inboxes[persona_id].append(visible)
         histories[persona_id].append(
             _PersonaTranscriptEntry(
-                persona_id=persona_id,
                 timestamp=action.timestamp,
                 local_sequence=action.local_sequence,
                 intent=action.intent,
