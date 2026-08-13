@@ -10,6 +10,8 @@ HumanWire turns one authenticated manager mandate into a persistent, minimum-nec
 
 ## Inspiration, problem, and why it matters
 
+HumanWire uses minimum necessary engagement: it does not interview everyone.
+
 Complex decisions routinely break between the mandate and the meeting. A broadcast can look like consent; delivery or silence can be mistaken for progress; context is lost when an interview moves channels; and meetings get scheduled before the real blocker is known. The result is more interruption with less trustworthy coordination.
 
 HumanWire is inspired by the deliberate work of a good chief of staff: give context to people who only need context, request a focused contribution only when it is necessary, retain an explicit authority boundary, and schedule only when asynchronous work reveals a verified unresolved conflict. This matters because an agentic product must preserve the difference between delivery, an asserted answer, confirmed evidence, a decision, and an unresolved blocker. A required `CHANGE` is therefore a truthful partial result—not agreement and not a meeting trigger.

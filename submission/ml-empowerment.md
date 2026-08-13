@@ -10,6 +10,8 @@ HumanWire uses constrained Featherless JSON suggestions and deterministic local 
 
 ## Inspiration, problem, and why it matters
 
+HumanWire uses minimum necessary engagement: it does not interview everyone.
+
 Most AI coordination products optimize for more messages and more model autonomy. That can turn delivery, silence, or plausible text into apparent progress, while obscuring who is authorized to decide. HumanWire takes the opposite approach: it minimizes interruption and makes every human contribution, confirmation, and unresolved blocker explicit.
 
 The inspiration is the careful work of a good chief of staff: inform people who only need context, ask a focused question only where evidence is needed, route a decision to its assigned authority, and call for availability only after an actual unresolved conflict. This matters because a system that helps coordinate humans must remain honest about its limits. An asserted answer is not confirmed evidence, and a required `CHANGE` is a partial blocker—not manufactured agreement or a meeting request.

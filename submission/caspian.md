@@ -6,7 +6,7 @@ HumanWire
 
 ## One-line summary
 
-HumanWire uses one Caspian message boundary for email and Telegram to turn an authenticated manager mandate into the smallest truthful set of human engagements needed to reach a decision.
+HumanWire uses one Caspian message boundary for email and Telegram to turn an authenticated manager mandate into the minimum necessary engagement set needed to reach a decision; it does not interview everyone.
 
 ## The problem, inspiration, and why it matters
 
@@ -122,7 +122,7 @@ Capture only the synthetic, read-only fixture after final QA; never capture rout
 ## Submission links and official-form items
 
 - Public repository URL: **[entrant-provided after publication and signed-out verification]**
-- Public demo URL: **[entrant-provided after signed-out synthetic/read-only verification]**
+- Public demo URL: **[entrant-provided after signed-out synthetic/read-only verification; current continuity target: https://secondsignal.vercel.app]**
 - Public video URL: **[entrant-provided after upload and signed-out playback verification]**
 - Caspian registration evidence: **[entrant-provided privacy-safe confirmation]**
 - Caspian eligibility, team, reuse/originality, deadline, judging, and required form/media evidence: **[official organizer evidence pending]**
