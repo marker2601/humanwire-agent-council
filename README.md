@@ -153,7 +153,7 @@ Actual Caspian and Telegram proof is a separate operator gate. It must cover one
 
 ## Reproducible synthetic persona proof
 
-Run generation and frozen replay through the installed module with explicit fresh run roots. The generated transcript must stay inside its run root:
+Run generation and frozen replay through the installed module with explicit single-owner run-root paths that do not yet exist. HumanWire atomically creates each root, so concurrent cooperative harness runs have exactly one owner. The generated transcript must stay inside its claimed run root:
 
 ```powershell
 $generateRoot = Join-Path $PWD "work/synthetic-generate-01"
@@ -163,7 +163,9 @@ $replayRoot = Join-Path $PWD "work/synthetic-replay-01"
 python -m humanwire synthetic replay --transcript tests/fixtures/humanwire/synthetic_launch_v1.json --run-root $replayRoot
 ```
 
-The installed `humanwire synthetic ...` command and `python scripts/synthetic_humanwire.py ...` wrapper accept the same arguments. A run fails closed if its root is not fresh, a generation output escapes that root, or a frozen transcript fails strict validation or digest verification.
+The installed `humanwire synthetic ...` command and `python scripts/synthetic_humanwire.py ...` wrapper accept the same arguments. A run fails closed if its root already exists, a generation output escapes that root, a competing file appears at the final output, or a frozen transcript fails strict validation or digest verification. It never overwrites or recursively deletes preexisting data, and it writes no artifact outside the claimed root.
+
+Atomic ownership protects competing well-behaved proof harness runs. It is not a security boundary against a malicious process running under the same operating-system account with direct filesystem control.
 
 Successful stdout contains only the six exact provenance labels, safe scenario/run identifiers, action/inbound/delivery counts, terminal state, and semantic trace SHA-256. It contains no routes, destinations, response content, operational UUIDs, or filesystem paths. The transcript excludes private fixture text, and `CapturedDelivery` objects are never serialized.
 

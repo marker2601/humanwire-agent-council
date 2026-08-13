@@ -5,6 +5,9 @@ import inspect
 import json
 import re
 import socket
+import subprocess
+import sys
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -730,14 +733,9 @@ def test_generation_rejects_preexisting_output_without_overwriting_it(tmp_path) 
     assert {path.name for path in run_root.iterdir()} == {"transcript.json"}
 
 
-@pytest.mark.parametrize("root_exists", [False, True])
 @pytest.mark.parametrize("mode", ["generate", "replay"])
-def test_synthetic_run_accepts_only_nonexistent_or_existing_empty_root(
-    tmp_path, mode, root_exists
-) -> None:
-    run_root = tmp_path / f"{mode}-{root_exists}"
-    if root_exists:
-        run_root.mkdir()
+def test_synthetic_run_accepts_nonexistent_root(tmp_path, mode) -> None:
+    run_root = tmp_path / mode
 
     if mode == "generate":
         result = generate_scenario(
@@ -756,6 +754,152 @@ def test_synthetic_run_accepts_only_nonexistent_or_existing_empty_root(
     assert result.database_path.is_file()
 
 
+@pytest.mark.parametrize("mode", ["generate", "replay"])
+def test_synthetic_run_rejects_existing_empty_root(tmp_path, mode) -> None:
+    run_root = tmp_path / mode
+    run_root.mkdir()
+
+    with pytest.raises(FileExistsError, match="fresh run root"):
+        if mode == "generate":
+            generate_scenario(
+                make_generation_scenario(),
+                run_root / "transcript.json",
+                run_root,
+            )
+        else:
+            synthetic_module.replay_transcript(
+                Path("tests/fixtures/humanwire/synthetic_launch_v1.json"),
+                run_root,
+            )
+
+    assert list(run_root.iterdir()) == []
+
+
+def test_two_concurrent_generations_have_exactly_one_run_root_owner(
+    tmp_path, monkeypatch
+) -> None:
+    run_root = tmp_path / "shared-run"
+    output = run_root / "transcript.json"
+    entered_settings: list[int] = []
+    settings_lock = threading.Lock()
+    second_entered = threading.Event()
+    original_settings = synthetic_module._isolated_settings
+
+    def hold_first_owner(database_path):
+        with settings_lock:
+            entered_settings.append(threading.get_ident())
+            entry_count = len(entered_settings)
+            if entry_count == 2:
+                second_entered.set()
+        if entry_count == 1:
+            second_entered.wait(timeout=0.5)
+        return original_settings(database_path)
+
+    monkeypatch.setattr(synthetic_module, "_isolated_settings", hold_first_owner)
+    results: list[object] = []
+
+    def run() -> None:
+        try:
+            results.append(
+                generate_scenario(make_generation_scenario(), output, run_root)
+            )
+        except BaseException as error:  # noqa: BLE001 - inspected by the test
+            results.append(error)
+
+    workers = [threading.Thread(target=run) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=15)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert len(entered_settings) == 1
+    assert sum(not isinstance(result, BaseException) for result in results) == 1
+    failures = [result for result in results if isinstance(result, BaseException)]
+    assert len(failures) == 1
+    assert isinstance(failures[0], FileExistsError)
+    assert output.is_file()
+    assert load_transcript(output).digest
+    assert {path.name for path in run_root.iterdir()} == {
+        "humanwire-synthetic.sqlite3",
+        "transcript.json",
+    }
+
+
+def test_two_cli_processes_have_one_safe_winner_and_one_safe_loser(tmp_path) -> None:
+    run_root = tmp_path / "shared-cli-run"
+    output = run_root / "transcript.json"
+    command = [
+        sys.executable,
+        "-m",
+        "humanwire",
+        "synthetic",
+        "generate",
+        "--output",
+        str(output),
+        "--run-root",
+        str(run_root),
+    ]
+    processes = [
+        subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        for _ in range(2)
+    ]
+    completed = [process.communicate(timeout=30) for process in processes]
+    return_codes = [process.returncode for process in processes]
+
+    assert sorted(return_codes) == [0, 1]
+    winner = return_codes.index(0)
+    loser = return_codes.index(1)
+    assert completed[winner][1] == ""
+    assert _parse_safe_cli_output(completed[winner][0])["proof_class"] == (
+        "synthetic_multi_persona"
+    )
+    assert completed[loser] == (
+        "",
+        "synthetic_status=failed\nfailure_reason=isolated_run_failed\n",
+    )
+    assert load_transcript(output).digest
+    assert {path.name for path in run_root.iterdir()} == {
+        "humanwire-synthetic.sqlite3",
+        "transcript.json",
+    }
+
+
+def test_generation_creates_nested_output_parents_inside_claimed_root(tmp_path) -> None:
+    run_root = tmp_path / "run"
+    output = run_root / "artifacts" / "frozen" / "transcript.json"
+
+    result = generate_scenario(make_generation_scenario(), output, run_root)
+
+    assert result.database_path.parent == run_root.resolve()
+    assert load_transcript(output) == result.transcript
+    assert not any(path.is_file() for path in tmp_path.iterdir())
+
+
+def test_generation_exclusively_creates_output_after_claim(
+    tmp_path, monkeypatch
+) -> None:
+    run_root = tmp_path / "run"
+    output = run_root / "transcript.json"
+    original = b"concurrent owner bytes must survive"
+    original_dump = SyntheticTranscript.model_dump_json
+
+    def inject_competing_output(self, *args, **kwargs):
+        output.write_bytes(original)
+        return original_dump(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        SyntheticTranscript,
+        "model_dump_json",
+        inject_competing_output,
+    )
+
+    with pytest.raises(FileExistsError):
+        generate_scenario(make_generation_scenario(), output, run_root)
+
+    assert output.read_bytes() == original
+
+
 def _symlink_or_skip(link: Path, target: Path, *, target_is_directory: bool = False) -> None:
     try:
         link.symlink_to(target, target_is_directory=target_is_directory)
@@ -763,14 +907,21 @@ def _symlink_or_skip(link: Path, target: Path, *, target_is_directory: bool = Fa
         pytest.skip(f"symbolic links are unavailable on this Windows host: {error.winerror}")
 
 
-def test_generation_rejects_output_symlink_escape_without_changing_target(tmp_path) -> None:
+def test_generation_rejects_post_claim_output_symlink_escape_without_changing_target(
+    tmp_path, monkeypatch
+) -> None:
     run_root = tmp_path / "run"
-    run_root.mkdir()
     outside = tmp_path / "outside.json"
     original = b"outside bytes must survive"
     outside.write_bytes(original)
     output = run_root / "transcript.json"
-    _symlink_or_skip(output, outside)
+    original_dump = SyntheticTranscript.model_dump_json
+
+    def inject_output_symlink(self, *args, **kwargs):
+        _symlink_or_skip(output, outside)
+        return original_dump(self, *args, **kwargs)
+
+    monkeypatch.setattr(SyntheticTranscript, "model_dump_json", inject_output_symlink)
 
     with pytest.raises(ValueError, match="output path must be inside run root"):
         generate_scenario(make_generation_scenario(), output, run_root)
@@ -778,13 +929,24 @@ def test_generation_rejects_output_symlink_escape_without_changing_target(tmp_pa
     assert outside.read_bytes() == original
 
 
-def test_generation_rejects_intermediate_symlink_escape_without_writing(tmp_path) -> None:
+def test_generation_rejects_post_claim_intermediate_symlink_escape_without_writing(
+    tmp_path, monkeypatch
+) -> None:
     run_root = tmp_path / "run"
-    run_root.mkdir()
     outside = tmp_path / "outside"
     outside.mkdir()
     intermediate = run_root / "escaped"
-    _symlink_or_skip(intermediate, outside, target_is_directory=True)
+    original_dump = SyntheticTranscript.model_dump_json
+
+    def inject_intermediate_symlink(self, *args, **kwargs):
+        _symlink_or_skip(intermediate, outside, target_is_directory=True)
+        return original_dump(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        SyntheticTranscript,
+        "model_dump_json",
+        inject_intermediate_symlink,
+    )
 
     with pytest.raises(ValueError, match="output path must be inside run root"):
         generate_scenario(

@@ -733,12 +733,45 @@ def _validated_output_path(output_path: str | Path, run_root: str | Path) -> tup
 
 def _prepare_fresh_run_root(run_root: str | Path) -> Path:
     root = Path(run_root).resolve()
-    if root.exists():
-        if not root.is_dir() or next(root.iterdir(), None) is not None:
-            raise FileExistsError("synthetic proof requires a fresh run root")
-        return root
-    root.mkdir()
+    try:
+        root.mkdir(exist_ok=False)
+    except FileExistsError as error:
+        raise FileExistsError("synthetic proof requires a fresh run root") from error
     return root
+
+
+def _reserve_database_path(root: Path) -> Path:
+    database_path = root / "humanwire-synthetic.sqlite3"
+    with database_path.open("x+b"):
+        pass
+    return database_path
+
+
+def _path_within_run_root(path: Path, root: Path) -> Path:
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as error:
+        raise ValueError("synthetic output path must be inside run root") from error
+    return resolved
+
+
+def _write_transcript_exclusively(output: Path, root: Path, content: str) -> None:
+    relative_output = output.relative_to(root)
+    parent = root
+    for part in relative_output.parts[:-1]:
+        candidate = parent / part
+        try:
+            candidate.mkdir(exist_ok=False)
+        except FileExistsError:
+            pass
+        parent = _path_within_run_root(candidate, root)
+        if not parent.is_dir():
+            raise FileExistsError("synthetic output parent must be an owned directory")
+
+    final_output = _path_within_run_root(parent / relative_output.name, root)
+    with final_output.open("x", encoding="utf-8", newline="\n") as handle:
+        handle.write(content)
 
 
 def generate_scenario(
@@ -750,7 +783,7 @@ def generate_scenario(
     scenario = SyntheticScenario.model_validate(scenario)
     output, root = _validated_output_path(output_path, run_root)
     root = _prepare_fresh_run_root(root)
-    database_path = root / "humanwire-synthetic.sqlite3"
+    database_path = _reserve_database_path(root)
 
     settings = _isolated_settings(database_path)
     directory, people = _synthetic_directory(scenario)
@@ -950,11 +983,10 @@ def generate_scenario(
         outbound_digests=outbound_digests,
         actions=actions,
     )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(
+    _write_transcript_exclusively(
+        output,
+        root,
         transcript.model_dump_json(indent=2) + "\n",
-        encoding="utf-8",
-        newline="\n",
     )
     latest = repository.list_recent_mandates(1)
     final_state = latest[0].state.value if latest else "missing"
@@ -978,7 +1010,7 @@ def replay_transcript(
     transcript = load_transcript(path)
     scenario = transcript.scenario
     root = _prepare_fresh_run_root(run_root)
-    database_path = root / "humanwire-synthetic.sqlite3"
+    database_path = _reserve_database_path(root)
 
     settings = _isolated_settings(database_path)
     directory, people = _synthetic_directory(scenario)
