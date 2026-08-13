@@ -5,6 +5,7 @@ import html as html_lib
 import io
 import json
 import re
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -1800,6 +1801,209 @@ def test_replay_flow_has_causal_step_transition_and_no_motion_override(web_clien
         css,
         re.DOTALL,
     )
+
+
+def test_replay_flow_controls_update_the_visible_strip_without_corrupting_events() -> None:
+    script_path = Path(__file__).resolve().parents[2] / "src/humanwire/static/app.js"
+    harness = r"""
+const fs = require("fs");
+const scriptPath = process.argv[1];
+const mode = process.argv[2];
+const reduced = mode === "reduced";
+const visible = mode !== "hidden";
+
+function fail(message) {
+  throw new Error(message);
+}
+
+function expect(actual, expected, message) {
+  if (actual !== expected) {
+    fail(`${message}: expected ${expected}, got ${actual}`);
+  }
+}
+
+class ClassList {
+  constructor(values = []) {
+    this.values = new Set(values);
+  }
+  add(value) { this.values.add(value); }
+  remove(value) { this.values.delete(value); }
+  toggle(value, force) {
+    const next = force === undefined ? !this.values.has(value) : force;
+    if (next) this.values.add(value); else this.values.delete(value);
+    return next;
+  }
+  contains(value) { return this.values.has(value); }
+}
+
+class Element {
+  constructor({ dataset = {}, text = "", dateTime = "", classes = [], children = {} } = {}) {
+    this.dataset = dataset;
+    this._text = text;
+    this.dateTime = dateTime;
+    this.classList = new ClassList(classes);
+    this.children = children;
+    this.attributes = {};
+    this.listeners = {};
+  }
+  get textContent() { return this._text; }
+  set textContent(value) {
+    this._text = String(value);
+    this.children = {};
+  }
+  querySelector(selector) { return this.children[selector] || null; }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+  getAttribute(name) { return this.attributes[name]; }
+  addEventListener(name, listener) { this.listeners[name] = listener; }
+  click() {
+    if (this.listeners.click) this.listeners.click();
+  }
+  scrollIntoView() {}
+}
+
+function replayEvent(values, highlight) {
+  const description = new Element({ text: values.description });
+  const time = new Element({ text: values.time, dateTime: values.dateTime });
+  return new Element({
+    dataset: {
+      highlight,
+      replaySource: values.source,
+      replayDestination: values.destination,
+      replayDataPoint: values.dataPoint,
+    },
+    classes: ["replay-event"],
+    children: { ".replay-copy strong": description, time },
+  });
+}
+
+const first = replayEvent({
+  source: "HumanWire",
+  destination: "Decision Room",
+  dataPoint: "Mandate created",
+  description: "First saved event",
+  time: "08:00",
+  dateTime: "2026-08-11T08:00:00+00:00",
+}, "origin");
+const second = replayEvent({
+  source: "HumanWire",
+  destination: "Eli Torres",
+  dataPoint: "Outreach sent",
+  description: "Second saved event",
+  time: "08:05",
+  dateTime: "2026-08-11T08:05:00+00:00",
+}, "eli-torres");
+const source = new Element({ text: "HumanWire" });
+const destination = new Element({ text: "Decision Room" });
+const dataPoint = new Element({ text: "Mandate created" });
+const flow = new Element({ children: {
+  "[data-replay-source]": source,
+  "[data-replay-destination]": destination,
+  "[data-replay-data-point]": dataPoint,
+} });
+const description = new Element({ text: "First saved event" });
+const time = new Element({ text: "08:00", dateTime: "2026-08-11T08:00:00+00:00" });
+const progress = new Element({ text: "Event 1 of 2" });
+const live = new Element();
+const previous = new Element();
+const next = new Element();
+const play = new Element();
+const action = new Element({ text: "Play" });
+const origin = new Element();
+const card = new Element({ dataset: { lanePerson: "eli-torres" } });
+const intervals = new Map();
+let nextInterval = 1;
+const documentListeners = {};
+
+global.document = {
+  documentElement: new Element(),
+  visibilityState: visible ? "visible" : "hidden",
+  querySelector(selector) {
+    const nodes = {
+      "[data-replay-previous]": previous,
+      "[data-replay-next]": next,
+      "[data-replay-play]": play,
+      "[data-replay-action]": action,
+      "[data-replay-description]": description,
+      "[data-replay-time]": time,
+      "[data-replay-progress]": progress,
+      "[data-replay-live]": live,
+      "[data-replay-flow]": flow,
+      "[data-replay-source]": first,
+      "[data-replay-destination]": first,
+      "[data-replay-data-point]": first,
+      '[data-testid="reach-origin"]': origin,
+    };
+    return nodes[selector] || null;
+  },
+  querySelectorAll(selector) {
+    if (selector === "[data-replay-event]") return [first, second];
+    if (selector === "[data-lane-person]") return [card];
+    if (selector === ".reach-step.is-replay-current, .reach-origin.is-replay-current") {
+      return [origin, card].filter((node) => node.classList.contains("is-replay-current"));
+    }
+    return [];
+  },
+  addEventListener(name, listener) { documentListeners[name] = listener; },
+};
+global.window = {
+  matchMedia() { return { matches: reduced }; },
+  setInterval(listener) {
+    const id = nextInterval++;
+    intervals.set(id, listener);
+    return id;
+  },
+  clearInterval(id) { intervals.delete(id); },
+  setTimeout(listener) { listener(); return 0; },
+  location: { href: "https://humanwire.local/mandates/HW-2411/reach" },
+  history: { replaceState() {} },
+};
+
+eval(fs.readFileSync(scriptPath, "utf8"));
+documentListeners.DOMContentLoaded();
+function replayIntervals() {
+  return [...intervals.values()].filter((listener) => listener.name === "advanceSavedEvent");
+}
+expect(replayIntervals().length, 0, "replay must not auto-start");
+next.click();
+expect(source.textContent, "HumanWire", "visible source after next");
+expect(destination.textContent, "Eli Torres", "visible destination after next");
+expect(dataPoint.textContent, "Outreach sent", "visible data point after next");
+expect(description.textContent, "Second saved event", "visible description after next");
+expect(time.textContent, "08:05", "visible time after next");
+expect(first.querySelector(".replay-copy strong").textContent, "First saved event", "first event description remains intact");
+expect(first.querySelector("time").textContent, "08:00", "first event time remains intact");
+expect(live.textContent, "Event 2 of 2: From HumanWire; To Eli Torres; Generated Outreach sent. Second saved event", "live copy after next");
+expect(card.classList.contains("is-replay-current"), true, "exact card highlight after next");
+expect([origin, card].filter((node) => node.classList.contains("is-replay-current")).length, 1, "one current highlight after next");
+previous.click();
+expect(source.textContent, "HumanWire", "visible source after return");
+expect(destination.textContent, "Decision Room", "visible destination after return");
+expect(dataPoint.textContent, "Mandate created", "visible data point after return");
+expect(description.textContent, "First saved event", "visible description after return");
+expect(time.textContent, "08:00", "visible time after return");
+expect(live.textContent, "Event 1 of 2: From HumanWire; To Decision Room; Generated Mandate created. First saved event", "live copy after return");
+expect(origin.classList.contains("is-replay-current"), true, "origin highlight after return");
+expect([origin, card].filter((node) => node.classList.contains("is-replay-current")).length, 1, "one current highlight after return");
+play.click();
+if (mode === "normal") {
+  expect(replayIntervals().length, 1, "play starts one replay interval");
+  replayIntervals()[0]();
+  expect(destination.textContent, "Eli Torres", "play advances visible destination");
+  expect(live.textContent, "Event 2 of 2: From HumanWire; To Eli Torres; Generated Outreach sent. Second saved event", "live copy after play");
+} else {
+  expect(replayIntervals().length, 0, "reduced-motion and hidden pages do not start playback");
+  expect(play.getAttribute("aria-pressed"), "false", "blocked play remains stopped");
+}
+"""
+
+    for mode in ("normal", "reduced", "hidden"):
+        result = subprocess.run(
+            ["node", "-e", harness, str(script_path), mode],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
 
 
 def test_reach_replay_explains_allowlisted_persisted_events(demo_app) -> None:

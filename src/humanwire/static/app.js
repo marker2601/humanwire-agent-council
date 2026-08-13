@@ -453,9 +453,9 @@
     const progress = document.querySelector("[data-replay-progress]");
     const live = document.querySelector("[data-replay-live]");
     const flow = document.querySelector("[data-replay-flow]");
-    const source = document.querySelector("[data-replay-source]");
-    const destination = document.querySelector("[data-replay-destination]");
-    const dataPoint = document.querySelector("[data-replay-data-point]");
+    const source = flow ? flow.querySelector("[data-replay-source]") : null;
+    const destination = flow ? flow.querySelector("[data-replay-destination]") : null;
+    const dataPoint = flow ? flow.querySelector("[data-replay-data-point]") : null;
     const sourceLabel = current.dataset.replaySource || "";
     const destinationLabel = current.dataset.replayDestination || "";
     const dataPointLabel = current.dataset.replayDataPoint || "";
