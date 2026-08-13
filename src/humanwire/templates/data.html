@@ -35,8 +35,8 @@
         <div class="data-export" aria-label="Data exports">
           <a
             class="data-control data-export-link"
-            href="/api/v1/mandates/{{ data.mandate.token }}/outreach-events{% if data.export_query %}?{{ data.export_query }}{% endif %}"
-          >JSON</a>
+            href="/api/v1/mandates/{{ data.mandate.token }}/outreach-events.json{% if data.export_query %}?{{ data.export_query }}{% endif %}"
+          >Download JSON</a>
           <a
             class="data-control data-export-link is-primary"
             href="/api/v1/mandates/{{ data.mandate.token }}/outreach-events.csv{% if data.export_query %}?{{ data.export_query }}{% endif %}"

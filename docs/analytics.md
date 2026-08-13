@@ -1,10 +1,11 @@
 # HumanWire analytics and Power BI import
 
-HumanWire exposes one canonical, redacted outreach-event projection through its technical Data page, JSON API, and CSV download. These surfaces are read-only snapshots of persisted events; consumers own refresh scheduling, and there is no realtime guarantee.
+HumanWire exposes one canonical, redacted outreach-event projection through its technical Data page, inline JSON API, JSON attachment, and CSV download. These surfaces are read-only snapshots of persisted events; consumers own refresh scheduling, and there is no realtime guarantee.
 
 ## Endpoints and authentication
 
-- JSON: `{base_url}/api/v1/mandates/{mandate_token}/outreach-events`
+- Inline JSON API: `{base_url}/api/v1/mandates/{mandate_token}/outreach-events`
+- JSON attachment: `{base_url}/api/v1/mandates/{mandate_token}/outreach-events.json`
 - CSV: `{base_url}/api/v1/mandates/{mandate_token}/outreach-events.csv`
 - Browser table: `{base_url}/mandates/{mandate_token}/data`
 
@@ -16,11 +17,11 @@ Authorization: Bearer <read-only-token>
 
 Never put a token in a query string, shared URL, screenshot, source control, or Power BI source text checked into the repository. The public HTML Data page contains no API credential.
 
-For authenticated JSON in Power BI Desktop, choose **Get Data**, select **Web**, enter the JSON endpoint, and configure the `Authorization` request header in the credential flow available to your managed Power BI environment. Expand the returned records using the stable field order below. A downloaded CSV is the simpler offline path when managed header authentication or scheduled API refresh is not available.
+For authenticated JSON in Power BI Desktop, choose **Get Data**, select **Web**, enter the inline JSON API endpoint, and configure the `Authorization` request header in the credential flow available to your managed Power BI environment. Expand the returned records using the stable field order below. The `.json` route downloads the same filtered snapshot as an indented UTF-8 attachment; a downloaded CSV is another offline option when managed header authentication or scheduled API refresh is not available.
 
 ## Stable fields
 
-Each HTML, JSON, and CSV row contains exactly these fields in this order. Unknown or unavailable optional values are empty strings.
+Each HTML, inline JSON, JSON attachment, and CSV row contains exactly these fields in this order. Unknown or unavailable optional values are empty strings.
 
 1. `mandate_token` — public mandate token; text.
 2. `timestamp` — persisted event time normalized to ISO-8601 UTC; datetime text.
@@ -43,7 +44,7 @@ Response latency is assignment-level and repeats on that assignment's rows. `inf
 
 ## Exact filters
 
-The Data page, JSON, and CSV accept the same nine case-sensitive, exact-match query filters. Each filter may appear at most once. Invalid values return a safe `400` rather than broadening the result.
+The Data page, inline JSON API, JSON attachment, and CSV accept the same nine case-sensitive, exact-match query filters. Each filter may appear at most once. Invalid values return a safe `400` rather than broadening the result. The Data page’s download controls preserve the active filter query exactly.
 
 - `engagement_type` — one supported lowercase engagement type.
 - `engagement_status` — one supported lowercase engagement status.
@@ -59,12 +60,13 @@ Credential-free, URL-encoded examples:
 
 ```text
 {base_url}/api/v1/mandates/{mandate_token}/outreach-events?engagement_type=structured_interview&engagement_status=in+progress
+{base_url}/api/v1/mandates/{mandate_token}/outreach-events.json?engagement_type=structured_interview&engagement_status=in+progress
 {base_url}/api/v1/mandates/{mandate_token}/outreach-events.csv?department=Support+Leadership&timestamp_from=2026-08-11T15%3A00%3A00%2B00%3A00&timestamp_to=2026-08-11T16%3A00%3A00%2B00%3A00
 ```
 
 ## Refresh and limitations
 
-API and CSV responses are read-only snapshots of persisted events. Power BI or another consumer decides when to request a new snapshot; HumanWire does not promise push updates or realtime refresh.
+Inline API, JSON attachment, and CSV responses are read-only snapshots of persisted events. Power BI or another consumer decides when to request a new snapshot; HumanWire does not promise push updates or realtime refresh.
 
 The projection intentionally uses redacted identifiers and blank unknown or unavailable fields. It contains no arbitrary event metadata, raw private evidence, interview questions or answers, proposal or change text, objectives, reasons, provider bodies, routes, message identifiers, contact destinations, availability windows, credentials, or operational UUIDs. Response latency covers required human responses only; `inform` remains blank.
 

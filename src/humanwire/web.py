@@ -1063,8 +1063,14 @@ def _outreach_csv(rows: list[dict[str, Any]]) -> bytes:
     return stream.getvalue().encode("utf-8")
 
 
-def _outreach_filename(token: str, denied_values: frozenset[str]) -> str:
-    candidate = f"{token}-outreach-events.csv"
+def _outreach_json(rows: list[dict[str, Any]]) -> bytes:
+    return (json.dumps(rows, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def _outreach_filename(
+    token: str, denied_values: frozenset[str], extension: str = "csv"
+) -> str:
+    candidate = f"{token}-outreach-events.{extension}"
     if (
         token.isascii()
         and _SAFE_FILENAME_TOKEN.fullmatch(token)
@@ -1072,7 +1078,7 @@ def _outreach_filename(token: str, denied_values: frozenset[str]) -> str:
         and _scrub_known_private(candidate, denied_values) == candidate
     ):
         return candidate
-    return "humanwire-outreach-events.csv"
+    return f"humanwire-outreach-events.{extension}"
 
 
 def _evidence_summary(repository: Any, mandate: Mandate) -> dict[str, Any]:
@@ -2575,6 +2581,29 @@ def create_app(
         return Response(
             content=_outreach_csv(export["rows"]),
             media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="{export["filename"]}"'
+                )
+            },
+        )
+
+    @app.get("/api/v1/mandates/{token}/outreach-events.json")
+    def mandate_events_json(request: Request, token: str):
+        mandate = load_mandate(token)
+        filters = _validated_outreach_filters(request)
+        export = safe_projection(
+            lambda: {
+                "rows": _outreach_rows(repository, mandate, filters),
+                "filename": _outreach_filename(
+                    mandate.token, _private_deny_values(repository, mandate), "json"
+                ),
+            },
+            mandate,
+        )
+        return Response(
+            content=_outreach_json(export["rows"]),
+            media_type="application/json",
             headers={
                 "Content-Disposition": (
                     f'attachment; filename="{export["filename"]}"'

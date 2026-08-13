@@ -121,6 +121,7 @@ def test_read_only_route_surface_and_html_placeholders(web_client, demo_app) -> 
         "/api/v1/mandates/{token}",
         "/api/v1/mandates/{token}/stakeholders",
         "/api/v1/mandates/{token}/outreach-events",
+        "/api/v1/mandates/{token}/outreach-events.json",
         "/api/v1/mandates/{token}/outreach-events.csv",
         "/api/v1/mandates/{token}/evidence-summary",
     }
@@ -172,6 +173,7 @@ def test_csv_route_and_data_table_are_get_only_with_stable_contract(
     } >= {
         "/mandates/{token}/data",
         "/api/v1/mandates/{token}/outreach-events",
+        "/api/v1/mandates/{token}/outreach-events.json",
         "/api/v1/mandates/{token}/outreach-events.csv",
     }
     assert all(
@@ -180,9 +182,44 @@ def test_csv_route_and_data_table_are_get_only_with_stable_contract(
         for path in (
             "/mandates/HW-2411/data",
             "/api/v1/mandates/HW-2411/outreach-events",
+            "/api/v1/mandates/HW-2411/outreach-events.json",
             "/api/v1/mandates/HW-2411/outreach-events.csv",
         )
     )
+
+
+def test_json_download_matches_filtered_inline_json_and_csv_with_stable_bytes(
+    web_client,
+) -> None:
+    params = {
+        "engagement_type": "structured_interview",
+        "channel": "telegram",
+        "timestamp_from": "2026-08-11T15:14:00+00:00",
+        "timestamp_to": "2026-08-11T15:15:00+00:00",
+    }
+    inline = web_client.get(
+        "/api/v1/mandates/HW-2411/outreach-events", params=params
+    )
+    csv_response = web_client.get(
+        "/api/v1/mandates/HW-2411/outreach-events.csv", params=params
+    )
+    download = web_client.get(
+        "/api/v1/mandates/HW-2411/outreach-events.json", params=params
+    )
+    expected_body = (
+        json.dumps(inline.json(), ensure_ascii=False, indent=2) + "\n"
+    ).encode("utf-8")
+
+    assert download.status_code == inline.status_code == csv_response.status_code == 200
+    assert download.headers["content-type"] == "application/json"
+    assert download.headers["content-disposition"] == (
+        'attachment; filename="HW-2411-outreach-events.json"'
+    )
+    assert download.content == expected_body
+    assert download.content.endswith(b"\n")
+    assert download.json() == inline.json()
+    assert [_string_row(row) for row in download.json()] == _csv_rows(csv_response)
+    assert all(list(row) == EXPECTED_OUTREACH_HEADERS for row in download.json())
 
 
 def test_data_table_json_csv_share_canonical_rows_and_order(web_client) -> None:
@@ -265,7 +302,11 @@ def test_engagement_filter_combination_empty_results_and_stable_export_query(
     assert response.status_code == 200
     assert len(_html_outreach_rows(response.text)) == 4
     decoded_html = html_lib.unescape(response.text)
-    assert f'href="/api/v1/mandates/HW-2411/outreach-events?{query}"' in decoded_html
+    assert f'href="/api/v1/mandates/HW-2411/outreach-events?{query}"' not in decoded_html
+    assert (
+        f'href="/api/v1/mandates/HW-2411/outreach-events.json?{query}"'
+        in decoded_html
+    )
     assert (
         f'href="/api/v1/mandates/HW-2411/outreach-events.csv?{query}"'
         in decoded_html
@@ -274,6 +315,27 @@ def test_engagement_filter_combination_empty_results_and_stable_export_query(
     assert _html_outreach_rows(empty.text) == []
     assert 'colspan="16"' in empty.text
     assert "No outreach events match these filters" in empty.text
+
+
+def test_json_download_data_control_preserves_the_active_filter_query(web_client) -> None:
+    params = [
+        ("timestamp_to", "2026-08-11T15:15:00+00:00"),
+        ("person_id", "priya-shah"),
+        ("engagement_status", "in progress"),
+    ]
+    response = web_client.get("/mandates/HW-2411/data", params=params)
+    query = (
+        "engagement_status=in+progress&person_id=priya-shah&"
+        "timestamp_to=2026-08-11T15%3A15%3A00%2B00%3A00"
+    )
+
+    assert response.status_code == 200
+    decoded_html = html_lib.unescape(response.text)
+    assert "Download JSON" in decoded_html
+    assert (
+        f'href="/api/v1/mandates/HW-2411/outreach-events.json?{query}"'
+        in decoded_html
+    )
 
 
 @pytest.mark.parametrize(
@@ -617,7 +679,7 @@ def test_data_table_response_latency_fails_closed_for_stale_or_impossible_truth(
         assert {row["response_latency_seconds"] for row in rows} == {""}
 
 
-def test_data_table_private_deny_corpus_and_metadata_never_cross_any_surface(
+def test_json_download_private_deny_corpus_and_metadata_never_cross_any_surface(
     demo_app,
 ) -> None:
     sentinel = "PRIVATE-ANALYTICS-SENTINEL"
@@ -725,6 +787,7 @@ def test_data_table_private_deny_corpus_and_metadata_never_cross_any_surface(
     responses = [
         client.get("/mandates/HW-2411/data"),
         client.get("/api/v1/mandates/HW-2411/outreach-events"),
+        client.get("/api/v1/mandates/HW-2411/outreach-events.json"),
         client.get("/api/v1/mandates/HW-2411/outreach-events.csv"),
     ]
     serialized = "\n".join(
@@ -802,12 +865,16 @@ def test_csv_cell_hardening_marks_every_formula_leading_character(prefix) -> Non
     assert "\n" not in hardened
 
 
-def test_csv_empty_dataset_still_has_headers_and_safe_filename_fallback(
+def test_json_download_empty_dataset_and_safe_filename_fallback(
     demo_app,
 ) -> None:
     client = TestClient(demo_app)
     empty = client.get(
         "/api/v1/mandates/HW-2411/outreach-events.csv",
+        params={"person_id": "arun-patel"},
+    )
+    empty_json = client.get(
+        "/api/v1/mandates/HW-2411/outreach-events.json",
         params={"person_id": "arun-patel"},
     )
     repository = demo_app.state.repository
@@ -823,16 +890,28 @@ def test_csv_empty_dataset_still_has_headers_and_safe_filename_fallback(
     fallback = client.get(
         "/api/v1/mandates/unsafe:token/outreach-events.csv"
     )
+    fallback_json = client.get(
+        "/api/v1/mandates/unsafe:token/outreach-events.json"
+    )
 
     assert empty.status_code == 200
     assert empty.text.splitlines()[0].split(",") == EXPECTED_OUTREACH_HEADERS
     assert _csv_rows(empty) == []
+    assert empty_json.status_code == 200
+    assert empty_json.content == b"[]\n"
     assert fallback.status_code == 200
     assert fallback.headers["content-disposition"] == (
         'attachment; filename="humanwire-outreach-events.csv"'
     )
     assert "\r" not in fallback.headers["content-disposition"]
     assert "\n" not in fallback.headers["content-disposition"]
+    assert fallback_json.status_code == 200
+    assert fallback_json.headers["content-disposition"] == (
+        'attachment; filename="humanwire-outreach-events.json"'
+    )
+    assert "unsafe:token" not in fallback_json.headers["content-disposition"]
+    assert "\r" not in fallback_json.headers["content-disposition"]
+    assert "\n" not in fallback_json.headers["content-disposition"]
 
 
 @pytest.mark.parametrize(
@@ -845,8 +924,10 @@ def test_csv_empty_dataset_still_has_headers_and_safe_filename_fallback(
         ("Bearer fictional-read-token", 200),
     ],
 )
-@pytest.mark.parametrize("suffix", ["outreach-events", "outreach-events.csv"])
-def test_csv_and_json_production_auth_match_the_read_only_boundary(
+@pytest.mark.parametrize(
+    "suffix", ["outreach-events", "outreach-events.json", "outreach-events.csv"]
+)
+def test_json_download_production_auth_matches_the_read_only_boundary(
     demo_app, authorization, expected_status, suffix
 ) -> None:
     client = TestClient(
@@ -868,11 +949,14 @@ def test_csv_and_json_production_auth_match_the_read_only_boundary(
     assert "fictional-read-token" not in response.text
 
 
-def test_data_table_demo_is_anonymous_unknown_is_bodyless_and_failures_are_safe(
+def test_json_download_demo_is_anonymous_unknown_is_bodyless_and_failures_are_safe(
     web_client,
 ) -> None:
     assert web_client.get(
         "/api/v1/mandates/HW-2411/outreach-events.csv"
+    ).status_code == 200
+    assert web_client.get(
+        "/api/v1/mandates/HW-2411/outreach-events.json"
     ).status_code == 200
     for path in (
         "/mandates/HW-UNKNOWN/data",
@@ -897,6 +981,7 @@ def test_data_table_demo_is_anonymous_unknown_is_bodyless_and_failures_are_safe(
     for path in (
         "/mandates/HW-2411/data",
         "/api/v1/mandates/HW-2411/outreach-events",
+        "/api/v1/mandates/HW-2411/outreach-events.json",
         "/api/v1/mandates/HW-2411/outreach-events.csv",
     ):
         response = client.get(path, headers=headers)
@@ -906,7 +991,7 @@ def test_data_table_demo_is_anonymous_unknown_is_bodyless_and_failures_are_safe(
         assert "secret" not in response.text
 
 
-def test_data_table_deny_corpus_failure_uses_one_safe_503_boundary(
+def test_json_download_deny_corpus_failure_uses_one_safe_503_boundary(
     demo_app, monkeypatch
 ) -> None:
     sentinel = "PRIVATE-DENY-CORPUS-FAILURE"
@@ -924,11 +1009,12 @@ def test_data_table_deny_corpus_failure_uses_one_safe_503_boundary(
         for path in (
             "/mandates/HW-2411/data",
             "/api/v1/mandates/HW-2411/outreach-events",
+            "/api/v1/mandates/HW-2411/outreach-events.json",
             "/api/v1/mandates/HW-2411/outreach-events.csv",
         )
     ]
 
-    assert [response.status_code for response in responses] == [503, 503, 503]
+    assert [response.status_code for response in responses] == [503, 503, 503, 503]
     assert all(
         response.json() == {"detail": "Service unavailable"}
         for response in responses
@@ -3565,6 +3651,7 @@ def test_list_filter_stakeholders_events_evidence_and_reach_are_persisted_projec
         "/api/v1/mandates/HW-UNKNOWN",
         "/api/v1/mandates/HW-UNKNOWN/stakeholders",
         "/api/v1/mandates/HW-UNKNOWN/outreach-events",
+        "/api/v1/mandates/HW-UNKNOWN/outreach-events.json",
         "/api/v1/mandates/HW-UNKNOWN/evidence-summary",
     ],
 )
@@ -3604,6 +3691,7 @@ def test_known_private_error_phrase_cannot_collide_with_bodyless_404_routes(demo
         "/api/v1/mandates/HW-UNKNOWN",
         "/api/v1/mandates/HW-UNKNOWN/stakeholders",
         "/api/v1/mandates/HW-UNKNOWN/outreach-events",
+        "/api/v1/mandates/HW-UNKNOWN/outreach-events.json",
         "/api/v1/mandates/HW-UNKNOWN/evidence-summary",
     ]
     responses = [client.get(path) for path in paths]
