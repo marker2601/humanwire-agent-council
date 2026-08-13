@@ -1,1 +1,1 @@
-"""SecondSignal operator and demo utilities."""
+"""HumanWire operator and demo utilities."""

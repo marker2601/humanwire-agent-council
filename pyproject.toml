@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "humanwire"
 version = "0.1.0"
-description = "AI chief of staff that interviews the organization"
+description = "AI chief of staff for adaptive human coordination"
 requires-python = ">=3.12"
 dependencies = [
   "caspian-sdk==0.6.1",
@@ -27,14 +27,12 @@ dev = [
 
 [project.scripts]
 humanwire = "humanwire.__main__:main"
-secondsignal = "secondsignal.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
 humanwire = ["templates/*.html", "static/*.css", "static/*.js"]
-secondsignal = ["templates/*.html", "static/*.css"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

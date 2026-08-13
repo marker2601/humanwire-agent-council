@@ -1,85 +1,72 @@
-# SecondSignal
+# HumanWire
 
-**Verify urgent requests through a channel the attacker does not control.**
+**The AI chief of staff that selects the minimum necessary engagement for every person a decision touches.**
 
-SecondSignal is a cross-channel verification agent built for the Caspian Buildathon. It receives a suspicious request on email or Telegram, extracts risk facts, contacts the claimed sender through a separately registered channel, and returns a deterministic human-confirmed verdict with a read-only evidence receipt.
+HumanWire turns one authenticated manager mandate into a bounded, cross-channel coordination plan. It informs people who only need context, asks for acknowledgement where receipt matters, collects quick or structured input where evidence is required, routes explicit approval to the right authority, and prepares a meeting only when asynchronous coordination cannot resolve a verified conflict.
 
 ## Live demo
 
-Open the public, read-only dashboard at **[secondsignal.vercel.app](https://secondsignal.vercel.app)**. It uses clearly labeled synthetic cases and never loads Caspian credentials, private identity mappings, or real messages. The credential-dependent Caspian email and Telegram listener runs separately as described below.
+The public deployment target is [secondsignal.vercel.app](https://secondsignal.vercel.app). The app is a deterministic, read-only HumanWire fixture: it loads no local organization directory, provider credentials, model credentials, or private responses. Local and browser gates must pass before that continuity URL is updated.
 
-## The same-channel trust problem
+## The coordination problem
 
-When an email account says “send gift cards now,” replying to that email does not establish who is behind it. The account carrying the request may already be compromised. SecondSignal treats the origin channel as evidence of a claim, never as proof of identity.
+Most coordination software treats reach as a broadcast problem. Real decisions need different contributions from different people, and asking everyone for the same response creates delay without adding authority or evidence.
 
-Its operating principle is simple:
+HumanWire applies one of six explicit contracts:
 
-> The channel carrying a request should not verify itself.
+- `INFORM` delivers context and never manufactures a response.
+- `ACKNOWLEDGE` records authenticated receipt without creating interview evidence.
+- `QUICK_RESPONSE` asks one focused question.
+- `STRUCTURED_INTERVIEW` conducts a bounded multi-question session.
+- `REVIEW_APPROVAL` accepts only an explicit authority response.
+- `AVAILABILITY` collects exact offset-aware windows for required attendees.
 
-## 60-second product flow
+Only quick and structured contributions create interview sessions. HumanWire does not interview everyone.
 
-1. A registered reporter receives a suspicious Telegram request.
-2. The reporter forwards it to SecondSignal with `/verify Asha Rao`.
-3. SecondSignal safely extracts risk facts and creates a time-limited case.
-4. Caspian initiates an email to Asha's registered address.
-5. Asha replies `NO SS-7K4P2M` from that registered email route.
-6. SecondSignal sends `DENIED — DO NOT PROCEED` back to the original Telegram conversation.
-7. The dashboard shows an immutable audit timeline and makes the decision boundary explicit: AI analyzed risk; a human response determined the verdict.
+## 75–90 second product flow
 
-## Why Caspian is essential
+1. A registered manager sends `/mandate` over email or Telegram.
+2. HumanWire resolves a safe plan, then shows the manager a destination-free preview of people, direction, reason, engagement type, and required contribution.
+3. The manager can use `ENGAGE` for a permitted optional override or `GO` for explicit release; otherwise the configured preview deadline releases the plan.
+4. One Caspian handler coordinates all six engagement types across email and Telegram. Silence, provider failure, and alternate-channel continuation remain distinct persisted states.
+5. Quick and structured answers persist as asserted evidence. The exact participant confirms answer-derived evidence with `CONFIRM <token>` from the session's current registered route and conversation.
+6. `DECIDE <token> APPROVE`, `REJECT`, or `CHANGE <reason>` records an explicit authority response. A required `CHANGE` remains a truthful blocker and is never forced into a meeting.
+7. When all required contributions are ready, deterministic policy evaluates alignment. At most two proposal rounds run; an unresolved conflict then moves to scheduling.
+8. Required attendees submit `AVAILABLE` windows. A meeting package and downloadable ICS are produced only from a verified overlap; the application never writes to a calendar.
+9. Decision Room, Reach, Data, JSON, CSV, and ICS rebuild a safe read-only view from persisted truth.
 
-SecondSignal is not a chatbot duplicated across two integrations. One Caspian `on_message` handler receives both email and Telegram events, normalizes them into one domain message, and dispatches the workflow's output through the correct channel capability.
+## Why Caspian and Featherless are essential
 
-- Email verification uses `client.initiate(...)` because Caspian can start an email conversation.
-- Telegram verification uses `client.send_message(...)` with a previously captured conversation because Telegram bots cannot cold-start a user chat.
-- Replies to the current inbound message use `client.reply(...)`.
-- The application registers exactly one handler for both channels and listens with queue concurrency.
+Caspian provides one channel-neutral message boundary for email and Telegram. HumanWire registers exactly one `on_message` handler, normalizes provider messages once, replies to the current message when appropriate, initiates new email conversations, and continues only existing Telegram conversations. The same deterministic workflow owns sender, route, token, mandate, assignment, conversation, replay, delivery callback, and failover checks.
 
-Without Caspian's common message model and channel-aware delivery methods, the cross-channel guarantee would collapse into separate bots with duplicated policy logic.
+Featherless provides constrained JSON suggestions for planning, evidence extraction, alignment analysis, and proposal drafting. Model output is advisory: local schemas, the organization directory, engagement policy, state machines, and transaction fences decide what may persist. If the model is absent or fails, bounded deterministic fallbacks preserve the authority and privacy boundary.
 
-## Architecture diagram
+## Architecture and safety invariants
 
 ```mermaid
 flowchart LR
-    Reporter["Registered reporter"] -->|"Email or Telegram"| Caspian["Caspian · two channels"]
-    Caspian --> Handler["One on_message handler"]
-    Handler --> Workflow["Deterministic verification workflow"]
-    Workflow --> Risk["Guarded AI risk extraction"]
-    Workflow --> Registry["Private identity registry"]
-    Workflow --> Store["SQLite cases + audit events"]
-    Workflow -->|"Independent channel"| Person["Claimed person"]
-    Person -->|"YES / NO + case token"| Handler
-    Workflow -->|"Verdict receipt"| Reporter
-    Store --> Dashboard["Read-only evidence dashboard"]
+    Manager["Registered manager"] -->|"Email or Telegram mandate"| Caspian["Caspian · one handler"]
+    Caspian --> Workflow["HumanWire workflow"]
+    Workflow --> Policy["Directory + engagement policy"]
+    Workflow --> Models["Featherless advisory JSON"]
+    Workflow --> Store["SQLite aggregates + append-only events + outbox"]
+    Workflow --> People["Minimum necessary engagements"]
+    Store --> Views["Decision Room · Reach · Data · ICS"]
 ```
 
-See [docs/architecture.md](docs/architecture.md) for the full flow and state model.
+- Model output cannot authenticate a sender, weaken a required contribution, approve a decision, choose a transport destination, or create a meeting.
+- Every inbound action correlates to the exact registered person, route, conversation, token, aggregate, and active state.
+- Preview release, overrides, answers, confirmations, decisions, proposals, availability, cancellation, expiry, and synthesis use persisted replay/concurrency fences.
+- Provider delivery is at least once. Stable outbox identity and leases make callbacks and recovery safe, but an external recipient may still see a duplicate after a provider accepted a send and its callback was lost.
+- Required silence, failure, rejection, `CHANGE`, missing evidence, and pending confirmation never become alignment.
+- Public projections exclude raw private evidence, change rationale, contact routes, provider bodies, message identifiers, credentials, and operational UUIDs.
+- The web app is GET-only; unknown resources use a bodyless 404 and internal APIs require a separate read token outside demo mode.
 
-## Safety guarantees
+See [architecture](docs/architecture.md) and the [threat model](docs/threat-model.md) for the complete boundary.
 
-- The origin channel is never selected as the verification channel.
-- Only configured reporters may open, inspect, or cancel their own cases through messages.
-- A verification response is accepted only when its channel, normalized sender address, token, and pending state all match the stored case.
-- AI output can describe risk but cannot select identities, routes, state transitions, or verdicts.
-- Model failure falls back to deterministic rules and is recorded as an audit event.
-- Duplicate reports are idempotent; terminal cases cannot be changed by replayed responses.
-- Cases expire to `UNVERIFIED`, never to approval.
-- Sensitive strings are redacted before model analysis, persistence, receipts, and logs.
-- The web dashboard exposes read-only GET routes and omits reporter and verifier addresses.
+## Local setup and organization seed
 
-These controls reduce same-channel impersonation risk; they do not prove legal identity or protect a user when both registered accounts are compromised. See [docs/threat-model.md](docs/threat-model.md).
-
-## Prerequisites
-
-- Python 3.12
-- A Caspian API key
-- A Telegram bot token from BotFather
-- Access to the email inbox created through Caspian
-- Optional: a Featherless API key for structured model-based risk extraction
-
-The deterministic rule analyzer works without Featherless, including the complete offline smoke check.
-
-## Local installation
+Requirements: Python 3.12, a Caspian API key, a Telegram bot token, an email connection created through Caspian, and optionally a Featherless API key.
 
 ```powershell
 python -m venv .venv
@@ -87,122 +74,113 @@ python -m venv .venv
 Copy-Item .env.example .env
 ```
 
-Fill in `CASPIAN_API_KEY` and `TELEGRAM_BOT_TOKEN` in `.env`. Add `FEATHERLESS_API_KEY` if you want live model extraction. Never commit `.env`, `data/identities.json`, captured channel identifiers, or API keys.
+Fill secret values only in `.env`. Keep `ANALYTICS_READ_TOKEN` separate from provider and model credentials. Never commit `.env`, `.env.local`, `.vercel`, `data/organization.json`, database files, contact destinations, conversation identifiers, keys, tokens, private answers, or screenshots containing them.
 
-## Caspian email and Telegram connection setup
-
-Set these values in `.env`:
-
-```dotenv
-CASPIAN_API_KEY=<local-secret>
-CASPIAN_BASE_URL=https://api.trycaspianai.com
-CASPIAN_EMAIL_USERNAME=secondsignal
-TELEGRAM_BOT_TOKEN=<local-secret>
-```
-
-When the listener starts, it calls `connect_email(username=...)` and `connect_telegram(bot_token=...)`, records each channel's readiness, registers one message handler, and begins queue-based listening.
-
-The resulting Caspian email address is the reporter-facing or verifier-facing email used in the live demonstration. Send the Telegram bot at least one message before attempting an email-to-Telegram verification route.
-
-## Capturing the Telegram verifier route
-
-Run the temporary route-capture utility, send one message to the Telegram bot from the verifier account, copy the printed identifiers into local environment values, and stop with Ctrl+C:
-
-```powershell
-.\.venv\Scripts\python.exe scripts\capture_telegram_route.py
-```
-
-The printed `sender_address` and `conversation_id` are private configuration. A Telegram handle by itself is not enough to send an unsolicited bot message.
-
-## Creating `data/identities.json`
-
-Set the registered reporter and verifier routes in the current PowerShell session:
-
-```powershell
-$env:DEMO_REPORTER_TELEGRAM_ADDRESS="<captured-reporter-address>"
-$env:DEMO_REPORTER_EMAIL="<reporter-email>"
-$env:DEMO_VERIFIER_EMAIL="<verifier-email>"
-$env:DEMO_VERIFIER_TELEGRAM_ADDRESS="<captured-verifier-address>"
-$env:DEMO_VERIFIER_TELEGRAM_CONVERSATION="<captured-verifier-conversation>"
-.\.venv\Scripts\python.exe scripts\seed_demo_registry.py
-```
-
-The generator validates every required value and refuses to replace an existing registry unless `--force` is supplied.
-
-## Running the listener and dashboard
-
-Initialize the database once:
-
-```powershell
-.\.venv\Scripts\python.exe -m secondsignal init-db
-```
-
-Start the Caspian listener in one terminal:
-
-```powershell
-.\.venv\Scripts\python.exe -m secondsignal listen
-```
-
-Start the read-only dashboard in another terminal:
-
-```powershell
-.\.venv\Scripts\python.exe -m secondsignal web
-```
-
-Open `http://127.0.0.1:8000`. Health probes are available at `/health/live` and `/health/ready`.
-
-Message commands:
+The safe directory shape is in `config/demo-organization.example.json`. For the seed utility, provide `_EMAIL`, `_TELEGRAM_ADDRESS`, and `_TELEGRAM_CONVERSATION` values for these private prefixes:
 
 ```text
-/verify <claimed identity>
-<suspicious request>
-
-YES <case token>
-NO <case token>
-/status <case token>
-/cancel <case token>
+HUMANWIRE_CEO
+HUMANWIRE_COO
+HUMANWIRE_VP_SUPPORT
+HUMANWIRE_SUPPORT_MANAGER
+HUMANWIRE_US_TEAM_LEAD
+HUMANWIRE_APAC_TEAM_LEAD
+HUMANWIRE_VP_PEOPLE
 ```
 
-## Running tests and smoke check
+Then create the ignored local directory:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest
-.\.venv\Scripts\python.exe scripts\smoke_check.py
-.\.venv\Scripts\python.exe -m ruff check src tests scripts
+.\.venv\Scripts\python.exe scripts\seed_humanwire_organization.py
 ```
 
-The smoke check uses an in-memory database and no network. It exercises Telegram-to-email denial, email-to-Telegram denial, and an expiring family-emergency request.
+The utility refuses to overwrite an existing directory unless `--force` is explicit.
 
-## Demonstration scenarios
+## Listener and web commands
 
-1. **Executive gift-card denial:** Telegram request → independent email challenge → `NO` → Telegram `DENIED` receipt.
-2. **Vendor bank-change denial:** Email request → existing Telegram verifier conversation → `NO` → email-origin conversation receipt.
-3. **Family-emergency timeout:** Telegram request → no human answer before the deadline → `UNVERIFIED` receipt.
+```powershell
+.\.venv\Scripts\python.exe -m humanwire init-db
+.\.venv\Scripts\python.exe -m humanwire listen
+```
 
-The recommended recording order is in [docs/demo-script.md](docs/demo-script.md).
+In another terminal:
 
-## Limitations
+```powershell
+.\.venv\Scripts\python.exe -m humanwire web
+```
 
-- SecondSignal verifies control of a registered route, not a person's legal identity.
-- If an attacker controls both the origin and verification accounts, the independent-channel assumption fails.
-- Telegram bots require a prior conversation and cannot initiate a new user chat.
-- The agent does not block payments or execute financial transactions.
-- SQLite and a local JSON registry are appropriate for this demonstration, not a multi-tenant deployment.
-- Delivery outages resolve safely as `DELIVERY_FAILED` or `EXPIRED`, but they can prevent a timely decision.
-- The rule fallback is intentionally conservative and is not a general fraud-classification model.
+Open `http://127.0.0.1:8000`. Health probes are `/health/live` and `/health/ready`.
+
+Core message forms:
+
+```text
+/mandate
+<objective and constraints>
+
+GO <token>
+ENGAGE <token> <person_id> <engagement_type>
+ACK <token>
+CONFIRM <token>
+DECIDE <token> APPROVE
+DECIDE <token> REJECT
+DECIDE <token> CHANGE <reason>
+ACCEPT <token>
+REJECT <token>
+CHANGE <token> <requested change>
+AVAILABLE <token> <start>/<end>
+/status <token>
+/cancel <token>
+```
+
+## Tests, offline smoke, and live checklist
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m ruff check src tests scripts
+.\.venv\Scripts\python.exe scripts\smoke_humanwire.py
+.\.venv\Scripts\python.exe -m humanwire smoke
+```
+
+The smoke proof uses a temporary file-backed database, real domain/workflow/repository/web boundaries, and deterministic fake channel/model adapters. It makes no network call and prints exactly eleven safe `PASS` lines.
+
+The opt-in live mode only prints a manual checklist and has no provider, model, or database side effects:
+
+```powershell
+.\.venv\Scripts\python.exe -m humanwire smoke --live --confirm-live
+```
+
+Actual Caspian and Telegram proof is a separate operator gate. It must cover one inform, acknowledgement, quick response, email structured interview continued on Telegram, authenticated evidence confirmation, explicit approval response, delivery failover, and three consecutive complete flows without database edits.
+
+## Analytics and Power BI contract
+
+The Data page, JSON endpoint, and CSV endpoint share one canonical redacted 16-field projection. Non-demo `/api/v1/*` requests require `Authorization: Bearer <read-only-token>`; credentials never belong in query strings, shared URLs, screenshots, or committed Power BI source text.
+
+Power BI can use an authenticated Web request where managed header credentials are available, or a downloaded CSV for an offline snapshot. It must never connect directly to `humanwire.db`. Field order, filters, privacy exclusions, and refresh limitations are documented in [HumanWire analytics](docs/analytics.md).
+
+## Limitations and calendar boundary
+
+- SQLite is the local proof boundary, not a multi-tenant production database.
+- The organization directory is administrator-managed local configuration; HumanWire does not provide route enrollment or user account administration.
+- Provider delivery is at least once, not exactly once.
+- Telegram outreach requires a previously established bot conversation.
+- Featherless improves suggestions but never owns authority; deterministic fallback is intentionally conservative.
+- The public demo is synthetic and read-only. Offline fake-provider proof is not evidence of a live provider run.
+- The ICS artifact uses `METHOD:PUBLISH`. HumanWire does not create, update, cancel, or verify an external calendar event.
+- HumanWire does not claim organizer endorsement, Power BI certification, production security certification, or realtime analytics.
+
+The recommended product walkthrough is in [docs/demo-script.md](docs/demo-script.md).
 
 ## Repository structure
 
 ```text
-src/secondsignal/       application, workflow, Caspian gateway, and web UI
-scripts/                registry setup, Telegram route capture, smoke check
-config/                 safe example identity registry
-tests/                  unit and integration coverage
-docs/                   architecture, threat model, and demo script
-submission/             Devpost copy and final submission checklist
-data/                   local database and private registry (ignored)
+src/humanwire/       domain, workflow, provider gateway, persistence, and web app
+tests/humanwire/     unit, race, integration, cutover, and privacy coverage
+scripts/             organization seed and offline smoke wrapper
+config/              safe organization-directory example
+docs/                architecture, threat model, demo, and analytics contract
+submission/          differentiated Devpost narratives and release checklist
 ```
 
 ## License
 
-SecondSignal is available under the [MIT License](LICENSE).
+HumanWire is available under the [MIT License](LICENSE).
