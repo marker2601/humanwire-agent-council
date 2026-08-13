@@ -731,6 +731,16 @@ def _validated_output_path(output_path: str | Path, run_root: str | Path) -> tup
     return output, root
 
 
+def _prepare_fresh_run_root(run_root: str | Path) -> Path:
+    root = Path(run_root).resolve()
+    if root.exists():
+        if not root.is_dir() or next(root.iterdir(), None) is not None:
+            raise FileExistsError("synthetic proof requires a fresh run root")
+        return root
+    root.mkdir()
+    return root
+
+
 def generate_scenario(
     scenario: SyntheticScenario,
     output_path: str | Path,
@@ -739,10 +749,8 @@ def generate_scenario(
     """Generate one isolated deterministic run through the real gateway boundary."""
     scenario = SyntheticScenario.model_validate(scenario)
     output, root = _validated_output_path(output_path, run_root)
-    root.mkdir(parents=True, exist_ok=True)
+    root = _prepare_fresh_run_root(root)
     database_path = root / "humanwire-synthetic.sqlite3"
-    if database_path.exists():
-        raise FileExistsError("synthetic generation requires a fresh run root")
 
     settings = _isolated_settings(database_path)
     directory, people = _synthetic_directory(scenario)
@@ -969,11 +977,8 @@ def replay_transcript(
     """Reinject a validated frozen transcript through the offline gateway boundary."""
     transcript = load_transcript(path)
     scenario = transcript.scenario
-    root = Path(run_root)
-    root.mkdir(parents=True, exist_ok=True)
+    root = _prepare_fresh_run_root(run_root)
     database_path = root / "humanwire-synthetic.sqlite3"
-    if database_path.exists():
-        raise FileExistsError("synthetic replay requires a fresh run root")
 
     settings = _isolated_settings(database_path)
     directory, people = _synthetic_directory(scenario)

@@ -689,6 +689,113 @@ def test_generation_rejects_output_outside_run_root_before_writing(tmp_path) -> 
     assert not outside.exists()
 
 
+@pytest.mark.parametrize("mode", ["generate", "replay"])
+def test_synthetic_run_rejects_populated_run_root_without_changing_bytes(
+    tmp_path, mode
+) -> None:
+    run_root = tmp_path / f"{mode}-run"
+    run_root.mkdir()
+    existing = run_root / "operator-note.txt"
+    original = b"operator-owned bytes must survive"
+    existing.write_bytes(original)
+
+    with pytest.raises(FileExistsError, match="fresh run root"):
+        if mode == "generate":
+            generate_scenario(
+                make_generation_scenario(),
+                run_root / "transcript.json",
+                run_root,
+            )
+        else:
+            synthetic_module.replay_transcript(
+                Path("tests/fixtures/humanwire/synthetic_launch_v1.json"),
+                run_root,
+            )
+
+    assert existing.read_bytes() == original
+    assert {path.name for path in run_root.iterdir()} == {"operator-note.txt"}
+
+
+def test_generation_rejects_preexisting_output_without_overwriting_it(tmp_path) -> None:
+    run_root = tmp_path / "generate-run"
+    run_root.mkdir()
+    output = run_root / "transcript.json"
+    original = b"operator-owned transcript bytes"
+    output.write_bytes(original)
+
+    with pytest.raises(FileExistsError, match="fresh run root"):
+        generate_scenario(make_generation_scenario(), output, run_root)
+
+    assert output.read_bytes() == original
+    assert {path.name for path in run_root.iterdir()} == {"transcript.json"}
+
+
+@pytest.mark.parametrize("root_exists", [False, True])
+@pytest.mark.parametrize("mode", ["generate", "replay"])
+def test_synthetic_run_accepts_only_nonexistent_or_existing_empty_root(
+    tmp_path, mode, root_exists
+) -> None:
+    run_root = tmp_path / f"{mode}-{root_exists}"
+    if root_exists:
+        run_root.mkdir()
+
+    if mode == "generate":
+        result = generate_scenario(
+            make_generation_scenario(),
+            run_root / "transcript.json",
+            run_root,
+        )
+        assert (run_root / "transcript.json").is_file()
+    else:
+        result = synthetic_module.replay_transcript(
+            Path("tests/fixtures/humanwire/synthetic_launch_v1.json"),
+            run_root,
+        )
+
+    assert result.database_path == run_root.resolve() / "humanwire-synthetic.sqlite3"
+    assert result.database_path.is_file()
+
+
+def _symlink_or_skip(link: Path, target: Path, *, target_is_directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError as error:
+        pytest.skip(f"symbolic links are unavailable on this Windows host: {error.winerror}")
+
+
+def test_generation_rejects_output_symlink_escape_without_changing_target(tmp_path) -> None:
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    outside = tmp_path / "outside.json"
+    original = b"outside bytes must survive"
+    outside.write_bytes(original)
+    output = run_root / "transcript.json"
+    _symlink_or_skip(output, outside)
+
+    with pytest.raises(ValueError, match="output path must be inside run root"):
+        generate_scenario(make_generation_scenario(), output, run_root)
+
+    assert outside.read_bytes() == original
+
+
+def test_generation_rejects_intermediate_symlink_escape_without_writing(tmp_path) -> None:
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    intermediate = run_root / "escaped"
+    _symlink_or_skip(intermediate, outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="output path must be inside run root"):
+        generate_scenario(
+            make_generation_scenario(),
+            intermediate / "transcript.json",
+            run_root,
+        )
+
+    assert list(outside.iterdir()) == []
+
+
 def test_synthetic_generate_cli_ignores_ambient_config_and_writes_only_in_run_root(
     tmp_path, monkeypatch, capsys
 ) -> None:
