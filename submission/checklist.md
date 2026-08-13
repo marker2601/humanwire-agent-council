@@ -1,16 +1,27 @@
 # HumanWire submission and launch checklist
 
-Verified against the official Caspian Buildathon rules and the deadline-extension update on 10 August 2026.
+Official event rules, eligibility, registration state, reuse terms, and deadlines are external pending until the entrant retains the event-specific official evidence.
 
 ## Eligibility and submission
 
-- [ ] Entrant and team eligibility are confirmed under the detailed rules.
-- [ ] All submitted project code was written during the hackathon window.
-- [ ] Submit by the extended deadline: **16 August 2026, 11:59 PM IST**.
+- [ ] Caspian: retain official eligibility evidence for entrant/team and any organizer exception.
+- [ ] Caspian: retain registration confirmation.
+- [ ] Caspian: retain official code-reuse/originality terms and map repository history to them.
+- [ ] Caspian: retain the official deadline/time-zone evidence and submit before it.
+- [ ] Caspian: retain required media/form-field evidence and final submission receipt.
+- [ ] ML Empowerment: retain official eligibility evidence for entrant/team and any organizer exception.
+- [ ] ML Empowerment: retain registration confirmation.
+- [ ] ML Empowerment: retain official code-reuse/originality terms and map repository history to them.
+- [ ] ML Empowerment: retain the official deadline/time-zone evidence and submit before it.
+- [ ] ML Empowerment: retain required media/form-field evidence and final submission receipt.
+- [ ] Build Beyond: retain official eligibility evidence for entrant/team and any organizer exception.
+- [ ] Build Beyond: retain registration confirmation.
+- [ ] Build Beyond: retain official code-reuse/originality terms and map repository history to them.
+- [ ] Build Beyond: retain the official deadline/time-zone evidence and submit before it.
+- [ ] Build Beyond: retain required media/form-field evidence and final submission receipt.
 - [ ] Project name and tagline consistently identify HumanWire.
 - [ ] Public repository, video, and demo links work in a signed-out browser.
 - [ ] Final page preview contains no missing media, private identifiers, or broken links.
-- [ ] Save submission confirmation evidence.
 
 ## Qualifying implementation
 
@@ -27,6 +38,7 @@ Verified against the official Caspian Buildathon rules and the deadline-extensio
 - [ ] Confirm a fresh-clone editable install exposes only the `humanwire` command.
 - [ ] Confirm `.env`, `.env.local`, `.vercel`, `data/organization.json`, databases, direct contact destinations, conversation IDs, provider bodies, and private responses are absent from tracked files and Git history.
 - [ ] Confirm no obsolete package, command, fixture, test, or operator script remains.
+- [ ] Do not publish `.superpowers/brainstorm/` or any of its token files.
 - [ ] Keep the repository public through judging.
 
 ## Required live proof
