@@ -461,8 +461,11 @@ def _metadata_schema_signature(metadata: MetaData) -> dict[str, object]:
     }
 
 
-def _inspector_signature(inspector: object) -> dict[str, object]:
-    table_names = set(inspector.get_table_names())
+def _inspector_signature(
+    inspector: object, table_names: set[str] | None = None
+) -> dict[str, object]:
+    if table_names is None:
+        table_names = set(inspector.get_table_names())
     columns = {
         table: tuple(
             (column["name"], str(column["type"]), column["nullable"], column["default"])
@@ -589,6 +592,55 @@ def test_migration_upgrade_matches_metadata_on_sqlite_and_downgrade_is_complete(
         )
         module.downgrade()
         assert inspect(connection).get_table_names() == []
+
+
+def test_real_alembic_upgrades_and_downgrades_only_the_configured_temp_database(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from alembic import command
+    from alembic.config import Config
+    from sqlalchemy import text
+
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    database_path = tmp_path / "humanwire-alembic.sqlite3"
+    default_database_path = ROOT / "data" / "humanwire.db"
+    default_database_state = (
+        default_database_path.exists(),
+        default_database_path.stat().st_mtime_ns if default_database_path.exists() else None,
+    )
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    config = Config(str(ROOT / "alembic.ini"))
+    config.set_main_option("sqlalchemy.url", database_url)
+
+    command.upgrade(config, "head")
+
+    migrated_engine = create_engine(database_url)
+    metadata_engine = create_engine("sqlite://")
+    Base.metadata.create_all(metadata_engine)
+    with migrated_engine.connect() as connection:
+        inspector = inspect(connection)
+        assert set(inspector.get_table_names()) == set(EXPECTED_COLUMNS) | {"alembic_version"}
+        assert _inspector_signature(inspector, set(EXPECTED_COLUMNS)) == _inspector_signature(
+            inspect(metadata_engine)
+        )
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
+            "0001_humanwire_schema"
+        )
+    migrated_engine.dispose()
+
+    command.downgrade(config, "base")
+
+    downgraded_engine = create_engine(database_url)
+    with downgraded_engine.connect() as connection:
+        inspector = inspect(connection)
+        assert not any(table.startswith("hw_") for table in inspector.get_table_names())
+        assert connection.execute(text("SELECT COUNT(*) FROM alembic_version")).scalar_one() == 0
+    downgraded_engine.dispose()
+    assert database_path.is_file()
+    assert (
+        default_database_path.exists(),
+        default_database_path.stat().st_mtime_ns if default_database_path.exists() else None,
+    ) == default_database_state
 
 
 def test_migration_postgresql_ddl_matches_every_metadata_table_and_index() -> None:
