@@ -1732,6 +1732,123 @@ def test_reach_replay_uses_every_saved_event_in_persisted_order(web_client) -> N
     assert "synthesized event" not in html.lower()
 
 
+def test_reach_replay_explains_allowlisted_persisted_events(demo_app) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assert mandate is not None
+    for index, event_type in enumerate(
+        (
+            "proposal.created",
+            "availability.recorded",
+            "meeting.package_created",
+            "mandate.aligned",
+        ),
+        start=1,
+    ):
+        repository.append_event(
+            mandate.mandate_id,
+            DomainEvent(
+                event_type=event_type,
+                created_at=NOW + timedelta(minutes=index),
+                idempotency_key=f"reach-explanation-{event_type}",
+            ),
+        )
+
+    event_times = {
+        (event.event_type, event.person_id): event.created_at.isoformat()
+        for event in repository.list_events(mandate.mandate_id)
+    }
+    replay_by_time = {
+        item["created_at"]: item for item in _internal_reach_view(repository, mandate)["replay"]
+    }
+    expected = (
+        ("mandate.created", None, "Mandate", "HumanWire", "Decision Room", "Mandate created"),
+        ("engagement.plan_previewed", None, "Plan", "HumanWire", "Decision Room", "Plan previewed"),
+        ("engagement.plan_released", None, "Plan", "HumanWire", "Decision Room", "Plan released"),
+        ("engagement.quick_response_sent", "eli-torres", "Outreach", "HumanWire", "Eli Torres", "Outreach sent"),
+        ("engagement.acknowledgement_sent", "nora-chen", "Outreach", "HumanWire", "Nora Chen", "Acknowledgement requested"),
+        ("interview.answer_recorded", "eli-torres", "Response", "HumanWire", "Eli Torres", "Answer recorded"),
+        ("interview.evidence_confirmed", "eli-torres", "Evidence", "HumanWire", "Eli Torres", "Evidence confirmed"),
+        ("engagement.approval_pending", "maya-brooks", "Decision", "HumanWire", "Maya Brooks", "Decision requested"),
+        ("proposal.created", None, "Proposal", "HumanWire", "Decision Room", "Proposal prepared"),
+        ("availability.recorded", None, "Scheduling", "HumanWire", "Decision Room", "Availability recorded"),
+        ("meeting.package_created", None, "Scheduling", "HumanWire", "Decision Room", "Meeting prepared"),
+        ("mandate.aligned", None, "Outcome", "HumanWire", "Decision Room", "Outcome recorded"),
+    )
+
+    for event_type, person_id, stage, source, destination, data_point in expected:
+        item = replay_by_time[event_times[(event_type, person_id)]]
+        assert (
+            item["stage_label"],
+            item["source_label"],
+            item["destination_label"],
+            item["data_point_label"],
+        ) == (stage, source, destination, data_point)
+        assert all(
+            item[key]
+            for key in (
+                "stage_label",
+                "source_label",
+                "destination_label",
+                "data_point_label",
+            )
+        )
+
+
+def test_reach_replay_unknown_and_cross_assignment_events_are_neutral(demo_app) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assert mandate is not None
+    assignments = {
+        item.person_id: item
+        for item in repository.list_assignments(mandate.mandate_id)
+    }
+    probes = (
+        DomainEvent(
+            event_type="internal.credentials_rotated",
+            created_at=NOW + timedelta(minutes=1),
+            idempotency_key="reach-unknown-private-event",
+            assignment_id=assignments["priya-shah"].assignment_id,
+            person_id="priya-shah",
+            metadata={"attempt_count": 97},
+        ),
+        DomainEvent(
+            event_type="engagement.quick_response_sent",
+            created_at=NOW + timedelta(minutes=2),
+            idempotency_key="reach-cross-assignment-event",
+            assignment_id=assignments["eli-torres"].assignment_id,
+            person_id="priya-shah",
+            metadata={"attempt_count": 98},
+        ),
+    )
+    for event in probes:
+        repository.append_event(mandate.mandate_id, event)
+
+    replay_by_time = {
+        item["created_at"]: item for item in _internal_reach_view(repository, mandate)["replay"]
+    }
+    for event in probes:
+        item = replay_by_time[event.created_at.isoformat()]
+        assert (
+            item["stage_label"],
+            item["source_label"],
+            item["destination_label"],
+            item["data_point_label"],
+            item["highlight"],
+            item["person_id"],
+        ) == (
+            "Saved event",
+            "HumanWire",
+            "Decision Room",
+            "No public data point",
+            "none",
+            None,
+        )
+        serialized = json.dumps(item)
+        assert event.event_type not in serialized
+        assert "attempt_count" not in serialized
+
+
 def _internal_reach_view(repository, mandate, rows=None, events=None):
     return web_projection._reach_page_view(
         web_projection._mandate_detail(repository, mandate),

@@ -1496,6 +1496,68 @@ _MANDATE_LEVEL_EVENT_TYPES = frozenset(
     }
 )
 
+_REPLAY_EVENT_EXPLANATIONS = {
+    "mandate.created": ("Mandate", "Mandate created"),
+    "mandate.received": ("Mandate", "Mandate received"),
+    "engagement.plan_previewed": ("Plan", "Plan previewed"),
+    "engagement.plan_released": ("Plan", "Plan released"),
+    "mandate.planned": ("Plan", "Plan prepared"),
+    "mandate.interviewing": ("Outreach", "Coordination started"),
+    "engagement.quick_response_sent": ("Outreach", "Outreach sent"),
+    "engagement.structured_interview_sent": ("Outreach", "Interview requested"),
+    "engagement.acknowledgement_sent": ("Outreach", "Acknowledgement requested"),
+    "engagement.inform_delivered": ("Outreach", "Update delivered"),
+    "engagement.structured_interview_reminder": ("Outreach", "Reminder sent"),
+    "engagement.structured_interview_alternate_selected": (
+        "Outreach",
+        "Alternate channel selected",
+    ),
+    "engagement.quick_response_completed": ("Response", "Response completed"),
+    "engagement.acknowledged": ("Response", "Acknowledgement received"),
+    "engagement.structured_interview_progressed": ("Response", "Interview progressed"),
+    "interview.answer_recorded": ("Response", "Answer recorded"),
+    "interview.evidence_confirmed": ("Evidence", "Evidence confirmed"),
+    "engagement.approval_pending": ("Decision", "Decision requested"),
+    "engagement.override_recorded": ("Decision", "Decision updated"),
+    "proposal.response_recorded": ("Decision", "Proposal response recorded"),
+    "proposal.created": ("Proposal", "Proposal prepared"),
+    "mandate.negotiating": ("Proposal", "Proposal review started"),
+    "mandate.meeting_required": ("Scheduling", "Meeting required"),
+    "mandate.scheduling": ("Scheduling", "Scheduling started"),
+    "availability.recorded": ("Scheduling", "Availability recorded"),
+    "meeting.package_created": ("Scheduling", "Meeting prepared"),
+    "mandate.meeting_ready": ("Scheduling", "Meeting ready"),
+    "mandate.aligned": ("Outcome", "Outcome recorded"),
+    "mandate.partial": ("Outcome", "Partial outcome recorded"),
+    "mandate.cancelled": ("Outcome", "Mandate cancelled"),
+    "mandate.expired": ("Outcome", "Mandate expired"),
+}
+
+
+def _replay_explanation(
+    event_type: Any, bound_row: Mapping[str, Any] | None
+) -> dict[str, str]:
+    """Return public replay labels using only allowlisted event types and bindings."""
+    explanation = _REPLAY_EVENT_EXPLANATIONS.get(str(event_type or ""))
+    if explanation is None:
+        return {
+            "stage_label": "Saved event",
+            "source_label": "HumanWire",
+            "destination_label": "Decision Room",
+            "data_point_label": "No public data point",
+        }
+    destination = (
+        str(bound_row.get("name") or "").strip()
+        if isinstance(bound_row, Mapping)
+        else ""
+    )
+    return {
+        "stage_label": explanation[0],
+        "source_label": "HumanWire",
+        "destination_label": destination or "Decision Room",
+        "data_point_label": explanation[1],
+    }
+
 
 def _reach_result(row: Mapping[str, Any]) -> str:
     """Return deterministic result copy from the typed public engagement contract."""
@@ -1622,7 +1684,24 @@ def _reach_page_view(
         event_mandate_id = str(event.get("_reach_mandate_id") or "")
         identity = (event_mandate_id, assignment_id, person_id)
         bound_row = exact_rows_by_identity.get(identity)
-        bound_person_id = str(bound_row.get("person_id") or "") if bound_row else ""
+        event_type = str(event.get("event_type") or "")
+        has_exact_binding = bound_row is not None
+        has_exact_mandate_identity = (
+            not assignment_id
+            and not person_id
+            and event_mandate_id == expected_mandate_id
+        )
+        can_explain = event_type in _REPLAY_EVENT_EXPLANATIONS and (
+            has_exact_binding or has_exact_mandate_identity
+        )
+        explanation = _replay_explanation(
+            event_type if can_explain else "", bound_row if has_exact_binding else None
+        )
+        bound_person_id = (
+            str(bound_row.get("person_id") or "")
+            if has_exact_binding and can_explain
+            else ""
+        )
         if bound_person_id:
             highlight = bound_person_id
         elif (
@@ -1657,6 +1736,7 @@ def _reach_page_view(
                     if event.get("direction")
                     else ""
                 ),
+                **explanation,
                 "highlight": highlight,
                 "person_id": bound_person_id or None,
             }
