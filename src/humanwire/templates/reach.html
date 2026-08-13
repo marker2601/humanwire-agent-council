@@ -1,0 +1,235 @@
+{% extends "base.html" %}
+
+{% macro icon(name, class_name="icon") -%}
+  <svg class="{{ class_name }}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    {% if name == "person" %}
+      <circle cx="12" cy="7" r="3.5"></circle><path d="M5 21v-2.5A6.5 6.5 0 0 1 11.5 12h1A6.5 6.5 0 0 1 19 18.5V21H5Z"></path>
+    {% elif name == "mail" %}
+      <rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="m4 7 8 6 8-6"></path>
+    {% elif name == "send" %}
+      <path d="m21 3-7.7 18-3.8-7.1L3 10.7 21 3Z"></path><path d="m9.5 13.9 4.4-4.4"></path>
+    {% elif name == "check" %}
+      <circle cx="12" cy="12" r="9"></circle><path d="m8 12 2.6 2.7L16.5 9"></path>
+    {% elif name == "clock" %}
+      <circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path>
+    {% elif name == "list" %}
+      <circle cx="5" cy="6" r="1"></circle><circle cx="5" cy="12" r="1"></circle><circle cx="5" cy="18" r="1"></circle><path d="M9 6h11M9 12h11M9 18h11"></path>
+    {% elif name == "previous" %}
+      <path d="M6 5v14M18 5l-8 7 8 7V5Z"></path>
+    {% elif name == "next" %}
+      <path d="M18 5v14M6 5l8 7-8 7V5Z"></path>
+    {% elif name == "pause" %}
+      <path d="M9 6v12M15 6v12"></path>
+    {% else %}
+      <path d="m8 5 11 7-11 7V5Z"></path>
+    {% endif %}
+  </svg>
+{%- endmacro %}
+
+{% block title %}HumanWire {{ reach.mandate.token }} Reach{% endblock %}
+{% block page_name %}reach{% endblock %}
+
+{% block main %}
+  <main
+    id="main-content"
+    class="reach-page shell"
+    data-testid="reach-page"
+    data-mandate-token="{{ reach.mandate.token }}"
+    data-baseline-updated="{{ reach.mandate.updated_at }}"
+    data-selected-person="{{ reach.selected.person_id if reach.selected else '' }}"
+    data-reach-filter-state="{{ reach.selected_filter }}"
+  >
+    <header class="reach-heading">
+      <h1>Reach: {{ reach.mandate.objective }}</h1>
+      <p>One mandate, routed through the minimum engagement each person needed.</p>
+    </header>
+
+    <section class="reach-origin" data-testid="reach-origin" aria-labelledby="origin-heading">
+      <h2 id="origin-heading" class="sr-only">Mandate origin</h2>
+      <div class="origin-person">
+        <span class="origin-icon">{{ icon("person") }}</span>
+        <dl>
+          <div><dt>Started by</dt><dd><strong>{{ reach.mandate.initiator.name }}</strong><span>{{ reach.mandate.initiator.role }}</span></dd></div>
+        </dl>
+      </div>
+      <dl class="origin-facts">
+        <div><dt>Mandate</dt><dd><span class="token">{{ reach.mandate.token }}</span></dd></div>
+        <div><dt>State</dt><dd><span class="status-dot" aria-hidden="true"></span>{{ reach.mandate.state_label }}</dd></div>
+        <div><dt>Safe start</dt><dd><time datetime="{{ reach.mandate.created_at }}">{{ reach.mandate.created_display }}</time></dd></div>
+      </dl>
+    </section>
+
+    <section class="reach-toolbar" aria-labelledby="reach-controls-heading">
+      <h2 id="reach-controls-heading" class="sr-only">Reach controls</h2>
+      <div class="reach-filters" aria-label="Engagement state filters">
+        {% set filters = [
+          ("all", "All", "all"),
+          ("in-progress", "In progress", "in_progress"),
+          ("completed", "Completed", "completed"),
+          ("pending", "Pending", "pending")
+        ] %}
+        {% for key, label, count_key in filters %}
+          <button
+            class="reach-control reach-filter"
+            type="button"
+            data-reach-filter="{{ key }}"
+            aria-pressed="{{ 'true' if reach.selected_filter == key else 'false' }}"
+          >{{ label }} <span>{{ reach.filter_counts[count_key] }}</span></button>
+        {% endfor %}
+        {% if reach.filter_counts.unreachable %}
+          <button
+            class="reach-control reach-filter"
+            type="button"
+            data-reach-filter="unreachable"
+            aria-pressed="{{ 'true' if reach.selected_filter == 'unreachable' else 'false' }}"
+          >Unreachable <span>{{ reach.filter_counts.unreachable }}</span></button>
+        {% endif %}
+      </div>
+      <button class="reach-control replay-jump" type="button" data-replay-jump>
+        {{ icon("play") }} <span>Replay saved events</span>
+      </button>
+      <p class="persisted-count">{{ icon("list") }} <strong>{{ reach.event_count }}</strong> persisted events</p>
+    </section>
+
+    <div class="propagation-lanes" data-testid="propagation-lanes">
+      {% for lane in reach.lanes %}
+        <section
+          class="propagation-lane"
+          data-testid="lane-{{ lane.key }}"
+          aria-labelledby="lane-{{ lane.key }}-heading"
+        >
+          <header class="lane-heading">
+            <div>
+              <h2 id="lane-{{ lane.key }}-heading">{{ lane.order }}. {{ lane.label }}</h2>
+              <p>{{ lane.direction_label }}</p>
+            </div>
+            <span>{{ lane.count_label }}</span>
+          </header>
+          {% if lane.rows %}
+            <ol class="reach-steps">
+              {% for row in lane.rows %}
+                <li
+                  class="reach-step status-{{ row.status_key }}{% if row.selected %} is-selected{% endif %}"
+                  data-sequence="{{ row.sequence }}"
+                  data-lane-person="{{ row.person_id }}"
+                  data-filter-groups="{{ row.filter_groups }}"
+                  data-selected="{{ 'true' if row.selected else 'false' }}"
+                  {% if row.initially_hidden %}hidden{% endif %}
+                >
+                  <button
+                    class="reach-person-select"
+                    type="button"
+                    data-reach-select
+                    aria-pressed="{{ 'true' if row.selected else 'false' }}"
+                    aria-label="Select {{ row.name }} engagement details"
+                  >
+                    <span class="reach-sequence" aria-hidden="true">{{ row.sequence }}</span>
+                    <span class="reach-person"><strong>{{ row.name }}</strong><span>{{ row.role }}</span><small>{{ row.department }} · {{ row.direction_label }}</small></span>
+                  </button>
+                  <dl class="reach-step-facts">
+                    <div><dt>Engagement</dt><dd>{{ row.engagement_label }}</dd></div>
+                    <div><dt>Safe channel</dt><dd class="reach-channel">{{ icon("send" if row.channel_label.startswith("Telegram") else "mail") }} {{ row.channel_label }}</dd></div>
+                    <div class="reach-progress"><dt>Progress</dt><dd><span>{{ row.progress_current }} of {{ row.progress_total }}</span><progress max="{{ row.progress_total if row.progress_total else 1 }}" value="{{ row.progress_current }}" aria-label="{{ row.name }} engagement progress"></progress></dd></div>
+                    <div><dt>Status</dt><dd class="engagement-status status-{{ row.status_key }}">{{ icon("clock" if row.engagement_status in ["pending", "missing", "in progress", "awaiting response", "awaiting acknowledgement"] else "check") }} {{ row.status_label }}</dd></div>
+                    <div><dt>First contact</dt><dd><time{% if row.first_contact_at %} datetime="{{ row.first_contact_at }}"{% endif %}>{{ row.first_contact_display }}</time></dd></div>
+                    <div><dt>Last contact</dt><dd><time{% if row.last_contact_at %} datetime="{{ row.last_contact_at }}"{% endif %}>{{ row.last_contact_display }}</time></dd></div>
+                  </dl>
+                  <p class="reach-result"><strong>Result:</strong> {{ row.result }}</p>
+                  <a class="text-link reach-technical-link" href="{{ row.technical_path }}">View technical rows <span aria-hidden="true">↗</span></a>
+                </li>
+              {% endfor %}
+            </ol>
+          {% else %}
+            <p class="lane-empty">{{ lane.empty_label }}</p>
+          {% endif %}
+          {% for row in lane.rows %}
+            <section
+              class="selected-history{% if row.selected %} is-current{% endif %}"
+              data-history-person="{{ row.person_id }}"
+              {% if not row.selected %}hidden{% endif %}
+              aria-labelledby="history-{{ row.sequence }}-heading"
+            >
+              <header>
+                <h3 id="history-{{ row.sequence }}-heading">{{ row.name }} <small>— engagement history</small></h3>
+                <p>{{ row.engagement_label }} · {{ row.progress_current }} of {{ row.progress_total }} · {{ row.status_label }}</p>
+              </header>
+              <ol class="selected-ladder" aria-label="{{ row.name }} engagement ladder">
+                {% for step in row.ladder %}
+                  <li class="ladder-step is-{{ step.status }}">
+                    <span class="ladder-marker">{{ loop.index }}</span>
+                    <span><strong>{{ step.label }}</strong><small>{{ step.detail }}</small></span>
+                  </li>
+                {% endfor %}
+              </ol>
+              <div class="saved-history">
+                <h4>Saved engagement events</h4>
+                {% if row.history %}
+                  <ol>
+                    {% for event in row.history %}
+                      <li>
+                        <time datetime="{{ event.created_at }}">{{ event.created_display }}</time>
+                        <strong>{{ event.description }}</strong>
+                        {% if event.context_label %}<span>{{ event.context_label }}</span>{% endif %}
+                      </li>
+                    {% endfor %}
+                  </ol>
+                {% else %}
+                  <p>No saved engagement history</p>
+                {% endif %}
+              </div>
+              <a class="text-link" href="{{ row.technical_path }}">View technical rows <span aria-hidden="true">↗</span></a>
+            </section>
+          {% endfor %}
+        </section>
+      {% endfor %}
+    </div>
+
+    <section class="replay-panel" data-testid="reach-replay" aria-labelledby="replay-heading">
+      <header>
+        <h2 id="replay-heading">Replay <small>(read-only) — {{ reach.event_count }} persisted events</small></h2>
+      </header>
+      {% if reach.replay %}
+        <ol class="replay-events" data-replay-list>
+          {% for event in reach.replay %}
+            <li
+              class="replay-event{% if loop.first %} is-current{% endif %}"
+              data-replay-event
+              data-created-at="{{ event.created_at }}"
+              data-highlight="{{ event.highlight }}"
+              data-event-index="{{ loop.index0 }}"
+              {% if not loop.first %}aria-hidden="true"{% endif %}
+            >
+              <span class="replay-number">{{ loop.index }}</span>
+              <span class="replay-copy"><strong>{{ event.description }}</strong>{% if event.context_label %}<small>{{ event.context_label }}</small>{% endif %}</span>
+              <time datetime="{{ event.created_at }}">{{ event.created_display }}</time>
+            </li>
+          {% endfor %}
+        </ol>
+        <div class="replay-current">
+          <p class="replay-progress" role="status" aria-live="off" data-replay-progress>Event 1 of {{ reach.event_count }}</p>
+          <p class="replay-description"><strong data-replay-description>{{ reach.first_event.description }}</strong><time datetime="{{ reach.first_event.created_at }}" data-replay-time>{{ reach.first_event.created_display }}</time></p>
+        </div>
+        <div class="replay-controls">
+          <button class="reach-control replay-control" type="button" data-replay-previous aria-label="Previous saved event">{{ icon("previous") }}</button>
+          <button class="reach-control replay-control replay-play" type="button" data-replay-play aria-label="Play saved events" aria-pressed="false">{{ icon("play") }}<span class="sr-only" data-replay-action>Play</span></button>
+          <button class="reach-control replay-control" type="button" data-replay-next aria-label="Next saved event">{{ icon("next") }}</button>
+        </div>
+        <p class="sr-only" aria-live="polite" aria-atomic="true" data-replay-live></p>
+      {% else %}
+        <p class="lane-empty">No saved events to replay</p>
+      {% endif %}
+    </section>
+  </main>
+{% endblock %}
+
+{% block footer %}
+  <footer
+    class="live-footer"
+    data-testid="live-refresh"
+    data-refresh-token="{{ reach.mandate.token }}"
+    data-refresh-baseline="{{ reach.mandate.updated_at }}"
+  >
+    <span class="live-state"><i aria-hidden="true"></i><span data-refresh-status>Live refresh every 5s</span></span>
+    <span>Last updated: <time datetime="{{ reach.mandate.updated_at }}" data-last-updated>{{ reach.mandate.updated_time }}</time></span>
+  </footer>
+{% endblock %}

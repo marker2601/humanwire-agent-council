@@ -9,6 +9,11 @@
     halted: false,
     lastAnnouncedMinute: null,
   };
+  const reachReplayState = {
+    timer: null,
+    index: 0,
+    playing: false,
+  };
 
   function decisionRoom() {
     return document.querySelector('[data-testid="decision-room"]');
@@ -264,6 +269,286 @@
     });
   }
 
+  function reachPage() {
+    return document.querySelector('[data-testid="reach-page"]');
+  }
+
+  function orderedReachRows() {
+    return Array.from(document.querySelectorAll("[data-lane-person]")).sort(
+      (left, right) => Number(left.dataset.sequence) - Number(right.dataset.sequence),
+    );
+  }
+
+  function updateReachUrl(filter, personId) {
+    const url = new URL(window.location.href);
+    url.searchParams.delete("status");
+    url.searchParams.delete("person_id");
+    if (filter && filter !== "all") {
+      url.searchParams.set("status", filter);
+    }
+    if (personId) {
+      url.searchParams.set("person_id", personId);
+    }
+    window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+  }
+
+  function selectReachRow(row, filter, writeUrl) {
+    const page = reachPage();
+    if (!page || !row || row.hidden) {
+      return;
+    }
+    const rows = orderedReachRows();
+    const histories = Array.from(document.querySelectorAll("[data-history-person]"));
+    rows.forEach((candidate) => {
+      const selected = candidate === row;
+      candidate.classList.toggle("is-selected", selected);
+      candidate.dataset.selected = String(selected);
+      const button = candidate.querySelector("[data-reach-select]");
+      if (button) {
+        button.setAttribute("aria-pressed", String(selected));
+      }
+    });
+    histories.forEach((history) => {
+      const selected = history.dataset.historyPerson === row.dataset.lanePerson;
+      history.hidden = !selected;
+      history.classList.toggle("is-current", selected);
+    });
+    page.dataset.selectedPerson = row.dataset.lanePerson || "";
+    if (writeUrl) {
+      updateReachUrl(filter, row.dataset.lanePerson || "");
+    }
+  }
+
+  function applyReachFilter(selectedFilter, writeUrl) {
+    const page = reachPage();
+    const filters = Array.from(document.querySelectorAll("[data-reach-filter]"));
+    const rows = orderedReachRows();
+    if (!page || !filters.length || !rows.length) {
+      return;
+    }
+    const allowed = filters.map((button) => button.dataset.reachFilter);
+    const filter = allowed.includes(selectedFilter) ? selectedFilter : "all";
+    filters.forEach((button) => {
+      button.setAttribute("aria-pressed", String(button.dataset.reachFilter === filter));
+    });
+    rows.forEach((row) => {
+      const groups = (row.dataset.filterGroups || "").split(" ").filter(Boolean);
+      row.hidden = filter !== "all" && !groups.includes(filter);
+    });
+    page.dataset.reachFilterState = filter;
+    const selected = rows.find((row) => row.dataset.selected === "true" && !row.hidden);
+    const next = selected || rows.find((row) => !row.hidden);
+    if (next) {
+      selectReachRow(next, filter, writeUrl);
+    } else if (writeUrl) {
+      updateReachUrl(filter, "");
+    }
+  }
+
+  function initializeReachFilters() {
+    const page = reachPage();
+    const filters = Array.from(document.querySelectorAll("[data-reach-filter]"));
+    if (!page || !filters.length) {
+      return;
+    }
+    const params = new URLSearchParams(window.location.search);
+    const statusValues = params.getAll("status");
+    const allowed = filters.map((button) => button.dataset.reachFilter);
+    const initial =
+      statusValues.length === 0
+        ? "all"
+        : statusValues.length === 1 && allowed.includes(statusValues[0])
+          ? statusValues[0]
+          : "all";
+    applyReachFilter(initial, false);
+    filters.forEach((button) => {
+      button.addEventListener("click", function filterReachRows() {
+        applyReachFilter(button.dataset.reachFilter || "all", true);
+      });
+    });
+  }
+
+  function initializeReachSelection() {
+    const page = reachPage();
+    const rows = orderedReachRows();
+    if (!page || !rows.length) {
+      return;
+    }
+    const params = new URLSearchParams(window.location.search);
+    const personValues = params.getAll("person_id");
+    const requested = personValues.length === 1 ? personValues[0] : "";
+    const exactMatches = rows.filter(
+      (row) => requested && row.dataset.lanePerson === requested && !row.hidden,
+    );
+    const selected =
+      exactMatches.length === 1
+        ? exactMatches[0]
+        : rows.find((row) => row.dataset.selected === "true" && !row.hidden) ||
+          rows.find((row) => !row.hidden);
+    if (selected) {
+      selectReachRow(selected, page.dataset.reachFilterState || "all", false);
+    }
+    rows.forEach((row) => {
+      const button = row.querySelector("[data-reach-select]");
+      if (!button) {
+        return;
+      }
+      button.addEventListener("click", function selectReachPerson() {
+        selectReachRow(row, page.dataset.reachFilterState || "all", true);
+      });
+    });
+  }
+
+  function stopReachReplay() {
+    if (reachReplayState.timer !== null) {
+      window.clearInterval(reachReplayState.timer);
+      reachReplayState.timer = null;
+    }
+    reachReplayState.playing = false;
+    const play = document.querySelector("[data-replay-play]");
+    const action = document.querySelector("[data-replay-action]");
+    if (play) {
+      play.setAttribute("aria-pressed", "false");
+      play.setAttribute("aria-label", "Play saved events");
+    }
+    if (action) {
+      action.textContent = "Play";
+    }
+  }
+
+  function showReachReplayEvent(nextIndex, announce) {
+    const events = Array.from(document.querySelectorAll("[data-replay-event]"));
+    if (!events.length) {
+      return;
+    }
+    const index = Math.min(Math.max(nextIndex, 0), events.length - 1);
+    reachReplayState.index = index;
+    const current = events[index];
+    events.forEach((event, eventIndex) => {
+      const active = eventIndex === index;
+      event.classList.toggle("is-current", active);
+      event.setAttribute("aria-hidden", String(!active));
+    });
+    document
+      .querySelectorAll(".reach-step.is-replay-current, .reach-origin.is-replay-current")
+      .forEach((node) => node.classList.remove("is-replay-current"));
+    if (current.dataset.highlight === "origin") {
+      const origin = document.querySelector('[data-testid="reach-origin"]');
+      if (origin) {
+        origin.classList.add("is-replay-current");
+      }
+    } else if (current.dataset.highlight && current.dataset.highlight !== "none") {
+      const matching = orderedReachRows().filter(
+        (row) => row.dataset.lanePerson === current.dataset.highlight,
+      );
+      if (matching.length === 1) {
+        matching[0].classList.add("is-replay-current");
+      }
+    }
+    const sourceDescription = current.querySelector(".replay-copy strong");
+    const sourceTime = current.querySelector("time");
+    const description = document.querySelector("[data-replay-description]");
+    const time = document.querySelector("[data-replay-time]");
+    const progress = document.querySelector("[data-replay-progress]");
+    const live = document.querySelector("[data-replay-live]");
+    if (description && sourceDescription) {
+      description.textContent = sourceDescription.textContent;
+    }
+    if (time && sourceTime) {
+      time.textContent = sourceTime.textContent;
+      time.dateTime = sourceTime.dateTime;
+    }
+    const progressText = `Event ${index + 1} of ${events.length}`;
+    if (progress) {
+      progress.textContent = progressText;
+    }
+    if (announce && live && sourceDescription) {
+      live.textContent = `${progressText}: ${sourceDescription.textContent}`;
+    }
+    if (index === events.length - 1) {
+      stopReachReplay();
+    }
+  }
+
+  function startReachReplay() {
+    const events = Array.from(document.querySelectorAll("[data-replay-event]"));
+    if (
+      !events.length ||
+      document.visibilityState !== "visible" ||
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    ) {
+      stopReachReplay();
+      return;
+    }
+    if (reachReplayState.index >= events.length - 1) {
+      showReachReplayEvent(0, true);
+    }
+    reachReplayState.playing = true;
+    const play = document.querySelector("[data-replay-play]");
+    const action = document.querySelector("[data-replay-action]");
+    if (play) {
+      play.setAttribute("aria-pressed", "true");
+      play.setAttribute("aria-label", "Pause saved events");
+    }
+    if (action) {
+      action.textContent = "Pause";
+    }
+    reachReplayState.timer = window.setInterval(function advanceSavedEvent() {
+      showReachReplayEvent(reachReplayState.index + 1, false);
+    }, 2000);
+  }
+
+  function initializeReachReplay() {
+    const events = Array.from(document.querySelectorAll("[data-replay-event]"));
+    if (!events.length) {
+      return;
+    }
+    const previous = document.querySelector("[data-replay-previous]");
+    const next = document.querySelector("[data-replay-next]");
+    const play = document.querySelector("[data-replay-play]");
+    const jump = document.querySelector("[data-replay-jump]");
+    if (previous) {
+      previous.addEventListener("click", function previousSavedEvent() {
+        stopReachReplay();
+        showReachReplayEvent(reachReplayState.index - 1, true);
+      });
+    }
+    if (next) {
+      next.addEventListener("click", function nextSavedEvent() {
+        stopReachReplay();
+        showReachReplayEvent(reachReplayState.index + 1, true);
+      });
+    }
+    if (play) {
+      play.addEventListener("click", function toggleSavedEventReplay() {
+        if (reachReplayState.playing) {
+          stopReachReplay();
+        } else {
+          startReachReplay();
+        }
+      });
+    }
+    if (jump) {
+      jump.addEventListener("click", function revealSavedEvents() {
+        const panel = document.querySelector('[data-testid="reach-replay"]');
+        if (panel) {
+          panel.scrollIntoView({
+            behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+              ? "auto"
+              : "smooth",
+            block: "start",
+          });
+        }
+      });
+    }
+    document.addEventListener("visibilitychange", function pauseHiddenReplay() {
+      if (document.visibilityState !== "visible") {
+        stopReachReplay();
+      }
+    });
+    showReachReplayEvent(0, false);
+  }
+
   function initializeVisibility() {
     document.addEventListener("visibilitychange", function handleVisibility() {
       if (document.visibilityState === "visible") {
@@ -285,6 +570,9 @@
     initializeNavigation();
     initializeFilters();
     initializeStakeholderSelection();
+    initializeReachFilters();
+    initializeReachSelection();
+    initializeReachReplay();
     initializeVisibility();
     startCountdown();
     scheduleRefresh();

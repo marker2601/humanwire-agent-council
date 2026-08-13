@@ -518,6 +518,10 @@ def _stakeholders(repository: Any, mandate: Mandate) -> list[dict[str, Any]]:
     for event in repository.list_events(mandate.mandate_id):
         if event.person_id is not None and event.channel is not None:
             event_channels[event.person_id] = event.channel
+    plan_order = {
+        planned.person_ref: index
+        for index, planned in enumerate(mandate.plan.stakeholders)
+    }
     return [
         _assignment_projection(
             repository,
@@ -529,7 +533,11 @@ def _stakeholders(repository: Any, mandate: Mandate) -> list[dict[str, Any]]:
         )
         for assignment in sorted(
             assignments,
-            key=lambda item: (item.direction.value, item.person_id, str(item.assignment_id)),
+            key=lambda item: (
+                plan_order.get(item.person_id, len(plan_order)),
+                item.person_id,
+                str(item.assignment_id),
+            ),
         )
     ]
 
@@ -779,6 +787,8 @@ def _filter_groups(row: Mapping[str, Any]) -> str:
         groups.append("pending")
     if status == "delivered":
         groups.append("delivered")
+    if status in {"delivery failed", "unreachable"}:
+        groups.append("unreachable")
     return " ".join(groups)
 
 
@@ -924,7 +934,285 @@ def _event_description(event: Mapping[str, Any]) -> str:
             f"{subject} structured interview progressed"
         ),
     }
-    return labels.get(event_type, event_type.replace(".", " ").replace("_", " ").capitalize())
+    return labels.get(
+        event_type,
+        "Saved engagement event" if name else "Saved mandate event",
+    )
+
+
+_REACH_FILTERS = frozenset({"all", "in-progress", "completed", "pending", "unreachable"})
+_REACH_LANES = (
+    ("downward", "Gather input", "Downward"),
+    ("lateral", "Coordinate policy", "Lateral"),
+    ("upward", "Get approval", "Upward"),
+)
+
+
+def _reach_result(row: Mapping[str, Any]) -> str:
+    """Return deterministic result copy from the typed public engagement contract."""
+    engagement_type = str(row.get("engagement_type") or "")
+    status = str(row.get("engagement_status") or "")
+    terminal = {
+        "delivery failed": "Delivery failed",
+        "unreachable": "Unreachable",
+        "declined": "Declined",
+    }
+    if status in terminal:
+        return terminal[status]
+    if engagement_type in {"quick_response", "structured_interview"}:
+        if status == "complete":
+            return "Response complete"
+        if status == "in progress":
+            return "Response in progress"
+        return "Awaiting response"
+    if engagement_type == "acknowledge":
+        return (
+            "Receipt confirmed"
+            if status == "acknowledged"
+            else "Awaiting acknowledgement"
+        )
+    if engagement_type == "review_approval":
+        return {
+            "approved": "Decision approved",
+            "rejected": "Decision rejected",
+            "change requested": "Change requested",
+        }.get(status, "Decision pending")
+    if engagement_type == "inform":
+        return "Update delivered" if status == "delivered" else "Delivery pending"
+    if engagement_type == "availability":
+        return (
+            "Availability recorded"
+            if status == "recorded"
+            else "Availability missing"
+        )
+    return "Engagement pending"
+
+
+def _safe_technical_path(token: Any, person_id: Any) -> str:
+    safe_token = str(token or "")
+    safe_person_id = str(person_id or "")
+    if not _SAFE_IDENTIFIER.fullmatch(safe_token):
+        return "/"
+    base = f"/mandates/{safe_token}/data"
+    if not _SAFE_IDENTIFIER.fullmatch(safe_person_id):
+        return base
+    return f"{base}?person_id={safe_person_id}"
+
+
+def _reach_page_view(
+    detail: Mapping[str, Any],
+    stakeholder_rows: list[dict[str, Any]],
+    saved_events: list[dict[str, Any]],
+    requested_status: str | None = None,
+    requested_person_id: str | None = None,
+) -> dict[str, Any]:
+    """Compose the Reach presentation using only existing public projections."""
+    plan_rows = list(stakeholder_rows)
+    plan_order = {id(row): index for index, row in enumerate(plan_rows)}
+    globally_ordered = sorted(
+        plan_rows,
+        key=lambda row: (
+            row.get("first_contact_at") is None,
+            str(row.get("first_contact_at") or ""),
+            plan_order[id(row)],
+            str(row.get("person_id") or ""),
+        ),
+    )
+    person_ids = [str(row.get("person_id") or "") for row in globally_ordered]
+    exact_public_person_ids = {
+        person_id
+        for person_id in person_ids
+        if person_ids.count(person_id) == 1 and _SAFE_IDENTIFIER.fullmatch(person_id)
+    }
+
+    replay: list[dict[str, Any]] = []
+    indexed_events = list(enumerate(saved_events))
+    indexed_events.sort(
+        key=lambda item: (str(item[1].get("created_at") or ""), item[0])
+    )
+    for event_index, (_saved_order, event) in enumerate(indexed_events, start=1):
+        person = event.get("person")
+        person_id = (
+            str(person.get("person_id") or "")
+            if isinstance(person, Mapping)
+            else ""
+        )
+        if person_id in exact_public_person_ids:
+            highlight = person_id
+        elif person is None:
+            highlight = "origin"
+        else:
+            highlight = "none"
+        context = " · ".join(
+            value
+            for value in (
+                _public_label(event.get("channel")) if event.get("channel") else "",
+                _public_label(event.get("direction")) if event.get("direction") else "",
+            )
+            if value
+        )
+        replay.append(
+            {
+                "index": event_index,
+                "created_at": event.get("created_at"),
+                "created_display": _short_datetime(event.get("created_at")),
+                "description": _event_description(event),
+                "context_label": context,
+                "channel_label": (
+                    _public_label(event.get("channel")) if event.get("channel") else ""
+                ),
+                "direction_label": (
+                    _public_label(event.get("direction"))
+                    if event.get("direction")
+                    else ""
+                ),
+                "highlight": highlight,
+                "person_id": person_id if person_id in exact_public_person_ids else None,
+            }
+        )
+
+    default_row = _selected_stakeholder(plan_rows)
+    selected_filter = requested_status if requested_status in _REACH_FILTERS else "all"
+    prepared_rows: list[dict[str, Any]] = []
+    for sequence, row in enumerate(globally_ordered, start=1):
+        person_id = str(row.get("person_id") or "")
+        engagement_type = str(row.get("engagement_type") or "")
+        status = str(row.get("engagement_status") or "")
+        channel = str(row.get("channel") or "")
+        filter_groups = _filter_groups(row)
+        prepared_rows.append(
+            {
+                "sequence": sequence,
+                "person_id": person_id,
+                "name": row.get("name") or "Stakeholder",
+                "role": row.get("role") or "Role not listed",
+                "department": row.get("department") or "Department not listed",
+                "direction": row.get("direction"),
+                "direction_label": _public_label(row.get("direction")),
+                "engagement_type": engagement_type,
+                "engagement_label": _ENGAGEMENT_LABELS.get(
+                    engagement_type,
+                    "Engagement",
+                ),
+                "channel_label": (
+                    f"{channel.capitalize()} (alternate)"
+                    if channel and row.get("channel_is_alternate")
+                    else channel.capitalize() if channel else "Not available"
+                ),
+                "progress_current": row.get("progress_current", 0),
+                "progress_total": row.get("progress_total", 0),
+                "engagement_status": status,
+                "status_label": _STATUS_LABELS.get(status, "Pending"),
+                "status_key": status.replace(" ", "-"),
+                "filter_groups": filter_groups,
+                "first_contact_at": row.get("first_contact_at"),
+                "first_contact_display": _short_datetime(row.get("first_contact_at")),
+                "last_contact_at": row.get("last_delivery_at")
+                or row.get("first_contact_at"),
+                "last_contact_display": _short_datetime(
+                    row.get("last_delivery_at") or row.get("first_contact_at")
+                ),
+                "result": _reach_result(row),
+                "technical_path": _safe_technical_path(detail.get("token"), person_id),
+                "ladder": _engagement_ladder(row),
+                "history": [
+                    event for event in replay if event.get("person_id") == person_id
+                ],
+                "is_default": row is default_row,
+            }
+        )
+
+    visible_rows = [
+        row
+        for row in prepared_rows
+        if selected_filter == "all"
+        or selected_filter in str(row.get("filter_groups") or "").split()
+    ]
+    if not visible_rows:
+        selected_filter = "all"
+        visible_rows = list(prepared_rows)
+    requested_matches = [
+        row
+        for row in visible_rows
+        if requested_person_id
+        and row.get("person_id") == requested_person_id
+        and requested_person_id in exact_public_person_ids
+    ]
+    selected_row = (
+        requested_matches[0]
+        if len(requested_matches) == 1
+        else next((row for row in visible_rows if row.get("is_default")), visible_rows[0] if visible_rows else None)
+    )
+    selected_sequence = selected_row.get("sequence") if selected_row else None
+    for row in prepared_rows:
+        row["selected"] = row.get("sequence") == selected_sequence
+        row["initially_hidden"] = row not in visible_rows
+        row.pop("is_default", None)
+
+    lanes = []
+    for order, (key, label, direction_label) in enumerate(_REACH_LANES, start=1):
+        if key == "downward":
+            lane_rows = [
+                row
+                for row in prepared_rows
+                if row.get("direction") in {"downward", "external"}
+            ]
+        else:
+            lane_rows = [row for row in prepared_rows if row.get("direction") == key]
+        lanes.append(
+            {
+                "order": order,
+                "key": key,
+                "label": label,
+                "direction_label": direction_label,
+                "count": len(lane_rows),
+                "count_label": f"{len(lane_rows)} {'person' if len(lane_rows) == 1 else 'people'}",
+                "empty_label": f"No saved {direction_label.lower()} engagements",
+                "rows": lane_rows,
+            }
+        )
+
+    filter_counts = {
+        "all": len(prepared_rows),
+        "in_progress": sum(
+            "in-progress" in str(row.get("filter_groups") or "").split()
+            for row in prepared_rows
+        ),
+        "completed": sum(
+            "completed" in str(row.get("filter_groups") or "").split()
+            for row in prepared_rows
+        ),
+        "pending": sum(
+            "pending" in str(row.get("filter_groups") or "").split()
+            for row in prepared_rows
+        ),
+        "unreachable": sum(
+            "unreachable" in str(row.get("filter_groups") or "").split()
+            for row in prepared_rows
+        ),
+    }
+    first_event = replay[0] if replay else None
+    updated_display = _short_datetime(detail.get("updated_at"))
+    return {
+        "mandate": {
+            "token": detail.get("token"),
+            "objective": detail.get("objective"),
+            "state_label": _public_label(detail.get("phase_label")),
+            "initiator": detail.get("initiator"),
+            "created_at": detail.get("created_at"),
+            "created_display": _short_datetime(detail.get("created_at")),
+            "updated_at": detail.get("updated_at"),
+            "updated_display": updated_display,
+            "updated_time": updated_display.rsplit(" ", 1)[-1] if detail.get("updated_at") else "—",
+        },
+        "lanes": lanes,
+        "selected": selected_row,
+        "selected_filter": selected_filter,
+        "filter_counts": filter_counts,
+        "replay": replay,
+        "event_count": len(replay),
+        "first_event": first_event,
+    }
 
 
 def _reach_view(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1397,16 +1685,32 @@ def create_app(
         )
 
     @app.get("/mandates/{token}/reach", response_class=HTMLResponse)
-    def reach(token: str):
+    def reach(request: Request, token: str):
         mandate = load_mandate(token)
-        denied_values = _private_deny_values(repository, mandate)
-        rows = safe_projection(lambda: _stakeholders(repository, mandate), mandate)
-        lanes = {
-            direction: [row for row in rows if row["direction"] == direction]
-            for direction in ("downward", "lateral", "upward", "external")
-        }
-        public_token = _scrub_known_private(mandate.token, denied_values)
-        return _html_page(f"HumanWire {public_token} Reach", lanes, denied_values)
+        status_values = request.query_params.getlist("status")
+        person_values = request.query_params.getlist("person_id")
+        requested_status = status_values[0] if len(status_values) == 1 else None
+        requested_person_id = person_values[0] if len(person_values) == 1 else None
+        view = safe_projection(
+            lambda: _reach_page_view(
+                _mandate_detail(repository, mandate),
+                _stakeholders(repository, mandate),
+                _events(repository, mandate),
+                requested_status,
+                requested_person_id,
+            ),
+            mandate,
+        )
+        return templates.TemplateResponse(
+            request=request,
+            name="reach.html",
+            context={
+                "reach": view,
+                "demo_mode": demo_mode,
+                "current_nav": "reach",
+                "nav_token": view["mandate"]["token"],
+            },
+        )
 
     @app.get("/mandates/{token}/data", response_class=HTMLResponse)
     def data(token: str):

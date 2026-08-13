@@ -23,6 +23,8 @@ from humanwire.database import (
 from humanwire.demo import create_demo_app
 from humanwire.domain import (
     AvailabilityWindow,
+    Channel,
+    Direction,
     DomainEvent,
     EngagementDecision,
     EngagementDecisionKind,
@@ -468,6 +470,361 @@ def test_decision_room_javascript_polls_persisted_state_only(web_client) -> None
         assert forbidden not in script
     for forbidden in ("ANALYTICS_READ_TOKEN", "provider_body", "synthesized event"):
         assert forbidden not in script
+
+
+def test_reach_page_uses_package_shell_and_propagation_lanes(web_client) -> None:
+    response = web_client.get("/mandates/HW-2411/reach")
+    html = response.text
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "script-src 'self'" in response.headers["content-security-policy"]
+    assert 'href="/static/styles.css"' in html
+    assert 'src="/static/app.js"' in html
+    assert 'data-testid="reach-page"' in html
+    assert 'data-testid="lane-downward"' in html
+    assert 'data-testid="lane-lateral"' in html
+    assert 'data-testid="lane-upward"' in html
+    assert re.search(r'<a[^>]+aria-current="page"[^>]*>\s*Reach</a>', html)
+    assert 'data-testid="live-refresh"' in html
+    assert 'data-testid="org-chart"' not in html
+    assert "org chart" not in html.lower()
+    assert html.count("<h1") == 1
+
+
+def test_reach_origin_is_safe_truthful_persisted_projection(web_client) -> None:
+    html = web_client.get("/mandates/HW-2411/reach").text
+
+    assert "Reach: Prepare approved weekend launch coverage" in html
+    assert "One mandate, routed through the minimum engagement each person needed." in html
+    assert "Arun Patel" in html
+    assert "Support Manager" in html
+    assert "HW-2411" in html
+    assert "Coordinating" in html
+    assert "Aug 11, 15:00" in html
+    for forbidden in (
+        "demo-origin-hw-2411",
+        "demo-message-hw-2411",
+        "sender_address",
+        "recipient",
+        "conversation_id",
+        "connection_id",
+    ):
+        assert forbidden not in html
+
+
+def _reach_lane(html: str, direction: str) -> str:
+    match = re.search(
+        rf'<section[^>]+data-testid="lane-{direction}".*?</section>',
+        html,
+        re.DOTALL,
+    )
+    assert match is not None
+    return match.group(0)
+
+
+def test_reach_lanes_group_by_direction_without_duplication_or_drop(web_client) -> None:
+    html = web_client.get("/mandates/HW-2411/reach").text
+    downward = _reach_lane(html, "downward")
+    lateral = _reach_lane(html, "lateral")
+    upward = _reach_lane(html, "upward")
+
+    assert all(name in downward for name in ("Eli Torres", "Sora Kim", "Inez Ward"))
+    assert "Priya Shah" in lateral
+    assert all(name in upward for name in ("Nora Chen", "Maya Brooks"))
+    assert "Gather input" in downward and "Downward" in downward and "3 people" in downward
+    assert "Coordinate policy" in lateral and "Lateral" in lateral and "1 person" in lateral
+    assert "Get approval" in upward and "Upward" in upward and "2 people" in upward
+    for person_id in (
+        "eli-torres",
+        "sora-kim",
+        "inez-ward",
+        "priya-shah",
+        "nora-chen",
+        "maya-brooks",
+    ):
+        assert len(re.findall(rf'data-lane-person="{person_id}"', html)) == 1
+
+
+def test_reach_keeps_empty_primary_lanes_and_labels_external_truth(demo_app) -> None:
+    client = TestClient(demo_app)
+    empty_html = client.get("/mandates/HW-2412/reach").text
+
+    assert "No saved downward engagements" in _reach_lane(empty_html, "downward")
+    assert "No saved lateral engagements" in _reach_lane(empty_html, "lateral")
+    assert "Nora Okafor" in _reach_lane(empty_html, "upward")
+
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assignment = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.person_id == "inez-ward"
+    )
+    repository.save_assignment(assignment.model_copy(update={"direction": Direction.EXTERNAL}))
+    external_html = client.get("/mandates/HW-2411/reach").text
+    external_step = re.search(
+        r'<li[^>]+data-lane-person="inez-ward".*?</li>', external_html, re.DOTALL
+    )
+
+    assert external_step is not None
+    assert "External" in external_step.group(0)
+    assert "Inez Ward" in _reach_lane(external_html, "downward")
+
+
+def test_reach_sequence_is_global_first_contact_then_plan_order(demo_app) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assignments = {
+        item.person_id: item for item in repository.list_assignments(mandate.mandate_id)
+    }
+    tie = mandate.created_at + timedelta(minutes=1)
+    mutations = {
+        "maya-brooks": mandate.created_at,
+        "sora-kim": tie,
+        "priya-shah": tie,
+        "eli-torres": None,
+        "inez-ward": None,
+    }
+    for person_id, first_contact in mutations.items():
+        repository.save_assignment(
+            assignments[person_id].model_copy(update={"first_contact_at": first_contact})
+        )
+    repository.set_runtime_status(
+        "public.person:sora-kim", json.dumps({"name": "Zulu", "role": "Lead"}), NOW
+    )
+    repository.set_runtime_status(
+        "public.person:priya-shah", json.dumps({"name": "Alpha", "role": "Partner"}), NOW
+    )
+
+    html = TestClient(demo_app).get("/mandates/HW-2411/reach").text
+    ordered = [
+        person
+        for _sequence, person in sorted(
+            (
+                (int(sequence), person)
+                for sequence, person in re.findall(
+                    r'data-sequence="(\d+)"[^>]+data-lane-person="([^"]+)"', html
+                )
+            )
+        )
+    ]
+
+    assert ordered == [
+        "maya-brooks",
+        "sora-kim",
+        "priya-shah",
+        "nora-chen",
+        "eli-torres",
+        "inez-ward",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("engagement_type", "status", "expected"),
+    [
+        ("quick_response", "complete", "Response complete"),
+        ("structured_interview", "in progress", "Response in progress"),
+        ("acknowledge", "acknowledged", "Receipt confirmed"),
+        ("acknowledge", "awaiting acknowledgement", "Awaiting acknowledgement"),
+        ("review_approval", "approved", "Decision approved"),
+        ("review_approval", "rejected", "Decision rejected"),
+        ("review_approval", "change requested", "Change requested"),
+        ("review_approval", "pending", "Decision pending"),
+        ("inform", "delivered", "Update delivered"),
+        ("inform", "pending", "Delivery pending"),
+        ("availability", "recorded", "Availability recorded"),
+        ("availability", "missing", "Availability missing"),
+        ("inform", "delivery failed", "Delivery failed"),
+        ("quick_response", "unreachable", "Unreachable"),
+        ("structured_interview", "declined", "Declined"),
+    ],
+)
+def test_reach_result_copy_is_allowlisted_by_engagement_semantics(
+    engagement_type, status, expected
+) -> None:
+    assert web_projection._reach_result(
+        {"engagement_type": engagement_type, "engagement_status": status}
+    ) == expected
+
+
+def test_reach_steps_show_safe_labels_progress_times_and_links(web_client) -> None:
+    html = web_client.get("/mandates/HW-2411/reach").text
+
+    expected = {
+        "eli-torres": ("Quick response", "Email", "1 of 1", "Response complete"),
+        "sora-kim": ("Quick response", "Telegram", "1 of 1", "Response complete"),
+        "priya-shah": (
+            "Structured interview",
+            "Telegram (alternate)",
+            "1 of 3",
+            "Response in progress",
+        ),
+        "nora-chen": ("Acknowledgement", "Email", "1 of 1", "Receipt confirmed"),
+        "maya-brooks": ("Approval review", "Email", "0 of 1", "Decision pending"),
+        "inez-ward": ("Inform only", "Email", "1 of 1", "Update delivered"),
+    }
+    for person_id, values in expected.items():
+        step = re.search(
+            rf'<li[^>]+data-lane-person="{person_id}".*?</li>', html, re.DOTALL
+        )
+        assert step is not None
+        assert all(value in step.group(0) for value in values)
+        assert f'href="/mandates/HW-2411/data?person_id={person_id}"' in step.group(0)
+        assert "View technical rows" in step.group(0)
+    for forbidden in (
+        "demo-route-",
+        "demo-conversation-",
+        "source_message_id",
+        "provider_body",
+        "idempotency_key",
+    ):
+        assert forbidden not in html
+
+
+def test_reach_has_one_default_selection_and_exact_saved_person_history(web_client) -> None:
+    html = web_client.get("/mandates/HW-2411/reach").text
+
+    assert len(re.findall(r'data-lane-person="[^"]+"[^>]+data-selected="true"', html)) == 1
+    assert 'data-lane-person="priya-shah"' in html
+    assert 'data-selected-person="priya-shah"' in html
+    priya = re.search(
+        r'<section[^>]+data-history-person="priya-shah".*?</section>', html, re.DOTALL
+    )
+    assert priya is not None
+    assert "Structured interview sent to Priya Shah" in priya.group(0)
+    assert "Reminder sent to Priya Shah" in priya.group(0)
+    assert "Alternate channel selected for Priya Shah" in priya.group(0)
+    assert "Priya Shah structured interview progressed" in priya.group(0)
+    assert "Eli Torres" not in priya.group(0)
+    assert "Private medical leave" not in html
+    assert "event_metadata" not in html
+    assert "Use a narrower approval scope" not in html
+
+
+def test_reach_filters_selection_url_and_replay_are_read_only(web_client) -> None:
+    html = web_client.get("/mandates/HW-2411/reach").text
+    script = web_client.get("/static/app.js").text
+
+    for key, label, count in (
+        ("all", "All", 6),
+        ("in-progress", "In progress", 1),
+        ("completed", "Completed", 4),
+        ("pending", "Pending", 1),
+    ):
+        assert re.search(rf'data-reach-filter="{key}"[^>]*>\s*{label}\s*<span>{count}</span>', html)
+    assert 'data-reach-filter="unreachable"' not in html
+    assert "URLSearchParams" in script
+    assert "history.replaceState" in script
+    assert "person_id" in script and "status" in script
+    assert "initializeReachFilters" in script
+    assert "initializeReachSelection" in script
+    assert "initializeReachReplay" in script
+    assert "prefers-reduced-motion: reduce" in script
+    assert "document.visibilityState" in script
+    assert "1500" in script or "2000" in script or "2500" in script
+    for forbidden in ('method: "POST"', 'method: "PUT"', 'method: "PATCH"', 'method: "DELETE"'):
+        assert forbidden not in script
+    assert "<form" not in html.lower()
+
+
+def test_reach_replay_uses_every_saved_event_in_persisted_order(web_client) -> None:
+    events = web_client.get("/api/v1/mandates/HW-2411/outreach-events").json()
+    html = web_client.get("/mandates/HW-2411/reach").text
+    replay_items = re.findall(
+        r'<li[^>]+data-replay-event[^>]+data-created-at="([^"]+)"[^>]+data-highlight="([^"]+)"',
+        html,
+    )
+
+    assert len(replay_items) == len(events) == 16
+    assert [created for created, _target in replay_items] == [
+        event["created_at"] for event in events
+    ]
+    assert replay_items[:4] == [
+        (events[index]["created_at"], "origin") for index in range(4)
+    ]
+    assert replay_items[4][1] == "eli-torres"
+    assert "16 persisted events" in html
+    assert "Event 1 of 16" in html
+    assert 'aria-label="Previous saved event"' in html
+    assert 'aria-label="Play saved events"' in html
+    assert 'aria-label="Next saved event"' in html
+    assert "synthesized event" not in html.lower()
+
+
+def test_reach_escapes_malicious_presentation_fields_and_links(demo_app) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    repository.save_mandate(
+        mandate.model_copy(update={"objective": '<script>alert("objective")</script>'})
+    )
+    repository.set_runtime_status(
+        "public.person:priya-shah",
+        json.dumps({"name": '"><img src=x onerror=alert("name")>', "role": "<b>Role</b>"}),
+        NOW,
+    )
+    repository.append_event(
+        mandate.mandate_id,
+        DomainEvent(
+            event_type="engagement.safe-looking-unknown",
+            created_at=NOW + timedelta(minutes=1),
+            idempotency_key="reach-xss-event",
+            person_id="priya-shah",
+            channel=Channel.TELEGRAM,
+            direction=Direction.LATERAL,
+            previous_state='<script>alert("event")</script>',
+        ),
+    )
+
+    html = TestClient(demo_app).get(
+        "/mandates/HW-2411/reach?status=completed&person_id=priya-shah"
+    ).text
+
+    assert "<script>alert" not in html
+    assert "<img src=x" not in html
+    assert "<b>Role</b>" not in html
+    assert "&lt;script&gt;alert" in html
+    assert "&lt;img src=x" in html
+    assert "&lt;b&gt;Role&lt;/b&gt;" in html
+    assert "Saved engagement event" in html
+    assert "safe-looking-unknown" not in html
+    assert 'href="/mandates/HW-2411/data?person_id=priya-shah"' in html
+    assert 'data-reach-filter="completed"' in html
+
+
+def test_reach_css_has_direction_lanes_mobile_siblings_and_accessible_motion(
+    web_client,
+) -> None:
+    css = web_client.get("/static/styles.css").text
+
+    assert re.search(
+        r"@media \(min-width: 851px\).*?\.propagation-lanes\s*\{[^}]*"
+        r"grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)",
+        css,
+        re.DOTALL,
+    )
+    assert re.search(
+        r"@media \(max-width: 850px\).*?\.propagation-lanes\s*\{[^}]*"
+        r"grid-template-columns:\s*1fr",
+        css,
+        re.DOTALL,
+    )
+    assert "@media (max-width: 480px)" in css
+    assert "@media (prefers-reduced-motion: reduce)" in css
+    assert ".reach-control" in css and "min-height: 44px" in css
+    assert ".reach-step.is-selected" in css
+    assert ".reach-step.is-replay-current" in css
+    for forbidden in ("canvas", "org-chart", "node-link", "min-width: 851px;"):
+        assert forbidden not in css.lower()
+
+
+def test_reach_mobile_navigation_toggle_keeps_a_44px_touch_target(web_client) -> None:
+    css = web_client.get("/static/styles.css").text
+
+    nav_toggle = re.search(r"\.nav-toggle\s*\{(?P<rules>[^}]*)\}", css)
+    assert nav_toggle is not None
+    assert "width: 44px" in nav_toggle.group("rules")
+    assert "height: 44px" in nav_toggle.group("rules")
 
 
 def test_public_demo_has_no_mutating_routes_or_hidden_mutation(web_client) -> None:
