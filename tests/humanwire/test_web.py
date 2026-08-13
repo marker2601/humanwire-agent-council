@@ -905,6 +905,40 @@ def test_data_table_demo_is_anonymous_unknown_is_bodyless_and_failures_are_safe(
         assert "secret" not in response.text
 
 
+def test_data_table_deny_corpus_failure_uses_one_safe_503_boundary(
+    demo_app, monkeypatch
+) -> None:
+    sentinel = "PRIVATE-DENY-CORPUS-FAILURE"
+    repository = demo_app.state.repository
+    assert repository.get_mandate_by_token("HW-2411") is not None
+
+    def fail_list_evidence(mandate_id):
+        del mandate_id
+        raise RuntimeError(sentinel)
+
+    monkeypatch.setattr(repository, "list_evidence", fail_list_evidence)
+    client = TestClient(demo_app, raise_server_exceptions=False)
+    responses = [
+        client.get(path)
+        for path in (
+            "/mandates/HW-2411/data",
+            "/api/v1/mandates/HW-2411/outreach-events",
+            "/api/v1/mandates/HW-2411/outreach-events.csv",
+        )
+    ]
+
+    assert [response.status_code for response in responses] == [503, 503, 503]
+    assert all(
+        response.json() == {"detail": "Service unavailable"}
+        for response in responses
+    )
+    serialized = "".join(
+        response.text + json.dumps(dict(response.headers)) for response in responses
+    )
+    assert sentinel not in serialized
+    assert all("content-disposition" not in response.headers for response in responses)
+
+
 def test_data_table_template_is_semantic_labelled_read_only_and_package_local(
     web_client,
 ) -> None:

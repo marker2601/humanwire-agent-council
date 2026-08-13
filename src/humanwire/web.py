@@ -2395,14 +2395,21 @@ def create_app(
     def mandate_events_csv(request: Request, token: str):
         mandate = load_mandate(token)
         filters = _validated_outreach_filters(request)
-        denied_values = _private_deny_values(repository, mandate)
-        rows = safe_projection(lambda: _outreach_rows(repository, mandate, filters), mandate)
+        export = safe_projection(
+            lambda: {
+                "rows": _outreach_rows(repository, mandate, filters),
+                "filename": _outreach_filename(
+                    mandate.token, _private_deny_values(repository, mandate)
+                ),
+            },
+            mandate,
+        )
         return Response(
-            content=_outreach_csv(rows),
+            content=_outreach_csv(export["rows"]),
             media_type="text/csv; charset=utf-8",
             headers={
                 "Content-Disposition": (
-                    f'attachment; filename="{_outreach_filename(mandate.token, denied_values)}"'
+                    f'attachment; filename="{export["filename"]}"'
                 )
             },
         )
