@@ -270,6 +270,7 @@ def test_engagement_filter_matrix_uses_exact_inclusive_matches(
     paths = (
         "/mandates/HW-2411/data",
         "/api/v1/mandates/HW-2411/outreach-events",
+        "/api/v1/mandates/HW-2411/outreach-events.json",
         "/api/v1/mandates/HW-2411/outreach-events.csv",
     )
     responses = [
@@ -279,7 +280,8 @@ def test_engagement_filter_matrix_uses_exact_inclusive_matches(
     assert all(response.status_code == 200 for response in responses)
     assert len(_html_outreach_rows(responses[0].text)) == expected_count
     assert len(responses[1].json()) == expected_count
-    assert len(_csv_rows(responses[2])) == expected_count
+    assert len(responses[2].json()) == expected_count
+    assert len(_csv_rows(responses[3])) == expected_count
 
 
 def test_engagement_filter_combination_empty_results_and_stable_export_query(
@@ -363,6 +365,7 @@ def test_engagement_filter_invalid_state_returns_unreflected_safe_400(
     paths = (
         "/mandates/HW-2411/data",
         "/api/v1/mandates/HW-2411/outreach-events",
+        "/api/v1/mandates/HW-2411/outreach-events.json",
         "/api/v1/mandates/HW-2411/outreach-events.csv",
     )
 
@@ -374,6 +377,7 @@ def test_engagement_filter_invalid_state_returns_unreflected_safe_400(
         response.text + json.dumps(dict(response.headers)) for response in responses
     )
     assert "PRIVATE-QUERY-SENTINEL" not in serialized
+    assert all("content-disposition" not in response.headers for response in responses)
 
 
 def test_data_table_exact_aggregate_join_fails_closed_for_malformed_events(
@@ -947,6 +951,46 @@ def test_json_download_production_auth_matches_the_read_only_boundary(
 
     assert response.status_code == expected_status
     assert "fictional-read-token" not in response.text
+    if expected_status == 401:
+        assert "content-disposition" not in response.headers
+
+
+@pytest.mark.parametrize(
+    ("failure_name", "method_name", "call_to_fail"),
+    [
+        ("assignments", "list_assignments", 1),
+        ("interviews", "list_interviews", 1),
+        ("decisions", "list_engagement_decisions", 2),
+        ("evidence", "list_evidence", 2),
+        ("events", "list_events", 1),
+        ("runtime_status", "get_runtime_status", 1),
+        ("filename_deny_corpus", "list_evidence", 3),
+    ],
+)
+def test_json_download_late_repository_failures_are_safe_before_attachment_headers(
+    demo_app, monkeypatch, failure_name, method_name, call_to_fail
+) -> None:
+    sentinel = f"PRIVATE-JSON-DOWNLOAD-{failure_name}"
+    repository = demo_app.state.repository
+    original = getattr(repository, method_name)
+    calls = 0
+
+    def fail_on_late_call(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == call_to_fail:
+            raise RuntimeError(sentinel)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(repository, method_name, fail_on_late_call)
+    response = TestClient(demo_app, raise_server_exceptions=False).get(
+        "/api/v1/mandates/HW-2411/outreach-events.json"
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Service unavailable"}
+    assert sentinel not in response.text
+    assert "content-disposition" not in response.headers
 
 
 def test_json_download_demo_is_anonymous_unknown_is_bodyless_and_failures_are_safe(
@@ -961,11 +1005,13 @@ def test_json_download_demo_is_anonymous_unknown_is_bodyless_and_failures_are_sa
     for path in (
         "/mandates/HW-UNKNOWN/data",
         "/api/v1/mandates/HW-UNKNOWN/outreach-events",
+        "/api/v1/mandates/HW-UNKNOWN/outreach-events.json",
         "/api/v1/mandates/HW-UNKNOWN/outreach-events.csv",
     ):
         response = web_client.get(path)
         assert response.status_code == 404
         assert response.content == b""
+        assert "content-disposition" not in response.headers
 
     client = TestClient(
         create_app(
@@ -989,6 +1035,7 @@ def test_json_download_demo_is_anonymous_unknown_is_bodyless_and_failures_are_sa
         assert response.json() == {"detail": "Service unavailable"}
         assert "private/path" not in response.text
         assert "secret" not in response.text
+        assert "content-disposition" not in response.headers
 
 
 def test_json_download_deny_corpus_failure_uses_one_safe_503_boundary(
