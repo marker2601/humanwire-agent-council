@@ -3554,11 +3554,17 @@ def test_expiration_is_processed_before_a_due_preview_release(
 def _file_mixed_race_workflow(tmp_path, name: str, settings: Settings):
     database_path = tmp_path / f"{name}.sqlite3"
     factory = create_session_factory(f"sqlite:///{database_path.as_posix()}")
+    _configure_sqlite_race_engine(factory)
+    repository = SqlAlchemyHumanWireRepository(factory)
+    return repository, _build_mixed_workflow(repository, settings=settings)
+
+
+def _configure_sqlite_race_engine(factory) -> None:
+    if factory.kw["bind"].dialect.name != "sqlite":
+        return
     with factory.kw["bind"].begin() as connection:
         connection.exec_driver_sql("PRAGMA journal_mode=WAL")
         connection.exec_driver_sql("PRAGMA busy_timeout=5000")
-    repository = SqlAlchemyHumanWireRepository(factory)
-    return repository, _build_mixed_workflow(repository, settings=settings)
 
 
 def _order_stale_transaction_race(
@@ -5490,9 +5496,7 @@ def test_file_scheduling_concurrent_conflicting_replay_preserves_first_windows(
 ) -> None:
     database_path = tmp_path / "scheduling-conflicting-replay.sqlite3"
     factory = create_session_factory(f"sqlite:///{database_path.as_posix()}")
-    with factory.kw["bind"].begin() as connection:
-        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
-        connection.exec_driver_sql("PRAGMA busy_timeout=5000")
+    _configure_sqlite_race_engine(factory)
     repository = SqlAlchemyHumanWireRepository(factory)
     workflow = _build_workflow(repository, lead_email_thread="lead-thread")
     mandate, _ = _create_mandate(
@@ -5581,9 +5585,7 @@ def test_file_final_scheduling_availability_cannot_resurrect_terminal_mandate(
 ) -> None:
     database_path = tmp_path / f"scheduling-{terminal_state.value}-{boundary}.sqlite3"
     factory = create_session_factory(f"sqlite:///{database_path.as_posix()}")
-    with factory.kw["bind"].begin() as connection:
-        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
-        connection.exec_driver_sql("PRAGMA busy_timeout=5000")
+    _configure_sqlite_race_engine(factory)
     repository = SqlAlchemyHumanWireRepository(factory)
     workflow = _build_workflow(repository, lead_email_thread="lead-thread")
     mandate, _ = _create_mandate(
@@ -6218,9 +6220,7 @@ def test_file_backed_synthesis_cannot_resurrect_terminal_mandate(
 ) -> None:
     database_path = tmp_path / f"synthesis-{terminal_state.value}.sqlite3"
     factory = create_session_factory(f"sqlite:///{database_path.as_posix()}")
-    with factory.kw["bind"].begin() as connection:
-        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
-        connection.exec_driver_sql("PRAGMA busy_timeout=5000")
+    _configure_sqlite_race_engine(factory)
     repository = SqlAlchemyHumanWireRepository(factory)
     workflow, mandate, _ = _ready_mixed_synthesis(
         repository,
@@ -6264,9 +6264,7 @@ def test_file_backed_final_approval_racing_synthesis_fails_closed_then_retries_f
 ) -> None:
     database_path = tmp_path / "synthesis-final-approval.sqlite3"
     factory = create_session_factory(f"sqlite:///{database_path.as_posix()}")
-    with factory.kw["bind"].begin() as connection:
-        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
-        connection.exec_driver_sql("PRAGMA busy_timeout=5000")
+    _configure_sqlite_race_engine(factory)
     repository = SqlAlchemyHumanWireRepository(factory)
     workflow, mandate, assignments = _ready_mixed_synthesis(
         repository,

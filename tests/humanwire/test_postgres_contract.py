@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
 import sys
+from collections.abc import Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
+from uuid import uuid4
 
+import pytest
 from sqlalchemy import (
     JSON,
     Boolean,
@@ -18,14 +23,21 @@ from sqlalchemy import (
     Text,
     create_engine,
     inspect,
+    text,
 )
 from sqlalchemy.dialects import postgresql, sqlite
+from sqlalchemy.engine import URL, make_url
+from sqlalchemy.orm import sessionmaker
 from sqlalchemy.schema import CreateIndex, CreateTable, UniqueConstraint
 
 from humanwire.database import Base
+from humanwire.domain import MandateState
+from humanwire.repository import SqlAlchemyHumanWireRepository
 
 ROOT = Path(__file__).resolve().parents[2]
 MIGRATION_PATH = ROOT / "migrations" / "versions" / "0001_humanwire_schema.py"
+POSTGRES_TEST_URL_ENV = "HUMANWIRE_TEST_POSTGRES_URL"
+POSTGRES_TEST_SCHEMA = re.compile(r"humanwire_test_[0-9a-f]{32}\Z")
 
 
 EXPECTED_COLUMNS = {
@@ -300,6 +312,95 @@ EXPECTED_INDEXES = {
 }
 
 
+def _validate_postgres_test_url(value: str) -> URL:
+    try:
+        url = make_url(value)
+    except Exception as error:
+        raise ValueError("explicit PostgreSQL test URL required") from error
+    if url.drivername not in {"postgresql", "postgresql+psycopg"} or not url.database:
+        raise ValueError("explicit PostgreSQL test URL required")
+    return url.set(drivername="postgresql+psycopg")
+
+
+def _explicit_postgres_test_url(environ: Mapping[str, str]) -> URL | None:
+    value = environ.get(POSTGRES_TEST_URL_ENV)
+    return None if value is None else _validate_postgres_test_url(value)
+
+
+def _new_postgres_test_schema() -> str:
+    return f"humanwire_test_{uuid4().hex}"
+
+
+def _validated_postgres_test_schema(schema: str) -> str:
+    if POSTGRES_TEST_SCHEMA.fullmatch(schema) is None:
+        raise ValueError("refusing PostgreSQL test schema cleanup")
+    return schema
+
+
+def _drop_postgres_test_schema(connection: object, schema: str) -> None:
+    exact_schema = _validated_postgres_test_schema(schema)
+    connection.exec_driver_sql(f'DROP SCHEMA "{exact_schema}" CASCADE')
+
+
+@contextmanager
+def _postgres_test_session_factory(environ: Mapping[str, str]):
+    url = _explicit_postgres_test_url(environ)
+    if url is None:
+        pytest.skip(f"{POSTGRES_TEST_URL_ENV} is not explicitly supplied")
+
+    schema = _new_postgres_test_schema()
+    schema_url = url.update_query_dict({"options": f"-csearch_path={schema}"})
+    admin_engine = None
+    schema_engine = None
+    created = False
+    try:
+        try:
+            from alembic import command
+            from alembic.config import Config
+
+            admin_engine = create_engine(url)
+            with admin_engine.begin() as connection:
+                connection.exec_driver_sql(f'CREATE SCHEMA "{schema}"')
+                created = True
+
+            config = Config(str(ROOT / "alembic.ini"))
+            configured_url = schema_url.render_as_string(hide_password=False).replace("%", "%%")
+            config.set_main_option("sqlalchemy.url", configured_url)
+            ambient_database_url = os.environ.pop("DATABASE_URL", None)
+            try:
+                command.upgrade(config, "head")
+            finally:
+                if ambient_database_url is not None:
+                    os.environ["DATABASE_URL"] = ambient_database_url
+
+            schema_engine = create_engine(schema_url)
+            with schema_engine.connect() as connection:
+                assert connection.execute(text("SELECT current_schema() ")).scalar_one() == schema
+                assert set(inspect(connection).get_table_names()) == set(EXPECTED_COLUMNS) | {
+                    "alembic_version"
+                }
+        except Exception:  # noqa: BLE001 -- redact connection coordinates from setup errors.
+            raise RuntimeError("PostgreSQL integration gate setup failed") from None
+        yield sessionmaker(bind=schema_engine, expire_on_commit=False)
+    finally:
+        if schema_engine is not None:
+            schema_engine.dispose()
+        if created and admin_engine is not None:
+            try:
+                with admin_engine.begin() as connection:
+                    _drop_postgres_test_schema(connection, schema)
+            except Exception:  # noqa: BLE001 -- redact connection coordinates from cleanup.
+                raise RuntimeError("PostgreSQL integration gate cleanup failed") from None
+        if admin_engine is not None:
+            admin_engine.dispose()
+
+
+@pytest.fixture
+def postgres_session_factory():
+    with _postgres_test_session_factory(os.environ) as factory:
+        yield factory
+
+
 def _type_token(column_type: object) -> str:
     if isinstance(column_type, Text):
         return "text"
@@ -555,9 +656,7 @@ def test_ddl_defaults_are_portable_and_preserve_runtime_behavior() -> None:
         CreateTable(Base.metadata.tables["hw_assignments"]).compile(dialect=sqlite.dialect())
     )
     postgres_ddl = str(
-        CreateTable(Base.metadata.tables["hw_assignments"]).compile(
-            dialect=postgresql.dialect()
-        )
+        CreateTable(Base.metadata.tables["hw_assignments"]).compile(dialect=postgresql.dialect())
     )
     assert "response_required BOOLEAN DEFAULT 1 NOT NULL" in sqlite_ddl
     assert "response_required BOOLEAN DEFAULT true NOT NULL" in postgres_ddl
@@ -662,3 +761,200 @@ def test_migration_postgresql_ddl_matches_every_metadata_table_and_index() -> No
         "on hw_interviews (mandate_id, stakeholder_person_id) where completed_at is null"
         in migration_ddl
     )
+
+
+def test_postgres_gate_ignores_ambient_database_url(monkeypatch) -> None:
+    """Break caught: the destructive gate discovers an ambient application database."""
+    monkeypatch.delenv("HUMANWIRE_TEST_POSTGRES_URL", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://ambient.invalid/private")
+
+    assert _explicit_postgres_test_url(os.environ) is None
+
+
+def test_postgres_gate_skips_before_engine_or_driver_loading(monkeypatch) -> None:
+    """Break caught: an absent opt-in variable still reaches connection setup or DNS."""
+    monkeypatch.delenv(POSTGRES_TEST_URL_ENV, raising=False)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://ambient.invalid/private")
+
+    def unexpected_engine(*_args, **_kwargs):
+        raise AssertionError("connection setup was reached")
+
+    monkeypatch.setattr(sys.modules[__name__], "create_engine", unexpected_engine)
+
+    with (
+        pytest.raises(pytest.skip.Exception, match=POSTGRES_TEST_URL_ENV),
+        _postgres_test_session_factory(os.environ),
+    ):
+        raise AssertionError("skipped gate entered its body")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "sqlite:///not-postgres.db",
+        "mysql://localhost/not-postgres",
+        "postgres://localhost/ambiguous-alias",
+        "postgresql://localhost",
+        "not a url",
+    ],
+)
+def test_postgres_gate_rejects_non_postgresql_urls_without_disclosing_them(value) -> None:
+    """Break caught: malformed or non-PostgreSQL targets reach schema creation."""
+    with pytest.raises(ValueError, match="explicit PostgreSQL test URL required") as error:
+        _validate_postgres_test_url(value)
+
+    assert value not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "postgresql://operator:secret@db.example.test/humanwire",
+        "postgresql+psycopg://operator:secret@db.example.test/humanwire",
+    ],
+)
+def test_postgres_gate_accepts_only_explicit_postgresql_schemes(value) -> None:
+    """Break caught: a valid psycopg/PostgreSQL URL is rejected before the opt-in gate."""
+    assert _validate_postgres_test_url(value).get_backend_name() == "postgresql"
+
+
+def test_postgres_gate_generates_unique_safe_schema_identifiers() -> None:
+    """Break caught: an unsafe or reused identifier broadens destructive SQL scope."""
+    first = _new_postgres_test_schema()
+    second = _new_postgres_test_schema()
+
+    assert first != second
+    assert re.fullmatch(r"humanwire_test_[0-9a-f]{32}", first)
+    assert re.fullmatch(r"humanwire_test_[0-9a-f]{32}", second)
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        "public",
+        "humanwire_test_123",
+        "humanwire_test_" + "g" * 32,
+        "humanwire_test_" + "a" * 32 + ";drop schema public",
+    ],
+)
+def test_postgres_teardown_guard_rejects_every_non_generated_schema(schema) -> None:
+    """Break caught: teardown can target a shared, malformed, or injected schema."""
+    with pytest.raises(ValueError, match="refusing PostgreSQL test schema cleanup"):
+        _validated_postgres_test_schema(schema)
+
+
+def test_postgres_teardown_targets_only_the_validated_exact_schema() -> None:
+    """Break caught: teardown emits broad or unquoted destructive SQL."""
+    schema = "humanwire_test_" + "a" * 32
+
+    class RecordingConnection:
+        def __init__(self) -> None:
+            self.statements: list[str] = []
+
+        def exec_driver_sql(self, statement: str) -> None:
+            self.statements.append(statement)
+
+    connection = RecordingConnection()
+    _drop_postgres_test_schema(connection, schema)
+
+    assert connection.statements == [f'DROP SCHEMA "{schema}" CASCADE']
+
+
+POSTGRES_TRANSACTION_INVARIANTS = (
+    "release_cas",
+    "outbox_lease",
+    "outbox_fence",
+    "callback_ownership",
+    "evidence_confirmation",
+    "synthesis",
+    "proposal",
+    "availability",
+    "meeting_cancel",
+    "meeting_expiry",
+)
+
+
+@pytest.mark.parametrize("invariant", POSTGRES_TRANSACTION_INVARIANTS)
+def test_postgresql_transaction_invariants_in_disposable_schema(
+    invariant,
+    postgres_session_factory,
+    tmp_path,
+    incoming_message_factory,
+    now,
+    monkeypatch,
+) -> None:
+    """Run the established transaction/race contracts against real PostgreSQL."""
+    from tests.humanwire import test_workflow as workflow_contract
+
+    monkeypatch.setattr(
+        workflow_contract,
+        "create_session_factory",
+        lambda _database_url: postgres_session_factory,
+    )
+
+    calls = {
+        "release_cas": lambda: (
+            workflow_contract.test_file_go_and_due_release_race_has_one_complete_winner(
+                tmp_path, incoming_message_factory, now, monkeypatch, 0, "due"
+            )
+        ),
+        "outbox_lease": lambda: (
+            workflow_contract.test_concurrent_restart_drains_claim_each_initial_release_entry_once(
+                tmp_path, incoming_message_factory, now
+            )
+        ),
+        "outbox_fence": lambda: (
+            workflow_contract.test_reclaimed_later_batch_entry_fences_the_original_dispatch_owner(
+                tmp_path, incoming_message_factory, now
+            )
+        ),
+        "callback_ownership": lambda: (
+            workflow_contract.test_stale_release_owner_callback_is_inert_after_reclaim(
+                tmp_path, incoming_message_factory, now, "quick-person", True
+            )
+        ),
+        "evidence_confirmation": lambda: (
+            workflow_contract.test_file_concurrent_evidence_confirmation_promotes_once(
+                tmp_path, incoming_message_factory
+            )
+        ),
+        "synthesis": lambda: (
+            workflow_contract.test_file_backed_final_approval_racing_synthesis_fails_closed_then_retries_fresh(
+                tmp_path, incoming_message_factory, now, monkeypatch
+            )
+        ),
+        "proposal": lambda: (
+            workflow_contract.test_proposals_require_all_authenticated_respondents_and_cap_after_round_two(
+                SqlAlchemyHumanWireRepository(postgres_session_factory),
+                incoming_message_factory,
+            )
+        ),
+        "availability": lambda: (
+            workflow_contract.test_file_scheduling_concurrent_conflicting_replay_preserves_first_windows(
+                tmp_path, incoming_message_factory, monkeypatch
+            )
+        ),
+        "meeting_cancel": lambda: (
+            workflow_contract.test_file_final_scheduling_availability_cannot_resurrect_terminal_mandate(
+                tmp_path,
+                incoming_message_factory,
+                monkeypatch,
+                MandateState.CANCELLED,
+                "before_package",
+            )
+        ),
+        "meeting_expiry": lambda: (
+            workflow_contract.test_file_final_scheduling_availability_cannot_resurrect_terminal_mandate(
+                tmp_path,
+                incoming_message_factory,
+                monkeypatch,
+                MandateState.EXPIRED,
+                "before_package",
+            )
+        ),
+    }
+
+    try:
+        calls[invariant]()
+    except Exception:  # noqa: BLE001 -- never disclose connection coordinates.
+        raise AssertionError(f"PostgreSQL invariant failed: {invariant}") from None
