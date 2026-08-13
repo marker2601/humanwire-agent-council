@@ -151,6 +151,24 @@ The opt-in live mode only prints a manual checklist and has no provider, model, 
 
 Actual Caspian and Telegram proof is a separate operator gate. It must cover one inform, acknowledgement, quick response, email structured interview continued on Telegram, authenticated evidence confirmation, explicit approval response, delivery failover, and three consecutive complete flows without database edits.
 
+## Reproducible synthetic persona proof
+
+Run generation and frozen replay through the installed module with explicit fresh run roots. The generated transcript must stay inside its run root:
+
+```powershell
+$generateRoot = Join-Path $PWD "work/synthetic-generate-01"
+python -m humanwire synthetic generate --output (Join-Path $generateRoot "transcript.json") --run-root $generateRoot
+
+$replayRoot = Join-Path $PWD "work/synthetic-replay-01"
+python -m humanwire synthetic replay --transcript tests/fixtures/humanwire/synthetic_launch_v1.json --run-root $replayRoot
+```
+
+The installed `humanwire synthetic ...` command and `python scripts/synthetic_humanwire.py ...` wrapper accept the same arguments. A run fails closed if its root is not fresh, a generation output escapes that root, or a frozen transcript fails strict validation or digest verification.
+
+Successful stdout contains only the six exact provenance labels, safe scenario/run identifiers, action/inbound/delivery counts, terminal state, and semantic trace SHA-256. It contains no routes, destinations, response content, operational UUIDs, or filesystem paths. The transcript excludes private fixture text, and `CapturedDelivery` objects are never serialized.
+
+**Non-live disclaimer:** This deterministic synthetic proof uses simulated personas, injected fake-Caspian transport, deterministic local policy, and fresh local SQLite. It does not contact real people, call Caspian or Featherless, verify a live provider or model, or constitute real-human testing.
+
 ## Analytics and Power BI contract
 
 The Data page, JSON endpoint, and CSV endpoint share one canonical redacted 16-field projection. Non-demo `/api/v1/*` requests require `Authorization: Bearer <read-only-token>`; credentials never belong in query strings, shared URLs, screenshots, or committed Power BI source text.
@@ -175,7 +193,7 @@ The recommended product walkthrough is in [docs/demo-script.md](docs/demo-script
 ```text
 src/humanwire/       domain, workflow, provider gateway, persistence, and web app
 tests/humanwire/     unit, race, integration, cutover, and privacy coverage
-scripts/             organization seed and offline smoke wrapper
+scripts/             organization seed, offline smoke, and synthetic proof wrappers
 config/              safe organization-directory example
 docs/                architecture, threat model, demo, and analytics contract
 submission/          differentiated Devpost narratives and release checklist

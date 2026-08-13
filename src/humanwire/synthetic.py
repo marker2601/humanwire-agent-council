@@ -114,6 +114,81 @@ class SyntheticScenario(_StrictModel):
         return self
 
 
+def default_synthetic_scenario() -> SyntheticScenario:
+    """Return the isolated six-contract scenario used by the public CLI proof."""
+    return SyntheticScenario(
+        schema_version=SUPPORTED_SCHEMA_VERSION,
+        scenario_id="launch-v1",
+        personas=[
+            SyntheticPersona(
+                persona_id="inform",
+                display_name="Inform Persona",
+                role="Delivery owner",
+                email="inform@example.test",
+                channels=[Channel.EMAIL],
+                allowed_intents=[SyntheticIntent.SILENCE],
+            ),
+            SyntheticPersona(
+                persona_id="ack",
+                display_name="Acknowledge Persona",
+                role="Executive owner",
+                email="ack@example.test",
+                channels=[Channel.EMAIL],
+                allowed_intents=[SyntheticIntent.ACKNOWLEDGE],
+            ),
+            SyntheticPersona(
+                persona_id="quick",
+                display_name="Quick Persona",
+                role="Program owner",
+                email="quick@example.test",
+                channels=[Channel.EMAIL],
+                allowed_intents=[
+                    SyntheticIntent.ACKNOWLEDGE,
+                    SyntheticIntent.ANSWER,
+                    SyntheticIntent.CONFIRM_EVIDENCE,
+                ],
+            ),
+            SyntheticPersona(
+                persona_id="structured",
+                display_name="Structured Persona",
+                role="People owner",
+                email="structured@example.test",
+                channels=[Channel.EMAIL, Channel.TELEGRAM],
+                allowed_intents=[
+                    SyntheticIntent.ACKNOWLEDGE,
+                    SyntheticIntent.INTERVIEW_RESPONSE,
+                    SyntheticIntent.CONFIRM_EVIDENCE,
+                ],
+                private_facts=["PRIVATE-PERSONA-SENTINEL"],
+            ),
+            SyntheticPersona(
+                persona_id="approval",
+                display_name="Approval Persona",
+                role="Approval owner",
+                email="approval@example.test",
+                channels=[Channel.EMAIL],
+                allowed_intents=[SyntheticIntent.APPROVE, SyntheticIntent.CHANGE],
+            ),
+            SyntheticPersona(
+                persona_id="availability",
+                display_name="Availability Persona",
+                role="Scheduling owner",
+                email="availability@example.test",
+                channels=[Channel.EMAIL],
+                allowed_intents=[SyntheticIntent.AVAILABILITY],
+            ),
+        ],
+        provenance=SyntheticProvenance(
+            proof_class="synthetic_multi_persona",
+            actor_type="simulated_persona",
+            identity_source="synthetic_fixture",
+            transport="fake_caspian",
+            human_attested=False,
+            live_provider_verified=False,
+        ),
+    )
+
+
 class SyntheticAction(_StrictModel):
     schema_version: Literal["humanwire.synthetic/v1"]
     action_id: str = Field(pattern=_STABLE_ID_PATTERN)
@@ -644,6 +719,18 @@ def _persona_context(
     )
 
 
+def _validated_output_path(output_path: str | Path, run_root: str | Path) -> tuple[Path, Path]:
+    root = Path(run_root).resolve()
+    output = Path(output_path).resolve()
+    try:
+        output.relative_to(root)
+    except ValueError as error:
+        raise ValueError("synthetic output path must be inside run root") from error
+    if output == root:
+        raise ValueError("synthetic output path must be inside run root")
+    return output, root
+
+
 def generate_scenario(
     scenario: SyntheticScenario,
     output_path: str | Path,
@@ -651,8 +738,7 @@ def generate_scenario(
 ) -> SyntheticRunResult:
     """Generate one isolated deterministic run through the real gateway boundary."""
     scenario = SyntheticScenario.model_validate(scenario)
-    output = Path(output_path)
-    root = Path(run_root)
+    output, root = _validated_output_path(output_path, run_root)
     root.mkdir(parents=True, exist_ok=True)
     database_path = root / "humanwire-synthetic.sqlite3"
     if database_path.exists():

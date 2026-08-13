@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import re
+import socket
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -238,7 +240,7 @@ def make_generation_scenario() -> SyntheticScenario:
 
 def _generate(tmp_path, scenario: SyntheticScenario | None = None):
     run_root = tmp_path / "run"
-    output_path = tmp_path / "transcript.json"
+    output_path = run_root / "transcript.json"
     return generate_scenario(scenario or make_generation_scenario(), output_path, run_root)
 
 
@@ -425,8 +427,8 @@ def test_persona_context_contains_only_its_own_inbox_transcript_and_private_fixt
 
 def test_two_fresh_generations_write_identical_safe_transcripts(tmp_path) -> None:
     scenario = make_generation_scenario()
-    first_output = tmp_path / "first.json"
-    second_output = tmp_path / "second.json"
+    first_output = tmp_path / "run-a" / "transcript.json"
+    second_output = tmp_path / "run-b" / "transcript.json"
 
     first = generate_scenario(scenario, first_output, tmp_path / "run-a")
     second = generate_scenario(scenario, second_output, tmp_path / "run-b")
@@ -516,7 +518,7 @@ def _write_transcript(path: Path, transcript: SyntheticTranscript) -> None:
 
 
 def test_generated_and_replayed_runs_have_the_same_semantic_trace_hash(tmp_path) -> None:
-    generated_path = tmp_path / "generated.json"
+    generated_path = tmp_path / "generate-run" / "transcript.json"
     generated = generate_scenario(
         make_generation_scenario(),
         generated_path,
@@ -536,12 +538,12 @@ def test_generated_and_replayed_runs_have_the_same_semantic_trace_hash(tmp_path)
 def test_semantic_trace_hash_is_independent_of_uuids_and_temporary_paths(tmp_path) -> None:
     first = generate_scenario(
         make_generation_scenario(),
-        tmp_path / "first.json",
+        tmp_path / "first-run" / "transcript.json",
         tmp_path / "first-run",
     )
     second = generate_scenario(
         make_generation_scenario(),
-        tmp_path / "second.json",
+        tmp_path / "second-run" / "transcript.json",
         tmp_path / "second-run",
     )
 
@@ -553,7 +555,7 @@ def test_semantic_trace_hash_is_independent_of_uuids_and_temporary_paths(tmp_pat
 
 
 def test_replay_never_builds_or_calls_persona_policies(tmp_path, monkeypatch) -> None:
-    generated_path = tmp_path / "generated.json"
+    generated_path = tmp_path / "generate-run" / "transcript.json"
     generate_scenario(
         make_generation_scenario(),
         generated_path,
@@ -587,7 +589,7 @@ def test_frozen_replay_hash_is_equal_after_a_fresh_replay_restart(tmp_path) -> N
 
 
 def test_semantic_trace_hash_changes_for_a_material_action_change(tmp_path) -> None:
-    original_path = tmp_path / "original.json"
+    original_path = tmp_path / "generate-run" / "transcript.json"
     original = generate_scenario(
         make_generation_scenario(),
         original_path,
@@ -628,7 +630,7 @@ def test_duplicate_inbound_attempt_remains_visible_in_semantic_hash(tmp_path) ->
 
 
 def test_replay_fails_closed_on_ambiguous_synthetic_identity_mapping(tmp_path) -> None:
-    generated_path = tmp_path / "generated.json"
+    generated_path = tmp_path / "generate-run" / "transcript.json"
     generated = generate_scenario(
         make_generation_scenario(),
         generated_path,
@@ -655,3 +657,262 @@ def test_replay_fails_closed_on_ambiguous_synthetic_identity_mapping(tmp_path) -
 
     with pytest.raises(ValueError, match="ambiguous synthetic identity"):
         synthetic_module.replay_transcript(ambiguous_path, tmp_path / "replay-run")
+
+
+def _parse_safe_cli_output(value: str) -> dict[str, str]:
+    lines = value.splitlines()
+    assert lines
+    assert all(line.count("=") == 1 for line in lines)
+    return dict(line.split("=", 1) for line in lines)
+
+
+def test_generate_requires_explicit_output_and_run_root(capsys) -> None:
+    from humanwire.__main__ import main
+
+    with pytest.raises(SystemExit) as caught:
+        main(["synthetic", "generate"])
+    captured = capsys.readouterr()
+
+    assert caught.value.code != 0
+    assert captured.out == ""
+    assert "--output" in captured.err
+    assert "--run-root" in captured.err
+
+
+def test_generation_rejects_output_outside_run_root_before_writing(tmp_path) -> None:
+    run_root = tmp_path / "run"
+    outside = tmp_path / "published" / "transcript.json"
+
+    with pytest.raises(ValueError, match="output path must be inside run root"):
+        generate_scenario(make_generation_scenario(), outside, run_root)
+
+    assert not outside.exists()
+
+
+def test_synthetic_generate_cli_ignores_ambient_config_and_writes_only_in_run_root(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    from humanwire.__main__ import main
+
+    ambient_secret = "PRIVATE-AMBIENT-SYNTHETIC-SECRET"
+    for key, value in {
+        "CASPIAN_API_KEY": ambient_secret,
+        "CASPIAN_BASE_URL": "https://ambient-provider.example.test",
+        "TELEGRAM_BOT_TOKEN": ambient_secret,
+        "FEATHERLESS_API_KEY": ambient_secret,
+        "FEATHERLESS_BASE_URL": "https://ambient-model.example.test/v1",
+        "DATABASE_URL": "sqlite:///ambient.sqlite3",
+        "ORGANIZATION_PATH": "ambient-directory.json",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(f"CASPIAN_API_KEY={ambient_secret}\n", encoding="utf-8")
+    (tmp_path / "ambient-directory.json").write_text(ambient_secret, encoding="utf-8")
+    before = {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    run_root = tmp_path / "explicit-run"
+    output = run_root / "transcript.json"
+
+    assert main(
+        [
+            "synthetic",
+            "generate",
+            "--output",
+            str(output),
+            "--run-root",
+            str(run_root),
+        ]
+    ) == 0
+    captured = capsys.readouterr()
+
+    after_outside = {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file() and run_root not in path.parents
+    }
+    assert after_outside == before
+    assert output.is_file()
+    assert (run_root / "humanwire-synthetic.sqlite3").is_file()
+    assert {path.name for path in run_root.iterdir()} == {
+        "humanwire-synthetic.sqlite3",
+        "transcript.json",
+    }
+    published = output.read_text(encoding="utf-8")
+    combined = captured.out + captured.err + published
+    assert ambient_secret not in combined
+    assert "ambient-provider" not in combined
+    assert "ambient-model" not in combined
+    assert "ambient-directory" not in combined
+
+
+def test_synthetic_cli_denies_network_provider_and_model_calls(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    from humanwire.__main__ import main
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("synthetic proof attempted forbidden external I/O")
+
+    monkeypatch.setattr(socket, "socket", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(socket, "getaddrinfo", forbidden)
+    monkeypatch.setattr("humanwire.caspian_gateway.CommClient", forbidden)
+    monkeypatch.setattr("humanwire.model_client.httpx.Client", forbidden)
+    run_root = tmp_path / "generate-run"
+
+    assert main(
+        [
+            "synthetic",
+            "generate",
+            "--output",
+            str(run_root / "transcript.json"),
+            "--run-root",
+            str(run_root),
+        ]
+    ) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_synthetic_generate_and_replay_print_only_safe_proof_summary(
+    tmp_path, capsys
+) -> None:
+    from humanwire.__main__ import main
+
+    private_text = "PRIVATE-PERSONA-SENTINEL"
+    generated_root = tmp_path / "generated-run"
+    generated_path = generated_root / "transcript.json"
+    assert main(
+        [
+            "synthetic",
+            "generate",
+            "--output",
+            str(generated_path),
+            "--run-root",
+            str(generated_root),
+        ]
+    ) == 0
+    generated_capture = capsys.readouterr()
+    replay_root = tmp_path / "replay-run"
+    assert main(
+        [
+            "synthetic",
+            "replay",
+            "--transcript",
+            str(generated_path),
+            "--run-root",
+            str(replay_root),
+        ]
+    ) == 0
+    replay_capture = capsys.readouterr()
+
+    expected_keys = {
+        "proof_class",
+        "actor_type",
+        "identity_source",
+        "transport",
+        "human_attested",
+        "live_provider_verified",
+        "scenario_id",
+        "run_id",
+        "action_count",
+        "inbound_attempt_count",
+        "delivery_count",
+        "terminal_state",
+        "trace_sha256",
+    }
+    for capture in (generated_capture, replay_capture):
+        assert capture.err == ""
+        summary = _parse_safe_cli_output(capture.out)
+        assert set(summary) == expected_keys
+        assert summary["proof_class"] == "synthetic_multi_persona"
+        assert summary["actor_type"] == "simulated_persona"
+        assert summary["identity_source"] == "synthetic_fixture"
+        assert summary["transport"] == "fake_caspian"
+        assert summary["human_attested"] == "false"
+        assert summary["live_provider_verified"] == "false"
+        assert summary["scenario_id"] == "launch-v1"
+        assert re.fullmatch(r"launch-v1-[0-9a-f]{12}", summary["run_id"])
+        assert all(
+            summary[key].isdigit()
+            for key in ("action_count", "inbound_attempt_count", "delivery_count")
+        )
+        assert summary["terminal_state"] in {
+            "aligned",
+            "negotiating",
+            "partial",
+            "scheduling",
+        }
+        assert re.fullmatch(r"[0-9a-f]{64}", summary["trace_sha256"])
+        forbidden = (
+            private_text,
+            "@example.test",
+            "synthetic-manager",
+            "conversation",
+            "connection",
+            "message_id",
+            "destination",
+            "CapturedDelivery",
+            str(tmp_path),
+        )
+        assert all(value not in capture.out for value in forbidden)
+    assert generated_capture.out == replay_capture.out
+    assert private_text not in generated_path.read_text(encoding="utf-8")
+    assert "CapturedDelivery" not in generated_path.read_text(encoding="utf-8")
+    assert not any(
+        path.suffix in {".json", ".txt", ".log"} for path in replay_root.rglob("*")
+    )
+
+
+def test_synthetic_replay_tamper_returns_nonzero_safe_error(tmp_path, capsys) -> None:
+    from humanwire.__main__ import main
+
+    private_text = "PRIVATE-TAMPERED-CONTENT"
+    payload = json.loads(
+        Path("tests/fixtures/humanwire/synthetic_launch_v1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    payload["actions"][0]["content"] = private_text
+    transcript_path = tmp_path / "tampered.json"
+    transcript_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert main(
+        [
+            "synthetic",
+            "replay",
+            "--transcript",
+            str(transcript_path),
+            "--run-root",
+            str(tmp_path / "replay-run"),
+        ]
+    ) != 0
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == "synthetic_status=failed\nfailure_reason=invalid_transcript\n"
+    assert private_text not in captured.err
+    assert str(transcript_path) not in captured.err
+
+
+def test_repository_synthetic_script_is_a_thin_installed_module_wrapper(
+    tmp_path, capsys
+) -> None:
+    from scripts.synthetic_humanwire import main
+
+    run_root = tmp_path / "wrapper-run"
+    assert main(
+        [
+            "generate",
+            "--output",
+            str(run_root / "transcript.json"),
+            "--run-root",
+            str(run_root),
+        ]
+    ) == 0
+    summary = _parse_safe_cli_output(capsys.readouterr().out)
+
+    assert summary["proof_class"] == "synthetic_multi_persona"
