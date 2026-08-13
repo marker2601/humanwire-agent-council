@@ -1,8 +1,12 @@
 import base64
+import csv
 import hashlib
+import html as html_lib
+import io
 import json
 import re
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -38,6 +42,53 @@ from humanwire.workflow import json_windows
 
 NOW = datetime(2026, 8, 11, 18, 0, tzinfo=UTC)
 _CALENDAR_UID_NAMESPACE = b"humanwire:calendar:uid:v1:"
+EXPECTED_OUTREACH_HEADERS = [
+    "mandate_token",
+    "timestamp",
+    "initiator_id",
+    "source_department",
+    "target_person_id",
+    "target_department",
+    "direction",
+    "channel",
+    "engagement_type",
+    "response_required",
+    "engagement_status",
+    "event_type",
+    "previous_state",
+    "new_state",
+    "outcome",
+    "response_latency_seconds",
+]
+
+
+def _csv_rows(response) -> list[dict[str, str]]:
+    return list(csv.DictReader(io.StringIO(response.text)))
+
+
+def _html_outreach_rows(source: str) -> list[dict[str, str]]:
+    rows = []
+    for body in re.findall(
+        r'<tr[^>]*data-outreach-row[^>]*>(.*?)</tr>', source, re.DOTALL
+    ):
+        row = {}
+        for field, value in re.findall(
+            r'<td[^>]+data-field="([^"]+)"[^>]*>(.*?)</td>', body, re.DOTALL
+        ):
+            row[field] = html_lib.unescape(re.sub(r"<[^>]+>", "", value)).strip()
+        rows.append(row)
+    return rows
+
+
+def _string_row(row: dict[str, object]) -> dict[str, str]:
+    return {
+        key: (
+            str(value).lower()
+            if isinstance(value, bool)
+            else "" if value is None else str(value)
+        )
+        for key, value in row.items()
+    }
 
 
 def expected_private_uid(meeting_id: str) -> str:
@@ -69,6 +120,7 @@ def test_read_only_route_surface_and_html_placeholders(web_client, demo_app) -> 
         "/api/v1/mandates/{token}",
         "/api/v1/mandates/{token}/stakeholders",
         "/api/v1/mandates/{token}/outreach-events",
+        "/api/v1/mandates/{token}/outreach-events.csv",
         "/api/v1/mandates/{token}/evidence-summary",
     }
     actual_get_paths = {
@@ -89,6 +141,900 @@ def test_read_only_route_surface_and_html_placeholders(web_client, demo_app) -> 
         response = web_client.get(path)
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("text/html")
+
+
+def test_csv_route_and_data_table_are_get_only_with_stable_contract(
+    web_client, demo_app
+) -> None:
+    csv_response = web_client.get(
+        "/api/v1/mandates/HW-2411/outreach-events.csv"
+    )
+    html_response = web_client.get("/mandates/HW-2411/data")
+    json_response = web_client.get(
+        "/api/v1/mandates/HW-2411/outreach-events"
+    )
+
+    assert csv_response.status_code == 200
+    assert csv_response.headers["content-type"].startswith("text/csv; charset=utf-8")
+    assert csv_response.headers["content-disposition"] == (
+        'attachment; filename="HW-2411-outreach-events.csv"'
+    )
+    assert list(_csv_rows(csv_response)[0]) == EXPECTED_OUTREACH_HEADERS
+    assert list(json_response.json()[0]) == EXPECTED_OUTREACH_HEADERS
+    assert re.findall(
+        r'<th scope="col" data-field="([^"]+)">', html_response.text
+    ) == EXPECTED_OUTREACH_HEADERS
+    assert {
+        route.path
+        for route in demo_app.routes
+        if getattr(route, "methods", set()) == {"GET"}
+    } >= {
+        "/mandates/{token}/data",
+        "/api/v1/mandates/{token}/outreach-events",
+        "/api/v1/mandates/{token}/outreach-events.csv",
+    }
+    assert all(
+        web_client.request(method, path).status_code == 405
+        for method in ("POST", "PUT", "PATCH", "DELETE")
+        for path in (
+            "/mandates/HW-2411/data",
+            "/api/v1/mandates/HW-2411/outreach-events",
+            "/api/v1/mandates/HW-2411/outreach-events.csv",
+        )
+    )
+
+
+def test_data_table_json_csv_share_canonical_rows_and_order(web_client) -> None:
+    params = {
+        "engagement_type": "structured_interview",
+        "channel": "telegram",
+        "timestamp_from": "2026-08-11T15:14:00+00:00",
+        "timestamp_to": "2026-08-11T15:15:00+00:00",
+    }
+    html_response = web_client.get("/mandates/HW-2411/data", params=params)
+    json_response = web_client.get(
+        "/api/v1/mandates/HW-2411/outreach-events", params=params
+    )
+    csv_response = web_client.get(
+        "/api/v1/mandates/HW-2411/outreach-events.csv", params=params
+    )
+
+    json_rows = [_string_row(row) for row in json_response.json()]
+    csv_rows = _csv_rows(csv_response)
+    html_rows = _html_outreach_rows(html_response.text)
+
+    assert html_response.status_code == json_response.status_code == csv_response.status_code == 200
+    assert html_rows == json_rows == csv_rows
+    assert [row["timestamp"] for row in json_rows] == [
+        "2026-08-11T15:14:00+00:00",
+        "2026-08-11T15:15:00+00:00",
+    ]
+    assert all(list(row) == EXPECTED_OUTREACH_HEADERS for row in json_rows)
+
+
+@pytest.mark.parametrize(
+    ("filter_name", "filter_value", "expected_count"),
+    [
+        ("engagement_type", "quick_response", 4),
+        ("engagement_status", "complete", 4),
+        ("department", "People", 4),
+        ("person_id", "priya-shah", 4),
+        ("channel", "telegram", 4),
+        ("direction", "lateral", 4),
+        ("event_type", "engagement.quick_response_sent", 2),
+        ("timestamp_from", "2026-08-11T15:15:00+00:00", 1),
+        ("timestamp_to", "2026-08-11T15:00:00+00:00", 1),
+    ],
+)
+def test_engagement_filter_matrix_uses_exact_inclusive_matches(
+    web_client, filter_name, filter_value, expected_count
+) -> None:
+    paths = (
+        "/mandates/HW-2411/data",
+        "/api/v1/mandates/HW-2411/outreach-events",
+        "/api/v1/mandates/HW-2411/outreach-events.csv",
+    )
+    responses = [
+        web_client.get(path, params={filter_name: filter_value}) for path in paths
+    ]
+
+    assert all(response.status_code == 200 for response in responses)
+    assert len(_html_outreach_rows(responses[0].text)) == expected_count
+    assert len(responses[1].json()) == expected_count
+    assert len(_csv_rows(responses[2])) == expected_count
+
+
+def test_engagement_filter_combination_empty_results_and_stable_export_query(
+    web_client,
+) -> None:
+    reversed_params = [
+        ("timestamp_to", "2026-08-11T15:15:00+00:00"),
+        ("person_id", "priya-shah"),
+        ("engagement_status", "in progress"),
+    ]
+    response = web_client.get("/mandates/HW-2411/data", params=reversed_params)
+    empty = web_client.get(
+        "/mandates/HW-2411/data", params={"person_id": "arun-patel"}
+    )
+    query = (
+        "engagement_status=in+progress&person_id=priya-shah&"
+        "timestamp_to=2026-08-11T15%3A15%3A00%2B00%3A00"
+    )
+
+    assert response.status_code == 200
+    assert len(_html_outreach_rows(response.text)) == 4
+    decoded_html = html_lib.unescape(response.text)
+    assert f'href="/api/v1/mandates/HW-2411/outreach-events?{query}"' in decoded_html
+    assert (
+        f'href="/api/v1/mandates/HW-2411/outreach-events.csv?{query}"'
+        in decoded_html
+    )
+    assert empty.status_code == 200
+    assert _html_outreach_rows(empty.text) == []
+    assert 'colspan="16"' in empty.text
+    assert "No outreach events match these filters" in empty.text
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "channel=email&channel=telegram",
+        "channel=carrier-pigeon",
+        "engagement_type=interview",
+        "engagement_status=success",
+        "person_id=%3DPRIVATE-QUERY-SENTINEL",
+        "department=%40PRIVATE-QUERY-SENTINEL",
+        "event_type=Unsafe%20Type",
+        "timestamp_from=2026-08-11T15%3A00%3A00",
+        "timestamp_to=not-a-time",
+        (
+            "timestamp_from=2026-08-11T16%3A00%3A00%2B00%3A00&"
+            "timestamp_to=2026-08-11T15%3A00%3A00%2B00%3A00"
+        ),
+        "unknown_filter=PRIVATE-QUERY-SENTINEL",
+    ],
+)
+def test_engagement_filter_invalid_state_returns_unreflected_safe_400(
+    web_client, query
+) -> None:
+    paths = (
+        "/mandates/HW-2411/data",
+        "/api/v1/mandates/HW-2411/outreach-events",
+        "/api/v1/mandates/HW-2411/outreach-events.csv",
+    )
+
+    responses = [web_client.get(f"{path}?{query}") for path in paths]
+
+    assert all(response.status_code == 400 for response in responses)
+    assert all(response.json() == {"detail": "Invalid filters"} for response in responses)
+    serialized = "".join(
+        response.text + json.dumps(dict(response.headers)) for response in responses
+    )
+    assert "PRIVATE-QUERY-SENTINEL" not in serialized
+
+
+def test_data_table_exact_aggregate_join_fails_closed_for_malformed_events(
+    demo_app,
+) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assert mandate is not None
+    assignments = {
+        item.person_id: item
+        for item in repository.list_assignments(mandate.mandate_id)
+    }
+    probes = (
+        DomainEvent(
+            event_type="engagement.quick_response_sent",
+            created_at=NOW + timedelta(minutes=1),
+            idempotency_key="analytics-cross-person",
+            assignment_id=assignments["eli-torres"].assignment_id,
+            person_id="priya-shah",
+            department="PRIVATE-EVENT-DEPARTMENT",
+            direction=Direction.LATERAL,
+            channel=Channel.TELEGRAM,
+        ),
+        DomainEvent(
+            event_type="engagement.quick_response_sent",
+            created_at=NOW + timedelta(minutes=2),
+            idempotency_key="analytics-assignment-without-person",
+            assignment_id=assignments["eli-torres"].assignment_id,
+            department="PRIVATE-EVENT-DEPARTMENT",
+            direction=Direction.DOWNWARD,
+            channel=Channel.EMAIL,
+        ),
+        DomainEvent(
+            event_type="engagement.quick_response_sent",
+            created_at=NOW + timedelta(minutes=3),
+            idempotency_key="analytics-unknown-assignment",
+            assignment_id=uuid4(),
+            person_id="eli-torres",
+            department="PRIVATE-EVENT-DEPARTMENT",
+            direction=Direction.DOWNWARD,
+            channel=Channel.EMAIL,
+        ),
+        DomainEvent(
+            event_type="engagement.quick_response_sent",
+            created_at=NOW + timedelta(minutes=4),
+            idempotency_key="analytics-unbound-person",
+            person_id="eli-torres",
+            department="PRIVATE-EVENT-DEPARTMENT",
+            direction=Direction.DOWNWARD,
+            channel=Channel.EMAIL,
+        ),
+    )
+    for probe in probes:
+        repository.append_event(mandate.mandate_id, probe)
+
+    rows = TestClient(demo_app).get(
+        "/api/v1/mandates/HW-2411/outreach-events",
+        params={"timestamp_from": NOW.isoformat()},
+    ).json()
+
+    assert len(rows) == len(probes)
+    blank_fields = (
+        "target_person_id",
+        "target_department",
+        "direction",
+        "channel",
+        "engagement_type",
+        "response_required",
+        "engagement_status",
+        "response_latency_seconds",
+    )
+    assert all(all(row[field] == "" for field in blank_fields) for row in rows)
+    assert "PRIVATE-EVENT-DEPARTMENT" not in json.dumps(rows)
+
+
+def test_data_table_cross_mandate_and_duplicate_person_identity_never_bind(
+    demo_app,
+) -> None:
+    repository = demo_app.state.repository
+    primary = repository.get_mandate_by_token("HW-2411")
+    other = repository.get_mandate_by_token("HW-2412")
+    assert primary is not None and other is not None
+    assignments = {
+        item.person_id: item
+        for item in repository.list_assignments(primary.mandate_id)
+    }
+    repository.append_event(
+        other.mandate_id,
+        DomainEvent(
+            event_type="engagement.quick_response_sent",
+            created_at=NOW + timedelta(minutes=1),
+            idempotency_key="analytics-cross-mandate",
+            assignment_id=assignments["eli-torres"].assignment_id,
+            person_id="eli-torres",
+            department="PRIVATE-CROSS-MANDATE",
+            direction=Direction.DOWNWARD,
+            channel=Channel.EMAIL,
+        ),
+    )
+    sora = assignments["sora-kim"]
+    repository.save_assignment(sora.model_copy(update={"person_id": "eli-torres"}))
+    client = TestClient(demo_app)
+    cross = client.get(
+        "/api/v1/mandates/HW-2412/outreach-events",
+        params={"timestamp_from": NOW.isoformat()},
+    ).json()[0]
+    duplicated = client.get(
+        "/api/v1/mandates/HW-2411/outreach-events",
+        params={"person_id": "eli-torres"},
+    ).json()
+
+    assert cross["target_person_id"] == ""
+    assert cross["engagement_type"] == ""
+    assert duplicated == []
+    unfiltered = client.get(
+        "/api/v1/mandates/HW-2411/outreach-events"
+    ).json()
+    eli_events = [
+        row
+        for row in unfiltered
+        if row["event_type"].startswith("engagement.quick_response")
+        and row["timestamp"] in {
+            "2026-08-11T15:04:00+00:00",
+            "2026-08-11T15:10:00+00:00",
+        }
+    ]
+    assert eli_events
+    assert all(row["target_person_id"] == "" for row in eli_events)
+
+
+def test_data_table_six_engagement_types_and_truthful_statuses(demo_app) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assert mandate is not None
+    client = TestClient(demo_app)
+    rows = client.get(
+        "/api/v1/mandates/HW-2411/outreach-events"
+    ).json()
+    by_person = {}
+    for row in rows:
+        if row["target_person_id"]:
+            by_person[row["target_person_id"]] = (
+                row["engagement_type"],
+                row["engagement_status"],
+            )
+
+    assert by_person == {
+        "eli-torres": ("quick_response", "complete"),
+        "sora-kim": ("quick_response", "complete"),
+        "priya-shah": ("structured_interview", "in progress"),
+        "nora-chen": ("acknowledge", "acknowledged"),
+        "maya-brooks": ("review_approval", "pending"),
+        "inez-ward": ("inform", "delivered"),
+    }
+
+    inez = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.person_id == "inez-ward"
+    )
+    repository.save_assignment(
+        inez.model_copy(
+            update={
+                "engagement_type": EngagementType.AVAILABILITY,
+                "response_required": True,
+            }
+        )
+    )
+    repository.set_runtime_status(
+        f"availability:{mandate.mandate_id}:inez-ward",
+        "2026-08-12T15:00:00+00:00/2026-08-12T16:00:00+00:00",
+        inez.completed_at,
+    )
+    availability = client.get(
+        "/api/v1/mandates/HW-2411/outreach-events",
+        params={"person_id": "inez-ward"},
+    ).json()
+
+    assert availability
+    assert {
+        (row["engagement_type"], row["engagement_status"])
+        for row in availability
+    } == {("availability", "recorded")}
+
+
+def test_data_table_response_latency_uses_first_exact_human_response(demo_app) -> None:
+    rows = TestClient(demo_app).get(
+        "/api/v1/mandates/HW-2411/outreach-events"
+    ).json()
+    latencies = {}
+    for row in rows:
+        if row["target_person_id"]:
+            latencies.setdefault(row["target_person_id"], set()).add(
+                row["response_latency_seconds"]
+            )
+
+    assert latencies == {
+        "eli-torres": {180},
+        "sora-kim": {180},
+        "priya-shah": {180},
+        "nora-chen": {180},
+        "maya-brooks": {""},
+        "inez-ward": {""},
+    }
+
+
+def test_data_table_review_and_availability_latency_require_exact_records(
+    demo_app,
+) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assert mandate is not None
+    assignments = {
+        item.person_id: item
+        for item in repository.list_assignments(mandate.mandate_id)
+    }
+    maya = assignments["maya-brooks"]
+    repository.add_engagement_decision(
+        EngagementDecision(
+            decision_id=uuid4(),
+            mandate_id=mandate.mandate_id,
+            assignment_id=maya.assignment_id,
+            stakeholder_id=maya.person_id,
+            response=EngagementDecisionKind.APPROVE,
+            source_message_id="analytics-review-response",
+            created_at=maya.first_contact_at + timedelta(seconds=95),
+            idempotency_key="analytics-review-response",
+        )
+    )
+    inez = assignments["inez-ward"]
+    repository.save_assignment(
+        inez.model_copy(
+            update={
+                "engagement_type": EngagementType.AVAILABILITY,
+                "response_required": True,
+            }
+        )
+    )
+    repository.set_runtime_status(
+        f"availability:{mandate.mandate_id}:inez-ward",
+        "2026-08-12T15:00:00+00:00/2026-08-12T16:00:00+00:00",
+        inez.completed_at,
+    )
+    client = TestClient(demo_app)
+
+    review = client.get(
+        "/api/v1/mandates/HW-2411/outreach-events",
+        params={"person_id": "maya-brooks"},
+    ).json()
+    availability = client.get(
+        "/api/v1/mandates/HW-2411/outreach-events",
+        params={"person_id": "inez-ward"},
+    ).json()
+
+    assert {row["response_latency_seconds"] for row in review} == {95}
+    assert {row["response_latency_seconds"] for row in availability} == {480}
+
+
+def test_data_table_response_latency_fails_closed_for_stale_or_impossible_truth(
+    demo_app,
+) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assert mandate is not None
+    assignments = {
+        item.person_id: item
+        for item in repository.list_assignments(mandate.mandate_id)
+    }
+    nora = assignments["nora-chen"]
+    repository.save_assignment(nora.model_copy(update={"acknowledged_at": None}))
+    eli = assignments["eli-torres"]
+    interview = repository.get_interview(eli.interview_id)
+    assert interview is not None
+    repository.save_interview(
+        interview.model_copy(
+            update={
+                "acknowledged_at": eli.first_contact_at - timedelta(seconds=1)
+            }
+        )
+    )
+    inez = assignments["inez-ward"]
+    repository.save_assignment(
+        inez.model_copy(
+            update={
+                "engagement_type": EngagementType.AVAILABILITY,
+                "response_required": True,
+            }
+        )
+    )
+    repository.set_runtime_status(
+        f"availability:{mandate.mandate_id}:inez-ward",
+        "2026-08-12T15:00:00+00:00/2026-08-12T16:00:00+00:00",
+        inez.completed_at - timedelta(seconds=1),
+    )
+    client = TestClient(demo_app)
+
+    for person_id in ("nora-chen", "eli-torres", "inez-ward"):
+        rows = client.get(
+            "/api/v1/mandates/HW-2411/outreach-events",
+            params={"person_id": person_id},
+        ).json()
+        assert rows
+        assert {row["response_latency_seconds"] for row in rows} == {""}
+
+
+def test_data_table_private_deny_corpus_and_metadata_never_cross_any_surface(
+    demo_app,
+) -> None:
+    sentinel = "PRIVATE-ANALYTICS-SENTINEL"
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assert mandate is not None
+    private = next(
+        item
+        for item in repository.list_evidence(mandate.mandate_id)
+        if item.visibility is EvidenceVisibility.PRIVATE
+    )
+    assignment = next(
+        item
+        for item in repository.list_assignments(mandate.mandate_id)
+        if item.person_id == "maya-brooks"
+    )
+    repository.add_evidence(
+        private.model_copy(
+            update={
+                "evidence_id": uuid4(),
+                "assignment_id": assignment.assignment_id,
+                "statement": sentinel,
+                "related_decision": f"{sentinel}-decision",
+                "resource": f"{sentinel}-resource",
+                "source_message_id": f"{sentinel}-evidence-message",
+            }
+        )
+    )
+    repository.add_engagement_decision(
+        EngagementDecision(
+            decision_id=uuid4(),
+            mandate_id=mandate.mandate_id,
+            assignment_id=assignment.assignment_id,
+            stakeholder_id=assignment.person_id,
+            response=EngagementDecisionKind.CHANGE,
+            change_text=f"{sentinel}-change-text",
+            source_message_id=f"{sentinel}-decision-message",
+            created_at=NOW,
+            idempotency_key=f"{sentinel}-decision-key",
+        )
+    )
+    with repository._session_factory() as session:
+        session.execute(
+            update(MandateRecord)
+            .where(MandateRecord.mandate_id == str(mandate.mandate_id))
+            .values(
+                objective=f"{sentinel}-objective",
+                redacted_request=f"{sentinel}-request",
+                reason=f"{sentinel}-reason",
+                origin_conversation_id=f"{sentinel}-conversation",
+                origin_message_id=f"{sentinel}-origin-message",
+                idempotency_key=f"{sentinel}-mandate-key",
+            )
+        )
+        session.execute(
+            update(StakeholderAssignmentRecord)
+            .where(
+                StakeholderAssignmentRecord.assignment_id
+                == str(assignment.assignment_id)
+            )
+            .values(
+                reason=f"{sentinel}-assignment-reason",
+                failure_reason=f"{sentinel}-failure",
+                route_ids=[f"{sentinel}-route"],
+            )
+        )
+        event_id = session.scalar(
+            DomainEventRecord.__table__.select()
+            .with_only_columns(DomainEventRecord.event_id)
+            .where(DomainEventRecord.mandate_id == str(mandate.mandate_id))
+            .limit(1)
+        )
+        session.execute(
+            update(DomainEventRecord)
+            .where(DomainEventRecord.event_id == event_id)
+            .values(
+                actor_id=f"{sentinel}-actor",
+                department=f"{sentinel}-event-department",
+                idempotency_key=f"{sentinel}-event-key",
+                event_metadata={
+                    "arbitrary_private_key": sentinel,
+                    "provider_body": f"{sentinel}-provider-body",
+                    "message_id": f"{sentinel}-message",
+                },
+            )
+        )
+        interview_id = session.scalar(
+            InterviewSessionRecord.__table__.select()
+            .with_only_columns(InterviewSessionRecord.session_id)
+            .where(InterviewSessionRecord.mandate_id == str(mandate.mandate_id))
+            .limit(1)
+        )
+        session.execute(
+            update(InterviewSessionRecord)
+            .where(InterviewSessionRecord.session_id == interview_id)
+            .values(
+                questions=[f"{sentinel}-question"],
+                current_route_id=f"{sentinel}-interview-route",
+                current_conversation_id=f"{sentinel}-interview-conversation",
+            )
+        )
+        session.commit()
+
+    client = TestClient(demo_app)
+    responses = [
+        client.get("/mandates/HW-2411/data"),
+        client.get("/api/v1/mandates/HW-2411/outreach-events"),
+        client.get("/api/v1/mandates/HW-2411/outreach-events.csv"),
+    ]
+    serialized = "\n".join(
+        response.text + json.dumps(dict(response.headers)) for response in responses
+    )
+
+    assert all(response.status_code == 200 for response in responses)
+    assert sentinel not in serialized
+    for forbidden in (
+        "arbitrary_private_key",
+        "provider_body",
+        "message_id",
+        "route_ids",
+        "assignment_id",
+        "mandate_id",
+            "change_text",
+            "objective",
+            "question",
+        ):
+        assert forbidden not in serialized
+    for persisted_assignment in repository.list_assignments(mandate.mandate_id):
+        assert str(persisted_assignment.assignment_id) not in serialized
+    assert str(mandate.mandate_id) not in serialized
+
+
+def test_csv_quotes_utf8_blanks_formula_crlf_and_keeps_json_semantics(
+    demo_app,
+) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assert mandate is not None
+    assignments = {
+        item.person_id: item
+        for item in repository.list_assignments(mandate.mandate_id)
+    }
+    repository.save_assignment(
+        assignments["inez-ward"].model_copy(
+            update={"department": "Research, Development"}
+        )
+    )
+    repository.save_assignment(
+        assignments["maya-brooks"].model_copy(
+            update={"department": "=1+1\r\nPRIVATE-CSV-FORMULA"}
+        )
+    )
+    client = TestClient(demo_app)
+    csv_response = client.get(
+        "/api/v1/mandates/HW-2411/outreach-events.csv"
+    )
+    json_rows = client.get(
+        "/api/v1/mandates/HW-2411/outreach-events"
+    ).json()
+    csv_rows = _csv_rows(csv_response)
+    inez_csv = next(row for row in csv_rows if row["target_person_id"] == "inez-ward")
+    inez_json = next(row for row in json_rows if row["target_person_id"] == "inez-ward")
+    maya_csv = next(row for row in csv_rows if row["target_person_id"] == "maya-brooks")
+    maya_json = next(row for row in json_rows if row["target_person_id"] == "maya-brooks")
+
+    assert csv_response.content.decode("utf-8") == csv_response.text
+    assert inez_csv["target_department"] == "Research, Development"
+    assert inez_json["target_department"] == "Research, Development"
+    assert '"Research, Development"' in csv_response.text
+    assert maya_csv["target_department"] == ""
+    assert maya_json["target_department"] == ""
+    assert "PRIVATE-CSV-FORMULA" not in csv_response.text
+    assert all("\r" not in value and "\n" not in value for row in csv_rows for value in row.values())
+
+
+@pytest.mark.parametrize("prefix", ["=", "+", "-", "@", "\t", "\r"])
+def test_csv_cell_hardening_marks_every_formula_leading_character(prefix) -> None:
+    hardened = web_projection._csv_cell(f"{prefix}SUM(A1:A2)\r\nnext")
+
+    assert hardened.startswith("'")
+    assert "\r" not in hardened
+    assert "\n" not in hardened
+
+
+def test_csv_empty_dataset_still_has_headers_and_safe_filename_fallback(
+    demo_app,
+) -> None:
+    client = TestClient(demo_app)
+    empty = client.get(
+        "/api/v1/mandates/HW-2411/outreach-events.csv",
+        params={"person_id": "arun-patel"},
+    )
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assert mandate is not None
+    with repository._session_factory() as session:
+        session.execute(
+            update(MandateRecord)
+            .where(MandateRecord.mandate_id == str(mandate.mandate_id))
+            .values(token="unsafe:token")
+        )
+        session.commit()
+    fallback = client.get(
+        "/api/v1/mandates/unsafe:token/outreach-events.csv"
+    )
+
+    assert empty.status_code == 200
+    assert empty.text.splitlines()[0].split(",") == EXPECTED_OUTREACH_HEADERS
+    assert _csv_rows(empty) == []
+    assert fallback.status_code == 200
+    assert fallback.headers["content-disposition"] == (
+        'attachment; filename="humanwire-outreach-events.csv"'
+    )
+    assert "\r" not in fallback.headers["content-disposition"]
+    assert "\n" not in fallback.headers["content-disposition"]
+
+
+@pytest.mark.parametrize(
+    ("authorization", "expected_status"),
+    [
+        (None, 401),
+        ("", 401),
+        ("Bearer ", 401),
+        ("Bearer wrong-token", 401),
+        ("Bearer fictional-read-token", 200),
+    ],
+)
+@pytest.mark.parametrize("suffix", ["outreach-events", "outreach-events.csv"])
+def test_csv_and_json_production_auth_match_the_read_only_boundary(
+    demo_app, authorization, expected_status, suffix
+) -> None:
+    client = TestClient(
+        create_app(
+            demo_app.state.repository,
+            Settings(
+                _env_file=None,
+                analytics_read_token="fictional-read-token",
+            ),
+            clock=lambda: NOW,
+        )
+    )
+    response = client.get(
+        f"/api/v1/mandates/HW-2411/{suffix}",
+        headers={"Authorization": authorization} if authorization is not None else {},
+    )
+
+    assert response.status_code == expected_status
+    assert "fictional-read-token" not in response.text
+
+
+def test_data_table_demo_is_anonymous_unknown_is_bodyless_and_failures_are_safe(
+    web_client,
+) -> None:
+    assert web_client.get(
+        "/api/v1/mandates/HW-2411/outreach-events.csv"
+    ).status_code == 200
+    for path in (
+        "/mandates/HW-UNKNOWN/data",
+        "/api/v1/mandates/HW-UNKNOWN/outreach-events",
+        "/api/v1/mandates/HW-UNKNOWN/outreach-events.csv",
+    ):
+        response = web_client.get(path)
+        assert response.status_code == 404
+        assert response.content == b""
+
+    client = TestClient(
+        create_app(
+            FailingRepository(),
+            Settings(
+                _env_file=None,
+                analytics_read_token="fictional-read-token",
+            ),
+            clock=lambda: NOW,
+        )
+    )
+    headers = {"Authorization": "Bearer fictional-read-token"}
+    for path in (
+        "/mandates/HW-2411/data",
+        "/api/v1/mandates/HW-2411/outreach-events",
+        "/api/v1/mandates/HW-2411/outreach-events.csv",
+    ):
+        response = client.get(path, headers=headers)
+        assert response.status_code == 503
+        assert response.json() == {"detail": "Service unavailable"}
+        assert "private/path" not in response.text
+        assert "secret" not in response.text
+
+
+def test_data_table_template_is_semantic_labelled_read_only_and_package_local(
+    web_client,
+) -> None:
+    response = web_client.get("/mandates/HW-2411/data")
+    html = response.text
+
+    assert response.status_code == 200
+    assert re.search(r'<a[^>]+aria-current="page"[^>]*>\s*Data</a>', html)
+    assert html.count("<h1") == 1
+    assert "Technical Data" in html
+    assert "HW-2411" in html
+    assert (
+        "Persisted, redacted outreach activity suitable for technical review and "
+        "external BI import."
+    ) in html
+    assert "16 saved events" in html
+    assert "Last updated" in html
+    assert '<form method="get"' in html.lower()
+    assert html.lower().count("<label") == 9
+    for label in (
+        "Engagement type",
+        "Engagement status",
+        "Department",
+        "Person ID",
+        "Channel",
+        "Direction",
+        "Event type",
+        "From timestamp",
+        "To timestamp",
+    ):
+        assert label in html
+    assert "Apply filters" in html
+    assert 'href="/mandates/HW-2411/data"' in html
+    assert "JSON" in html and "Download CSV" in html
+    assert '<caption>Canonical redacted outreach events</caption>' in html
+    assert html.count('scope="col"') == 16
+    assert response.headers["content-security-policy"].endswith("form-action 'self'")
+    assert 'href="/static/styles.css"' in html
+    assert 'src="/static/app.js"' in html
+    assert "<style" not in html.lower()
+    assert not re.search(r"<script(?![^>]+src=)", html)
+    assert "contenteditable" not in html.lower()
+    assert not re.search(r'on(?:click|change|submit|keydown)=', html, re.IGNORECASE)
+    for forbidden in ('method="post"', 'method="put"', 'method="patch"', 'method="delete"'):
+        assert forbidden not in html.lower()
+
+
+def test_data_table_css_has_local_overflow_focus_touch_and_two_mobile_reflows(
+    web_client,
+) -> None:
+    css = web_client.get("/static/styles.css").text
+
+    assert re.search(
+        r"\.data-table-region\s*\{[^}]*overflow-x:\s*auto", css, re.DOTALL
+    )
+    assert re.search(r"body\s*\{[^}]*overflow-x:\s*clip", css, re.DOTALL)
+    assert ".data-page" in css and ".data-filters" in css and ".data-export" in css
+    assert ":focus-visible" in css
+    assert "@media (max-width: 600px)" in css
+    assert "@media (max-width: 390px)" in css
+    assert re.search(
+        r"@media \(max-width: 600px\).*?\.data-filters\s*\{[^}]*"
+        r"grid-template-columns:\s*1fr",
+        css,
+        re.DOTALL,
+    )
+    assert re.search(
+        r"@media \(max-width: 390px\).*?\.data-control[^}]*min-height:\s*44px",
+        css,
+        re.DOTALL,
+    )
+    numeric_sizes = re.findall(r"font-size:\s*([0-9.]+)(px|rem)", css)
+    assert all(
+        (float(value) if unit == "px" else float(value) * 14) >= 14
+        for value, unit in numeric_sizes
+    )
+
+
+def test_data_table_heading_reuses_the_reach_type_scale(web_client) -> None:
+    css = web_client.get("/static/styles.css").text
+
+    assert re.search(
+        r"\.data-heading h1\s*\{[^}]*font-size:\s*clamp\(24px,\s*2\.2vw,\s*26px\)",
+        css,
+        re.DOTALL,
+    )
+    assert re.search(
+        r"@media \(max-width: 390px\).*?\.data-heading h1\s*\{[^}]*"
+        r"font-size:\s*24px",
+        css,
+        re.DOTALL,
+    )
+
+
+def test_analytics_documentation_has_secret_safe_power_bi_contract() -> None:
+    text = Path("docs/analytics.md").read_text(encoding="utf-8")
+
+    assert "{base_url}/api/v1/mandates/{mandate_token}/outreach-events" in text
+    assert "{base_url}/api/v1/mandates/{mandate_token}/outreach-events.csv" in text
+    assert "Authorization: Bearer <read-only-token>" in text
+    assert "Power BI Desktop" in text and "Get Data" in text and "Web" in text
+    assert "downloaded CSV" in text
+    assert [
+        line.split("`", 2)[1]
+        for line in text.splitlines()
+        if re.match(r"\d+\. `[^`]+`", line)
+    ] == EXPECTED_OUTREACH_HEADERS
+    for filter_name in (
+        "engagement_type",
+        "engagement_status",
+        "department",
+        "person_id",
+        "channel",
+        "direction",
+        "event_type",
+        "timestamp_from",
+        "timestamp_to",
+    ):
+        assert f"`{filter_name}`" in text
+    assert "read-only snapshots of persisted events" in text
+    assert "no realtime guarantee" in text
+    assert "never connect Power BI or any BI tool directly to `humanwire.db`" in text
+    assert "do not copy or upload the operational SQLite file" in text
+    assert "token" in text.lower() and "query string" in text.lower()
+    for forbidden in (
+        "Power BI certified",
+        "organizer endorsed",
+        "production security certified",
+    ):
+        assert forbidden not in text
 
 
 def test_dashboard_templates_and_static_assets_are_package_local(
@@ -738,10 +1684,10 @@ def test_reach_replay_uses_every_saved_event_in_persisted_order(web_client) -> N
 
     assert len(replay_items) == len(events) == 16
     assert [created for created, _target in replay_items] == [
-        event["created_at"] for event in events
+        event["timestamp"] for event in events
     ]
     assert replay_items[:4] == [
-        (events[index]["created_at"], "origin") for index in range(4)
+        (events[index]["timestamp"], "origin") for index in range(4)
     ]
     assert replay_items[4][1] == "eli-torres"
     assert "16 persisted events" in html
@@ -1761,10 +2707,10 @@ def test_every_public_surface_applies_one_recursive_sanitization_boundary(demo_a
     assert "downward" in serialized
     assert "mandate.interviewing" in serialized
     event_rows = responses[9].json()
-    redacted_event = next(row for row in event_rows if row["event_type"] == "[REDACTED]")
-    assert redacted_event["metadata"] == {
-        "references": [{"person_id": "[REDACTED]"}]
-    }
+    redacted_event = next(row for row in event_rows if row["event_type"] == "")
+    assert list(redacted_event) == EXPECTED_OUTREACH_HEADERS
+    assert redacted_event["target_person_id"] == ""
+    assert "metadata" not in redacted_event
 
 
 def test_private_evidence_text_is_denied_on_every_surface_but_public_text_remains(
@@ -1965,7 +2911,7 @@ def test_private_common_word_does_not_damage_independently_public_prose(demo_app
     assert "Coverage requires a documented handoff." in serialized
     assert distinctive not in serialized
     assert "Discuss [PRIVATE] after lunch." in serialized
-    assert events.json()[0]["metadata"] == {"references": [{"status": "[PRIVATE]"}]}
+    assert "metadata" not in events.json()[0]
 
 
 def test_private_token_and_meeting_id_are_removed_at_final_html_header_and_ics_boundary(
@@ -2108,7 +3054,7 @@ def test_list_filter_stakeholders_events_evidence_and_reach_are_persisted_projec
         ("upward", "awaiting_acknowledgement"),
     }
     assert len([item for item in stakeholders if item["direction"] == "downward" and item["state"] == "complete"]) == 3
-    assert [item["created_at"] for item in events] == sorted(item["created_at"] for item in events)
+    assert [item["timestamp"] for item in events] == sorted(item["timestamp"] for item in events)
     assert len(events) >= 12
     assert evidence["counts"] == {"shareable": 2, "anonymous": 1, "private_blockers": 1}
     assert evidence["items"][1]["stakeholder_id"] is None

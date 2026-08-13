@@ -109,7 +109,7 @@ def test_exact_hw_2411_story_and_public_fixture_are_safe() -> None:
     assert any(row["interview_status"] == "complete" for row in stakeholders)
     assert any(row["interview_status"] == "in_progress" for row in stakeholders)
     assert len(events) >= 12
-    assert [row["created_at"] for row in events] == sorted(row["created_at"] for row in events)
+    assert [row["timestamp"] for row in events] == sorted(row["timestamp"] for row in events)
     assert "approval request" in serialized.lower()
 
     for forbidden in (

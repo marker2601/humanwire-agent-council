@@ -1,0 +1,158 @@
+{% extends "base.html" %}
+
+{% block title %}HumanWire {{ data.mandate.token }} Technical Data{% endblock %}
+{% block page_name %}data{% endblock %}
+
+{% block main %}
+  <main id="main-content" class="data-page shell" data-testid="data-page" data-mandate-token="{{ data.mandate.token }}">
+    <header class="data-heading">
+      <div>
+        <span class="token">{{ data.mandate.token }}</span>
+        <h1>Technical Data</h1>
+        <p>Persisted, redacted outreach activity suitable for technical review and external BI import.</p>
+      </div>
+      <dl class="data-evidence" aria-label="Saved event evidence">
+        <div><dt>Rows</dt><dd>{{ data.row_count_label }}</dd></div>
+        <div>
+          <dt>Last updated</dt>
+          <dd>
+            {% if data.mandate.updated_at %}
+              <time datetime="{{ data.mandate.updated_at }}">{{ data.mandate.updated_display }}</time>
+            {% else %}
+              No saved events
+            {% endif %}
+          </dd>
+        </div>
+      </dl>
+    </header>
+
+    <section class="panel data-filter-panel" aria-labelledby="data-filter-heading">
+      <div class="data-section-heading">
+        <div>
+          <h2 id="data-filter-heading">Narrow the event stream</h2>
+          <p>Exact, read-only filters are preserved in both exports.</p>
+        </div>
+        <div class="data-export" aria-label="Data exports">
+          <a
+            class="data-control data-export-link"
+            href="/api/v1/mandates/{{ data.mandate.token }}/outreach-events{% if data.export_query %}?{{ data.export_query }}{% endif %}"
+          >JSON</a>
+          <a
+            class="data-control data-export-link is-primary"
+            href="/api/v1/mandates/{{ data.mandate.token }}/outreach-events.csv{% if data.export_query %}?{{ data.export_query }}{% endif %}"
+          >Download CSV</a>
+        </div>
+      </div>
+      <form method="get" action="/mandates/{{ data.mandate.token }}/data">
+        <div class="data-filters">
+          <div class="data-field">
+            <label for="filter-engagement-type">Engagement type</label>
+            <select id="filter-engagement-type" name="engagement_type" class="data-control">
+              <option value="">All engagement types</option>
+              {% for value in data.engagement_types %}
+                <option value="{{ value }}"{% if data.filters.get('engagement_type') == value %} selected{% endif %}>{{ value | replace('_', ' ') | title }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="data-field">
+            <label for="filter-engagement-status">Engagement status</label>
+            <select id="filter-engagement-status" name="engagement_status" class="data-control">
+              <option value="">All engagement statuses</option>
+              {% for value in data.engagement_statuses %}
+                <option value="{{ value }}"{% if data.filters.get('engagement_status') == value %} selected{% endif %}>{{ value | replace('_', ' ') | title }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="data-field">
+            <label for="filter-department">Department</label>
+            <input id="filter-department" name="department" class="data-control" value="{{ data.filters.get('department', '') }}" autocomplete="off">
+          </div>
+          <div class="data-field">
+            <label for="filter-person-id">Person ID</label>
+            <input id="filter-person-id" name="person_id" class="data-control" value="{{ data.filters.get('person_id', '') }}" autocomplete="off">
+          </div>
+          <div class="data-field">
+            <label for="filter-channel">Channel</label>
+            <select id="filter-channel" name="channel" class="data-control">
+              <option value="">All channels</option>
+              {% for value in data.channels %}
+                <option value="{{ value }}"{% if data.filters.get('channel') == value %} selected{% endif %}>{{ value | title }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="data-field">
+            <label for="filter-direction">Direction</label>
+            <select id="filter-direction" name="direction" class="data-control">
+              <option value="">All directions</option>
+              {% for value in data.directions %}
+                <option value="{{ value }}"{% if data.filters.get('direction') == value %} selected{% endif %}>{{ value | title }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="data-field">
+            <label for="filter-event-type">Event type</label>
+            <input id="filter-event-type" name="event_type" class="data-control" value="{{ data.filters.get('event_type', '') }}" autocomplete="off">
+          </div>
+          <div class="data-field">
+            <label for="filter-timestamp-from">From timestamp</label>
+            <input id="filter-timestamp-from" name="timestamp_from" class="data-control" value="{{ data.filters.get('timestamp_from', '') }}" inputmode="text" autocomplete="off" placeholder="2026-08-11T15:00:00+00:00">
+          </div>
+          <div class="data-field">
+            <label for="filter-timestamp-to">To timestamp</label>
+            <input id="filter-timestamp-to" name="timestamp_to" class="data-control" value="{{ data.filters.get('timestamp_to', '') }}" inputmode="text" autocomplete="off" placeholder="2026-08-11T16:00:00+00:00">
+          </div>
+        </div>
+        <div class="data-filter-actions">
+          <button class="data-control data-apply" type="submit">Apply filters</button>
+          <a class="data-control data-clear" href="/mandates/{{ data.mandate.token }}/data">Clear</a>
+        </div>
+      </form>
+    </section>
+
+    <section class="panel data-table-panel" aria-labelledby="data-table-heading">
+      <div class="data-section-heading data-table-heading">
+        <div>
+          <h2 id="data-table-heading">Canonical outreach events</h2>
+          <p>{{ data.row_count_label }} in persisted order</p>
+        </div>
+      </div>
+      <div class="data-table-region" role="region" aria-label="Canonical outreach event table" tabindex="0">
+        <table class="data-table" data-outreach-table>
+          <caption>Canonical redacted outreach events</caption>
+          <thead>
+            <tr>
+              {% for header in data.headers %}
+                <th scope="col" data-field="{{ header }}">{{ header | replace('_', ' ') | title }}</th>
+              {% endfor %}
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in data.rows %}
+              <tr data-outreach-row>
+                {% for header in data.headers %}
+                  <td data-field="{{ header }}">{% if row[header] is sameas true %}true{% elif row[header] is sameas false %}false{% else %}{{ row[header] }}{% endif %}</td>
+                {% endfor %}
+              </tr>
+            {% else %}
+              <tr class="data-empty-row"><td colspan="16">{{ data.empty_label }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+{% endblock %}
+
+{% block footer %}
+  <footer class="live-footer data-footer">
+    <span class="live-state"><i aria-hidden="true"></i>Read-only persisted snapshot</span>
+    <span>
+      Last updated:
+      {% if data.mandate.updated_at %}
+        <time datetime="{{ data.mandate.updated_at }}">{{ data.mandate.updated_display }}</time>
+      {% else %}
+        No saved events
+      {% endif %}
+    </span>
+  </footer>
+{% endblock %}

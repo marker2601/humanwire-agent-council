@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import base64
+import csv
 import hashlib
 import hmac
 import html
+import io
 import json
 import re
 from collections import Counter
@@ -13,6 +15,7 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -66,6 +69,8 @@ _IDENTIFIER_FIELDS = frozenset(
     {"actor_id", "evidence_id", "person_id", "stakeholder_id", "token"}
 )
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_SAFE_FILENAME_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SAFE_DEPARTMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 &'(),./_-]{0,127}$")
 _SAFE_EVENT_TYPE = re.compile(r"^[a-z][a-z0-9_.-]{0,99}$")
 _SAFE_PUBLIC_KEY = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _ENUM_FIELDS = {
@@ -160,6 +165,51 @@ _ACTIONABLE_ASSIGNMENT_STATES = frozenset(
         StakeholderState.ALTERNATE_CHANNEL,
     }
 )
+OUTREACH_HEADERS = [
+    "mandate_token",
+    "timestamp",
+    "initiator_id",
+    "source_department",
+    "target_person_id",
+    "target_department",
+    "direction",
+    "channel",
+    "engagement_type",
+    "response_required",
+    "engagement_status",
+    "event_type",
+    "previous_state",
+    "new_state",
+    "outcome",
+    "response_latency_seconds",
+]
+_OUTREACH_FILTER_KEYS = (
+    "engagement_type",
+    "engagement_status",
+    "department",
+    "person_id",
+    "channel",
+    "direction",
+    "event_type",
+    "timestamp_from",
+    "timestamp_to",
+)
+_OUTREACH_OUTCOMES = {
+    "mandate.created": "mandate created",
+    "engagement.plan_previewed": "plan previewed",
+    "engagement.plan_released": "plan released",
+    "mandate.interviewing": "coordination started",
+    "engagement.quick_response_sent": "outreach sent",
+    "engagement.structured_interview_sent": "outreach sent",
+    "engagement.acknowledgement_sent": "outreach sent",
+    "engagement.approval_pending": "decision pending",
+    "engagement.inform_delivered": "delivered",
+    "engagement.quick_response_completed": "response complete",
+    "engagement.acknowledged": "acknowledged",
+    "engagement.structured_interview_reminder": "reminder sent",
+    "engagement.structured_interview_alternate_selected": "alternate selected",
+    "engagement.structured_interview_progressed": "response in progress",
+}
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -244,6 +294,8 @@ def _public_projection(
     if not isinstance(value, str):
         return value
     value = _scrub_known_private(value, denied_values)
+    if value == "":
+        return ""
     if value == _PRIVATE_MARKER:
         return value
     if field in _IDENTIFIER_FIELDS or (field is not None and field.endswith("_ids")):
@@ -596,6 +648,382 @@ def _events(
             )
         rows.append(row)
     return rows
+
+
+def _safe_identifier(value: Any) -> str:
+    text = str(value or "")
+    return text if text.isascii() and _SAFE_IDENTIFIER.fullmatch(text) else ""
+
+
+def _safe_department(value: Any) -> str:
+    text = str(value or "")
+    return text if text.isascii() and _SAFE_DEPARTMENT.fullmatch(text) else ""
+
+
+def _safe_enum_value(value: Any, allowed: set[str]) -> str:
+    text = str(getattr(value, "value", value) or "")
+    return text if text in allowed else ""
+
+
+def _safe_event_type(value: Any) -> str:
+    text = str(value or "")
+    return text if text.isascii() and _SAFE_EVENT_TYPE.fullmatch(text) else ""
+
+
+def _analytics_timestamp(value: Any) -> str:
+    if not isinstance(value, datetime) or value.utcoffset() is None:
+        return ""
+    return value.astimezone(UTC).isoformat()
+
+
+def _parse_analytics_timestamp(value: str) -> datetime | None:
+    if not value or not value.isascii():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _validated_outreach_filters(request: Request) -> dict[str, str]:
+    supplied: dict[str, str] = {}
+    allowed_keys = set(_OUTREACH_FILTER_KEYS)
+    for key, value in request.query_params.multi_items():
+        if key not in allowed_keys or key in supplied:
+            raise HTTPException(status_code=400, detail="Invalid filters")
+        supplied[key] = value
+
+    validators: dict[str, Callable[[str], str]] = {
+        "engagement_type": lambda value: (
+            value if value in _ENUM_FIELDS["engagement_type"] else ""
+        ),
+        "engagement_status": lambda value: (
+            value if value in _ENUM_FIELDS["engagement_status"] else ""
+        ),
+        "department": _safe_department,
+        "person_id": _safe_identifier,
+        "channel": lambda value: value if value in _ENUM_FIELDS["channel"] else "",
+        "direction": lambda value: value if value in _ENUM_FIELDS["direction"] else "",
+        "event_type": _safe_event_type,
+    }
+    normalized: dict[str, str] = {}
+    for key in _OUTREACH_FILTER_KEYS:
+        if key not in supplied:
+            continue
+        value = supplied[key]
+        if value == "":
+            continue
+        if key in {"timestamp_from", "timestamp_to"}:
+            parsed = _parse_analytics_timestamp(value)
+            normalized_value = _analytics_timestamp(parsed)
+        else:
+            normalized_value = validators[key](value)
+        if not normalized_value:
+            raise HTTPException(status_code=400, detail="Invalid filters")
+        normalized[key] = normalized_value
+    if (
+        normalized.get("timestamp_from")
+        and normalized.get("timestamp_to")
+        and normalized["timestamp_from"] > normalized["timestamp_to"]
+    ):
+        raise HTTPException(status_code=400, detail="Invalid filters")
+    return normalized
+
+
+def _exact_interview(
+    interviews: Mapping[Any, Any], assignment: StakeholderAssignment
+) -> Any | None:
+    interview = interviews.get(assignment.interview_id)
+    if (
+        assignment.engagement_type
+        not in {EngagementType.QUICK_RESPONSE, EngagementType.STRUCTURED_INTERVIEW}
+        or interview is None
+        or interview.mandate_id != assignment.mandate_id
+        or interview.assignment_id != assignment.assignment_id
+    ):
+        return None
+    return interview
+
+
+def _exact_decision(
+    decisions: Mapping[Any, Any], assignment: StakeholderAssignment
+) -> Any | None:
+    decision = decisions.get(assignment.assignment_id)
+    if (
+        assignment.engagement_type is not EngagementType.REVIEW_APPROVAL
+        or decision is None
+        or decision.mandate_id != assignment.mandate_id
+        or decision.assignment_id != assignment.assignment_id
+        or decision.stakeholder_id != assignment.person_id
+    ):
+        return None
+    return decision
+
+
+def _response_latency(
+    repository: Any,
+    assignment: StakeholderAssignment,
+    engagement_status: str,
+    interviews: Mapping[Any, Any],
+    decisions: Mapping[Any, Any],
+) -> int | str:
+    if assignment.engagement_type is EngagementType.INFORM:
+        return ""
+    response_at: datetime | None = None
+    if assignment.engagement_type is EngagementType.ACKNOWLEDGE:
+        if engagement_status == "acknowledged":
+            response_at = assignment.acknowledged_at
+    elif assignment.engagement_type in {
+        EngagementType.QUICK_RESPONSE,
+        EngagementType.STRUCTURED_INTERVIEW,
+    }:
+        interview = _exact_interview(interviews, assignment)
+        response_at = interview.acknowledged_at if interview is not None else None
+    elif assignment.engagement_type is EngagementType.REVIEW_APPROVAL:
+        decision = _exact_decision(decisions, assignment)
+        response_at = decision.created_at if decision is not None else None
+    elif (
+        assignment.engagement_type is EngagementType.AVAILABILITY
+        and _has_exact_availability(repository, assignment)
+    ):
+        response_at = assignment.completed_at
+    started_at = assignment.first_contact_at
+    if (
+        started_at is None
+        or response_at is None
+        or started_at.utcoffset() is None
+        or response_at.utcoffset() is None
+        or response_at < started_at
+    ):
+        return ""
+    return int((response_at - started_at).total_seconds())
+
+
+def _outreach_outcome(
+    event_type: str,
+    event: Any,
+    assignment: StakeholderAssignment | None,
+    engagement_status: str,
+) -> str:
+    if not event_type:
+        return ""
+    if assignment is None:
+        if (
+            getattr(event, "assignment_id", None) is None
+            and getattr(event, "person_id", None) is None
+            and event_type in _MANDATE_LEVEL_EVENT_TYPES
+        ):
+            return _OUTREACH_OUTCOMES.get(event_type, "")
+        return ""
+    outcome = _OUTREACH_OUTCOMES.get(event_type, "")
+    if event_type == "engagement.inform_delivered" and engagement_status != "delivered":
+        return ""
+    if (
+        event_type == "engagement.quick_response_completed"
+        and engagement_status != "complete"
+    ):
+        return ""
+    if event_type == "engagement.acknowledged" and engagement_status != "acknowledged":
+        return ""
+    return outcome
+
+
+def _outreach_rows(
+    repository: Any,
+    mandate: Mandate,
+    filters: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    """Project one canonical, read-only analytics row per persisted event."""
+    assignments = repository.list_assignments(mandate.mandate_id)
+    person_counts = Counter(item.person_id for item in assignments)
+    assignment_counts = Counter(str(item.assignment_id) for item in assignments)
+    identity_counts = Counter(
+        (str(item.mandate_id), str(item.assignment_id), item.person_id)
+        for item in assignments
+    )
+    exact_assignments = {
+        identity: assignment
+        for assignment in assignments
+        if (
+            identity := (
+                str(assignment.mandate_id),
+                str(assignment.assignment_id),
+                assignment.person_id,
+            )
+        )[0]
+        == str(mandate.mandate_id)
+        and person_counts[identity[2]] == 1
+        and assignment_counts[identity[1]] == 1
+        and identity_counts[identity] == 1
+    }
+    initiator_matches = [
+        assignment
+        for identity, assignment in exact_assignments.items()
+        if identity[2] == mandate.initiator_id
+    ]
+    source_department = (
+        _safe_department(initiator_matches[0].department)
+        if len(initiator_matches) == 1
+        else ""
+    )
+    interview_values = repository.list_interviews(mandate.mandate_id)
+    interview_counts = Counter(str(item.session_id) for item in interview_values)
+    interviews = {
+        item.session_id: item
+        for item in interview_values
+        if interview_counts[str(item.session_id)] == 1
+    }
+    decision_values = repository.list_engagement_decisions(mandate.mandate_id)
+    decision_counts = Counter(str(item.assignment_id) for item in decision_values)
+    decisions = {
+        item.assignment_id: item
+        for item in decision_values
+        if decision_counts[str(item.assignment_id)] == 1
+    }
+    planned = {item.person_ref: item for item in mandate.plan.stakeholders}
+    state_values = _ENUM_FIELDS["previous_state"]
+    channel_values = _ENUM_FIELDS["channel"]
+    rows: list[dict[str, Any]] = []
+    for event in repository.list_events(mandate.mandate_id):
+        identity = (
+            str(mandate.mandate_id),
+            str(event.assignment_id) if event.assignment_id is not None else "",
+            event.person_id or "",
+        )
+        assignment = exact_assignments.get(identity)
+        engagement_status = ""
+        if assignment is not None:
+            projection = _assignment_projection(
+                repository,
+                assignment,
+                interviews,
+                planned.get(assignment.person_id),
+                decisions,
+            )
+            engagement_status = _safe_enum_value(
+                projection.get("engagement_status"),
+                _ENUM_FIELDS["engagement_status"],
+            )
+        event_type = _safe_event_type(event.event_type)
+        row = {
+            "mandate_token": _safe_identifier(mandate.token),
+            "timestamp": _analytics_timestamp(event.created_at),
+            "initiator_id": _safe_identifier(mandate.initiator_id),
+            "source_department": source_department,
+            "target_person_id": (
+                _safe_identifier(assignment.person_id) if assignment is not None else ""
+            ),
+            "target_department": (
+                _safe_department(assignment.department) if assignment is not None else ""
+            ),
+            "direction": (
+                _safe_enum_value(assignment.direction, _ENUM_FIELDS["direction"])
+                if assignment is not None
+                else ""
+            ),
+            "channel": (
+                _safe_enum_value(event.channel, channel_values)
+                if assignment is not None
+                else ""
+            ),
+            "engagement_type": (
+                _safe_enum_value(
+                    assignment.engagement_type,
+                    _ENUM_FIELDS["engagement_type"],
+                )
+                if assignment is not None
+                else ""
+            ),
+            "response_required": (
+                assignment.response_required if assignment is not None else ""
+            ),
+            "engagement_status": engagement_status,
+            "event_type": event_type,
+            "previous_state": _safe_enum_value(event.previous_state, state_values),
+            "new_state": _safe_enum_value(event.new_state, state_values),
+            "outcome": _outreach_outcome(
+                event_type, event, assignment, engagement_status
+            ),
+            "response_latency_seconds": (
+                _response_latency(
+                    repository,
+                    assignment,
+                    engagement_status,
+                    interviews,
+                    decisions,
+                )
+                if assignment is not None
+                else ""
+            ),
+        }
+        if not row["timestamp"]:
+            row["timestamp"] = ""
+        if filters.get("engagement_type") != row["engagement_type"] and filters.get(
+            "engagement_type"
+        ):
+            continue
+        if filters.get("engagement_status") != row["engagement_status"] and filters.get(
+            "engagement_status"
+        ):
+            continue
+        if filters.get("department") != row["target_department"] and filters.get(
+            "department"
+        ):
+            continue
+        if filters.get("person_id") != row["target_person_id"] and filters.get(
+            "person_id"
+        ):
+            continue
+        if filters.get("channel") != row["channel"] and filters.get("channel"):
+            continue
+        if filters.get("direction") != row["direction"] and filters.get("direction"):
+            continue
+        if filters.get("event_type") != row["event_type"] and filters.get(
+            "event_type"
+        ):
+            continue
+        if filters.get("timestamp_from") and row["timestamp"] < filters["timestamp_from"]:
+            continue
+        if filters.get("timestamp_to") and row["timestamp"] > filters["timestamp_to"]:
+            continue
+        rows.append({header: row[header] for header in OUTREACH_HEADERS})
+    return rows
+
+
+def _csv_cell(value: Any) -> str:
+    if isinstance(value, bool):
+        text = "true" if value else "false"
+    else:
+        text = str(value if value is not None else "")
+    formula_leading = text.startswith(("=", "+", "-", "@", "\t", "\r"))
+    text = text.replace("\r", " ").replace("\n", " ")
+    if formula_leading:
+        return f"'{text}"
+    return text
+
+
+def _outreach_csv(rows: list[dict[str, Any]]) -> bytes:
+    stream = io.StringIO(newline="")
+    writer = csv.DictWriter(stream, fieldnames=OUTREACH_HEADERS, lineterminator="\r\n")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({header: _csv_cell(row[header]) for header in OUTREACH_HEADERS})
+    return stream.getvalue().encode("utf-8")
+
+
+def _outreach_filename(token: str, denied_values: frozenset[str]) -> str:
+    candidate = f"{token}-outreach-events.csv"
+    if (
+        token.isascii()
+        and _SAFE_FILENAME_TOKEN.fullmatch(token)
+        and _scrub_known_private(token, denied_values) == token
+        and _scrub_known_private(candidate, denied_values) == candidate
+    ):
+        return candidate
+    return "humanwire-outreach-events.csv"
 
 
 def _evidence_summary(repository: Any, mandate: Mandate) -> dict[str, Any]:
@@ -1705,10 +2133,14 @@ def create_app(
                     headers={"WWW-Authenticate": "Bearer"},
                 )
         response = await call_next(request)
+        data_form_action = bool(
+            re.fullmatch(r"/mandates/[^/]+/data", request.url.path)
+        )
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; script-src 'self'; style-src 'self'; "
             "img-src 'self' data:; object-src 'none'; base-uri 'none'; "
-            "frame-ancestors 'none'; form-action 'none'"
+            "frame-ancestors 'none'; form-action "
+            + ("'self'" if data_form_action else "'none'")
         )
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
@@ -1818,14 +2250,48 @@ def create_app(
         )
 
     @app.get("/mandates/{token}/data", response_class=HTMLResponse)
-    def data(token: str):
+    def data(request: Request, token: str):
         mandate = load_mandate(token)
-        denied_values = _private_deny_values(repository, mandate)
-        public_token = _scrub_known_private(mandate.token, denied_values)
-        return _html_page(
-            f"HumanWire {public_token} Data",
-            safe_projection(lambda: _events(repository, mandate), mandate),
-            denied_values,
+        filters = _validated_outreach_filters(request)
+
+        def project():
+            rows = _outreach_rows(repository, mandate, filters)
+            last_updated = rows[-1]["timestamp"] if rows else ""
+            return {
+                "mandate": {
+                    "token": _safe_identifier(mandate.token),
+                    "updated_at": last_updated,
+                    "updated_display": _short_datetime(last_updated),
+                },
+                "headers": OUTREACH_HEADERS,
+                "rows": rows,
+                "row_count": len(rows),
+                "row_count_label": (
+                    f"{len(rows)} saved event{'s' if len(rows) != 1 else ''}"
+                ),
+                "filters": filters,
+                "export_query": urlencode(list(filters.items())),
+                "empty_label": (
+                    "No outreach events match these filters"
+                    if filters
+                    else "No saved events"
+                ),
+                "engagement_types": sorted(_ENUM_FIELDS["engagement_type"]),
+                "engagement_statuses": sorted(_ENUM_FIELDS["engagement_status"]),
+                "channels": sorted(_ENUM_FIELDS["channel"]),
+                "directions": sorted(_ENUM_FIELDS["direction"]),
+            }
+
+        view = safe_projection(project, mandate)
+        return templates.TemplateResponse(
+            request=request,
+            name="data.html",
+            context={
+                "data": view,
+                "demo_mode": demo_mode,
+                "current_nav": "data",
+                "nav_token": view["mandate"]["token"],
+            },
         )
 
     @app.get("/mandates/{token}/meeting.ics")
@@ -1920,9 +2386,26 @@ def create_app(
         return safe_projection(lambda: _stakeholders(repository, mandate), mandate)
 
     @app.get("/api/v1/mandates/{token}/outreach-events")
-    def mandate_events(token: str):
+    def mandate_events(request: Request, token: str):
         mandate = load_mandate(token)
-        return safe_projection(lambda: _events(repository, mandate), mandate)
+        filters = _validated_outreach_filters(request)
+        return safe_projection(lambda: _outreach_rows(repository, mandate, filters), mandate)
+
+    @app.get("/api/v1/mandates/{token}/outreach-events.csv")
+    def mandate_events_csv(request: Request, token: str):
+        mandate = load_mandate(token)
+        filters = _validated_outreach_filters(request)
+        denied_values = _private_deny_values(repository, mandate)
+        rows = safe_projection(lambda: _outreach_rows(repository, mandate, filters), mandate)
+        return Response(
+            content=_outreach_csv(rows),
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="{_outreach_filename(mandate.token, denied_values)}"'
+                )
+            },
+        )
 
     @app.get("/api/v1/mandates/{token}/evidence-summary")
     def mandate_evidence(token: str):
