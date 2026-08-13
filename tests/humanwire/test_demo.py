@@ -222,6 +222,32 @@ def test_hw_2411_is_the_exact_mixed_engagement_story() -> None:
     assert "mandate.aligned" not in event_types
     assert "engagement.approved" not in event_types
 
+    mandate_events = [item for item in events if item.person_id is None]
+    person_events = [item for item in events if item.person_id is not None]
+    assert all(item.assignment_id is None for item in mandate_events)
+    assert all(
+        item.assignment_id == assignments[item.person_id].assignment_id
+        for item in person_events
+    )
+
+
+def test_secondary_demo_person_events_use_the_exact_persisted_assignment() -> None:
+    app = create_demo_app()
+    repository = app.state.repository
+
+    for token in ("HW-2412", "HW-2413"):
+        mandate = repository.get_mandate_by_token(token)
+        assert mandate is not None
+        assignments = {
+            item.person_id: item
+            for item in repository.list_assignments(mandate.mandate_id)
+        }
+        for event in repository.list_events(mandate.mandate_id):
+            if event.person_id is None:
+                assert event.assignment_id is None
+            else:
+                assert event.assignment_id == assignments[event.person_id].assignment_id
+
 
 def test_secondary_demo_cases_have_consistent_typed_authority_facts() -> None:
     app = create_demo_app()

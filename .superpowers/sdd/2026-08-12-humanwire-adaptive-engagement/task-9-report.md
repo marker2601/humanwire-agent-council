@@ -103,3 +103,39 @@ IAB's experimental full-page mobile capture duplicated/clipped its fixed-shell r
 ## Completion identity
 
 Exactly one task commit is created after this report and all gates are final. A Git commit cannot contain its own SHA without changing that SHA, so the exact final commit SHA and clean `git status --short` result are recorded in the final handoff immediately after commit creation.
+
+## Review round 1 — 2026-08-12
+
+Addressed the official Important event-identity finding without changing visible Reach composition, Task 10, Task 11, deployment, or review scope.
+
+### Root cause and fix
+
+The repository persists `DomainEvent.assignment_id`, but the public `_events` projection dropped it before Reach construction. Reach consequently matched history/highlights on `person_id` alone and treated any event without a person as a mandate-origin event. A malformed Eli-assignment/Priya-person event could therefore appear in Priya's history and highlight Priya; an assignment-bound event missing its person could highlight origin.
+
+Reach now carries `(mandate_id, assignment_id, person_id)` only through an internal construction path. A person event binds only when all three values match exactly one rendered assignment and both the rendered person and assignment identities are unique. Cross-assignment, missing-person, missing-assignment, wrong-mandate, duplicate-person, duplicate-assignment, and unbound engagement events remain in the ordered saved replay but target `none` and enter no person's history. Only an allowlisted mandate-level event with both assignment and person absent and the exact current mandate targets origin. The internal identifiers are dropped before the final recursive public projection and never appear in Jinja context, DOM, replay JSON, or the existing public API/data views.
+
+The same exact binding now chooses the latest saved channel used by stakeholder projection; a cross-assignment Telegram event cannot change Maya's truthful Email channel. No missing assignment is inferred from a person ID, including legacy records.
+
+The deterministic demo fixture now persists the exact assignment ID on every person event, including the secondary meeting-package person event. Mandate-level demo events retain neither person nor assignment identity.
+
+### Strict TDD evidence
+
+- Demo RED: `.\.venv\Scripts\python.exe -m pytest tests\humanwire\test_demo.py -k "event" -v` → 1 failed, 4 deselected. The person-bound HW-2413 meeting-package event had no assignment identity.
+- Reach RED: `.\.venv\Scripts\python.exe -m pytest tests\humanwire\test_web.py -k "reach_binds_history or reach_duplicate_rendered or reach_origin_wrong" -v` → 4 failed, 142 deselected. The identity-aware projection/binding contract did not exist.
+- Focused GREEN: the same Reach command → 4 passed, 142 deselected; demo identity slice → 1 passed, 4 deselected.
+- Broader Reach GREEN: `.\.venv\Scripts\python.exe -m pytest tests\humanwire\test_web.py -k "reach or lane or replay" -v` → 37 passed, 109 deselected.
+
+Repository-backed tests cover the reviewer probe, cross-assignment channel poisoning, assignment-without-person, person-without-assignment, engagement event with neither identity, duplicate persisted person, duplicate rendered assignment, wrong mandate, exact origin allowlist, internal identifier non-exposure, exact actual event order/count, and selected-history/replay targets. Demo tests assert every person event has its exact assignment pair and mandate-level events have neither.
+
+### Review round 1 final gates
+
+- `.\.venv\Scripts\python.exe -m pytest tests\humanwire\test_demo.py -v` → 5 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\humanwire\test_web.py -v` → 146 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\humanwire\test_demo.py tests\humanwire\test_repository.py -v` → 94 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\humanwire\test_repository.py -v` → 89 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\humanwire -q` → 1031 passed.
+- `.\.venv\Scripts\python.exe -m pytest -q` → 1121 passed.
+- `.\.venv\Scripts\python.exe -m ruff check src\humanwire\web.py src\humanwire\demo.py tests\humanwire\test_web.py tests\humanwire\test_demo.py` → all checks passed.
+- `git diff --check` → passed; staged diff check is recorded at commit time.
+
+The exact review-fix commit SHA and final clean status are recorded in the round-one handoff because a commit cannot contain its own SHA.

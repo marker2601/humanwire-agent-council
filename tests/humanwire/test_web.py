@@ -752,6 +752,192 @@ def test_reach_replay_uses_every_saved_event_in_persisted_order(web_client) -> N
     assert "synthesized event" not in html.lower()
 
 
+def _internal_reach_view(repository, mandate, rows=None, events=None):
+    return web_projection._reach_page_view(
+        web_projection._mandate_detail(repository, mandate),
+        rows
+        if rows is not None
+        else web_projection._stakeholders(
+            repository, mandate, include_reach_identity=True
+        ),
+        events
+        if events is not None
+        else web_projection._events(repository, mandate, include_reach_identity=True),
+        expected_mandate_id=str(mandate.mandate_id),
+    )
+
+
+def test_reach_binds_history_and_highlights_only_to_exact_event_identity(demo_app) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assert mandate is not None
+    assignments = {
+        item.person_id: item
+        for item in repository.list_assignments(mandate.mandate_id)
+    }
+    probes = (
+        DomainEvent(
+            event_type="engagement.quick_response_sent",
+            created_at=NOW + timedelta(minutes=1),
+            idempotency_key="reach-review-cross-assignment",
+            assignment_id=assignments["eli-torres"].assignment_id,
+            person_id="priya-shah",
+            channel=Channel.TELEGRAM,
+            direction=Direction.LATERAL,
+        ),
+        DomainEvent(
+            event_type="engagement.quick_response_sent",
+            created_at=NOW + timedelta(minutes=2),
+            idempotency_key="reach-review-assignment-without-person",
+            assignment_id=assignments["eli-torres"].assignment_id,
+            channel=Channel.TELEGRAM,
+            direction=Direction.DOWNWARD,
+        ),
+        DomainEvent(
+            event_type="engagement.quick_response_sent",
+            created_at=NOW + timedelta(minutes=3),
+            idempotency_key="reach-review-person-without-assignment",
+            person_id="priya-shah",
+            channel=Channel.TELEGRAM,
+            direction=Direction.LATERAL,
+        ),
+        DomainEvent(
+            event_type="engagement.quick_response_sent",
+            created_at=NOW + timedelta(minutes=4),
+            idempotency_key="reach-review-engagement-without-identity",
+            channel=Channel.EMAIL,
+            direction=Direction.DOWNWARD,
+        ),
+        DomainEvent(
+            event_type="engagement.approval_pending",
+            created_at=NOW + timedelta(minutes=5),
+            idempotency_key="reach-review-cross-assignment-channel",
+            assignment_id=assignments["eli-torres"].assignment_id,
+            person_id="maya-brooks",
+            channel=Channel.TELEGRAM,
+            direction=Direction.UPWARD,
+        ),
+    )
+    for event in probes:
+        repository.append_event(mandate.mandate_id, event)
+
+    view = _internal_reach_view(repository, mandate)
+    replay_by_time = {event["created_at"]: event for event in view["replay"]}
+    probe_times = {event.created_at.isoformat() for event in probes}
+    histories = {
+        item["created_at"]
+        for lane in view["lanes"]
+        for row in lane["rows"]
+        for item in row["history"]
+    }
+    maya = next(
+        row
+        for lane in view["lanes"]
+        for row in lane["rows"]
+        if row["person_id"] == "maya-brooks"
+    )
+
+    assert {replay_by_time[value]["highlight"] for value in probe_times} == {"none"}
+    assert probe_times.isdisjoint(histories)
+    assert maya["channel_label"] == "Email"
+    assert len(view["replay"]) == len(repository.list_events(mandate.mandate_id)) == 21
+    assert [item["created_at"] for item in view["replay"]] == [
+        item.created_at.isoformat()
+        for item in repository.list_events(mandate.mandate_id)
+    ]
+
+
+@pytest.mark.parametrize("duplicate_kind", ["person", "assignment"])
+def test_reach_duplicate_rendered_identity_fails_event_binding_closed(
+    demo_app, duplicate_kind
+) -> None:
+    repository = demo_app.state.repository
+    mandate = repository.get_mandate_by_token("HW-2411")
+    assert mandate is not None
+    if duplicate_kind == "person":
+        sora = next(
+            item
+            for item in repository.list_assignments(mandate.mandate_id)
+            if item.person_id == "sora-kim"
+        )
+        repository.save_assignment(sora.model_copy(update={"person_id": "eli-torres"}))
+    rows = web_projection._stakeholders(
+        repository, mandate, include_reach_identity=True
+    )
+    events = web_projection._events(repository, mandate, include_reach_identity=True)
+    eli = next(row for row in rows if row["person_id"] == "eli-torres")
+    if duplicate_kind == "assignment":
+        duplicate = dict(eli)
+        duplicate["person_id"] = "duplicate-rendered-person"
+        duplicate["name"] = "Duplicate rendered person"
+        rows.append(duplicate)
+    view = _internal_reach_view(
+        repository,
+        mandate,
+        rows=rows,
+        events=events,
+    )
+    eli_events = [
+        item
+        for item in view["replay"]
+        if "Eli Torres" in item["description"]
+    ]
+
+    assert eli_events
+    assert {item["highlight"] for item in eli_events} == {"none"}
+    assert all(
+        not row["history"]
+        for lane in view["lanes"]
+        for row in lane["rows"]
+        if row["person_id"] in {"eli-torres", "duplicate-rendered-person"}
+    )
+
+
+def test_reach_origin_wrong_mandate_and_private_binding_identifiers_fail_safe(
+    demo_app,
+) -> None:
+    repository = demo_app.state.repository
+    primary = repository.get_mandate_by_token("HW-2411")
+    aligned = repository.get_mandate_by_token("HW-2412")
+    assert primary is not None and aligned is not None
+    priya = next(
+        item
+        for item in repository.list_assignments(primary.mandate_id)
+        if item.person_id == "priya-shah"
+    )
+    cross_mandate = DomainEvent(
+        event_type="engagement.structured_interview_reminder",
+        created_at=NOW + timedelta(minutes=1),
+        idempotency_key="reach-review-wrong-mandate",
+        assignment_id=priya.assignment_id,
+        person_id=priya.person_id,
+        channel=Channel.EMAIL,
+        direction=Direction.LATERAL,
+    )
+    repository.append_event(aligned.mandate_id, cross_mandate)
+
+    primary_view = _internal_reach_view(repository, primary)
+    aligned_view = _internal_reach_view(repository, aligned)
+    html = TestClient(demo_app).get("/mandates/HW-2411/reach").text
+    public_events = TestClient(demo_app).get(
+        "/api/v1/mandates/HW-2411/outreach-events"
+    ).json()
+    serialized = html + json.dumps(public_events) + json.dumps(primary_view)
+
+    assert len(primary_view["replay"]) == 16
+    assert aligned_view["replay"][-1]["highlight"] == "none"
+    assert [item["highlight"] for item in primary_view["replay"][:4]] == [
+        "origin",
+        "origin",
+        "origin",
+        "origin",
+    ]
+    assert "assignment_id" not in serialized
+    assert "mandate_id" not in serialized
+    for assignment in repository.list_assignments(primary.mandate_id):
+        assert str(assignment.assignment_id) not in serialized
+
+
 def test_reach_escapes_malicious_presentation_fields_and_links(demo_app) -> None:
     repository = demo_app.state.repository
     mandate = repository.get_mandate_by_token("HW-2411")

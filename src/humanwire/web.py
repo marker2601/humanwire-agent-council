@@ -8,6 +8,7 @@ import hmac
 import html
 import json
 import re
+from collections import Counter
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -57,6 +58,8 @@ _PRIVATE_PROJECTION_KEYS = frozenset(
         "sender_address",
         "sender_id",
         "source_message_id",
+        "assignment_id",
+        "mandate_id",
     }
 )
 _IDENTIFIER_FIELDS = frozenset(
@@ -503,7 +506,12 @@ def _mandate_detail(repository: Any, mandate: Mandate) -> dict[str, Any]:
     return detail
 
 
-def _stakeholders(repository: Any, mandate: Mandate) -> list[dict[str, Any]]:
+def _stakeholders(
+    repository: Any,
+    mandate: Mandate,
+    *,
+    include_reach_identity: bool = False,
+) -> list[dict[str, Any]]:
     interviews = {
         interview.session_id: interview
         for interview in repository.list_interviews(mandate.mandate_id)
@@ -514,37 +522,62 @@ def _stakeholders(repository: Any, mandate: Mandate) -> list[dict[str, Any]]:
         item.assignment_id: item
         for item in repository.list_engagement_decisions(mandate.mandate_id)
     }
-    event_channels: dict[str, Channel] = {}
+    person_counts = Counter(item.person_id for item in assignments)
+    assignment_counts = Counter(str(item.assignment_id) for item in assignments)
+    exact_assignments = {
+        (str(item.mandate_id), str(item.assignment_id), item.person_id): item
+        for item in assignments
+        if item.mandate_id == mandate.mandate_id
+        and person_counts[item.person_id] == 1
+        and assignment_counts[str(item.assignment_id)] == 1
+    }
+    event_channels: dict[Any, Channel] = {}
     for event in repository.list_events(mandate.mandate_id):
-        if event.person_id is not None and event.channel is not None:
-            event_channels[event.person_id] = event.channel
+        identity = (
+            str(mandate.mandate_id),
+            str(event.assignment_id) if event.assignment_id is not None else "",
+            event.person_id or "",
+        )
+        assignment = exact_assignments.get(identity)
+        if assignment is not None and event.channel is not None:
+            event_channels[assignment.assignment_id] = event.channel
     plan_order = {
         planned.person_ref: index
         for index, planned in enumerate(mandate.plan.stakeholders)
     }
-    return [
-        _assignment_projection(
+    rows = []
+    for assignment in sorted(
+        assignments,
+        key=lambda item: (
+            plan_order.get(item.person_id, len(plan_order)),
+            item.person_id,
+            str(item.assignment_id),
+        ),
+    ):
+        row = _assignment_projection(
             repository,
             assignment,
             interviews,
             planned.get(assignment.person_id),
             decisions,
-            event_channels.get(assignment.person_id),
+            event_channels.get(assignment.assignment_id),
         )
-        for assignment in sorted(
-            assignments,
-            key=lambda item: (
-                plan_order.get(item.person_id, len(plan_order)),
-                item.person_id,
-                str(item.assignment_id),
-            ),
-        )
-    ]
+        if include_reach_identity:
+            row["_reach_mandate_id"] = str(assignment.mandate_id)
+            row["_reach_assignment_id"] = str(assignment.assignment_id)
+        rows.append(row)
+    return rows
 
 
-def _events(repository: Any, mandate: Mandate) -> list[dict[str, Any]]:
-    return [
-        {
+def _events(
+    repository: Any,
+    mandate: Mandate,
+    *,
+    include_reach_identity: bool = False,
+) -> list[dict[str, Any]]:
+    rows = []
+    for event in repository.list_events(mandate.mandate_id):
+        row = {
             "event_type": event.event_type,
             "created_at": _iso(event.created_at),
             "actor": _person(repository, event.actor_id) if event.actor_id else None,
@@ -556,8 +589,13 @@ def _events(repository: Any, mandate: Mandate) -> list[dict[str, Any]]:
             "new_state": event.new_state,
             "metadata": event.metadata,
         }
-        for event in repository.list_events(mandate.mandate_id)
-    ]
+        if include_reach_identity:
+            row["_reach_mandate_id"] = str(mandate.mandate_id)
+            row["_reach_assignment_id"] = (
+                str(event.assignment_id) if event.assignment_id is not None else None
+            )
+        rows.append(row)
+    return rows
 
 
 def _evidence_summary(repository: Any, mandate: Mandate) -> dict[str, Any]:
@@ -946,6 +984,30 @@ _REACH_LANES = (
     ("lateral", "Coordinate policy", "Lateral"),
     ("upward", "Get approval", "Upward"),
 )
+_MANDATE_LEVEL_EVENT_TYPES = frozenset(
+    {
+        "alignment.brief_persisted",
+        "engagement.plan_previewed",
+        "engagement.plan_released",
+        "mandate.aligned",
+        "mandate.cancelled",
+        "mandate.created",
+        "mandate.expired",
+        "mandate.interviewing",
+        "mandate.meeting_ready",
+        "mandate.meeting_required",
+        "mandate.negotiating",
+        "mandate.partial",
+        "mandate.planned",
+        "mandate.received",
+        "mandate.scheduling",
+        "mandate.synthesizing",
+        "meeting.package_created",
+        "model.fallback",
+        "proposal.created",
+        "proposal.response_recorded",
+    }
+)
 
 
 def _reach_result(row: Mapping[str, Any]) -> str:
@@ -1005,6 +1067,8 @@ def _reach_page_view(
     saved_events: list[dict[str, Any]],
     requested_status: str | None = None,
     requested_person_id: str | None = None,
+    *,
+    expected_mandate_id: str,
 ) -> dict[str, Any]:
     """Compose the Reach presentation using only existing public projections."""
     plan_rows = list(stakeholder_rows)
@@ -1024,6 +1088,36 @@ def _reach_page_view(
         for person_id in person_ids
         if person_ids.count(person_id) == 1 and _SAFE_IDENTIFIER.fullmatch(person_id)
     }
+    assignment_ids = [
+        str(row.get("_reach_assignment_id") or "") for row in globally_ordered
+    ]
+    binding_person_counts = Counter(person_ids)
+    binding_assignment_counts = Counter(assignment_ids)
+    binding_identity_counts = Counter(
+        (
+            str(row.get("_reach_mandate_id") or ""),
+            str(row.get("_reach_assignment_id") or ""),
+            str(row.get("person_id") or ""),
+        )
+        for row in globally_ordered
+    )
+    exact_rows_by_identity = {
+        identity: row
+        for row in globally_ordered
+        if (
+            identity := (
+                str(row.get("_reach_mandate_id") or ""),
+                str(row.get("_reach_assignment_id") or ""),
+                str(row.get("person_id") or ""),
+            )
+        )[0]
+        == expected_mandate_id
+        and identity[1]
+        and identity[2] in exact_public_person_ids
+        and binding_person_counts[identity[2]] == 1
+        and binding_assignment_counts[identity[1]] == 1
+        and binding_identity_counts[identity] == 1
+    }
 
     replay: list[dict[str, Any]] = []
     indexed_events = list(enumerate(saved_events))
@@ -1037,9 +1131,19 @@ def _reach_page_view(
             if isinstance(person, Mapping)
             else ""
         )
-        if person_id in exact_public_person_ids:
-            highlight = person_id
-        elif person is None:
+        assignment_id = str(event.get("_reach_assignment_id") or "")
+        event_mandate_id = str(event.get("_reach_mandate_id") or "")
+        identity = (event_mandate_id, assignment_id, person_id)
+        bound_row = exact_rows_by_identity.get(identity)
+        bound_person_id = str(bound_row.get("person_id") or "") if bound_row else ""
+        if bound_person_id:
+            highlight = bound_person_id
+        elif (
+            not assignment_id
+            and not person_id
+            and event_mandate_id == expected_mandate_id
+            and str(event.get("event_type") or "") in _MANDATE_LEVEL_EVENT_TYPES
+        ):
             highlight = "origin"
         else:
             highlight = "none"
@@ -1067,7 +1171,7 @@ def _reach_page_view(
                     else ""
                 ),
                 "highlight": highlight,
-                "person_id": person_id if person_id in exact_public_person_ids else None,
+                "person_id": bound_person_id or None,
             }
         )
 
@@ -1694,10 +1798,11 @@ def create_app(
         view = safe_projection(
             lambda: _reach_page_view(
                 _mandate_detail(repository, mandate),
-                _stakeholders(repository, mandate),
-                _events(repository, mandate),
+                _stakeholders(repository, mandate, include_reach_identity=True),
+                _events(repository, mandate, include_reach_identity=True),
                 requested_status,
                 requested_person_id,
+                expected_mandate_id=str(mandate.mandate_id),
             ),
             mandate,
         )

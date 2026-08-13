@@ -191,6 +191,7 @@ def _event(
     previous_state: str | None = None,
     new_state: str | None = None,
     actor_id: str | None = None,
+    assignment_id: UUID | None = None,
     metadata: dict[str, str] | None = None,
 ) -> DomainEvent:
     return DomainEvent(
@@ -198,6 +199,7 @@ def _event(
         created_at=mandate.created_at + timedelta(minutes=index),
         idempotency_key=f"demo-event-{mandate.token.lower()}-{index:02d}",
         actor_id=mandate.initiator_id if index == 0 else actor_id,
+        assignment_id=assignment_id,
         person_id=person_id,
         department=department,
         direction=direction,
@@ -383,6 +385,7 @@ def _seed_primary(repository: SqlAlchemyHumanWireRepository) -> None:
                 )
             )
 
+    by_person = {item.person_id: item for item in assignments}
     events = [
         (0, "mandate.created", None, None, None, None, "received", "planned"),
         (1, "engagement.plan_previewed", None, None, None, None, "planned", "planned"),
@@ -409,6 +412,9 @@ def _seed_primary(repository: SqlAlchemyHumanWireRepository) -> None:
                 mandate,
                 index,
                 event_type,
+                assignment_id=(
+                    by_person[person_id].assignment_id if person_id is not None else None
+                ),
                 person_id=person_id,
                 department=department,
                 direction=direction,
@@ -424,7 +430,6 @@ def _seed_primary(repository: SqlAlchemyHumanWireRepository) -> None:
         ("apac", "sora-kim", EvidenceVisibility.SHAREABLE, EvidenceType.COMMITMENT, "The APAC lead confirmed the launch handoff."),
         ("private", "priya-shah", EvidenceVisibility.PRIVATE, EvidenceType.CONSTRAINT, "Private medical leave details must remain confidential."),
     ]
-    by_person = {item.person_id: item for item in assignments}
     for offset, (label, person_id, visibility, evidence_type, statement) in enumerate(
         evidence_specs, start=20
     ):
@@ -603,6 +608,7 @@ def _seed_meeting_ready(repository: SqlAlchemyHumanWireRepository) -> None:
             mandate,
             30,
             "meeting.package_created",
+            assignment_id=assignment.assignment_id,
             person_id="maya-chen",
             department="Executive",
             direction=Direction.UPWARD,
