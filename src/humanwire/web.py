@@ -81,6 +81,7 @@ _ENUM_FIELDS = {
         "acknowledged",
         "approved",
         "awaiting acknowledgement",
+        "awaiting confirmation",
         "awaiting response",
         "change requested",
         "complete",
@@ -118,6 +119,7 @@ _STATUS_LABELS = {
     "acknowledged": "Acknowledged",
     "approved": "Approved",
     "awaiting acknowledgement": "Awaiting acknowledgement",
+    "awaiting confirmation": "Awaiting confirmation",
     "awaiting response": "Awaiting response",
     "change requested": "Change requested",
     "complete": "Complete",
@@ -335,6 +337,8 @@ def _assignment_projection(
     planned: PlannedStakeholder | None,
     decisions: dict[Any, Any],
     event_channel: Channel | None = None,
+    evidence: tuple[Any, ...] | list[Any] = (),
+    events: tuple[Any, ...] | list[Any] = (),
 ) -> dict[str, Any]:
     interview = interviews.get(assignment.interview_id)
     if not (
@@ -373,6 +377,42 @@ def _assignment_projection(
         planned,
         decision,
     )
+    answer_prefix = f"interview:{assignment.assignment_id}:answer:"
+    answer_sources = {
+        event.idempotency_key.removeprefix(answer_prefix)
+        for event in events
+        if event.event_type == "interview.answer_recorded"
+        and event.assignment_id == assignment.assignment_id
+        and event.person_id == assignment.person_id
+        and event.idempotency_key.startswith(answer_prefix)
+    }
+    confirmation_proven = any(
+        event.event_type == "interview.evidence_confirmed"
+        and event.assignment_id == assignment.assignment_id
+        and event.person_id == assignment.person_id
+        and interview is not None
+        and event.channel is interview.current_channel
+        and event.metadata.get("evidence_count", 0) > 0
+        for event in events
+    )
+    answer_evidence = [
+        item
+        for item in evidence
+        if item.mandate_id == assignment.mandate_id
+        and item.assignment_id == assignment.assignment_id
+        and item.stakeholder_id == assignment.person_id
+        and item.source_message_id in answer_sources
+    ]
+    evidence_confirmed = confirmation_proven and any(
+        item.status is EvidenceStatus.CONFIRMED for item in answer_evidence
+    ) and not any(item.status is EvidenceStatus.ASSERTED for item in answer_evidence)
+    if (
+        assignment.engagement_type
+        in {EngagementType.QUICK_RESPONSE, EngagementType.STRUCTURED_INTERVIEW}
+        and assignment.state is StakeholderState.COMPLETE
+        and not evidence_confirmed
+    ):
+        engagement_status = "awaiting confirmation"
     return {
         **_person(repository, assignment.person_id),
         "department": redact_sensitive(assignment.department),
@@ -382,6 +422,7 @@ def _assignment_projection(
         "engagement_type": assignment.engagement_type.value,
         "response_required": assignment.response_required,
         "engagement_status": engagement_status,
+        "evidence_confirmed": evidence_confirmed,
         "progress_current": progress_current,
         "progress_total": progress_total,
         "state": assignment.state.value,
@@ -574,6 +615,8 @@ def _stakeholders(
         item.assignment_id: item
         for item in repository.list_engagement_decisions(mandate.mandate_id)
     }
+    evidence = repository.list_evidence(mandate.mandate_id)
+    events = repository.list_events(mandate.mandate_id)
     person_counts = Counter(item.person_id for item in assignments)
     assignment_counts = Counter(str(item.assignment_id) for item in assignments)
     exact_assignments = {
@@ -584,7 +627,7 @@ def _stakeholders(
         and assignment_counts[str(item.assignment_id)] == 1
     }
     event_channels: dict[Any, Channel] = {}
-    for event in repository.list_events(mandate.mandate_id):
+    for event in events:
         identity = (
             str(mandate.mandate_id),
             str(event.assignment_id) if event.assignment_id is not None else "",
@@ -613,6 +656,8 @@ def _stakeholders(
             planned.get(assignment.person_id),
             decisions,
             event_channels.get(assignment.assignment_id),
+            evidence,
+            events,
         )
         if include_reach_identity:
             row["_reach_mandate_id"] = str(assignment.mandate_id)
@@ -884,10 +929,12 @@ def _outreach_rows(
         if decision_counts[str(item.assignment_id)] == 1
     }
     planned = {item.person_ref: item for item in mandate.plan.stakeholders}
+    evidence = repository.list_evidence(mandate.mandate_id)
+    events = repository.list_events(mandate.mandate_id)
     state_values = _ENUM_FIELDS["previous_state"]
     channel_values = _ENUM_FIELDS["channel"]
     rows: list[dict[str, Any]] = []
-    for event in repository.list_events(mandate.mandate_id):
+    for event in events:
         identity = (
             str(mandate.mandate_id),
             str(event.assignment_id) if event.assignment_id is not None else "",
@@ -902,6 +949,8 @@ def _outreach_rows(
                 interviews,
                 planned.get(assignment.person_id),
                 decisions,
+                evidence=evidence,
+                events=events,
             )
             engagement_status = _safe_enum_value(
                 projection.get("engagement_status"),
@@ -1210,10 +1259,15 @@ def _engagement_ladder(row: Mapping[str, Any]) -> list[dict[str, str]]:
                 else "Pending"
             ),
         )
+        confirmed = bool(row.get("evidence_confirmed"))
         add(
             "Confirmation",
-            "complete" if response_complete else "pending",
-            _short_datetime(row.get("completed_at")) if response_complete else "Pending",
+            "complete" if confirmed else "current" if response_complete else "pending",
+            (
+                _short_datetime(row.get("completed_at"))
+                if confirmed
+                else "Awaiting CONFIRM" if response_complete else "Pending"
+            ),
         )
         return finish()
 
@@ -1245,7 +1299,12 @@ def _engagement_ladder(row: Mapping[str, Any]) -> list[dict[str, str]]:
 def _filter_groups(row: Mapping[str, Any]) -> str:
     status = str(row.get("engagement_status") or "")
     groups: list[str] = []
-    if status in {"in progress", "awaiting response", "awaiting acknowledgement"}:
+    if status in {
+        "in progress",
+        "awaiting response",
+        "awaiting acknowledgement",
+        "awaiting confirmation",
+    }:
         groups.append("in-progress")
     if status in {"complete", "acknowledged", "approved", "recorded", "delivered"}:
         groups.append("completed")

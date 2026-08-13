@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import exists, insert, select, update
+from sqlalchemy import exists, insert, literal, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -491,6 +491,7 @@ _EVENT_INTEGER_KEYS = frozenset(
         "attempt",
         "attempt_count",
         "duration_ms",
+        "evidence_count",
         "question_index",
         "round_number",
         "route_index",
@@ -1094,6 +1095,112 @@ class RepositoryUnitOfWork:
 
     def add_evidence(self, evidence: EvidenceItem) -> None:
         self._session.add(_evidence_record(evidence))
+
+    def confirm_interview_evidence(
+        self,
+        assignment: StakeholderAssignment,
+        interview: InterviewSession,
+        now: datetime,
+    ) -> int:
+        """Promote one completed, correlated interview's asserted evidence atomically."""
+        if (
+            assignment.state is not StakeholderState.COMPLETE
+            or assignment.engagement_type
+            not in {
+                EngagementType.QUICK_RESPONSE,
+                EngagementType.STRUCTURED_INTERVIEW,
+            }
+            or assignment.interview_id != interview.session_id
+            or interview.mandate_id != assignment.mandate_id
+            or interview.assignment_id != assignment.assignment_id
+            or interview.completed_at is None
+            or interview.current_channel is None
+            or interview.current_route_id is None
+            or interview.current_conversation_id is None
+        ):
+            return 0
+        active_mandate = exists().where(
+            MandateRecord.mandate_id == str(assignment.mandate_id),
+            MandateRecord.state == MandateState.INTERVIEWING.value,
+            MandateRecord.expires_at > now,
+        )
+        exact_assignment = exists().where(
+                StakeholderAssignmentRecord.assignment_id
+                == str(assignment.assignment_id),
+                StakeholderAssignmentRecord.mandate_id
+                == str(assignment.mandate_id),
+                StakeholderAssignmentRecord.person_id == assignment.person_id,
+                StakeholderAssignmentRecord.department == assignment.department,
+                StakeholderAssignmentRecord.direction == assignment.direction.value,
+                StakeholderAssignmentRecord.reason == assignment.reason,
+                StakeholderAssignmentRecord.required == assignment.required,
+                StakeholderAssignmentRecord.state == StakeholderState.COMPLETE.value,
+                StakeholderAssignmentRecord.engagement_type
+                == assignment.engagement_type.value,
+                StakeholderAssignmentRecord.response_required
+                == assignment.response_required,
+                StakeholderAssignmentRecord.route_ids == assignment.route_ids,
+                StakeholderAssignmentRecord.active_route_index
+                == assignment.active_route_index,
+                StakeholderAssignmentRecord.attempt_count == assignment.attempt_count,
+                StakeholderAssignmentRecord.interview_id == str(interview.session_id),
+                StakeholderAssignmentRecord.first_contact_at
+                == assignment.first_contact_at,
+                StakeholderAssignmentRecord.last_delivery_at
+                == assignment.last_delivery_at,
+                StakeholderAssignmentRecord.next_action_at
+                == assignment.next_action_at,
+                StakeholderAssignmentRecord.acknowledged_at
+                == assignment.acknowledged_at,
+                StakeholderAssignmentRecord.completed_at == assignment.completed_at,
+                StakeholderAssignmentRecord.failure_reason == assignment.failure_reason,
+            )
+        exact_interview = exists().where(
+            InterviewSessionRecord.session_id == str(interview.session_id),
+            InterviewSessionRecord.mandate_id == str(interview.mandate_id),
+            InterviewSessionRecord.assignment_id == str(interview.assignment_id),
+            InterviewSessionRecord.stakeholder_person_id == assignment.person_id,
+            InterviewSessionRecord.questions == interview.questions,
+            InterviewSessionRecord.current_question_index
+            == interview.current_question_index,
+            InterviewSessionRecord.current_channel == interview.current_channel.value,
+            InterviewSessionRecord.current_route_id == interview.current_route_id,
+            InterviewSessionRecord.current_conversation_id
+            == interview.current_conversation_id,
+            InterviewSessionRecord.channel_history
+            == [channel.value for channel in interview.channel_history],
+            InterviewSessionRecord.default_visibility
+            == interview.default_visibility.value,
+            InterviewSessionRecord.acknowledged_at == interview.acknowledged_at,
+            InterviewSessionRecord.started_at == interview.started_at,
+            InterviewSessionRecord.updated_at == interview.updated_at,
+            InterviewSessionRecord.completed_at == interview.completed_at,
+        )
+        exact_answer_event = exists().where(
+            DomainEventRecord.mandate_id == str(assignment.mandate_id),
+            DomainEventRecord.assignment_id == str(assignment.assignment_id),
+            DomainEventRecord.person_id == assignment.person_id,
+            DomainEventRecord.event_type == "interview.answer_recorded",
+            DomainEventRecord.idempotency_key
+            == literal(f"interview:{assignment.assignment_id}:answer:")
+            + EvidenceItemRecord.source_message_id,
+        )
+        result = self._session.execute(
+            update(EvidenceItemRecord)
+            .where(
+                EvidenceItemRecord.mandate_id == str(assignment.mandate_id),
+                EvidenceItemRecord.assignment_id == str(assignment.assignment_id),
+                EvidenceItemRecord.stakeholder_id == assignment.person_id,
+                EvidenceItemRecord.status == EvidenceStatus.ASSERTED.value,
+                active_mandate,
+                exact_assignment,
+                exact_interview,
+                exact_answer_event,
+            )
+            .values(status=EvidenceStatus.CONFIRMED.value)
+            .execution_options(synchronize_session=False)
+        )
+        return result.rowcount
 
     def add_issue(self, issue: AlignmentIssue) -> None:
         self._session.add(_issue_record(issue))

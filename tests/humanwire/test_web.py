@@ -215,11 +215,11 @@ def test_data_table_json_csv_share_canonical_rows_and_order(web_client) -> None:
 @pytest.mark.parametrize(
     ("filter_name", "filter_value", "expected_count"),
     [
-        ("engagement_type", "quick_response", 4),
-        ("engagement_status", "complete", 4),
+        ("engagement_type", "quick_response", 8),
+        ("engagement_status", "complete", 8),
         ("department", "People", 4),
         ("person_id", "priya-shah", 4),
-        ("channel", "telegram", 4),
+        ("channel", "telegram", 6),
         ("direction", "lateral", 4),
         ("event_type", "engagement.quick_response_sent", 2),
         ("timestamp_from", "2026-08-11T15:15:00+00:00", 1),
@@ -954,7 +954,7 @@ def test_data_table_template_is_semantic_labelled_read_only_and_package_local(
         "Persisted, redacted outreach activity suitable for technical review and "
         "external BI import."
     ) in html
-    assert "16 saved events" in html
+    assert "20 saved events" in html
     assert "Last updated" in html
     assert '<form method="get"' in html.lower()
     assert html.lower().count("<label") == 9
@@ -1716,7 +1716,7 @@ def test_reach_replay_uses_every_saved_event_in_persisted_order(web_client) -> N
         html,
     )
 
-    assert len(replay_items) == len(events) == 16
+    assert len(replay_items) == len(events) == 20
     assert [created for created, _target in replay_items] == [
         event["timestamp"] for event in events
     ]
@@ -1724,8 +1724,8 @@ def test_reach_replay_uses_every_saved_event_in_persisted_order(web_client) -> N
         (events[index]["timestamp"], "origin") for index in range(4)
     ]
     assert replay_items[4][1] == "eli-torres"
-    assert "16 persisted events" in html
-    assert "Event 1 of 16" in html
+    assert "20 persisted events" in html
+    assert "Event 1 of 20" in html
     assert 'aria-label="Previous saved event"' in html
     assert 'aria-label="Play saved events"' in html
     assert 'aria-label="Next saved event"' in html
@@ -1820,7 +1820,7 @@ def test_reach_binds_history_and_highlights_only_to_exact_event_identity(demo_ap
     assert {replay_by_time[value]["highlight"] for value in probe_times} == {"none"}
     assert probe_times.isdisjoint(histories)
     assert maya["channel_label"] == "Email"
-    assert len(view["replay"]) == len(repository.list_events(mandate.mandate_id)) == 21
+    assert len(view["replay"]) == len(repository.list_events(mandate.mandate_id)) == 25
     assert [item["created_at"] for item in view["replay"]] == [
         item.created_at.isoformat()
         for item in repository.list_events(mandate.mandate_id)
@@ -1904,7 +1904,7 @@ def test_reach_origin_wrong_mandate_and_private_binding_identifiers_fail_safe(
     ).json()
     serialized = html + json.dumps(public_events) + json.dumps(primary_view)
 
-    assert len(primary_view["replay"]) == 16
+    assert len(primary_view["replay"]) == 20
     assert aligned_view["replay"][-1]["highlight"] == "none"
     assert [item["highlight"] for item in primary_view["replay"][:4]] == [
         "origin",
@@ -3433,3 +3433,37 @@ def test_ics_rejects_removed_attendee_or_altered_package_fields(demo_app, update
     response = TestClient(demo_app).get("/mandates/HW-2413/meeting.ics")
 
     assert response.status_code == 404
+
+
+def test_interview_ladder_waits_for_exact_evidence_confirmation() -> None:
+    base = {
+        "engagement_type": "structured_interview",
+        "engagement_status": "complete",
+        "state": "complete",
+        "attempt_count": 1,
+        "first_contact_at": NOW.isoformat(),
+        "acknowledged_at": NOW.isoformat(),
+        "completed_at": NOW.isoformat(),
+        "progress_current": 3,
+        "progress_total": 3,
+        "channel_is_alternate": True,
+        "channel": "telegram",
+    }
+
+    awaiting = web_projection._engagement_ladder(
+        base | {"evidence_confirmed": False}
+    )
+    confirmed = web_projection._engagement_ladder(
+        base | {"evidence_confirmed": True}
+    )
+
+    assert awaiting[-1] == {
+        "label": "Confirmation",
+        "status": "current",
+        "detail": "Awaiting CONFIRM",
+    }
+    assert confirmed[-1] == {
+        "label": "Confirmation",
+        "status": "complete",
+        "detail": web_projection._short_datetime(NOW.isoformat()),
+    }

@@ -1,9 +1,27 @@
 import json
 
+import pytest
 from fastapi.testclient import TestClient
 
 from humanwire.demo import create_demo_app
-from humanwire.domain import EngagementDecisionKind, EngagementType, StakeholderState
+from humanwire.domain import (
+    EngagementDecisionKind,
+    EngagementType,
+    StakeholderState,
+)
+
+SMOKE_OUTPUT = """PASS domain
+PASS adaptive-engagement
+PASS preview-override
+PASS cross-channel-interview
+PASS explicit-approval
+PASS negotiation-limit
+PASS meeting-package
+PASS decision-room
+PASS propagation-lanes
+PASS analytics-export
+PASS privacy-scan
+"""
 
 
 def test_demo_is_deterministic_isolated_and_ready_without_local_configuration(
@@ -276,3 +294,68 @@ def test_secondary_demo_cases_have_consistent_typed_authority_facts() -> None:
         EngagementDecisionKind.REJECT,
         EngagementDecisionKind.CHANGE,
     }
+
+
+def test_smoke_prints_only_the_exact_safe_product_proof(capsys) -> None:
+    from scripts.smoke_humanwire import main
+
+    assert main([]) == 0
+    captured = capsys.readouterr()
+
+    assert captured.out == SMOKE_OUTPUT
+    assert captured.err == ""
+
+
+def test_live_checklist_requires_confirmation_and_has_no_side_effects(
+    capsys, monkeypatch
+) -> None:
+    import scripts.smoke_humanwire as smoke
+
+    def fail_if_offline_proof_runs(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("live checklist must not run or mutate the offline proof")
+
+    monkeypatch.setattr(smoke, "run_offline_proof", fail_if_offline_proof_runs)
+
+    assert smoke.main(["--live"]) != 0
+    refused = capsys.readouterr()
+    assert "--confirm-live" in refused.err
+    assert refused.out == ""
+
+    assert smoke.main(["--live", "--confirm-live"]) == 0
+    checklist = capsys.readouterr()
+    assert checklist.err == ""
+    assert "operator checklist only" in checklist.out.casefold()
+    assert "does not transmit" in checklist.out.casefold()
+    for step in (
+        "manager mandate",
+        "preview, override, and release",
+        "delivery acknowledgement",
+        "quick and structured replies",
+        "cross-channel continuation",
+        "explicit decision",
+        "bounded proposal rounds",
+        "availability",
+        "meeting package",
+        "UI, API, and CSV inspection",
+        "privacy and log review",
+    ):
+        assert step in checklist.out
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--confirm-live"],
+        ["--unknown"],
+        ["--live", "--live", "--confirm-live"],
+        ["--live", "--confirm-live", "--confirm-live"],
+    ],
+)
+def test_live_checklist_rejects_unsafe_flag_combinations(argv, capsys) -> None:
+    from scripts.smoke_humanwire import main
+
+    assert main(argv) != 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "usage:" in captured.err.casefold() or "--live" in captured.err

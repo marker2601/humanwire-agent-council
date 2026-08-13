@@ -573,3 +573,14 @@ def test_close_stops_open_channels_closes_client_once_and_is_idempotent(
     assert fake_client.close_calls == 1
     assert repository.get_runtime_status("channel.email") == ("stopped", NOW)
     assert repository.get_runtime_status("channel.telegram") == ("stopped", NOW)
+
+
+def test_adaptive_product_flow_uses_one_real_handler_across_channels(tmp_path) -> None:
+    from scripts.smoke_humanwire import run_offline_proof
+
+    proof = run_offline_proof(tmp_path)
+
+    assert proof.gateway_handler_count == 1
+    assert proof.gateway_channels == ("email", "telegram")
+    assert proof.provider_callback_count > 0
+    assert proof.provider_failure_safe is True

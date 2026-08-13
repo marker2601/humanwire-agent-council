@@ -19,6 +19,9 @@ PROPOSAL = re.compile(
 ACKNOWLEDGEMENT = re.compile(
     rf"^ACK[ \t]+(?P<token>{TOKEN})$", ASCII_CASE_INSENSITIVE
 )
+CONFIRMATION = re.compile(
+    rf"^CONFIRM[ \t]+(?P<token>{TOKEN})$", ASCII_CASE_INSENSITIVE
+)
 ENGAGEMENT_DECISION = re.compile(
     rf"^DECIDE[ \t]+(?P<token>{TOKEN})[ \t]+"
     r"(?P<answer>APPROVE|REJECT|CHANGE)(?:[ \t]+(?P<change>[^\r\n].*))?$",
@@ -64,6 +67,11 @@ class AcknowledgeCommand:
 
 
 @dataclass(frozen=True)
+class ConfirmCommand:
+    token: str
+
+
+@dataclass(frozen=True)
 class GoCommand:
     token: str
 
@@ -105,6 +113,7 @@ type ParsedCommand = (
     | StatusCommand
     | CancelCommand
     | AcknowledgeCommand
+    | ConfirmCommand
     | GoCommand
     | EngageCommand
     | ProposalResponseCommand
@@ -128,6 +137,8 @@ def parse_command(text: str) -> ParsedCommand:
         )
     if match := ACKNOWLEDGEMENT.fullmatch(source):
         return AcknowledgeCommand(token=match.group("token").upper())
+    if strict_ascii_command and (match := CONFIRMATION.fullmatch(ascii_command_source)):
+        return ConfirmCommand(token=match.group("token").upper())
     if strict_ascii_command and (match := GO.fullmatch(ascii_command_source)):
         return GoCommand(token=match.group("token").upper())
     if strict_ascii_command and (match := ENGAGE.fullmatch(ascii_command_source)):

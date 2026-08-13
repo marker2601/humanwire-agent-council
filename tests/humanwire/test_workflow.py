@@ -561,7 +561,7 @@ def _complete_interview(
             statement="An authenticated contribution was confirmed.",
             visibility=EvidenceVisibility.SHAREABLE,
             status=EvidenceStatus.CONFIRMED,
-            source_message_id=f"{prefix}-confirmed-contribution",
+            source_message_id=f"{prefix}-answer",
             channel=Channel.EMAIL,
             created_at=mandate.created_at,
         )
@@ -951,6 +951,543 @@ def _release_selected_mixed_delivery(
                 now=now + timedelta(seconds=2),
             )
     return settings, repository, workflow, mandate, selected
+
+
+def _completed_asserted_interview(workflow, incoming_message_factory, *, prefix):
+    mandate, _ = _create_mandate(
+        workflow,
+        incoming_message_factory,
+        message_id=f"{prefix}-create",
+    )
+    workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"ACK {mandate.token}",
+            message_id=f"{prefix}-ack",
+        )
+    )
+    completed = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            "PRIVATE: PRIVATE-CONFIRMATION-SENTINEL",
+            message_id=f"{prefix}-answer",
+        )
+    )
+    return mandate, completed
+
+
+def test_evidence_confirmation_is_exact_safe_and_idempotent(
+    repository, incoming_message_factory
+) -> None:
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, completed = _completed_asserted_interview(
+        workflow, incoming_message_factory, prefix="confirmation"
+    )
+    assignment = repository.list_assignments(mandate.mandate_id)[0]
+    asserted = repository.list_evidence(mandate.mandate_id)
+
+    assert repository.get_mandate_by_token(mandate.token).state is MandateState.INTERVIEWING
+    assert assignment.state is StakeholderState.COMPLETE
+    assert len(asserted) == 1 and asserted[0].status is EvidenceStatus.ASSERTED
+    assert completed.deliveries[0].text == (
+        f"HUMANWIRE EVIDENCE CONFIRMATION · {mandate.token}\n\n"
+        f"Review your recorded response, then reply CONFIRM {mandate.token}."
+    )
+
+    unrelated = asserted[0].model_copy(
+        update={
+            "evidence_id": uuid4(),
+            "source_message_id": "unrelated-same-assignment-source",
+            "statement": "An unrelated asserted row must remain unconfirmed.",
+        }
+    )
+    repository.add_evidence(unrelated)
+
+    before = _terminal_snapshot(repository, mandate)
+    rejected = [
+        workflow.handle(
+            _message_for(
+                incoming_message_factory,
+                "team-lead",
+                "CONFIRM HW-FFFFFFFF",
+                message_id="confirmation-wrong-token",
+            )
+        ),
+        workflow.handle(
+            _message_for(
+                incoming_message_factory,
+                "manager",
+                f"CONFIRM {mandate.token}",
+                message_id="confirmation-wrong-person",
+            )
+        ),
+        workflow.handle(
+            _message_for(
+                incoming_message_factory,
+                "team-lead",
+                f"CONFIRM {mandate.token}",
+                conversation_id="wrong-thread",
+                message_id="confirmation-wrong-route",
+            )
+        ),
+    ]
+    assert all(result.deliveries == [] for result in rejected)
+    assert _terminal_snapshot(repository, mandate) == before
+
+    message = _message_for(
+        incoming_message_factory,
+        "team-lead",
+        f"CONFIRM {mandate.token}",
+        message_id="confirmation-correct",
+    )
+    confirmed = workflow.handle(message)
+
+    evidence = repository.list_evidence(mandate.mandate_id)
+    events = repository.list_events(mandate.mandate_id)
+    confirmation_events = [
+        event for event in events if event.event_type == "interview.evidence_confirmed"
+    ]
+    by_source = {item.source_message_id: item for item in evidence}
+    assert by_source[asserted[0].source_message_id].status is EvidenceStatus.CONFIRMED
+    assert by_source[unrelated.source_message_id].status is EvidenceStatus.ASSERTED
+    assert len(confirmation_events) == 1
+    assert confirmation_events[0].assignment_id == assignment.assignment_id
+    assert confirmation_events[0].person_id == assignment.person_id
+    assert confirmation_events[0].channel is Channel.EMAIL
+    assert confirmation_events[0].metadata == {"evidence_count": 1}
+    safe_text = "\n".join(
+        [
+            *(delivery.text for delivery in confirmed.deliveries),
+            *(event.model_dump_json() for event in events),
+        ]
+    )
+    assert "PRIVATE-CONFIRMATION-SENTINEL" not in safe_text
+
+    confirmed_snapshot = _terminal_snapshot(repository, mandate)
+    replay = workflow.handle(message)
+    assert replay.deliveries == []
+    assert _terminal_snapshot(repository, mandate) == confirmed_snapshot
+
+
+def test_evidence_confirmation_rejects_incomplete_noninterview_and_terminal_work(
+    repository, incoming_message_factory
+) -> None:
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _create_mandate(
+        workflow,
+        incoming_message_factory,
+        message_id="confirmation-incomplete-create",
+    )
+    before = _terminal_snapshot(repository, mandate)
+    incomplete = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"CONFIRM {mandate.token}",
+            message_id="confirmation-incomplete",
+        )
+    )
+    assert incomplete.deliveries == []
+    assert _terminal_snapshot(repository, mandate) == before
+
+    terminal, _ = _completed_asserted_interview(
+        workflow,
+        incoming_message_factory,
+        prefix="confirmation-terminal",
+    )
+    workflow.handle(
+        incoming_message_factory(
+            text=f"/cancel {terminal.token}",
+            message_id="confirmation-terminal-cancel",
+        )
+    )
+    terminal_before = _terminal_snapshot(repository, terminal)
+    rejected = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"CONFIRM {terminal.token}",
+            message_id="confirmation-terminal-confirm",
+        )
+    )
+    assert rejected.deliveries == []
+    assert _terminal_snapshot(repository, terminal) == terminal_before
+
+    mixed = _build_mixed_workflow(repository)
+    message, mixed_mandate, _ = _mixed_preview(
+        mixed,
+        incoming_message_factory,
+        message_id="confirmation-noninterview-create",
+    )
+    mixed.handle(
+        message.model_copy(
+            update={
+                "text": f"GO {mixed_mandate.token}",
+                "message_id": "confirmation-noninterview-go",
+            }
+        )
+    )
+    noninterview_before = _terminal_snapshot(repository, mixed_mandate)
+    noninterview = mixed.handle(
+        incoming_message_factory(
+            text=f"CONFIRM {mixed_mandate.token}",
+            sender_address="ack-person@private.example.test",
+            channel=Channel.EMAIL,
+            conversation_id="ack-person-thread",
+            message_id="confirmation-noninterview",
+        )
+    )
+    assert noninterview.deliveries == []
+    assert _terminal_snapshot(repository, mixed_mandate) == noninterview_before
+
+
+def test_file_concurrent_evidence_confirmation_promotes_once(
+    tmp_path, incoming_message_factory
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'evidence-confirmation.sqlite3').as_posix()}"
+    repository = SqlAlchemyHumanWireRepository(create_session_factory(database_url))
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _completed_asserted_interview(
+        workflow,
+        incoming_message_factory,
+        prefix="confirmation-race",
+    )
+    workflows = [
+        _build_workflow(
+            SqlAlchemyHumanWireRepository(create_session_factory(database_url)),
+            lead_email_thread="lead-thread",
+        )
+        for _ in range(2)
+    ]
+    messages = [
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"CONFIRM {mandate.token}",
+            message_id=f"confirmation-race-{index}",
+        )
+        for index in range(2)
+    ]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda pair: pair[0].handle(pair[1]),
+                zip(workflows, messages),
+            )
+        )
+
+    evidence = repository.list_evidence(mandate.mandate_id)
+    confirmation_events = [
+        event
+        for event in repository.list_events(mandate.mandate_id)
+        if event.event_type == "interview.evidence_confirmed"
+    ]
+    assert len(evidence) == 1 and evidence[0].status is EvidenceStatus.CONFIRMED
+    assert len(confirmation_events) == 1
+    assert sum(bool(result.deliveries) for result in results) == 1
+
+
+@pytest.mark.parametrize(
+    "terminal_state", [MandateState.CANCELLED, MandateState.EXPIRED]
+)
+def test_terminal_first_evidence_confirmation_race_is_inert(
+    tmp_path,
+    incoming_message_factory,
+    now,
+    monkeypatch,
+    terminal_state,
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / f'confirm-{terminal_state.value}.sqlite3').as_posix()}"
+    repository = SqlAlchemyHumanWireRepository(create_session_factory(database_url))
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _completed_asserted_interview(
+        workflow,
+        incoming_message_factory,
+        prefix=f"confirmation-{terminal_state.value}",
+    )
+    terminal_at = mandate.expires_at if terminal_state is MandateState.EXPIRED else now
+    evidence_before = repository.list_evidence(mandate.mandate_id)
+    events_before = repository.list_events(mandate.mandate_id)
+    raced = _terminal_wins_before_next_transaction(
+        repository,
+        monkeypatch,
+        mandate.mandate_id,
+        terminal_state,
+        terminal_at,
+    )
+
+    result = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"CONFIRM {mandate.token}",
+            message_id=f"confirmation-terminal-race-{terminal_state.value}",
+        )
+    )
+
+    assert raced()
+    assert result == WorkflowResult()
+    assert repository.get_mandate_by_token(mandate.token).state is terminal_state
+    assert repository.list_evidence(mandate.mandate_id) == evidence_before
+    assert repository.list_events(mandate.mandate_id) == events_before
+
+
+def test_stale_assignment_snapshot_cannot_confirm_evidence(
+    repository, incoming_message_factory, monkeypatch
+) -> None:
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _completed_asserted_interview(
+        workflow, incoming_message_factory, prefix="confirmation-stale-assignment"
+    )
+    assignment = repository.list_assignments(mandate.mandate_id)[0]
+    original_transaction = repository.transaction
+
+    @contextmanager
+    def mutate_assignment_first():
+        current = repository.get_assignment(assignment.assignment_id)
+        assert current is not None
+        with original_transaction() as winner:
+            winner.save_assignment(
+                current.model_copy(update={"attempt_count": current.attempt_count + 1})
+            )
+        with original_transaction() as unit:
+            yield unit
+
+    monkeypatch.setattr(repository, "transaction", mutate_assignment_first)
+    evidence_before = repository.list_evidence(mandate.mandate_id)
+    events_before = repository.list_events(mandate.mandate_id)
+
+    result = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"CONFIRM {mandate.token}",
+            message_id="confirmation-stale-assignment-confirm",
+        )
+    )
+
+    assert result == WorkflowResult()
+    assert repository.list_evidence(mandate.mandate_id) == evidence_before
+    assert repository.list_events(mandate.mandate_id) == events_before
+
+
+def test_stale_interview_correlation_cannot_confirm_evidence(
+    repository, incoming_message_factory, monkeypatch
+) -> None:
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    mandate, _ = _completed_asserted_interview(
+        workflow, incoming_message_factory, prefix="confirmation-stale-session"
+    )
+    session = repository.list_interviews(mandate.mandate_id)[0]
+    original_transaction = repository.transaction
+
+    @contextmanager
+    def mutate_session_first():
+        with original_transaction() as winner:
+            winner.save_interview(
+                session.model_copy(update={"current_conversation_id": "new-current-thread"})
+            )
+        with original_transaction() as unit:
+            yield unit
+
+    monkeypatch.setattr(repository, "transaction", mutate_session_first)
+    evidence_before = repository.list_evidence(mandate.mandate_id)
+    events_before = repository.list_events(mandate.mandate_id)
+
+    result = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"CONFIRM {mandate.token}",
+            message_id="confirmation-stale-session-confirm",
+        )
+    )
+
+    assert result == WorkflowResult()
+    assert repository.list_evidence(mandate.mandate_id) == evidence_before
+    assert repository.list_events(mandate.mandate_id) == events_before
+
+
+def test_confirmation_without_asserted_answer_evidence_is_inert(
+    repository, incoming_message_factory
+) -> None:
+    class EmptyEvidenceExtractor:
+        def extract(self, *args, **kwargs):
+            del args, kwargs
+            return []
+
+    workflow = _build_workflow(repository, lead_email_thread="lead-thread")
+    workflow.engagements.interviews.evidence_extractor = EmptyEvidenceExtractor()
+    mandate, _ = _completed_asserted_interview(
+        workflow, incoming_message_factory, prefix="confirmation-no-evidence"
+    )
+    events_before = repository.list_events(mandate.mandate_id)
+
+    result = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"CONFIRM {mandate.token}",
+            message_id="confirmation-no-evidence-confirm",
+        )
+    )
+
+    assert result == WorkflowResult()
+    assert repository.list_evidence(mandate.mandate_id) == []
+    assert repository.list_events(mandate.mandate_id) == events_before
+
+
+def test_optional_unconfirmed_interview_does_not_block_ready_required_work(
+    repository, incoming_message_factory, now
+) -> None:
+    workflow = _build_workflow(
+        repository,
+        person_ids=("team-lead", "vp-people"),
+        optional_people={"vp-people"},
+        lead_email_thread="lead-thread",
+    )
+    mandate, _ = _create_mandate(workflow, incoming_message_factory)
+    assignments = {
+        item.person_id: item for item in repository.list_assignments(mandate.mandate_id)
+    }
+    required = assignments["team-lead"]
+    workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "vp-people",
+            f"ACK {mandate.token}",
+            message_id="optional-boundary-ack",
+        )
+    )
+    ready_required = required.model_copy(
+        update={"state": StakeholderState.COMPLETE, "completed_at": now}
+    )
+    with repository.transaction() as unit:
+        unit.save_assignment(ready_required)
+        unit.add_evidence(
+            EvidenceItem(
+                evidence_id=uuid4(),
+                mandate_id=mandate.mandate_id,
+                assignment_id=required.assignment_id,
+                stakeholder_id=required.person_id,
+                evidence_type=EvidenceType.FACT,
+                statement="Required contribution is ready.",
+                visibility=EvidenceVisibility.SHAREABLE,
+                status=EvidenceStatus.CONFIRMED,
+                source_message_id="optional-boundary-required-source",
+                channel=Channel.EMAIL,
+                created_at=now,
+            )
+        )
+    result = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "vp-people",
+            "An optional asserted answer.",
+            message_id="optional-boundary-answer",
+        )
+    )
+
+    assert repository.get_mandate_by_token(mandate.token).state is MandateState.NEGOTIATING
+    assert repository.get_active_proposal(mandate.mandate_id) is not None
+    assert result.deliveries
+
+
+def test_latest_required_answer_must_be_confirmed_before_synthesis(
+    repository, incoming_message_factory
+) -> None:
+    workflow = _build_workflow(
+        repository,
+        question_count=2,
+        lead_email_thread="lead-thread",
+    )
+    mandate, _ = _create_mandate(workflow, incoming_message_factory)
+    workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"ACK {mandate.token}",
+            message_id="latest-confirmation-ack",
+        )
+    )
+    workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            "The first answer was recorded.",
+            message_id="latest-confirmation-first",
+        )
+    )
+    first = repository.list_evidence(mandate.mandate_id)[0]
+    repository.add_evidence(
+        first.model_copy(
+            update={"evidence_id": uuid4(), "status": EvidenceStatus.CONFIRMED}
+        )
+    )
+
+    completed = workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            "The latest answer still needs confirmation.",
+            message_id="latest-confirmation-second",
+        )
+    )
+
+    assert repository.get_mandate_by_token(mandate.token).state is MandateState.INTERVIEWING
+    assert repository.get_active_proposal(mandate.mandate_id) is None
+    assert completed.deliveries[0].text.endswith(f"CONFIRM {mandate.token}.")
+
+    workflow.handle(
+        _message_for(
+            incoming_message_factory,
+            "team-lead",
+            f"CONFIRM {mandate.token}",
+            message_id="latest-confirmation-confirm",
+        )
+    )
+
+    assert repository.get_mandate_by_token(mandate.token).state is MandateState.NEGOTIATING
+    assert repository.get_active_proposal(mandate.mandate_id) is not None
+    assert all(
+        item.status is EvidenceStatus.CONFIRMED
+        for item in repository.list_evidence(mandate.mandate_id)
+    )
+
+
+def test_adaptive_product_flow_survives_restart_and_keeps_change_blocking(
+    tmp_path,
+) -> None:
+    from scripts.smoke_humanwire import run_offline_proof
+
+    proof = run_offline_proof(tmp_path)
+
+    assert proof.primary_state == "meeting_ready"
+    assert proof.change_state == "partial"
+    assert proof.engagement_types == {
+        "inform",
+        "acknowledge",
+        "quick_response",
+        "structured_interview",
+        "review_approval",
+        "availability",
+    }
+    assert proof.inform_question_count == 0
+    assert proof.ack_interview_count == 0
+    assert proof.quick_question_counts == (1, 1)
+    assert proof.structured_channels == ("email", "telegram")
+    assert proof.review_response == "approve"
+    assert proof.required_contributions == 6
+    assert proof.proposal_rounds == 2
+    assert proof.meeting_package_count == 1
+    assert proof.restart_verified is True
+    assert proof.replay_verified is True
+    assert proof.change_created_proposal is False
+    assert proof.change_created_meeting_package is False
+    assert proof.private_sentinel_absent is True
 
 
 def test_mandate_previews_mixed_engagements_before_release_without_outreach(

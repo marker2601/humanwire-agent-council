@@ -15,6 +15,14 @@ from humanwire.database import create_session_factory
 from humanwire.logging_config import configure_logging
 
 
+class _OnceFlag(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        del values
+        if getattr(namespace, self.dest, False):
+            parser.error(f"{option_string} may be supplied only once")
+        setattr(namespace, self.dest, True)
+
+
 def _safe_database_url(database_url: str) -> str:
     return make_url(database_url).render_as_string(hide_password=True)
 
@@ -56,40 +64,53 @@ def run_web(settings: Settings) -> None:
     uvicorn.run(app, host=settings.dashboard_host, port=settings.dashboard_port)
 
 
-def run_smoke() -> None:
-    from scripts.smoke_check import main as smoke_main
+def run_smoke(argv: Sequence[str] | None = None) -> int:
+    from humanwire.smoke import main as smoke_main
 
-    smoke_main()
+    return smoke_main([] if argv is None else argv)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="humanwire",
-        description="AI chief of staff that interviews the organization",
+        description="AI chief of staff for adaptive human coordination",
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
     subcommands.add_parser("init-db")
     subcommands.add_parser("listen")
     subcommands.add_parser("web")
-    subcommands.add_parser("smoke")
+    smoke = subcommands.add_parser("smoke")
+    smoke.add_argument("--live", nargs=0, action=_OnceFlag, default=False)
+    smoke.add_argument("--confirm-live", nargs=0, action=_OnceFlag, default=False)
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> None:
+def main(argv: Sequence[str] | None = None) -> int:
     configure_logging()
     args = build_parser().parse_args(argv)
+    if args.command == "smoke":
+        smoke_args = [
+            flag
+            for enabled, flag in (
+                (args.live, "--live"),
+                (args.confirm_live, "--confirm-live"),
+            )
+            if enabled
+        ]
+        return run_smoke(smoke_args)
     settings = Settings()
     if args.command == "init-db":
         init_database(settings)
+        return 0
     elif args.command == "listen":
         run_listener(settings)
+        return 0
     elif args.command == "web":
         run_web(settings)
-    elif args.command == "smoke":
-        run_smoke()
+        return 0
     else:
         raise AssertionError(f"Unhandled command: {args.command}")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

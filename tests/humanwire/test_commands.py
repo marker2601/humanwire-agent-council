@@ -5,6 +5,7 @@ from humanwire.commands import (
     AcknowledgeCommand,
     AvailabilityCommand,
     CancelCommand,
+    ConfirmCommand,
     EngageCommand,
     EngagementDecisionCommand,
     FreeTextCommand,
@@ -30,6 +31,7 @@ def test_parses_case_actions_case_insensitively() -> None:
     assert parse_command("/status hw-2411") == StatusCommand(token="HW-2411")
     assert parse_command("/cancel hw-2411") == CancelCommand(token="HW-2411")
     assert parse_command("ACK HW-2411") == AcknowledgeCommand(token="HW-2411")
+    assert parse_command("confirm hw-2411") == ConfirmCommand(token="HW-2411")
     assert parse_command("ACCEPT hw-2411") == ProposalResponseCommand(
         token="HW-2411", response=ProposalResponseKind.ACCEPT, change_text=None
     )
@@ -132,6 +134,23 @@ def test_unstructured_reply_remains_free_text() -> None:
     assert parse_command("We need 72 hours of notice.") == FreeTextCommand(
         text="We need 72 hours of notice."
     )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "CONFIRM HW-2411 now",
+        "CONFIRM HW-12",
+        "\nCONFIRM HW-2411",
+        "CONFIRM HW-2411\n",
+        "CONFÄ°RM HW-2411",
+        "CONFIRM HW-24Ä°1",
+        "CONFIRM\u00a0HW-2411",
+        "CONFIRM HW-2411\u2003",
+    ],
+)
+def test_malformed_or_unicode_confirmation_commands_remain_free_text(text: str) -> None:
+    assert parse_command(text) == FreeTextCommand(text=text)
 
 
 def test_parses_exact_go_and_engage_commands_with_ascii_case_folding() -> None:

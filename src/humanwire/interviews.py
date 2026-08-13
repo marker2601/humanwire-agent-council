@@ -7,7 +7,12 @@ import re
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4
 
-from humanwire.commands import AcknowledgeCommand, AvailabilityCommand, parse_command
+from humanwire.commands import (
+    AcknowledgeCommand,
+    AvailabilityCommand,
+    ConfirmCommand,
+    parse_command,
+)
 from humanwire.config import Settings
 from humanwire.directory import AmbiguousPersonError, OrganizationDirectory, UnknownPersonError
 from humanwire.domain import (
@@ -17,6 +22,7 @@ from humanwire.domain import (
     DeliveryKind,
     DomainEvent,
     EngagementType,
+    EvidenceStatus,
     EvidenceVisibility,
     IncomingMessage,
     InterviewSession,
@@ -27,6 +33,7 @@ from humanwire.domain import (
 from humanwire.evidence import EvidenceExtractor, confirm_drafts
 from humanwire.messages import (
     render_channel_switch,
+    render_evidence_confirmation,
     render_interview_intro,
     render_question,
     render_reminder,
@@ -581,10 +588,89 @@ class InterviewCoordinator:
                     raise ValueError("concurrent exact answer already won")
         except ValueError:
             return WorkflowResult()
+        confirmed_sources = {
+            item.source_message_id
+            for item in self.repository.list_evidence(saved.mandate_id)
+            if item.mandate_id == saved.mandate_id
+            and item.assignment_id == saved.assignment_id
+            and item.stakeholder_id == saved.person_id
+            and item.status is EvidenceStatus.CONFIRMED
+        }
+        if completed and any(
+            item.status is EvidenceStatus.ASSERTED
+            and item.source_message_id not in confirmed_sources
+            for item in evidence
+        ):
+            return WorkflowResult(
+                deliveries=[
+                    self._reply(
+                        message,
+                        render_evidence_confirmation(self._token(saved)),
+                        updated_assignment,
+                    )
+                ]
+            )
         if completed:
             return WorkflowResult()
         return WorkflowResult(
             deliveries=[self._reply(message, render_question(session.questions[next_index], next_index + 1, len(session.questions)), saved)]
+        )
+
+    def confirm_evidence(
+        self,
+        message: IncomingMessage,
+        assignment: StakeholderAssignment,
+        now: datetime,
+    ) -> WorkflowResult:
+        parsed = parse_command(message.text)
+        if (
+            not message.conversation_id.strip()
+            or not isinstance(parsed, ConfirmCommand)
+        ):
+            return WorkflowResult()
+        saved = self.repository.get_assignment(assignment.assignment_id)
+        if (
+            saved is None
+            or saved.state is not StakeholderState.COMPLETE
+            or saved.engagement_type
+            not in {
+                EngagementType.QUICK_RESPONSE,
+                EngagementType.STRUCTURED_INTERVIEW,
+            }
+            or parsed.token != self._token(saved)
+        ):
+            return WorkflowResult()
+        route = self._message_route(message, saved)
+        session = self._session(saved)
+        if route is None or not self._is_active_correlation(session, route, message):
+            return WorkflowResult()
+        event = self._event(
+            "interview.evidence_confirmed",
+            saved,
+            saved,
+            now,
+            f"interview:{saved.assignment_id}:evidence_confirmed",
+            {},
+            channel=message.channel,
+        )
+        try:
+            with self.repository.transaction() as unit:
+                count = unit.confirm_interview_evidence(saved, session, now)
+                if count == 0:
+                    return WorkflowResult()
+                event = event.model_copy(update={"metadata": {"evidence_count": count}})
+                if not unit.append_event_once(saved.mandate_id, event):
+                    raise ValueError("interview evidence was already confirmed")
+        except ValueError:
+            return WorkflowResult()
+        return WorkflowResult(
+            deliveries=[
+                self._reply(
+                    message,
+                    render_evidence_confirmation(parsed.token, confirmed=True),
+                    saved,
+                )
+            ]
         )
 
     def decline(

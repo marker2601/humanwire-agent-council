@@ -168,6 +168,18 @@ def render_question(question: str, index: int, total: int) -> str:
     return f"Question {index} of {total}:\n{question}"
 
 
+def render_evidence_confirmation(token: str, *, confirmed: bool = False) -> str:
+    if confirmed:
+        return (
+            f"HUMANWIRE EVIDENCE CONFIRMED · {token}\n\n"
+            "Your recorded response is confirmed."
+        )
+    return (
+        f"HUMANWIRE EVIDENCE CONFIRMATION · {token}\n\n"
+        f"Review your recorded response, then reply CONFIRM {token}."
+    )
+
+
 def render_reminder(
     token: str,
     engagement_type: EngagementType = EngagementType.STRUCTURED_INTERVIEW,

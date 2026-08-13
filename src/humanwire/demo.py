@@ -181,7 +181,7 @@ def _interview(
 
 def _event(
     mandate: Mandate,
-    index: int,
+    index: float,
     event_type: str,
     *,
     person_id: str | None = None,
@@ -192,12 +192,15 @@ def _event(
     new_state: str | None = None,
     actor_id: str | None = None,
     assignment_id: UUID | None = None,
-    metadata: dict[str, str] | None = None,
+    metadata: dict[str, object] | None = None,
+    idempotency_key: str | None = None,
 ) -> DomainEvent:
     return DomainEvent(
         event_type=event_type,
         created_at=mandate.created_at + timedelta(minutes=index),
-        idempotency_key=f"demo-event-{mandate.token.lower()}-{index:02d}",
+        idempotency_key=(
+            idempotency_key or f"demo-event-{mandate.token.lower()}-{index:02d}"
+        ),
         actor_id=mandate.initiator_id if index == 0 else actor_id,
         assignment_id=assignment_id,
         person_id=person_id,
@@ -424,13 +427,56 @@ def _seed_primary(repository: SqlAlchemyHumanWireRepository) -> None:
             ),
         )
 
+    for index, (label, person_id, channel) in enumerate(
+        (
+            ("us", "eli-torres", Channel.EMAIL),
+            ("apac", "sora-kim", Channel.TELEGRAM),
+        ),
+        start=10,
+    ):
+        assignment = by_person[person_id]
+        repository.append_event(
+            mandate.mandate_id,
+            _event(
+                mandate,
+                index + 0.25,
+                "interview.answer_recorded",
+                assignment_id=assignment.assignment_id,
+                person_id=person_id,
+                department=assignment.department,
+                direction=assignment.direction,
+                channel=channel,
+                metadata={"question_index": 0},
+                idempotency_key=(
+                    f"interview:{assignment.assignment_id}:answer:demo-source-{label}"
+                ),
+            ),
+        )
+        repository.append_event(
+            mandate.mandate_id,
+            _event(
+                mandate,
+                index + 0.5,
+                "interview.evidence_confirmed",
+                assignment_id=assignment.assignment_id,
+                person_id=person_id,
+                department=assignment.department,
+                direction=assignment.direction,
+                channel=channel,
+                metadata={"evidence_count": 1},
+                idempotency_key=(
+                    f"interview:{assignment.assignment_id}:evidence_confirmed"
+                ),
+            ),
+        )
+
     evidence_specs = [
-        ("us", "eli-torres", EvidenceVisibility.SHAREABLE, EvidenceType.COMMITMENT, "The US lead can staff one voluntary on-call shift."),
-        ("policy", "priya-shah", EvidenceVisibility.ANONYMOUS, EvidenceType.CONSTRAINT, "Coverage requires a documented handoff."),
-        ("apac", "sora-kim", EvidenceVisibility.SHAREABLE, EvidenceType.COMMITMENT, "The APAC lead confirmed the launch handoff."),
-        ("private", "priya-shah", EvidenceVisibility.PRIVATE, EvidenceType.CONSTRAINT, "Private medical leave details must remain confidential."),
+        ("us", "eli-torres", EvidenceVisibility.SHAREABLE, EvidenceType.COMMITMENT, "The US lead can staff one voluntary on-call shift.", Channel.EMAIL),
+        ("policy", "priya-shah", EvidenceVisibility.ANONYMOUS, EvidenceType.CONSTRAINT, "Coverage requires a documented handoff.", Channel.TELEGRAM),
+        ("apac", "sora-kim", EvidenceVisibility.SHAREABLE, EvidenceType.COMMITMENT, "The APAC lead confirmed the launch handoff.", Channel.TELEGRAM),
+        ("private", "priya-shah", EvidenceVisibility.PRIVATE, EvidenceType.CONSTRAINT, "Private medical leave details must remain confidential.", Channel.TELEGRAM),
     ]
-    for offset, (label, person_id, visibility, evidence_type, statement) in enumerate(
+    for offset, (label, person_id, visibility, evidence_type, statement, channel) in enumerate(
         evidence_specs, start=20
     ):
         assignment = by_person[person_id]
@@ -445,7 +491,7 @@ def _seed_primary(repository: SqlAlchemyHumanWireRepository) -> None:
                 visibility=visibility,
                 status=EvidenceStatus.CONFIRMED,
                 source_message_id=f"demo-source-{label}",
-                channel=Channel.EMAIL,
+                channel=channel,
                 created_at=mandate.created_at + timedelta(minutes=offset),
             )
         )

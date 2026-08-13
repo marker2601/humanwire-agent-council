@@ -628,10 +628,18 @@ def test_quick_response_completes_only_after_every_required_answer(
     assert "Question 2 of 2" in first.deliveries[0].text
     assert midway is not None
     assert midway.state is StakeholderState.INTERVIEWING
-    assert second.deliveries == []
+    assert second.deliveries[0].text == (
+        "HUMANWIRE EVIDENCE CONFIRMATION · HW-2411\n\n"
+        "Review your recorded response, then reply CONFIRM HW-2411."
+    )
     assert saved is not None
     assert saved.state is StakeholderState.COMPLETE
+    assert repository.get_mandate_by_token(mandate.token).state is MandateState.INTERVIEWING
     assert len(repository.list_evidence(mandate.mandate_id)) == 2
+    assert all(
+        item.status is EvidenceStatus.ASSERTED
+        for item in repository.list_evidence(mandate.mandate_id)
+    )
 
 
 def test_structured_interview_preserves_exact_cross_channel_token_correlation(

@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 import threading
 from datetime import UTC, datetime, timedelta
@@ -451,7 +452,7 @@ def test_due_worker_stop_does_not_return_while_dispatch_is_still_in_flight() -> 
 def test_cli_parser_exposes_required_commands_and_description() -> None:
     parser = cli.build_parser()
 
-    assert parser.description == "AI chief of staff that interviews the organization"
+    assert parser.description == "AI chief of staff for adaptive human coordination"
     for command in ("init-db", "listen", "web", "smoke"):
         assert parser.parse_args([command]).command == command
 
@@ -605,10 +606,51 @@ def test_web_command_builds_container_and_starts_fastapi(tmp_path, monkeypatch) 
     assert calls == [(app, "127.0.0.7", 8765)]
 
 
-def test_smoke_command_delegates_to_smoke_script(monkeypatch) -> None:
+def test_smoke_command_delegates_to_installed_smoke_module(monkeypatch) -> None:
     calls: list[str] = []
-    monkeypatch.setattr("scripts.smoke_check.main", lambda: calls.append("smoke"))
+    monkeypatch.setattr(
+        "humanwire.smoke.main", lambda argv: calls.append(f"smoke:{argv}")
+    )
 
     cli.run_smoke()
 
-    assert calls == ["smoke"]
+    assert calls == ["smoke:[]"]
+
+
+def test_installed_smoke_command_runs_outside_repository(tmp_path) -> None:
+    result = subprocess.run(
+        [sys.executable, "-I", "-m", "humanwire", "smoke"],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.splitlines() == [
+        "PASS domain",
+        "PASS adaptive-engagement",
+        "PASS preview-override",
+        "PASS cross-channel-interview",
+        "PASS explicit-approval",
+        "PASS negotiation-limit",
+        "PASS meeting-package",
+        "PASS decision-room",
+        "PASS propagation-lanes",
+        "PASS analytics-export",
+        "PASS privacy-scan",
+    ]
+    assert result.stderr == ""
+
+
+def test_smoke_command_forwards_only_explicit_live_flags(monkeypatch) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        cli,
+        "run_smoke",
+        lambda argv: calls.append(list(argv)) or 0,
+    )
+
+    assert cli.main(["smoke", "--live", "--confirm-live"]) == 0
+
+    assert calls == [["--live", "--confirm-live"]]

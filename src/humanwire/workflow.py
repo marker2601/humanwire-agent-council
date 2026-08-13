@@ -12,6 +12,7 @@ from humanwire.commands import (
     AcknowledgeCommand,
     AvailabilityCommand,
     CancelCommand,
+    ConfirmCommand,
     EngageCommand,
     EngagementDecisionCommand,
     FreeTextCommand,
@@ -78,6 +79,8 @@ class HumanWireWorkflow:
             return self.mandates.authorized_release(message, command.token)
         if isinstance(command, EngageCommand):
             return self.mandates.override(message, command)
+        if isinstance(command, ConfirmCommand):
+            return self._confirm_evidence(message, command)
         if isinstance(command, EngagementDecisionCommand):
             return self._engagement_decision(message, command)
         if isinstance(command, ProposalResponseCommand):
@@ -258,6 +261,41 @@ class HumanWireWorkflow:
             else self.engagements.record_answer(message, assignment, message.received_at)
         )
         synthesis = self.synthesis.run(assignment.mandate_id, message.received_at)
+        return WorkflowResult(deliveries=[*result.deliveries, *synthesis.deliveries])
+
+    def _confirm_evidence(
+        self,
+        message: IncomingMessage,
+        command: ConfirmCommand,
+    ) -> WorkflowResult:
+        mandate = self.repository.get_mandate_by_token(command.token)
+        if mandate is None or mandate.state is not MandateState.INTERVIEWING:
+            return WorkflowResult()
+        try:
+            person = self.directory.person_for_sender(message)
+        except (UnknownPersonError, AmbiguousPersonError):
+            return WorkflowResult()
+        candidates = [
+            assignment
+            for assignment in self.repository.list_assignments(mandate.mandate_id)
+            if assignment.person_id.casefold() == person.person_id.casefold()
+            and assignment.engagement_type
+            in {
+                EngagementType.QUICK_RESPONSE,
+                EngagementType.STRUCTURED_INTERVIEW,
+            }
+            and assignment.state is StakeholderState.COMPLETE
+        ]
+        if len(candidates) != 1:
+            return WorkflowResult()
+        result = self.engagements.interviews.confirm_evidence(
+            message,
+            candidates[0],
+            message.received_at,
+        )
+        if not result.deliveries:
+            return result
+        synthesis = self.synthesis.run(mandate.mandate_id, message.received_at)
         return WorkflowResult(deliveries=[*result.deliveries, *synthesis.deliveries])
 
     def _is_stale_interview_conversation(

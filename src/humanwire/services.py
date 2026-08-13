@@ -27,6 +27,8 @@ from humanwire.domain import (
     DeliveryKind,
     DomainEvent,
     EngagementType,
+    EvidenceItem,
+    EvidenceStatus,
     IncomingMessage,
     Mandate,
     MandateState,
@@ -684,6 +686,8 @@ class SynthesisService:
             )
             for assignment in assignments
         }
+        if any(self._has_pending_confirmation(item, evidence) for item in required):
+            return WorkflowResult()
         engine = self.alignment_engine_factory(mandate_id)
         valid_assignment_ids = engine._valid_assignment_ids(mandate.plan, assignments)
         eligible_evidence_ids = engine._eligible_contribution_evidence_ids(
@@ -790,6 +794,55 @@ class SynthesisService:
             deliveries=self._route_deliveries(
                 proposal.required_respondent_ids, text, mandate.token
             )
+        )
+
+    def _has_pending_confirmation(
+        self,
+        assignment: StakeholderAssignment,
+        evidence: list[EvidenceItem],
+    ) -> bool:
+        if (
+            assignment.engagement_type
+            not in {
+                EngagementType.QUICK_RESPONSE,
+                EngagementType.STRUCTURED_INTERVIEW,
+            }
+            or assignment.interview_id is None
+        ):
+            return False
+        interview = self.repository.get_interview(assignment.interview_id)
+        if (
+            interview is None
+            or interview.mandate_id != assignment.mandate_id
+            or interview.assignment_id != assignment.assignment_id
+            or interview.completed_at is None
+        ):
+            return False
+        answer_prefix = f"interview:{assignment.assignment_id}:answer:"
+        answer_sources = {
+            event.idempotency_key.removeprefix(answer_prefix)
+            for event in self.repository.list_events(assignment.mandate_id)
+            if event.event_type == "interview.answer_recorded"
+            and event.assignment_id == assignment.assignment_id
+            and event.person_id == assignment.person_id
+            and event.idempotency_key.startswith(answer_prefix)
+        }
+        confirmed_sources = {
+            item.source_message_id
+            for item in evidence
+            if item.mandate_id == assignment.mandate_id
+            and item.assignment_id == assignment.assignment_id
+            and item.stakeholder_id == assignment.person_id
+            and item.status is EvidenceStatus.CONFIRMED
+        }
+        return any(
+            item.mandate_id == assignment.mandate_id
+            and item.assignment_id == assignment.assignment_id
+            and item.stakeholder_id == assignment.person_id
+            and item.status is EvidenceStatus.ASSERTED
+            and item.source_message_id in answer_sources
+            and item.source_message_id not in confirmed_sources
+            for item in evidence
         )
 
     def _partial(
