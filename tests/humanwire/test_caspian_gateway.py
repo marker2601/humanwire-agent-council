@@ -10,6 +10,11 @@ from pydantic import SecretStr
 from humanwire.caspian_gateway import CaspianGateway, UnsupportedCaspianChannelError
 from humanwire.config import Settings
 from humanwire.domain import Channel, DeliveryInstruction, DeliveryKind, WorkflowResult
+from humanwire.offline_caspian import (
+    OfflineCaspianClient,
+    email_envelope,
+    telegram_envelope,
+)
 
 NOW = datetime(2026, 8, 11, 15, 0, tzinfo=UTC)
 ASSIGNMENT_ID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
@@ -573,6 +578,76 @@ def test_close_stops_open_channels_closes_client_once_and_is_idempotent(
     assert fake_client.close_calls == 1
     assert repository.get_runtime_status("channel.email") == ("stopped", NOW)
     assert repository.get_runtime_status("channel.telegram") == ("stopped", NOW)
+
+
+def test_offline_caspian_extracts_gateway_transport_contract(
+    settings, repository, workflow
+) -> None:
+    client = OfflineCaspianClient()
+    gateway = CaspianGateway(
+        settings=settings,
+        workflow=workflow,
+        repository=repository,
+        client=client,
+        clock=lambda: NOW,
+    )
+    reply = assigned_delivery(DeliveryKind.REPLY_TO_MESSAGE, message_id="offline-source")
+    initiate = assigned_delivery(
+        DeliveryKind.INITIATE_EMAIL,
+        recipient="offline-recipient@example.test",
+    )
+    send = assigned_delivery(
+        DeliveryKind.SEND_TO_CONVERSATION,
+        conversation_id="offline-conversation",
+    )
+
+    gateway.connect()
+    client.emit_inbound(
+        email_envelope(
+            message_id="offline-email",
+            conversation_id="offline-email-thread",
+            sender_address="offline-email@example.test",
+            sender_name="Offline Email",
+            text="ACK HW-OFFLINE",
+        )
+    )
+    client.emit_inbound(
+        telegram_envelope(
+            message_id="offline-telegram",
+            conversation_id="offline-telegram-thread",
+            sender_address="offline-telegram-user",
+            sender_name="Offline Telegram",
+            text="ACK HW-OFFLINE",
+        )
+    )
+    gateway.dispatch(reply)
+    gateway.dispatch(initiate)
+    gateway.dispatch(send)
+
+    assert client.on_message_registration_count == 1
+    assert client.inbound_channels == ["email", "telegram"]
+    assert [call.channel for call in workflow.calls] == [Channel.EMAIL, Channel.TELEGRAM]
+    assert client.replies == [("offline-source", reply.text)]
+    assert client.initiated == [
+        ("offline-email-connection", "offline-recipient@example.test", initiate.text)
+    ]
+    assert client.sent == [("offline-conversation", send.text)]
+    assert [delivery.kind for delivery in client.deliveries] == ["reply", "initiate", "send"]
+
+
+def test_offline_caspian_configured_provider_failure_is_a_comm_error() -> None:
+    client = OfflineCaspianClient()
+    client.configure_provider_failure("offline-recipient@example.test")
+
+    with pytest.raises(CommError):
+        client.initiate(
+            "offline-email-connection",
+            recipient="offline-recipient@example.test",
+            text="offline body",
+        )
+
+    assert client.initiated == []
+    assert client.deliveries == []
 
 
 def test_adaptive_product_flow_uses_one_real_handler_across_channels(tmp_path) -> None:

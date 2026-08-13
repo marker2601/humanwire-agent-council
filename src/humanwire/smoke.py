@@ -17,7 +17,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
-from caspian_sdk import CommError
 from pydantic import SecretStr
 
 from humanwire.alignment import contribution_status
@@ -37,6 +36,11 @@ from humanwire.domain import (
     PlannedStakeholder,
 )
 from humanwire.evidence import RuleBasedEvidenceExtractor
+from humanwire.offline_caspian import (
+    OfflineCaspianClient,
+    email_envelope,
+    telegram_envelope,
+)
 from humanwire.planning import ResolvedPlan
 from humanwire.repository import SqlAlchemyHumanWireRepository
 from humanwire.web import OUTREACH_HEADERS, create_app
@@ -242,47 +246,6 @@ class _SmokeEvidenceExtractor:
         ]
 
 
-class _FakeCaspianClient:
-    def __init__(self) -> None:
-        self.handlers = []
-        self.inbound_channels: list[str] = []
-        self.replies: list[tuple[str, str]] = []
-        self.initiated: list[tuple[str, str, str]] = []
-        self.sent: list[tuple[str, str]] = []
-        self.fail_recipient: str | None = None
-
-    def connect_email(self, *, username: str):
-        del username
-        return {"id": "offline-email-connection"}
-
-    def connect_telegram(self, *, bot_token: str):
-        del bot_token
-        return {"id": "offline-telegram-connection"}
-
-    def on_message(self, handler):
-        self.handlers.append(handler)
-        return handler
-
-    def emit(self, message) -> None:
-        self.inbound_channels.append(str(message.channel))
-        self.handlers[0](message)
-
-    def reply(self, message_id: str, *, text: str):
-        self.replies.append((message_id, text))
-        return {"id": f"reply-{len(self.replies)}"}
-
-    def initiate(self, connection_id: str, *, recipient: str, text: str):
-        if recipient == self.fail_recipient:
-            self.fail_recipient = None
-            raise CommError(503, _PROVIDER_BODY)
-        self.initiated.append((connection_id, recipient, text))
-        return {"id": f"email-{len(self.initiated)}"}
-
-    def send_message(self, conversation_id: str, *, text: str):
-        self.sent.append((conversation_id, text))
-        return {"id": f"telegram-{len(self.sent)}"}
-
-
 def _directory() -> tuple[OrganizationDirectory, dict[str, Person]]:
     manager = Person(
         person_id="manager",
@@ -395,15 +358,17 @@ def _provider_message(
 ) -> SimpleNamespace:
     chosen = channel or Channel.EMAIL
     route = next(route for route in person.routes if route.channel is chosen)
-    return SimpleNamespace(
-        id=message_id,
-        conversation_id=route.conversation_id or f"{person.person_id}-email-thread",
-        connection_id=f"offline-{chosen.value}-connection",
-        channel=chosen.value,
-        sender={"address": route.sender_address, "name": person.display_name},
-        subject="HumanWire" if chosen is Channel.EMAIL else None,
-        text=text,
-    )
+    envelope = {
+        "message_id": message_id,
+        "conversation_id": route.conversation_id or f"{person.person_id}-email-thread",
+        "connection_id": f"offline-{chosen.value}-connection",
+        "sender_address": route.sender_address,
+        "sender_name": person.display_name,
+        "text": text,
+    }
+    if chosen is Channel.EMAIL:
+        return email_envelope(**envelope)
+    return telegram_envelope(**envelope)
 
 
 def _csv_matches_json(json_rows: list[dict], csv_body: str) -> bool:
@@ -442,7 +407,7 @@ def run_offline_proof(workdir: Path) -> OfflineProof:
     repository = SqlAlchemyHumanWireRepository(session_factories[-1])
     workflow = _workflow(directory, people, repository, settings)
     clock = [_NOW]
-    client = _FakeCaspianClient()
+    client = OfflineCaspianClient()
     gateway = CaspianGateway(
         settings=settings,
         workflow=workflow,
@@ -474,7 +439,7 @@ def run_offline_proof(workdir: Path) -> OfflineProof:
     logger.addHandler(handler)
     logger.propagate = False
     try:
-        client.emit(
+        client.emit_inbound(
             _provider_message(
                 people["manager"],
                 "/mandate\nCoordinate the primary adaptive product flow",
@@ -489,7 +454,7 @@ def run_offline_proof(workdir: Path) -> OfflineProof:
         assert preview_types == set(EngagementType)
 
         before_unauthorized = preview_assignments
-        client.emit(
+        client.emit_inbound(
             _provider_message(
                 people["quick-a"],
                 f"ENGAGE {primary.token} override-owner ACKNOWLEDGE",
@@ -498,7 +463,7 @@ def run_offline_proof(workdir: Path) -> OfflineProof:
         )
         assert repository.list_assignments(primary.mandate_id) == before_unauthorized
 
-        client.emit(
+        client.emit_inbound(
             _provider_message(
                 people["manager"],
                 f"ENGAGE {primary.token} override-owner ACKNOWLEDGE",
@@ -530,7 +495,7 @@ def run_offline_proof(workdir: Path) -> OfflineProof:
         session_factories.append(create_session_factory(database_url))
         repository = SqlAlchemyHumanWireRepository(session_factories[-1])
         workflow = _workflow(directory, people, repository, settings)
-        client = _FakeCaspianClient()
+        client = OfflineCaspianClient()
         gateway = CaspianGateway(
             settings=settings,
             workflow=workflow,
@@ -555,9 +520,11 @@ def run_offline_proof(workdir: Path) -> OfflineProof:
         for delivery in recovered.deliveries:
             assignment = by_assignment[delivery.assignment_id]
             if assignment.person_id == "override-owner":
-                client.fail_recipient = people["override-owner"].routes[0].recipient
+                client.configure_provider_failure(
+                    people["override-owner"].routes[0].recipient,
+                    body=_PROVIDER_BODY,
+                )
             gateway.dispatch(delivery)
-        assert client.fail_recipient is None
         provider_calls_after_callbacks = (
             len(client.initiated),
             len(client.sent),
@@ -580,7 +547,7 @@ def run_offline_proof(workdir: Path) -> OfflineProof:
             seconds: int,
         ) -> None:
             clock[0] = release_at + timedelta(seconds=seconds)
-            client.emit(
+            client.emit_inbound(
                 _provider_message(
                     people[person_id],
                     text,
@@ -821,7 +788,7 @@ def run_offline_proof(workdir: Path) -> OfflineProof:
         )
 
         clock[0] = release_at + timedelta(seconds=100)
-        client.emit(
+        client.emit_inbound(
             _provider_message(
                 people["manager"],
                 "/mandate\nProve explicit CHANGE safety",
