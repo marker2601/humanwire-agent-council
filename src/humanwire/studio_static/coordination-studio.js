@@ -349,7 +349,7 @@ document.addEventListener("DOMContentLoaded", () => {
       return 190;
     }
     if (node.kind === "stakeholder") {
-      return 180;
+      return 190;
     }
     if (node.kind === "artifact") {
       return 160;
@@ -394,13 +394,13 @@ document.addEventListener("DOMContentLoaded", () => {
     const artifactPitch = 54;
     const artifactStart = Math.max(8, (height - 4 * 44 - 3 * 10) / 2);
     const artifactPositions = {
-      conflict: { x: 660, y: artifactStart },
-      interview: { x: 660, y: artifactStart + artifactPitch },
-      evidence: { x: 660, y: artifactStart + artifactPitch * 2 },
-      proposal: { x: 660, y: artifactStart + artifactPitch * 3 },
-      approval: { x: 835, y: centerY - 86 },
-      availability: { x: 835, y: centerY },
-      meeting: { x: 835, y: centerY + 86 },
+      conflict: { x: 670, y: artifactStart },
+      interview: { x: 670, y: artifactStart + artifactPitch },
+      evidence: { x: 670, y: artifactStart + artifactPitch * 2 },
+      proposal: { x: 670, y: artifactStart + artifactPitch * 3 },
+      approval: { x: 845, y: centerY - 86 },
+      availability: { x: 845, y: centerY },
+      meeting: { x: 845, y: centerY + 86 },
     };
     Object.assign(positions, artifactPositions);
     return { height, positions };
@@ -420,7 +420,7 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
     const isMobile = mobileLayout.matches;
-    const width = isMobile ? 420 : 1000;
+    const width = isMobile ? 420 : 1010;
     const nodeHeight = isMobile ? 54 : 44;
     const layout = graphPositions(snapshot.graph_nodes, isMobile);
     const height = layout.height;

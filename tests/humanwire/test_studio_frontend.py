@@ -3,6 +3,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 
@@ -256,14 +257,22 @@ def test_real_completed_graph_rendered_content_has_five_pixel_clearance(
         <script>
           window.addEventListener("load", () => {
             setTimeout(() => document.querySelector("[data-start-coordination]").click(), 25);
-            setTimeout(() => {
+            setTimeout(async () => {
+              await document.fonts.ready;
+              await new Promise((resolve) => setTimeout(resolve, 100));
               const groups = Array.from(document.querySelectorAll("[data-flow-node]"));
               const boxes = groups.map((group) => {
                 const bounds = group.getBoundingClientRect();
                 const card = group.querySelector("rect").getBoundingClientRect();
                 const textBounds = Array.from(group.querySelectorAll("text"), (item) => {
                   const box = item.getBoundingClientRect();
-                  return { left: box.left, top: box.top, right: box.right, bottom: box.bottom };
+                  return {
+                    text: item.textContent,
+                    left: box.left,
+                    top: box.top,
+                    right: box.right,
+                    bottom: box.bottom,
+                  };
                 });
                 return {
                   id: group.getAttribute("data-flow-node"),
@@ -292,23 +301,30 @@ def test_real_completed_graph_rendered_content_has_five_pixel_clearance(
                   }
                 }
               }
-              const escapedText = boxes.flatMap((box) =>
-                box.textBounds
-                  .filter((text) => (
+              const escapedText = boxes.flatMap((box) => box.textBounds.flatMap((text) => {
+                const requiredRightInset = box.id.startsWith("person-") ? 7.5 : 0;
+                const contentRight = box.card.right - requiredRightInset;
+                const escaped = (
                     text.left < box.card.left - 0.5
-                    || text.right > box.card.right + 0.5
+                    || text.right > contentRight + 0.5
                     || text.top < box.card.top - 0.5
                     || text.bottom > box.card.bottom + 0.5
-                  ))
-                  .map(() => box.label)
-              );
+                );
+                return escaped ? [{
+                  label: box.label,
+                  text: text.text,
+                  rightOverflow: text.right - contentRight,
+                }] : [];
+              }));
               const result = document.createElement("pre");
               result.id = "graph-bounds-result";
               result.textContent = JSON.stringify({
                 nodeCount: boxes.length,
                 edgeCount: document.querySelectorAll("[data-flow-edge]").length,
+                viewport: { width: window.innerWidth, height: window.innerHeight },
+                fontStatus: document.fonts.status,
                 collisions,
-                escapedText: Array.from(new Set(escapedText)),
+                escapedText,
               });
               document.body.append(result);
             }, 800);
@@ -332,7 +348,7 @@ def test_real_completed_graph_rendered_content_has_five_pixel_clearance(
             "--no-sandbox",
             "--hide-scrollbars",
             "--force-device-scale-factor=1",
-            "--window-size=1680,950",
+            "--window-size=1702,1104" if sys.platform == "win32" else "--window-size=1680,950",
             "--virtual-time-budget=2200",
             f"--user-data-dir={profile}",
             "--dump-dom",
@@ -353,6 +369,8 @@ def test_real_completed_graph_rendered_content_has_five_pixel_clearance(
     )
     assert matched is not None, result.stdout[-2000:]
     measured = json.loads(html.unescape(matched.group(1)))
+    assert measured["viewport"] == {"width": 1680, "height": 950}
+    assert measured["fontStatus"] == "loaded"
     assert measured["nodeCount"] == 17
     assert measured["edgeCount"] == 57
     assert {
