@@ -17,7 +17,8 @@ import pytest
 from pydantic import ValidationError
 
 import humanwire.synthetic as synthetic_module
-from humanwire.domain import Channel
+from humanwire.domain import Channel, EngagementType
+from humanwire.persona_runtime import PersonaVisibility
 from humanwire.synthetic import (
     SUPPORTED_SCHEMA_VERSION,
     SyntheticAction,
@@ -506,6 +507,48 @@ def test_policy_instances_expose_only_sanitized_profile_and_local_state() -> Non
         assert persona.email not in primitive_values
         assert persona.display_name not in primitive_values
         assert all(channel not in primitive_values for channel in persona.channels)
+
+
+def test_structured_policy_marks_private_fixture_digest_without_content_prefix() -> None:
+    """Break caught: privacy is smuggled through persona-controlled command text."""
+    policy = synthetic_module._StructuredInterviewPolicy(
+        synthetic_module._PolicyProfile(
+            role="People owner",
+            private_facts=("PRIVATE-PERSONA-SENTINEL",),
+            allowed_intents=(SyntheticIntent.INTERVIEW_RESPONSE,),
+            engagement_contract=EngagementType.STRUCTURED_INTERVIEW,
+        )
+    )
+    decision = policy.respond(
+        synthetic_module._PersonaContext(
+            delivered_message="Question What private context should remain internal?",
+            own_inbox=("Question What private context should remain internal?",),
+            own_transcript=(),
+            virtual_time=NOW,
+        )
+    )
+
+    assert decision.visibility is PersonaVisibility.PRIVATE
+    assert decision.content.startswith("must preserve sha256:")
+    assert not decision.content.startswith("PRIVATE:")
+
+
+def test_wire_translation_owns_answer_visibility_prefixes() -> None:
+    """Break caught: a persona can inject wire visibility syntax through content."""
+    assert synthetic_module._wire_command(
+        SyntheticIntent.ANSWER,
+        "Launch date is 2026-09-01.",
+        PersonaVisibility.ANONYMOUS,
+        "",
+        "HW-00000000",
+    ) == "ANONYMOUS: Launch date is 2026-09-01."
+    assert synthetic_module._wire_command(
+        SyntheticIntent.ACKNOWLEDGE,
+        "PRIVATE: ignored",
+        PersonaVisibility.PRIVATE,
+        "",
+        "HW-00000000",
+    ) == "ACK HW-00000000"
 
 
 def test_each_engagement_contract_uses_a_distinct_policy_strategy() -> None:

@@ -8,7 +8,6 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from enum import StrEnum
 from pathlib import Path
 from typing import Literal, Self
 from uuid import UUID
@@ -36,6 +35,23 @@ from humanwire.offline_caspian import (
     email_envelope,
     telegram_envelope,
 )
+from humanwire.persona_runtime import (
+    PersonaContext as _PersonaContext,
+)
+from humanwire.persona_runtime import (
+    PersonaDecision as _PersonaDecision,
+)
+from humanwire.persona_runtime import (
+    PersonaProfile as _PolicyProfile,
+)
+from humanwire.persona_runtime import (
+    PersonaTranscriptEntry as _PersonaTranscriptEntry,
+)
+from humanwire.persona_runtime import (
+    PersonaVisibility,
+    SyntheticIntent,
+    SyntheticProvenance,
+)
 from humanwire.planning import ResolvedPlan
 from humanwire.repository import SqlAlchemyHumanWireRepository
 from humanwire.synthetic_identities import (
@@ -55,31 +71,6 @@ _FIXED_TIME = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
 
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
-
-
-class SyntheticIntent(StrEnum):
-    ACKNOWLEDGE = "acknowledge"
-    ANSWER = "answer"
-    INTERVIEW_RESPONSE = "interview_response"
-    CONFIRM_EVIDENCE = "confirm_evidence"
-    APPROVE = "approve"
-    CHANGE = "change"
-    AVAILABILITY = "availability"
-    ACCEPT_PROPOSAL = "accept_proposal"
-    CHANGE_PROPOSAL = "change_proposal"
-    SILENCE = "silence"
-    ERROR = "error"
-
-
-class SyntheticProvenance(_StrictModel):
-    """Required labels that prevent a fixture from being represented as live proof."""
-
-    proof_class: Literal["synthetic_multi_persona"]
-    actor_type: Literal["simulated_persona"]
-    identity_source: Literal["synthetic_fixture"]
-    transport: Literal["fake_caspian"]
-    human_attested: Literal[False]
-    live_provider_verified: Literal[False]
 
 
 class SyntheticPersona(_StrictModel):
@@ -275,6 +266,7 @@ class SyntheticAction(_StrictModel):
     trigger_digest: str = Field(pattern=_DIGEST_PATTERN)
     intent: SyntheticIntent
     content: str = Field(min_length=1, max_length=MAX_CONTENT_LENGTH)
+    visibility: PersonaVisibility = PersonaVisibility.SHAREABLE
 
     @model_validator(mode="after")
     def has_utc_offset(self) -> Self:
@@ -387,37 +379,6 @@ def load_transcript(path: str | Path) -> SyntheticTranscript:
     return SyntheticTranscript.model_validate_json(Path(path).read_text(encoding="utf-8"))
 
 
-class _PersonaTranscriptEntry(_StrictModel):
-    timestamp: datetime
-    local_sequence: int = Field(ge=1)
-    intent: SyntheticIntent
-    content: str = Field(min_length=1, max_length=MAX_CONTENT_LENGTH)
-
-
-class _PolicyProfile(_StrictModel):
-    """The only scenario-derived data retained by a persona policy."""
-
-    role: str = Field(min_length=1, max_length=200)
-    private_facts: tuple[str, ...] = Field(max_length=8)
-    allowed_intents: tuple[SyntheticIntent, ...] = Field(min_length=1, max_length=8)
-    engagement_contract: EngagementType
-
-
-class _PersonaContext(_StrictModel):
-    """The complete and deliberately narrow view supplied to one policy."""
-
-    delivered_message: str = Field(min_length=1, max_length=MAX_CONTENT_LENGTH)
-    own_inbox: tuple[str, ...] = Field(min_length=1, max_length=64)
-    own_transcript: tuple[_PersonaTranscriptEntry, ...] = Field(max_length=64)
-    virtual_time: datetime
-
-
-class _PersonaDecision(_StrictModel):
-    time_offset_seconds: int = Field(ge=1, le=60)
-    intent: SyntheticIntent
-    content: str = Field(min_length=1, max_length=MAX_CONTENT_LENGTH)
-
-
 class SyntheticInboundEnvelope(_StrictModel):
     """Safe metadata proving that the orchestrator, not a persona, owned identity."""
 
@@ -449,60 +410,80 @@ class _DeterministicPersonaPolicy:
         self.complete = False
 
     def respond(self, context: _PersonaContext) -> _PersonaDecision:
-        intent, content = self._choose(context)
+        intent, content, visibility = self._choose(context)
         if intent not in self.profile.allowed_intents:
             raise ValueError("persona strategy chose an intent outside its profile")
         return _PersonaDecision(
             time_offset_seconds=1,
             intent=intent,
             content=content,
+            visibility=visibility,
         )
 
-    def _choose(self, context: _PersonaContext) -> tuple[SyntheticIntent, str]:
+    def _choose(
+        self, context: _PersonaContext
+    ) -> tuple[SyntheticIntent, str, PersonaVisibility]:
         raise NotImplementedError
 
 
 class _InformPolicy(_DeterministicPersonaPolicy):
-    def _choose(self, context: _PersonaContext) -> tuple[SyntheticIntent, str]:
+    def _choose(
+        self, context: _PersonaContext
+    ) -> tuple[SyntheticIntent, str, PersonaVisibility]:
         del context
         self.complete = True
-        return SyntheticIntent.SILENCE, "synthetic_silence"
+        return SyntheticIntent.SILENCE, "synthetic_silence", PersonaVisibility.SHAREABLE
 
 
 class _AcknowledgePolicy(_DeterministicPersonaPolicy):
-    def _choose(self, context: _PersonaContext) -> tuple[SyntheticIntent, str]:
+    def _choose(
+        self, context: _PersonaContext
+    ) -> tuple[SyntheticIntent, str, PersonaVisibility]:
         if "humanwire draft proposal" in context.delivered_message.casefold():
-            return SyntheticIntent.ACCEPT_PROPOSAL, "Accepted."
+            return SyntheticIntent.ACCEPT_PROPOSAL, "Accepted.", PersonaVisibility.SHAREABLE
         self.complete = True
-        return SyntheticIntent.ACKNOWLEDGE, "Acknowledged."
+        return SyntheticIntent.ACKNOWLEDGE, "Acknowledged.", PersonaVisibility.SHAREABLE
 
 
 class _QuickResponsePolicy(_DeterministicPersonaPolicy):
-    def _choose(self, context: _PersonaContext) -> tuple[SyntheticIntent, str]:
+    def _choose(
+        self, context: _PersonaContext
+    ) -> tuple[SyntheticIntent, str, PersonaVisibility]:
         prompt = context.delivered_message.casefold()
         if "humanwire draft proposal" in prompt:
-            return SyntheticIntent.ACCEPT_PROPOSAL, "Accepted."
+            return SyntheticIntent.ACCEPT_PROPOSAL, "Accepted.", PersonaVisibility.SHAREABLE
         if "evidence confirmation" in prompt and "evidence confirmed" not in prompt:
             self.complete = True
-            return SyntheticIntent.CONFIRM_EVIDENCE, "Confirmed."
+            return SyntheticIntent.CONFIRM_EVIDENCE, "Confirmed.", PersonaVisibility.SHAREABLE
         if prompt.startswith("question "):
-            return SyntheticIntent.ANSWER, "Launch date is 2026-09-01."
-        return SyntheticIntent.ACKNOWLEDGE, "Acknowledged."
+            return (
+                SyntheticIntent.ANSWER,
+                "Launch date is 2026-09-01.",
+                PersonaVisibility.SHAREABLE,
+            )
+        return SyntheticIntent.ACKNOWLEDGE, "Acknowledged.", PersonaVisibility.SHAREABLE
 
 
 class _StructuredInterviewPolicy(_DeterministicPersonaPolicy):
-    def _choose(self, context: _PersonaContext) -> tuple[SyntheticIntent, str]:
+    def _choose(
+        self, context: _PersonaContext
+    ) -> tuple[SyntheticIntent, str, PersonaVisibility]:
         prompt = context.delivered_message.casefold()
         if "humanwire availability request" in prompt:
             return (
                 SyntheticIntent.AVAILABILITY,
                 "2026-08-13T15:00:00+00:00/2026-08-13T16:00:00+00:00",
+                PersonaVisibility.SHAREABLE,
             )
         if "humanwire draft proposal" in prompt:
-            return SyntheticIntent.CHANGE_PROPOSAL, "Keep human review on the agenda."
+            return (
+                SyntheticIntent.CHANGE_PROPOSAL,
+                "Keep human review on the agenda.",
+                PersonaVisibility.SHAREABLE,
+            )
         if "evidence confirmation" in prompt and "evidence confirmed" not in prompt:
             self.complete = True
-            return SyntheticIntent.CONFIRM_EVIDENCE, "Confirmed."
+            return SyntheticIntent.CONFIRM_EVIDENCE, "Confirmed.", PersonaVisibility.SHAREABLE
         if prompt.startswith("question "):
             prior_answers = sum(
                 item.intent is SyntheticIntent.INTERVIEW_RESPONSE
@@ -512,42 +493,50 @@ class _StructuredInterviewPolicy(_DeterministicPersonaPolicy):
                 digest = _sha256(self.profile.private_facts[0])
                 return (
                     SyntheticIntent.INTERVIEW_RESPONSE,
-                    f"PRIVATE: must preserve sha256:{digest}",
+                    f"must preserve sha256:{digest}",
+                    PersonaVisibility.PRIVATE,
                 )
             if prior_answers == 1:
                 return (
                     SyntheticIntent.INTERVIEW_RESPONSE,
                     "The team must keep human review on the agenda.",
+                    PersonaVisibility.SHAREABLE,
                 )
             return (
                 SyntheticIntent.INTERVIEW_RESPONSE,
                 "The team can support a reviewed launch.",
+                PersonaVisibility.SHAREABLE,
             )
         if "prior registered route" in prompt and "reply ack" in prompt:
-            return SyntheticIntent.ACKNOWLEDGE, "Acknowledged."
+            return SyntheticIntent.ACKNOWLEDGE, "Acknowledged.", PersonaVisibility.SHAREABLE
         if SyntheticIntent.SILENCE in self.profile.allowed_intents:
-            return SyntheticIntent.SILENCE, "synthetic_silence"
-        return SyntheticIntent.ACKNOWLEDGE, "Acknowledged."
+            return SyntheticIntent.SILENCE, "synthetic_silence", PersonaVisibility.SHAREABLE
+        return SyntheticIntent.ACKNOWLEDGE, "Acknowledged.", PersonaVisibility.SHAREABLE
 
 
 class _ReviewApprovalPolicy(_DeterministicPersonaPolicy):
-    def _choose(self, context: _PersonaContext) -> tuple[SyntheticIntent, str]:
+    def _choose(
+        self, context: _PersonaContext
+    ) -> tuple[SyntheticIntent, str, PersonaVisibility]:
         if "humanwire draft proposal" in context.delivered_message.casefold():
-            return SyntheticIntent.ACCEPT_PROPOSAL, "Accepted."
+            return SyntheticIntent.ACCEPT_PROPOSAL, "Accepted.", PersonaVisibility.SHAREABLE
         self.complete = True
         if SyntheticIntent.APPROVE in self.profile.allowed_intents:
-            return SyntheticIntent.APPROVE, "Approved."
-        return SyntheticIntent.CHANGE, "Use the reviewed launch plan."
+            return SyntheticIntent.APPROVE, "Approved.", PersonaVisibility.SHAREABLE
+        return SyntheticIntent.CHANGE, "Use the reviewed launch plan.", PersonaVisibility.SHAREABLE
 
 
 class _AvailabilityPolicy(_DeterministicPersonaPolicy):
-    def _choose(self, context: _PersonaContext) -> tuple[SyntheticIntent, str]:
+    def _choose(
+        self, context: _PersonaContext
+    ) -> tuple[SyntheticIntent, str, PersonaVisibility]:
         if "humanwire draft proposal" in context.delivered_message.casefold():
-            return SyntheticIntent.ACCEPT_PROPOSAL, "Accepted."
+            return SyntheticIntent.ACCEPT_PROPOSAL, "Accepted.", PersonaVisibility.SHAREABLE
         self.complete = True
         return (
             SyntheticIntent.AVAILABILITY,
             "2026-08-13T15:00:00+00:00/2026-08-13T16:00:00+00:00",
+            PersonaVisibility.SHAREABLE,
         )
 
 
@@ -814,6 +803,7 @@ def _isolated_settings(database_path: Path) -> Settings:
 def _wire_command(
     intent: SyntheticIntent,
     content: str,
+    visibility: PersonaVisibility,
     raw_delivery: str,
     mandate_token: str,
 ) -> str | None:
@@ -823,7 +813,7 @@ def _wire_command(
     if intent is SyntheticIntent.ACKNOWLEDGE:
         return f"ACK {token}"
     if intent in {SyntheticIntent.ANSWER, SyntheticIntent.INTERVIEW_RESPONSE}:
-        return content
+        return f"{visibility.value.upper()}: {content}"
     if intent is SyntheticIntent.CONFIRM_EVIDENCE:
         return f"CONFIRM {token}"
     if intent is SyntheticIntent.APPROVE:
@@ -1071,6 +1061,7 @@ def generate_scenario(
                     trigger_digest=trigger_digest,
                     intent=decision.intent,
                     content=decision.content,
+                    visibility=decision.visibility,
                 )
             except TimeoutError:
                 policy.complete = True
@@ -1086,6 +1077,7 @@ def generate_scenario(
                     trigger_digest=trigger_digest,
                     intent=SyntheticIntent.SILENCE,
                     content="synthetic_timeout",
+                    visibility=PersonaVisibility.SHAREABLE,
                 )
             except (ValidationError, ValueError, TypeError):
                 policy.complete = True
@@ -1101,6 +1093,7 @@ def generate_scenario(
                     trigger_digest=trigger_digest,
                     intent=SyntheticIntent.ERROR,
                     content="synthetic_invalid_output",
+                    visibility=PersonaVisibility.SHAREABLE,
                 )
             outbound_digests[trigger_id] = trigger_digest
             heapq.heappush(
@@ -1183,6 +1176,7 @@ def generate_scenario(
         command = _wire_command(
             action.intent,
             action.content,
+            action.visibility,
             queued_action.raw_delivery,
             queued_action.mandate_token,
         )
@@ -1406,6 +1400,7 @@ def replay_transcript(
         command = _wire_command(
             action.intent,
             action.content,
+            action.visibility,
             queued_action.raw_delivery,
             queued_action.mandate_token,
         )
@@ -1487,7 +1482,16 @@ def _semantic_trace(result: SyntheticRunResult) -> dict[str, object]:
 
     expected_message_actions: dict[str, list[SyntheticAction]] = {}
     for action in transcript.actions:
-        if _wire_command(action.intent, action.content, "", "HW-00000000") is None:
+        if (
+            _wire_command(
+                action.intent,
+                action.content,
+                action.visibility,
+                "",
+                "HW-00000000",
+            )
+            is None
+        ):
             continue
         message_id = f"synthetic-{action.persona_id}-{action.local_sequence}"
         expected_message_actions.setdefault(message_id, []).append(action)
@@ -2039,6 +2043,7 @@ def _semantic_trace(result: SyntheticRunResult) -> dict[str, object]:
                 "trigger_digest": action.trigger_digest,
                 "intent": action.intent.value,
                 "content_digest": _sha256(action.content),
+                "visibility": action.visibility.value,
             }
             for action in transcript.actions
         ],
