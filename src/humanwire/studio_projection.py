@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -12,13 +12,14 @@ from typing import Literal, Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
-from humanwire.domain import Channel
+from humanwire.domain import AvailabilityWindow, Channel
 from humanwire.persona_runtime import SyntheticIntent
 from humanwire.replay_projection import project_replay_labels
 from humanwire.studio_models import (
     CoordinationRequest,
     RequesterRole,
     TargetTiming,
+    product_catalog,
 )
 from humanwire.synthetic_progress import (
     RepositoryProgressObserver,
@@ -44,24 +45,32 @@ _PRIVATE_KEY = re.compile(
 )
 _PRIMARY_UI_WORD = re.compile(r"\b(?:proof|synthetic|simulated|fake)\b", re.IGNORECASE)
 _WIRE_COMMAND = re.compile(
-    r"(?:^|\n)\s*/(?:mandate|go|confirm|decide|available|change)\b",
+    r"/(?:mandate|go|confirm|decide|available|change)\b",
     re.IGNORECASE,
 )
 _CREDENTIAL = re.compile(
-    r"\bbearer\s+\S+|\b(?:api[_-]?key|authorization|password|credential|secret|"
-    r"database[_-]?(?:url|uri)|token)\b\s*[:=]",
+    r"\bbearer\s+\S+|"
+    r"\b(?:[A-Za-z0-9]+[_-])*(?:(?:api|access|private|secret)[\s_-]?key"
+    r"(?:[\s_-]?id)?|"
+    r"authorization|password|credential|secret|database[_-]?(?:url|uri)|token)"
+    r"[\"']?\s*(?:[:=]|\s)\s*[\"']?\S+",
     re.IGNORECASE,
 )
-_DATABASE_COORDINATE = re.compile(r"\b(?:postgres(?:ql)?|mysql|sqlite)://", re.IGNORECASE)
+_URI_COORDINATE = re.compile(
+    r"(?<![A-Za-z0-9])(?:[A-Za-z][A-Za-z0-9+.-]{0,31}):(?:/{0,2})\S+",
+    re.IGNORECASE,
+)
+_SECRET_VALUE = re.compile(
+    r"\bsk-[A-Za-z0-9_-]{8,}\b|\bAKIA[A-Z0-9]{8,}\b|"
+    r"-{2,}BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-{2,}",
+    re.IGNORECASE,
+)
 _DATABASE_ASSIGNMENT = re.compile(
     r"\b(?:server|host|database|dbname|user(?:name)?)\s*=\s*[^;\s]+(?:;|$)",
     re.IGNORECASE,
 )
-_FILESYSTEM_PATH = re.compile(
-    r"(?:\b[A-Za-z]:\\|\\\\[^\s\\]+\\|(?:^|[\s\"'(])\.\.[\\/]|"
-    r"(?:^|[\s\"'(])/[A-Za-z0-9._-]+/[A-Za-z0-9._/-]+)",
-    re.IGNORECASE,
-)
+_SAFE_SLASH_TOKENS = frozenset({"go/no-go", "humanwire.studio/v1"})
+_PATH_TOKEN_WRAPPERS = "\"'`()[]{}<>,.;:!?"
 
 _REQUESTER_ROLE_LABELS = {
     RequesterRole.MANAGER: "Strategy manager",
@@ -89,6 +98,7 @@ _OUTBOUND_COPY = {
     "meeting_reminder": "HumanWire shared a meeting reminder.",
     "partial": "HumanWire shared the current partial outcome.",
 }
+_AVAILABILITY_COPY = "Availability received for the requested window."
 _DELIVERY_HEADINGS = (
     ("HUMANWIRE EVIDENCE CONFIRMATION", "evidence_confirmation"),
     ("HUMANWIRE EVIDENCE CONFIRMED", "evidence_confirmed"),
@@ -117,6 +127,16 @@ def _strings(value: object):
             yield from _strings(item)
 
 
+def _contains_filesystem_path(text: str) -> bool:
+    for raw_token in text.split():
+        token = raw_token.strip(_PATH_TOKEN_WRAPPERS)
+        if "/" not in token and "\\" not in token:
+            continue
+        if token.casefold() not in _SAFE_SLASH_TOKENS:
+            return True
+    return False
+
+
 def _assert_product_safe(value: object, forbidden_texts: Sequence[str] = ()) -> None:
     for text in _strings(value):
         if (
@@ -127,9 +147,10 @@ def _assert_product_safe(value: object, forbidden_texts: Sequence[str] = ()) -> 
             or _PRIMARY_UI_WORD.search(text)
             or _WIRE_COMMAND.search(text)
             or _CREDENTIAL.search(text)
-            or _DATABASE_COORDINATE.search(text)
+            or _URI_COORDINATE.search(text)
+            or _SECRET_VALUE.search(text)
             or _DATABASE_ASSIGNMENT.search(text)
-            or _FILESYSTEM_PATH.search(text)
+            or _contains_filesystem_path(text)
             or any(secret and secret.casefold() in text.casefold() for secret in forbidden_texts)
         ):
             raise ValueError("studio projection text must be product-safe")
@@ -254,11 +275,30 @@ class StudioWorkspaceSnapshot(_StudioProjection):
             raise ValueError("studio event counts must match the immutable timeline")
         if [item.timeline_ordinal for item in self.events] != list(range(1, count + 1)):
             raise ValueError("studio timeline ordinals must be contiguous")
+        if any(
+            (item.persisted_ordinal is not None) != (item.effect == "persisted")
+            for item in self.events
+        ):
+            raise ValueError(
+                "studio persisted ordinal must exist exactly for persisted events"
+            )
         persisted = [item.persisted_ordinal for item in self.events if item.effect == "persisted"]
         if persisted != list(range(1, len(persisted) + 1)):
             raise ValueError("studio persisted ordinals must be contiguous")
         if [item.event_ordinal for item in self.data_points] != list(range(1, count + 1)):
             raise ValueError("studio data ordinals must exactly match timeline ordinals")
+        if any(
+            point.effect != event.effect
+            for event, point in zip(self.events, self.data_points, strict=True)
+        ):
+            raise ValueError("studio data effect must match its timeline event effect")
+        if any(
+            point.label != event.active_transition.generated_label
+            for event, point in zip(self.events, self.data_points, strict=True)
+        ):
+            raise ValueError(
+                "studio data generated label must match its timeline transition"
+            )
         if [item.ordinal for item in self.conversations] != list(
             range(1, len(self.conversations) + 1)
         ):
@@ -285,6 +325,13 @@ class StudioWorkspaceSnapshot(_StudioProjection):
             active_people and active_people[0].persona_id != expected_person
         ):
             raise ValueError("studio workspace must expose only the affected stakeholder")
+        if self.lifecycle.stages != _STAGE_ORDER:
+            raise ValueError("studio lifecycle stages must use the exact approved order")
+        lifecycle_index = _STAGE_ORDER.index(self.lifecycle.current)
+        if self.lifecycle.completed != _STAGE_ORDER[:lifecycle_index]:
+            raise ValueError(
+                "studio lifecycle completed stages must be the exact current-stage prefix"
+            )
         current = StudioLifecycleStage.BRIEF
         for event in self.events:
             if event.effect == "inert" and event.stage != current:
@@ -338,6 +385,13 @@ class _ScenarioView(Protocol):
     personas: Sequence[_PersonaView]
 
 
+@dataclass(frozen=True)
+class _ProductIdentity:
+    persona_id: str
+    display_name: str
+    role: str
+
+
 class _RepositoryView(Protocol):
     def list_recent_mandates(self, limit: int) -> Sequence[object]: ...
     def list_events(self, mandate_id: object) -> Sequence[object]: ...
@@ -379,6 +433,23 @@ def project_delivery_presentation(text: str) -> tuple[str, str] | None:
     return None
 
 
+def _project_availability_content(content: str) -> str:
+    value = content.strip()
+    if any(character.isspace() for character in value) or value.count("/") != 1:
+        raise ValueError("studio availability content must be one ISO-8601 window")
+    start_text, end_text = value.split("/", 1)
+    try:
+        AvailabilityWindow(
+            start=datetime.fromisoformat(start_text),
+            end=datetime.fromisoformat(end_text),
+        )
+    except ValueError as error:
+        raise ValueError(
+            "studio availability content must be one timezone-aware ISO-8601 window"
+        ) from error
+    return _AVAILABILITY_COPY
+
+
 def _channel_label(channel: Channel) -> Literal["Email", "Telegram"]:
     return "Email" if channel is Channel.EMAIL else "Telegram"
 
@@ -394,7 +465,48 @@ def _initials(name: str) -> str:
     return "".join(part[0] for part in name.split()[:2]).upper()
 
 
-def _graph_nodes(scenario: _ScenarioView) -> tuple[StudioGraphNode, ...]:
+def _product_identities(
+    request: CoordinationRequest,
+) -> dict[str, _ProductIdentity]:
+    catalog = {item.persona_id: item for item in product_catalog().stakeholders}
+    identities = {
+        "synthetic-manager": _ProductIdentity(
+            persona_id="synthetic-manager",
+            display_name=request.requester_name,
+            role=_REQUESTER_ROLE_LABELS[request.requester_role],
+        )
+    }
+    identities.update(
+        {
+            persona_id: _ProductIdentity(
+                persona_id=persona_id,
+                display_name=catalog[persona_id].display_name,
+                role=catalog[persona_id].role,
+            )
+            for persona_id in request.participant_ids
+        }
+    )
+    return identities
+
+
+def _validate_scenario_identities(
+    scenario: _ScenarioView,
+    identities: Mapping[str, _ProductIdentity],
+) -> None:
+    scenario_people = {item.persona_id: item for item in scenario.personas}
+    if len(scenario_people) != len(scenario.personas) or set(scenario_people) != set(identities):
+        raise ValueError("studio scenario identities must match the product catalog")
+    if any(
+        scenario_people[persona_id].display_name != identity.display_name
+        or scenario_people[persona_id].role != identity.role
+        for persona_id, identity in identities.items()
+    ):
+        raise ValueError("studio scenario identities must match the product catalog")
+
+
+def _graph_nodes(
+    identities: Mapping[str, _ProductIdentity],
+) -> tuple[StudioGraphNode, ...]:
     nodes = [
         StudioGraphNode(node_id="request", label="Request", kind="request"),
         StudioGraphNode(node_id="humanwire", label="HumanWire", kind="service"),
@@ -409,7 +521,7 @@ def _graph_nodes(scenario: _ScenarioView) -> tuple[StudioGraphNode, ...]:
             role=persona.role,
             initials=_initials(persona.display_name),
         )
-        for persona in scenario.personas
+        for persona in identities.values()
         if persona.persona_id != "synthetic-manager"
     )
     nodes.extend(
@@ -476,8 +588,9 @@ def _lifecycle(current: StudioLifecycleStage) -> StudioLifecycle:
 def _initial_snapshot(
     request: CoordinationRequest,
     scenario: _ScenarioView,
+    identities: Mapping[str, _ProductIdentity],
 ) -> StudioWorkspaceSnapshot:
-    nodes = _graph_nodes(scenario)
+    nodes = _graph_nodes(identities)
     return StudioWorkspaceSnapshot(
         schema_version="humanwire.studio/v1",
         run_alias=scenario.scenario_id,
@@ -557,13 +670,13 @@ class StudioProgressStore:
         previous: StudioWorkspaceSnapshot,
         candidate: StudioWorkspaceSnapshot,
     ) -> None:
-        if previous.run_state == "complete":
+        if previous.run_state in {"complete", "failed"}:
             if (
                 candidate.model_dump(mode="json") != previous.model_dump(mode="json")
                 or candidate._final_trace_sha256 != previous._final_trace_sha256
                 or candidate._transcript_sha256 != previous._transcript_sha256
             ):
-                raise ValueError("complete studio snapshots are immutable")
+                raise ValueError("terminal studio snapshots are immutable")
             return
         allowed = {
             "starting": {"starting", "running", "failed"},
@@ -658,6 +771,46 @@ _LIFECYCLE_BY_STAGE = {
     "Meeting": StudioLifecycleStage.SCHEDULE,
 }
 
+_ORIGIN_EVENT_TYPES = frozenset(
+    {
+        "mandate.created",
+        "mandate.received",
+        "mandate.planned",
+        "engagement.plan_previewed",
+        "engagement.plan_released",
+    }
+)
+_OUTREACH_EVENT_TYPES = frozenset(
+    {
+        "mandate.interviewing",
+        "outreach.primary_sent",
+        "outreach.delivery_confirmed",
+        "outreach.delivery_failed",
+        "outreach.reminder_sent",
+        "outreach.alternate_sent",
+        "stakeholder.acknowledged",
+        "engagement.quick_response_sent",
+        "engagement.structured_interview_sent",
+        "engagement.acknowledgement_sent",
+        "engagement.inform_delivered",
+        "engagement.structured_interview_reminder",
+        "engagement.structured_interview_alternate_selected",
+        "engagement.acknowledged",
+    }
+)
+_INTERVIEW_EVENT_TYPES = frozenset(
+    {
+        "interview.answer_recorded",
+        "engagement.quick_response_completed",
+        "engagement.structured_interview_progressed",
+    }
+)
+_EVIDENCE_EVENT_TYPES = frozenset(
+    {"interview.evidence_confirmed", "mandate.synthesizing"}
+)
+_NEGOTIATION_EVENT_TYPES = frozenset({"proposal.created", "mandate.negotiating"})
+_MEETING_EVENT_TYPES = frozenset({"meeting.package_created", "mandate.meeting_ready"})
+
 
 def _event_phase(
     raw_type: str,
@@ -666,20 +819,15 @@ def _event_phase(
     negotiation_started: bool,
     approval_started: bool,
 ) -> str | None:
-    if raw_type in {"mandate.received", "mandate.created", "mandate.planned"} or raw_type.startswith(
-        "engagement.plan_"
-    ):
+    if raw_type in _ORIGIN_EVENT_TYPES:
         return "Origin"
-    if raw_type.startswith("outreach.") or raw_type in {
-        "mandate.interviewing",
-        "stakeholder.acknowledged",
-    }:
+    if raw_type in _OUTREACH_EVENT_TYPES:
         return "Outreach"
-    if raw_type == "interview.answer_recorded":
+    if raw_type in _INTERVIEW_EVENT_TYPES:
         return "Interview"
-    if raw_type in {"interview.evidence_confirmed", "mandate.synthesizing"}:
+    if raw_type in _EVIDENCE_EVENT_TYPES:
         return "Evidence"
-    if raw_type in {"proposal.created", "mandate.negotiating"}:
+    if raw_type in _NEGOTIATION_EVENT_TYPES:
         return "Negotiation"
     if raw_type == "proposal.response_recorded":
         return "Approval" if persona_id == "approval" else "Negotiation"
@@ -691,7 +839,7 @@ def _event_phase(
         return "Availability"
     if raw_type == "availability.recorded":
         return "Availability" if approval_started else None
-    if raw_type.startswith("meeting.") or raw_type == "mandate.meeting_ready":
+    if raw_type in _MEETING_EVENT_TYPES:
         return "Meeting"
     return None
 
@@ -803,11 +951,21 @@ class StudioProgressObserver:
         delegate: RepositoryProgressObserver,
         request: CoordinationRequest,
         scenario: _ScenarioView,
+        identities: Mapping[str, _ProductIdentity],
     ) -> None:
         self._store = store
         self._delegate = delegate
         self._request = request
-        self._scenario = scenario
+        self._identities = dict(identities)
+        self._run_alias = scenario.scenario_id
+        self._connection_label: Literal["Workspace channels", "Provider connected"] = (
+            "Provider connected"
+            if bool(getattr(scenario.provenance, "live_provider_verified", False))
+            else "Workspace channels"
+        )
+        self._private_fact_values = tuple(
+            fact for person in scenario.personas for fact in person.private_facts
+        )
         self._lock = threading.RLock()
         self._records: list[_PresentationRecord] = []
         self._last_repository: _RepositoryView | None = None
@@ -897,6 +1055,10 @@ class StudioProgressObserver:
                 text, status = "No response received.", "no_response"
             elif intent is SyntheticIntent.ERROR:
                 text, status = "Response could not be accepted.", "rejected"
+            elif intent is SyntheticIntent.AVAILABILITY:
+                text = _project_availability_content(safe_content)
+                _assert_product_safe(text, self._private_facts())
+                status = "received"
             else:
                 text = safe_content.strip()
                 _assert_product_safe(text, self._private_facts())
@@ -915,14 +1077,14 @@ class StudioProgressObserver:
                 )
             )
 
-    def _persona(self, persona_id: str) -> _PersonaView:
-        matches = [item for item in self._scenario.personas if item.persona_id == persona_id]
-        if len(matches) != 1:
+    def _persona(self, persona_id: str) -> _ProductIdentity:
+        persona = self._identities.get(persona_id)
+        if persona is None:
             raise ValueError("studio presentation requires one known persona")
-        return matches[0]
+        return persona
 
     def _private_facts(self) -> tuple[str, ...]:
-        return tuple(fact for person in self._scenario.personas for fact in person.private_facts)
+        return self._private_fact_values
 
     def _assign_records(
         self,
@@ -995,7 +1157,7 @@ class StudioProgressObserver:
             self._timeline.append(_TimelineSource(effect="inert", created_at=item.created_at))
         self._inert_seen = len(inert_events)
         overrides = self._assign_records(raw)
-        people = {item.persona_id: item for item in self._scenario.personas}
+        people = self._identities
         current_stage = StudioLifecycleStage.BRIEF
         negotiation_started = False
         approval_started = False
@@ -1092,7 +1254,7 @@ class StudioProgressObserver:
             for item in events
         )
         active = events[-1].active_transition if events else None
-        initial_nodes = _graph_nodes(self._scenario)
+        initial_nodes = _graph_nodes(self._identities)
         active_persona = events[-1].affected_persona_id if events else None
         nodes = tuple(
             item.model_copy(update={"active": item.persona_id == active_persona})
@@ -1111,17 +1273,13 @@ class StudioProgressObserver:
         outcome = self._outcome(typed_repository, progress.run_state)
         snapshot = StudioWorkspaceSnapshot(
             schema_version="humanwire.studio/v1",
-            run_alias=self._scenario.scenario_id,
+            run_alias=self._run_alias,
             objective=self._request.objective,
             requester_name=self._request.requester_name,
             requester_role_label=_REQUESTER_ROLE_LABELS[self._request.requester_role],
             target_timing_label=_timing_label(self._request),
             run_state=progress.run_state.value,
-            connection_label=(
-                "Provider connected"
-                if bool(getattr(self._scenario.provenance, "live_provider_verified", False))
-                else "Workspace channels"
-            ),
+            connection_label=self._connection_label,
             lifecycle=_lifecycle(current_stage),
             graph_nodes=nodes,
             graph_edges=edges,
@@ -1162,7 +1320,7 @@ class StudioProgressObserver:
         package = repository.get_meeting_package(mandate.mandate_id)
         if package is not None:
             names = {
-                item.persona_id: item.display_name for item in self._scenario.personas
+                item.persona_id: item.display_name for item in self._identities.values()
             }
             return StudioOutcome(
                 state="meeting_ready",
@@ -1195,9 +1353,11 @@ def create_studio_progress(
 ) -> tuple[StudioProgressStore, StudioProgressObserver]:
     """Create the safe product store and its repository/presentation observer."""
     request = CoordinationRequest.model_validate(request)
-    initial = _initial_snapshot(request, scenario)
+    identities = _product_identities(request)
+    _validate_scenario_identities(scenario, identities)
+    initial = _initial_snapshot(request, scenario, identities)
     private_facts = tuple(fact for person in scenario.personas for fact in person.private_facts)
     store = StudioProgressStore(initial, forbidden_texts=private_facts)
     internal_store = SyntheticProgressStore(initial_progress(scenario))
     delegate = RepositoryProgressObserver(internal_store)
-    return store, StudioProgressObserver(store, delegate, request, scenario)
+    return store, StudioProgressObserver(store, delegate, request, scenario, identities)
