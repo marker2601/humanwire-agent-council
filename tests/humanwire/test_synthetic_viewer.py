@@ -1,0 +1,458 @@
+from __future__ import annotations
+
+import csv
+import io
+import json
+import re
+import subprocess
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from humanwire.demo import create_demo_app
+from humanwire.synthetic import default_synthetic_scenario, generate_scenario
+from humanwire.synthetic_progress import (
+    RepositoryProgressObserver,
+    SyntheticAggregateCounts,
+    SyntheticProgressEvent,
+    SyntheticProgressStore,
+    SyntheticRunState,
+    SyntheticRuntimeStatus,
+    initial_progress,
+)
+from humanwire.synthetic_viewer import (
+    create_synthetic_viewer_app,
+    validate_viewer_host,
+)
+
+
+def _event(
+    ordinal: int,
+    *,
+    source: str = "HumanWire",
+    destination: str = "Decision Room",
+    data_point: str = "Mandate created",
+    highlight_target: str = "origin",
+) -> SyntheticProgressEvent:
+    return SyntheticProgressEvent(
+        timeline_ordinal=ordinal,
+        persisted_ordinal=ordinal,
+        created_at=datetime(2026, 8, 13, 12, ordinal, tzinfo=UTC),
+        story="primary",
+        effect="persisted",
+        stage="Mandate",
+        source=source,
+        destination=destination,
+        data_point=data_point,
+        description=f"Mandate: {data_point}",
+        highlight_target=highlight_target,
+    )
+
+
+@pytest.fixture
+def running_viewer_client(tmp_path: Path) -> TestClient:
+    scenario = default_synthetic_scenario(seed=31)
+    initial = initial_progress(scenario)
+    events = (_event(1),)
+    running = initial.model_copy(
+        update={
+            "run_state": SyntheticRunState.RUNNING,
+            "runtime_status": SyntheticRuntimeStatus.PERSISTED,
+            "saved_event_count": 1,
+            "timeline_event_count": 1,
+            "current_timeline_ordinal": 1,
+            "current_persisted_ordinal": 1,
+            "events": events,
+            "aggregate_counts": SyntheticAggregateCounts(
+                personas=len(initial.personas),
+                persisted_events=1,
+                inert_attempts=0,
+                complete_assignments=0,
+                pending_assignments=0,
+                terminal_mandates=0,
+            ),
+        }
+    )
+    return TestClient(
+        create_synthetic_viewer_app(
+            SyntheticProgressStore(running), tmp_path / "unfinished-transcript.json"
+        )
+    )
+
+
+@pytest.fixture(scope="module")
+def completed_viewer_material(tmp_path_factory):
+    run_root = tmp_path_factory.mktemp("completed-viewer") / "run"
+    transcript_path = run_root / "transcript.json"
+    scenario = default_synthetic_scenario(seed=37)
+    store = SyntheticProgressStore(initial_progress(scenario))
+    observer = RepositoryProgressObserver(store)
+    generate_scenario(
+        scenario,
+        transcript_path,
+        run_root,
+        progress_observer=observer,
+    )
+    return store, transcript_path
+
+
+@pytest.fixture
+def completed_viewer_client(completed_viewer_material) -> TestClient:
+    store, transcript_path = completed_viewer_material
+    return TestClient(create_synthetic_viewer_app(store, transcript_path))
+
+
+def test_viewer_is_get_only_and_progress_is_no_store(running_viewer_client) -> None:
+    progress = running_viewer_client.get("/progress.json")
+
+    assert progress.status_code == 200
+    assert progress.headers["cache-control"] == "no-store"
+    assert progress.json()["run_state"] == "running"
+    for method in ("post", "put", "patch", "delete", "options"):
+        response = getattr(running_viewer_client, method)("/")
+        assert response.status_code == 405
+        assert response.json() == {"detail": "Method not allowed"}
+        assert response.headers["cache-control"] == "no-store"
+
+
+def test_get_and_head_responses_have_safe_headers_and_head_has_no_body(
+    running_viewer_client,
+) -> None:
+    for path in ("/", "/progress.json", "/static/synthetic-progress.js"):
+        response = running_viewer_client.get(path)
+        head = running_viewer_client.head(path)
+
+        assert response.status_code == 200
+        assert head.status_code == 200
+        assert head.content == b""
+        for candidate in (response, head):
+            assert candidate.headers["cache-control"] == "no-store"
+            assert candidate.headers["x-content-type-options"] == "nosniff"
+            assert candidate.headers["referrer-policy"] == "no-referrer"
+            assert candidate.headers["permissions-policy"] == (
+                "camera=(), microphone=(), geolocation=()"
+            )
+            assert candidate.headers["content-security-policy"] == (
+                "default-src 'self'; script-src 'self'; style-src 'self'; "
+                "img-src 'self' data:; object-src 'none'; base-uri 'none'; "
+                "frame-ancestors 'none'; form-action 'none'"
+            )
+
+
+def test_final_downloads_are_unavailable_until_completion(running_viewer_client) -> None:
+    for path in ("/evidence.json", "/events.csv"):
+        response = running_viewer_client.get(path)
+
+        assert response.status_code == 409
+        assert response.json() == {"detail": "Final evidence unavailable"}
+        assert "content-disposition" not in response.headers
+
+
+def test_completed_json_and_csv_are_attachments(completed_viewer_client) -> None:
+    json_response = completed_viewer_client.get("/evidence.json")
+    csv_response = completed_viewer_client.get("/events.csv")
+
+    assert json_response.status_code == 200
+    assert csv_response.status_code == 200
+    assert json_response.headers["content-disposition"] == (
+        'attachment; filename="humanwire-synthetic-evidence.json"'
+    )
+    assert csv_response.headers["content-disposition"] == (
+        'attachment; filename="humanwire-synthetic-events.csv"'
+    )
+    assert json_response.headers["content-type"].startswith("application/json")
+    assert csv_response.headers["content-type"].startswith("text/csv")
+    evidence = json.loads(json_response.content)
+    assert evidence["provenance"]["transport"] == "fake_caspian"
+    assert evidence["schema_version"] == "humanwire.synthetic-evidence/v1"
+    assert "actions" not in evidence
+    assert "outbound_digests" not in evidence
+    assert csv_response.text.startswith(
+        "ordinal,created_at,story,stage,source,destination,data_point"
+    )
+
+
+def test_downloads_fail_closed_for_invalid_or_mismatched_transcript(
+    completed_viewer_material, tmp_path: Path
+) -> None:
+    store, transcript_path = completed_viewer_material
+    invalid = tmp_path / "private-path" / "transcript.json"
+    invalid.parent.mkdir()
+    invalid.write_text('{"secret":"provider-body"}', encoding="utf-8")
+    invalid_client = TestClient(create_synthetic_viewer_app(store, invalid))
+    mismatch = store.snapshot()
+    mismatch._identity_seed = 99
+    mismatch_client = TestClient(
+        create_synthetic_viewer_app(SyntheticProgressStore(mismatch), transcript_path)
+    )
+
+    for client in (invalid_client, mismatch_client):
+        for path in ("/evidence.json", "/events.csv"):
+            response = client.get(path)
+            assert response.status_code == 409
+            assert response.json() == {"detail": "Final evidence unavailable"}
+            assert "content-disposition" not in response.headers
+            assert "provider-body" not in response.text
+            assert "private-path" not in response.text
+
+
+def test_csv_neutralizes_formula_cells_and_exports_only_allowlisted_fields(
+    completed_viewer_material,
+) -> None:
+    store, transcript_path = completed_viewer_material
+    completed = store.snapshot()
+    injected = completed.events[0].model_copy(
+        update={"source": "=2+2", "destination": "\tprivate", "data_point": "@SUM(A1)"}
+    )
+    changed = completed.model_copy(update={"events": (injected, *completed.events[1:])})
+    changed._identity_seed = completed._identity_seed
+    client = TestClient(
+        create_synthetic_viewer_app(SyntheticProgressStore(changed), transcript_path)
+    )
+
+    response = client.get("/events.csv")
+    rows = list(csv.DictReader(io.StringIO(response.text)))
+
+    assert response.status_code == 200
+    assert rows[0]["source"] == "'=2+2"
+    assert rows[0]["destination"] == "'\tprivate"
+    assert rows[0]["data_point"] == "'@SUM(A1)"
+    assert set(rows[0]) == {
+        "ordinal",
+        "created_at",
+        "story",
+        "stage",
+        "source",
+        "destination",
+        "data_point",
+    }
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [("127.0.0.1", "127.0.0.1"), ("::1", "::1")],
+)
+def test_viewer_accepts_only_explicit_loopback_ips(host: str, expected: str) -> None:
+    assert validate_viewer_host(host) == expected
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "192.0.2.10", "example.test", "localhost"])
+def test_viewer_rejects_non_loopback_binding(host: str) -> None:
+    with pytest.raises(ValueError, match="loopback"):
+        validate_viewer_host(host)
+
+
+def test_public_demo_has_no_local_progress_surface() -> None:
+    web_client = TestClient(create_demo_app())
+
+    assert web_client.get("/progress.json").status_code == 404
+    assert web_client.get("/evidence.json").status_code == 404
+    assert web_client.get("/events.csv").status_code == 404
+
+
+def test_viewer_template_is_truthful_accessible_and_download_first(
+    running_viewer_client,
+) -> None:
+    response = running_viewer_client.get("/")
+    html = response.text
+
+    assert response.status_code == 200
+    assert "Synthetic HumanWire progress" in html
+    for label in (
+        "proof_class=synthetic_multi_persona",
+        "actor_type=simulated_persona",
+        "identity_source=synthetic_fixture",
+        "transport=fake_caspian",
+        "human_attested=false",
+        "live_provider_verified=false",
+    ):
+        assert label in html
+    for marker in (
+        "data-synthetic-viewer",
+        "data-run-mode",
+        "data-run-state",
+        "data-runtime-status",
+        "data-persona-list",
+        "data-saved-event-count",
+        "data-follow-live",
+        "data-replay-list",
+        "data-replay-source",
+        "data-replay-destination",
+        "data-replay-data-point",
+        "data-replay-previous",
+        "data-replay-play",
+        "data-replay-next",
+        'aria-live="polite"',
+    ):
+        assert marker in html
+    assert re.search(r'<a[^>]+href="/evidence.json"[^>]+download[^>]+aria-disabled="true"', html)
+    assert re.search(r'<a[^>]+href="/events.csv"[^>]+download[^>]+aria-disabled="true"', html)
+    assert '<ol class="replay-events" data-replay-list hidden' in html
+    assert '<script src="/static/synthetic-progress.js" defer></script>' in html
+
+
+def test_viewer_styles_have_accessible_controls_and_responsive_no_overflow_layout(
+    running_viewer_client,
+) -> None:
+    css = running_viewer_client.get("/static/styles.css").text
+
+    assert re.search(
+        r"\.synthetic-progress-page\s*\{[^}]*font-size:\s*14px",
+        css,
+        re.DOTALL,
+    )
+    assert re.search(
+        r"\.synthetic-personas\s*\{[^}]*grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)",
+        css,
+        re.DOTALL,
+    )
+    assert re.search(
+        r"\.synthetic-progress-page (?:button|\.synthetic-download)\b[^}]*min-height:\s*44px",
+        css,
+        re.DOTALL,
+    )
+    assert ".synthetic-progress-page :focus-visible" in css
+    assert re.search(
+        r"\.synthetic-progress-page \.replay-events\[hidden\]\s*\{[^}]*display:\s*none",
+        css,
+        re.DOTALL,
+    )
+    mobile_sections = re.findall(r"@media \(max-width: 759px\)(.*?)(?=@media|\Z)", css, re.DOTALL)
+    mobile = "\n".join(mobile_sections)
+    assert re.search(
+        r"\.synthetic-personas\s*\{[^}]*grid-template-columns:\s*1fr", mobile, re.DOTALL
+    )
+    assert re.search(
+        r"\.replay-flow-strip\s*\{[^}]*grid-template-columns:\s*repeat\(2,", mobile, re.DOTALL
+    )
+    reduced = re.search(
+        r"@media \(prefers-reduced-motion: reduce\)(.*?)(?=@media|\Z)", css, re.DOTALL
+    )
+    assert reduced is not None
+    assert "transition-duration: 0.01ms !important" in reduced.group(1)
+    assert "animation-duration: 0.01ms !important" in reduced.group(1)
+
+
+def test_progress_controller_exercises_live_manual_playback_and_download_states() -> None:
+    script_path = Path(__file__).resolve().parents[2] / "src/humanwire/static/synthetic-progress.js"
+    harness = r"""
+const fs = require("fs");
+const scriptPath = process.argv[1];
+const mode = process.argv[2];
+const reduced = mode === "reduced";
+
+function expect(actual, expected, message) {
+  if (actual !== expected) throw new Error(`${message}: expected ${expected}, got ${actual}`);
+}
+class ClassList {
+  constructor() { this.values = new Set(); }
+  add(...values) { values.forEach((value) => this.values.add(value)); }
+  remove(...values) { values.forEach((value) => this.values.delete(value)); }
+  toggle(value, force) { const next = force === undefined ? !this.values.has(value) : force; next ? this.values.add(value) : this.values.delete(value); return next; }
+  contains(value) { return this.values.has(value); }
+}
+class Element {
+  constructor(tag = "div") { this.tagName = tag.toUpperCase(); this.attributes = {}; this.dataset = {}; this.classList = new ClassList(); this.children = []; this.listeners = {}; this._text = ""; }
+  get textContent() { return this._text; }
+  set textContent(value) { this._text = String(value); this.children = []; }
+  set innerHTML(_) { throw new Error("innerHTML must not be used"); }
+  setAttribute(name, value) { this.attributes[name] = String(value); if (name.startsWith("data-")) this.dataset[name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = String(value); }
+  removeAttribute(name) { delete this.attributes[name]; }
+  getAttribute(name) { return this.attributes[name]; }
+  append(...nodes) { this.children.push(...nodes); }
+  replaceChildren(...nodes) { this.children = nodes; }
+  addEventListener(name, listener) { (this.listeners[name] ||= []).push(listener); }
+  click() { (this.listeners.click || []).forEach((listener) => listener({ preventDefault() { this.prevented = true; } })); }
+  scrollIntoView() {}
+  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+  querySelectorAll(selector) {
+    const matches = (node) => selector === "[data-highlight-target]" ? node.attributes["data-highlight-target"] !== undefined : false;
+    const found = [];
+    const visit = (node) => { if (matches(node)) found.push(node); node.children.forEach(visit); };
+    this.children.forEach(visit); return found;
+  }
+}
+const selectors = ["[data-synthetic-viewer]", "[data-run-status]", "[data-run-mode]", "[data-run-state]", "[data-runtime-status]", "[data-active-persona]", "[data-saved-event-count]", "[data-persona-list]", "[data-replay-list]", "[data-follow-live]", "[data-replay-previous]", "[data-replay-play]", "[data-replay-next]", "[data-replay-progress]", "[data-replay-source]", "[data-replay-destination]", "[data-replay-data-point]", "[data-replay-description]", "[data-replay-time]", "[data-replay-live]", "[data-evidence-json]", "[data-evidence-csv]"];
+const nodes = Object.fromEntries(selectors.map((selector) => [selector, new Element(selector.includes("evidence") ? "a" : "div")]));
+const root = nodes["[data-synthetic-viewer]"];
+const origin = new Element(); origin.setAttribute("data-highlight-target", "origin"); root.append(origin, nodes["[data-persona-list]"]);
+nodes["[data-follow-live]"].setAttribute("aria-pressed", "true");
+nodes["[data-replay-play]"].setAttribute("aria-pressed", "false");
+nodes["[data-evidence-json]"].setAttribute("aria-disabled", "true");
+nodes["[data-evidence-csv]"].setAttribute("aria-disabled", "true");
+const documentListeners = {};
+global.document = {
+  visibilityState: "visible",
+  querySelector(selector) { return nodes[selector] || null; },
+  querySelectorAll(selector) { return root.querySelectorAll(selector); },
+  createElement(tag) { return new Element(tag); },
+  addEventListener(name, listener) { (documentListeners[name] ||= []).push(listener); },
+};
+const intervals = new Map(); let intervalId = 0;
+const snapshots = [
+  { schema_version: "humanwire.synthetic-progress/v1", mode: "deterministic", run_state: "running", runtime_status: "persisted", active_persona_label: "Ada Stone", active_contract: "quick_response", saved_event_count: 1, events: [{ timeline_ordinal: 1, persisted_ordinal: 1, effect: "persisted", created_at: "2026-08-13T12:01:00Z", story: "primary", stage: "Mandate", source: "HumanWire", destination: "Decision Room", data_point: "Mandate created", description: "First saved event", highlight_target: "origin" }], personas: [{ ordinal: 1, display_name: "Ada Stone", role: "Program owner", contract: "quick_response", status: "pending", progress_current: 0, progress_total: 1 }] },
+  { schema_version: "humanwire.synthetic-progress/v1", mode: "model_assisted", run_state: "complete", runtime_status: "persisted", active_persona_label: null, active_contract: null, saved_event_count: 2, final_trace_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", events: [{ timeline_ordinal: 1, persisted_ordinal: 1, effect: "persisted", created_at: "2026-08-13T12:01:00Z", story: "primary", stage: "Mandate", source: "HumanWire", destination: "Decision Room", data_point: "Mandate created", description: "First saved event", highlight_target: "origin" }, { timeline_ordinal: 2, persisted_ordinal: 2, effect: "persisted", created_at: "2026-08-13T12:02:00Z", story: "primary", stage: "Outreach", source: "HumanWire", destination: "Ada Stone", data_point: "Outreach sent", description: "Second saved event", highlight_target: "persona-1" }], personas: [{ ordinal: 1, display_name: "Ada Stone", role: "Program owner", contract: "quick_response", status: "complete", progress_current: 1, progress_total: 1 }] }
+];
+let fetchCount = 0;
+global.fetch = async (url, options) => { expect(url, "/progress.json", "poll URL"); expect(options.cache, "no-store", "poll cache"); const value = snapshots[Math.min(fetchCount, snapshots.length - 1)]; fetchCount += 1; return { ok: true, json: async () => value }; };
+global.window = {
+  matchMedia() { return { matches: reduced }; },
+  setInterval(listener) { const id = ++intervalId; intervals.set(id, listener); return id; },
+  clearInterval(id) { intervals.delete(id); },
+  setTimeout(listener) { listener(); return 1; },
+};
+const dispatch = (name) => (documentListeners[name] || []).forEach((listener) => listener());
+const flush = async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); };
+
+(async () => {
+  eval(fs.readFileSync(scriptPath, "utf8"));
+  dispatch("DOMContentLoaded"); await flush();
+  expect(fetchCount, 1, "initial visible poll");
+  expect(nodes["[data-run-status]"].textContent, "Running · persisted · 1 saved event", "progress copy");
+  expect(nodes["[data-replay-source]"].textContent, "HumanWire", "first From");
+  expect(nodes["[data-replay-destination]"].textContent, "Decision Room", "first To");
+  expect(nodes["[data-replay-data-point]"].textContent, "Mandate created", "first Generated");
+  expect(nodes["[data-evidence-json]"].getAttribute("aria-disabled"), "true", "JSON disabled while running");
+  expect(root.querySelectorAll("[data-highlight-target]").filter((node) => node.classList.contains("is-replay-current")).length, 1, "one initial highlight");
+  const poll = [...intervals.values()][0]; await poll(); await flush();
+  expect(nodes["[data-run-status]"].textContent, "Complete · persisted · 2 saved events", "completed progress copy");
+  expect(nodes["[data-replay-destination]"].textContent, "Ada Stone", "Follow Live newest To");
+  expect(nodes["[data-replay-data-point]"].textContent, "Outreach sent", "Follow Live newest Generated");
+  expect(nodes["[data-evidence-json]"].getAttribute("aria-disabled"), undefined, "JSON enabled after completion");
+  expect(nodes["[data-evidence-csv]"].getAttribute("aria-disabled"), undefined, "CSV enabled after completion");
+  nodes["[data-replay-previous]"].click();
+  expect(nodes["[data-follow-live]"].getAttribute("aria-pressed"), "false", "manual Previous disables Follow Live");
+  expect(nodes["[data-replay-destination]"].textContent, "Decision Room", "Previous To");
+  nodes["[data-replay-next]"].click();
+  expect(nodes["[data-replay-live]"].textContent, "Event 2 of 2: From HumanWire; To Ada Stone; Generated Outreach sent. Second saved event", "polite replay announcement");
+  expect(root.querySelectorAll("[data-highlight-target]").filter((node) => node.classList.contains("is-replay-current")).length, 1, "one manual highlight");
+  nodes["[data-follow-live]"].click();
+  expect(nodes["[data-follow-live]"].getAttribute("aria-pressed"), "true", "Follow Live can resume");
+  nodes["[data-replay-previous]"].click();
+  nodes["[data-replay-play]"].click();
+  if (reduced) {
+    expect(nodes["[data-replay-play]"].getAttribute("aria-pressed"), "false", "reduced motion blocks timed playback");
+  } else {
+    expect(nodes["[data-replay-play]"].getAttribute("aria-pressed"), "true", "Play starts playback");
+    nodes["[data-replay-play]"].click();
+    expect(nodes["[data-replay-play]"].getAttribute("aria-pressed"), "false", "Pause stops playback");
+    nodes["[data-replay-play]"].click();
+  }
+  const visibleFetches = fetchCount;
+  document.visibilityState = "hidden"; dispatch("visibilitychange");
+  expect(nodes["[data-replay-play]"].getAttribute("aria-pressed"), "false", "hidden page pauses playback");
+  expect(intervals.size, 0, "hidden page clears polling and playback");
+  await flush(); expect(fetchCount, visibleFetches, "hidden page does not poll");
+})().catch((error) => { console.error(error.stack); process.exitCode = 1; });
+"""
+
+    for mode in ("normal", "reduced"):
+        result = subprocess.run(
+            ["node", "-e", harness, str(script_path), mode],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr

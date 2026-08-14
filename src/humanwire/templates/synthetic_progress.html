@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#001428">
+    <title>Synthetic HumanWire progress</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="/static/synthetic-progress.js" defer></script>
+  </head>
+  <body class="synthetic-viewer-body">
+    <a class="skip-link" href="#main-content">Skip to main content</a>
+    <main id="main-content" class="synthetic-progress-page shell" data-synthetic-viewer>
+      <header class="synthetic-heading">
+        <p class="eyebrow">Local simulation viewer</p>
+        <h1>Synthetic HumanWire progress</h1>
+        <p>Follow safe saved events as simulated personas move through HumanWire.</p>
+      </header>
+
+      <aside class="proof-provenance" aria-label="Synthetic proof provenance">
+        <strong>Synthetic agent simulation</strong>
+        <ul>
+          <li><code>proof_class=synthetic_multi_persona</code></li>
+          <li><code>actor_type=simulated_persona</code></li>
+          <li><code>identity_source=synthetic_fixture</code></li>
+          <li><code>transport=fake_caspian</code></li>
+          <li><code>human_attested=false</code></li>
+          <li><code>live_provider_verified=false</code></li>
+        </ul>
+      </aside>
+
+      <section class="synthetic-run-card" aria-labelledby="synthetic-run-heading">
+        <div>
+          <p class="eyebrow">Run state</p>
+          <h2 id="synthetic-run-heading">Saved progress</h2>
+        </div>
+        <p class="synthetic-run-status" aria-live="polite" data-run-status>Starting</p>
+        <dl class="synthetic-run-facts">
+          <div><dt>Mode</dt><dd data-run-mode>Deterministic</dd></div>
+          <div><dt>State</dt><dd data-run-state>Starting</dd></div>
+          <div><dt>Status</dt><dd data-runtime-status>Persisted</dd></div>
+          <div><dt>Active persona</dt><dd data-active-persona>Waiting</dd></div>
+          <div><dt>Saved events</dt><dd data-saved-event-count>0</dd></div>
+        </dl>
+      </section>
+
+      <section class="synthetic-persona-panel" aria-labelledby="synthetic-persona-heading">
+        <div class="synthetic-section-heading">
+          <div>
+            <p class="eyebrow">Simulated team</p>
+            <h2 id="synthetic-persona-heading">Persona progress</h2>
+          </div>
+          <div class="synthetic-origin" data-highlight-target="origin">HumanWire</div>
+        </div>
+        <ol class="synthetic-personas" data-persona-list></ol>
+      </section>
+
+      <section class="replay-panel" aria-labelledby="synthetic-replay-heading">
+        <div class="synthetic-section-heading">
+          <div>
+            <p class="eyebrow">Persisted replay</p>
+            <h2 id="synthetic-replay-heading">Saved event flow</h2>
+          </div>
+          <button type="button" data-follow-live aria-pressed="true">Follow live</button>
+        </div>
+        <ol class="replay-events" data-replay-list hidden aria-hidden="true"></ol>
+        <dl class="replay-flow-strip" data-replay-flow>
+          <div><dt>From</dt><dd data-replay-source>No persisted event yet</dd></div>
+          <div><dt>To</dt><dd data-replay-destination>HumanWire</dd></div>
+          <div><dt>Generated</dt><dd data-replay-data-point>Waiting</dd></div>
+        </dl>
+        <div class="replay-detail">
+          <p data-replay-description>Waiting for the first saved event.</p>
+          <time data-replay-time></time>
+          <p data-replay-progress>Event 0 of 0</p>
+        </div>
+        <div class="replay-controls" aria-label="Saved event replay controls">
+          <button type="button" data-replay-previous aria-label="Previous saved event">Previous</button>
+          <button type="button" data-replay-play aria-label="Play saved events" aria-pressed="false">Play</button>
+          <button type="button" data-replay-next aria-label="Next saved event">Next</button>
+        </div>
+        <p class="sr-only" aria-live="polite" aria-atomic="true" data-replay-live></p>
+      </section>
+
+      <section class="synthetic-downloads" aria-labelledby="synthetic-download-heading">
+        <div>
+          <p class="eyebrow">Final artifacts</p>
+          <h2 id="synthetic-download-heading">Evidence downloads</h2>
+          <p>Downloads unlock only after a valid completed transcript is available.</p>
+        </div>
+        <div class="synthetic-download-actions">
+          <a class="synthetic-download" href="/evidence.json" download data-evidence-json aria-disabled="true" tabindex="-1">Download JSON evidence</a>
+          <a class="synthetic-download" href="/events.csv" download data-evidence-csv aria-disabled="true" tabindex="-1">Download CSV events</a>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
