@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import threading
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -138,20 +139,26 @@ def _contains_filesystem_path(text: str) -> bool:
 
 
 def _assert_product_safe(value: object, forbidden_texts: Sequence[str] = ()) -> None:
+    normalized_forbidden = tuple(
+        unicodedata.normalize("NFKC", secret).casefold()
+        for secret in forbidden_texts
+        if secret
+    )
     for text in _strings(value):
+        scan_text = unicodedata.normalize("NFKC", text)
         if (
-            _UUID.search(text)
-            or _EMAIL.search(text)
-            or _HW_TOKEN.search(text)
-            or _PRIVATE_KEY.search(text)
-            or _PRIMARY_UI_WORD.search(text)
-            or _WIRE_COMMAND.search(text)
-            or _CREDENTIAL.search(text)
-            or _URI_COORDINATE.search(text)
-            or _SECRET_VALUE.search(text)
-            or _DATABASE_ASSIGNMENT.search(text)
-            or _contains_filesystem_path(text)
-            or any(secret and secret.casefold() in text.casefold() for secret in forbidden_texts)
+            _UUID.search(scan_text)
+            or _EMAIL.search(scan_text)
+            or _HW_TOKEN.search(scan_text)
+            or _PRIVATE_KEY.search(scan_text)
+            or _PRIMARY_UI_WORD.search(scan_text)
+            or _WIRE_COMMAND.search(scan_text)
+            or _CREDENTIAL.search(scan_text)
+            or _URI_COORDINATE.search(scan_text)
+            or _SECRET_VALUE.search(scan_text)
+            or _DATABASE_ASSIGNMENT.search(scan_text)
+            or _contains_filesystem_path(scan_text)
+            or any(secret in scan_text.casefold() for secret in normalized_forbidden)
         ):
             raise ValueError("studio projection text must be product-safe")
 
