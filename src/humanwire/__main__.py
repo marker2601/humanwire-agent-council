@@ -227,6 +227,35 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         action=_OnceValue,
     )
+    studio = subcommands.add_parser(
+        "studio",
+        help="start the private HumanWire coordination studio",
+    )
+    studio.add_argument("--workspace-root", required=True, action=_OnceValue)
+    studio.add_argument(
+        "--port",
+        type=_bounded_integer("port", 1024, 65535),
+        default=8766,
+        action=_OnceValue,
+    )
+    studio.add_argument(
+        "--seed",
+        type=_bounded_integer("seed", 0, 2_147_483_647),
+        default=0,
+        action=_OnceValue,
+    )
+    studio.add_argument(
+        "--step-delay-ms",
+        type=_bounded_integer("step delay", 0, 3000),
+        default=350,
+        action=_OnceValue,
+    )
+    studio.add_argument(
+        "--max-decision-workers",
+        type=_bounded_integer("max decision workers", 1, 8),
+        default=4,
+        action=_OnceValue,
+    )
     sandbox = subcommands.add_parser(
         "sandbox",
         help="run read-only private sandbox readiness tooling",
@@ -254,6 +283,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         from humanwire.sandbox import main as sandbox_main
 
         return sandbox_main([args.sandbox_command])
+    if args.command == "studio":
+        from humanwire.studio_app import StudioOptions, run_coordination_studio
+
+        return run_coordination_studio(
+            StudioOptions(
+                workspace_root=Path(args.workspace_root),
+                port=args.port,
+                seed=args.seed,
+                step_delay_ms=args.step_delay_ms,
+                max_decision_workers=args.max_decision_workers,
+            )
+        )
     settings = Settings()
     if args.command == "init-db":
         init_database(settings)

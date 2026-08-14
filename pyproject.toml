@@ -35,7 +35,14 @@ humanwire = "humanwire.__main__:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-humanwire = ["templates/*.html", "static/*.css", "static/*.js", "viewer_static/*.js"]
+humanwire = [
+  "templates/*.html",
+  "static/*.css",
+  "static/*.js",
+  "viewer_static/*.js",
+  "studio_static/*.css",
+  "studio_static/*.js",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

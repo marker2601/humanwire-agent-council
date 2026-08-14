@@ -77,6 +77,8 @@ def test_vercel_entrypoint_serves_the_isolated_humanwire_demo() -> None:
     assert client.get("/mandates/HW-2411/data").status_code == 200
     assert client.get("/health/live").json() == {"status": "live"}
     assert client.get("/health/ready").json() == {"status": "ready", "mode": "demo"}
+    assert client.get("/api/runs").status_code == 404
+    assert client.get("/studio-static/coordination-studio.js").status_code == 404
 
 
 def test_installed_distribution_exposes_only_the_humanwire_product() -> None:
@@ -100,6 +102,8 @@ def test_installed_distribution_exposes_only_the_humanwire_product() -> None:
             "static/*.css",
             "static/*.js",
             "viewer_static/*.js",
+            "studio_static/*.css",
+            "studio_static/*.js",
         ]
     }
 

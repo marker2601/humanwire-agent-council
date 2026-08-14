@@ -455,6 +455,7 @@ def test_cli_parser_exposes_required_commands_and_description() -> None:
     assert parser.description == "AI chief of staff for adaptive human coordination"
     for command in ("init-db", "listen", "web", "smoke"):
         assert parser.parse_args([command]).command == command
+    assert parser.parse_args(["studio", "--workspace-root", "work"]).command == "studio"
 
 
 def test_init_database_redacts_password(tmp_path, capsys) -> None:
