@@ -207,6 +207,20 @@ function assertGraphGeometry() {
   const boxes = groups.map((group) => { const transform = group.getAttribute("transform").match(/translate\(([-0-9.]+) ([-0-9.]+)\)/); const rect = group.querySelector("rect"); return { id: group.getAttribute("data-flow-node"), x: Number(transform[1]), y: Number(transform[2]), width: Number(rect.getAttribute("width")), height: Number(rect.getAttribute("height")) }; });
   for (let left = 0; left < boxes.length; left += 1) for (let right = left + 1; right < boxes.length; right += 1) { const a = boxes[left]; const b = boxes[right]; const overlaps = a.x < b.x + b.width + 5 && a.x + a.width + 5 > b.x && a.y < b.y + b.height + 5 && a.y + a.height + 5 > b.y; assert.equal(overlaps, false, `${a.id} overlaps ${b.id}`); }
   const viewBox = canvas.getAttribute("viewBox").split(/\s+/).map(Number); assert.ok(viewBox[3] >= Math.max(...boxes.map((box) => box.y + box.height)) + 8);
+  if (mode !== "mobile") {
+    const stakeholders = boxes.filter((box) => box.id.startsWith("persona-"));
+    const primaryArtifacts = boxes.filter((box) => ["conflict", "interview", "evidence", "proposal"].includes(box.id));
+    const terminalArtifacts = boxes.filter((box) => ["approval", "availability", "meeting"].includes(box.id));
+    const stakeholderWidth = Math.min(...stakeholders.map((box) => box.width));
+    const stakeholderRight = Math.max(...stakeholders.map((box) => box.x + box.width));
+    const artifactLeft = Math.min(...primaryArtifacts.map((box) => box.x));
+    const artifactRight = Math.max(...primaryArtifacts.map((box) => box.x + box.width));
+    const terminalLeft = Math.min(...terminalArtifacts.map((box) => box.x));
+    assert.ok(stakeholderWidth >= 200, `desktop stakeholder width ${stakeholderWidth} must be at least 200`);
+    assert.ok(artifactLeft - stakeholderRight >= 15, `stakeholder/artifact separation ${artifactLeft - stakeholderRight} must be at least 15`);
+    assert.ok(terminalLeft - artifactRight >= 15, `artifact/terminal separation ${terminalLeft - artifactRight} must be at least 15`);
+    assert.ok(viewBox[2] - Math.max(...boxes.map((box) => box.x + box.width)) >= 5, "desktop viewBox must preserve its right gutter");
+  }
   canvas.querySelectorAll("[data-flow-edge]").forEach((edge) => assert.notEqual(edge.getAttribute("data-lane"), null));
 }
 
