@@ -11,12 +11,16 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from humanwire.persona_runtime import SyntheticGenerationMode, SyntheticProvenance
 from humanwire.replay_projection import REPLAY_EVENT_EXPLANATIONS, project_replay_labels
 
 _SAFE_ALIAS = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_UUID_SHAPED_VALUE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
 _SAFE_LABEL = re.compile(r"^[A-Za-z][A-Za-z .,'-]{0,119}$")
 _SAFE_ROLE = re.compile(r"^[A-Za-z][A-Za-z0-9 .,'&()/_-]{0,199}$")
 _SAFE_STATE = re.compile(r"^[a-z][a-z_]{0,63}$")
@@ -45,6 +49,22 @@ _INERT_DATA_POINTS = frozenset(
 
 class _StrictProgressModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    @model_validator(mode="after")
+    def has_no_uuid_shaped_public_text(self):
+        def strings(value: object):
+            if isinstance(value, str):
+                yield value
+            elif isinstance(value, dict):
+                for item in value.values():
+                    yield from strings(item)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    yield from strings(item)
+
+        if any(_UUID_SHAPED_VALUE.search(value) for value in strings(self.model_dump())):
+            raise ValueError("public progress models cannot contain UUID-shaped values")
+        return self
 
 
 class SyntheticRunState(StrEnum):
@@ -120,6 +140,25 @@ class SyntheticProgressSnapshot(_StrictProgressModel):
     terminal_states: tuple[str, ...] = ()
     final_trace_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     _identity_seed: int | None = PrivateAttr(default=None)
+
+    @model_validator(mode="after")
+    def has_consistent_public_progress(self):
+        if self.final_trace_sha256 is not None and self.run_state is not SyntheticRunState.COMPLETE:
+            raise ValueError("final trace is only valid for a complete synthetic run")
+        persisted = tuple(event for event in self.events if event.effect == "persisted")
+        if self.saved_event_count != len(persisted):
+            raise ValueError("saved event count must match persisted progress events")
+        if self.current_persisted_ordinal != len(persisted):
+            raise ValueError("current persisted ordinal must match saved events")
+        if self.timeline_event_count != len(self.events):
+            raise ValueError("timeline event count must match progress events")
+        if self.current_timeline_ordinal != len(self.events):
+            raise ValueError("current timeline ordinal must match progress events")
+        if [event.persisted_ordinal for event in persisted] != list(
+            range(1, len(persisted) + 1)
+        ):
+            raise ValueError("persisted ordinals must be contiguous in displayed order")
+        return self
 
 
 class SyntheticEvidenceBundle(_StrictProgressModel):
@@ -202,7 +241,9 @@ class _InertAttempt:
 
 def _safe_alias(value: object) -> str:
     candidate = str(value or "")
-    return candidate if _SAFE_ALIAS.fullmatch(candidate) else "synthetic-run"
+    if _SAFE_ALIAS.fullmatch(candidate) and not _UUID_SHAPED_VALUE.search(candidate):
+        return candidate
+    return "synthetic-run"
 
 
 def _safe_display_name(value: object) -> str:
@@ -325,7 +366,11 @@ def initial_progress(scenario: SyntheticScenarioView) -> SyntheticProgressSnapsh
 
 def evidence_bundle(snapshot: SyntheticProgressSnapshot) -> SyntheticEvidenceBundle | None:
     """Return the terminal public evidence view only after a final semantic trace exists."""
-    if snapshot.final_trace_sha256 is None or snapshot._identity_seed is None:
+    if (
+        snapshot.run_state is not SyntheticRunState.COMPLETE
+        or snapshot.final_trace_sha256 is None
+        or snapshot._identity_seed is None
+    ):
         return None
     return SyntheticEvidenceBundle(
         schema_version="humanwire.synthetic-evidence/v1",
@@ -346,13 +391,13 @@ class SyntheticProgressStore:
 
     def __init__(self, initial: SyntheticProgressSnapshot) -> None:
         self._lock = threading.Lock()
-        self._snapshot = initial
+        self._snapshot = self._validated_copy(initial)
 
     def publish(self, snapshot: SyntheticProgressSnapshot) -> None:
         with self._lock:
-            if len(snapshot.events) < len(self._snapshot.events):
-                raise ValueError("synthetic progress cannot lose persisted events")
-            self._snapshot = snapshot
+            candidate = self._validated_copy(snapshot)
+            self._assert_valid_transition(self._snapshot, candidate)
+            self._snapshot = candidate
 
     def snapshot(self) -> SyntheticProgressSnapshot:
         with self._lock:
@@ -360,6 +405,50 @@ class SyntheticProgressStore:
 
     def evidence_bundle(self) -> SyntheticEvidenceBundle | None:
         return evidence_bundle(self.snapshot())
+
+    @staticmethod
+    def _validated_copy(snapshot: SyntheticProgressSnapshot) -> SyntheticProgressSnapshot:
+        validated = SyntheticProgressSnapshot.model_validate(snapshot.model_dump())
+        validated._identity_seed = snapshot._identity_seed
+        return validated.model_copy(deep=True)
+
+    @staticmethod
+    def _assert_valid_transition(
+        previous: SyntheticProgressSnapshot,
+        candidate: SyntheticProgressSnapshot,
+    ) -> None:
+        allowed_states = {
+            SyntheticRunState.STARTING: {
+                SyntheticRunState.STARTING,
+                SyntheticRunState.RUNNING,
+                SyntheticRunState.FAILED,
+            },
+            SyntheticRunState.RUNNING: {
+                SyntheticRunState.RUNNING,
+                SyntheticRunState.COMPLETE,
+                SyntheticRunState.FAILED,
+            },
+            SyntheticRunState.COMPLETE: {SyntheticRunState.COMPLETE},
+            SyntheticRunState.FAILED: {SyntheticRunState.FAILED},
+        }
+        if candidate.run_state not in allowed_states[previous.run_state]:
+            raise ValueError("synthetic progress state cannot regress or skip finality")
+        previous_persisted = tuple(
+            event.model_dump(mode="json")
+            for event in previous.events
+            if event.effect == "persisted"
+        )
+        candidate_persisted = tuple(
+            event.model_dump(mode="json")
+            for event in candidate.events
+            if event.effect == "persisted"
+        )
+        if candidate_persisted[: len(previous_persisted)] != previous_persisted:
+            raise ValueError("synthetic progress must preserve the exact persisted prefix")
+        if previous.final_trace_sha256 is not None and (
+            candidate.final_trace_sha256 != previous.final_trace_sha256
+        ):
+            raise ValueError("synthetic progress final trace cannot change")
 
 
 class RepositoryProgressObserver:
@@ -473,7 +562,6 @@ class RepositoryProgressObserver:
         mandates.sort(key=lambda item: (item.created_at, str(item.mandate_id)))
         all_assignments: list[object] = []
         persisted: list[tuple[datetime, int, int, SyntheticProgressEvent]] = []
-        persisted_ordinal = 0
         terminal_states: list[str] = []
 
         for mandate_index, mandate in enumerate(mandates):
@@ -496,7 +584,6 @@ class RepositoryProgressObserver:
                 terminal_states.append(mandate_state)
 
             for saved_order, event in enumerate(repository.list_events(mandate_id), start=1):
-                persisted_ordinal += 1
                 event_assignment_id = str(getattr(event, "assignment_id", "") or "")
                 event_person_id = str(getattr(event, "person_id", "") or "")
                 definition = REPLAY_EVENT_EXPLANATIONS.get(str(getattr(event, "event_type", "")))
@@ -555,7 +642,7 @@ class RepositoryProgressObserver:
                     contract = None
                 projected = SyntheticProgressEvent(
                     timeline_ordinal=1,
-                    persisted_ordinal=persisted_ordinal,
+                    persisted_ordinal=None,
                     created_at=event.created_at,
                     story=_story_for_index(mandate_index),
                     effect="persisted",
@@ -568,7 +655,20 @@ class RepositoryProgressObserver:
                     persona_label=persona_label,
                     contract=contract,
                 )
-                persisted.append((projected.created_at, 0, saved_order, projected))
+                persisted.append((projected.created_at, mandate_index, saved_order, projected))
+
+        persisted.sort(key=lambda item: item[:3])
+        ordered_persisted = [
+            (
+                created_at,
+                0,
+                ordinal,
+                event.model_copy(update={"persisted_ordinal": ordinal}),
+            )
+            for ordinal, (created_at, _mandate_index, _saved_order, event) in enumerate(
+                persisted, start=1
+            )
+        ]
 
         inert = [
             (
@@ -592,7 +692,7 @@ class RepositoryProgressObserver:
             )
             for attempt in self._inert_attempts
         ]
-        combined = [*persisted, *inert]
+        combined = [*ordered_persisted, *inert]
         combined.sort(key=lambda item: item[:3])
         events = tuple(
             item[3].model_copy(update={"timeline_ordinal": index})
@@ -630,15 +730,15 @@ class RepositoryProgressObserver:
                     else None
                 ),
                 active_contract=active_contract,
-                saved_event_count=persisted_ordinal,
+                saved_event_count=len(ordered_persisted),
                 timeline_event_count=len(events),
                 current_timeline_ordinal=len(events),
-                current_persisted_ordinal=persisted_ordinal,
+                current_persisted_ordinal=len(ordered_persisted),
                 events=events,
                 personas=persona_rows,
                 aggregate_counts=SyntheticAggregateCounts(
                     personas=len(persona_rows),
-                    persisted_events=persisted_ordinal,
+                    persisted_events=len(ordered_persisted),
                     inert_attempts=len(self._inert_attempts),
                     complete_assignments=assignment_states.count("complete"),
                     pending_assignments=sum(

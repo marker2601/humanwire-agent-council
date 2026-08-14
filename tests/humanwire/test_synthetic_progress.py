@@ -4,7 +4,6 @@ import re
 import threading
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from uuid import UUID
 
 import pytest
 from pydantic import ValidationError
@@ -14,6 +13,9 @@ from humanwire.replay_projection import project_replay_labels
 from humanwire.synthetic import default_synthetic_scenario, generate_scenario
 from humanwire.synthetic_progress import (
     RepositoryProgressObserver,
+    SyntheticAggregateCounts,
+    SyntheticProgressEvent,
+    SyntheticProgressSnapshot,
     SyntheticProgressStore,
     SyntheticRunState,
     SyntheticRuntimeStatus,
@@ -32,11 +34,32 @@ class BlockingProgressObserver:
         self._release = threading.Event()
         self._snapshot = None
         self._published_counts: list[int] = []
+        self._persisted_boundaries: list[tuple[tuple[datetime, str], ...]] = []
 
     def capture(self, *args: object, **kwargs: object) -> None:
         self._delegate.capture(*args, **kwargs)
         snapshot = self._delegate.snapshot()
         self._published_counts.append(snapshot.saved_event_count)
+        repository = args[0]
+        mandates = sorted(
+            repository.list_recent_mandates(1000),
+            key=lambda mandate: (mandate.created_at, str(mandate.mandate_id)),
+        )
+        saved_events = [
+            (event.created_at, mandate_index, saved_order, event.event_type)
+            for mandate_index, mandate in enumerate(mandates)
+            for saved_order, event in enumerate(
+                repository.list_events(mandate.mandate_id), start=1
+            )
+        ]
+        self._persisted_boundaries.append(
+            tuple(
+                (created_at, event_type)
+                for created_at, _mandate_index, _saved_order, event_type in sorted(
+                    saved_events
+                )
+            )
+        )
         if (
             not self._blocked.is_set()
             and snapshot.saved_event_count >= self._release_after_event_count
@@ -62,6 +85,59 @@ class BlockingProgressObserver:
     @property
     def published_counts(self) -> tuple[int, ...]:
         return tuple(self._published_counts)
+
+    @property
+    def persisted_boundaries(self) -> tuple[tuple[tuple[datetime, str], ...], ...]:
+        return tuple(self._persisted_boundaries)
+
+
+def _persisted_event(
+    ordinal: int,
+    *,
+    data_point: str = "Mandate created",
+    created_at: datetime = datetime(2026, 8, 13, 12, 0, tzinfo=UTC),
+) -> SyntheticProgressEvent:
+    return SyntheticProgressEvent(
+        timeline_ordinal=ordinal,
+        persisted_ordinal=ordinal,
+        created_at=created_at,
+        story="primary",
+        effect="persisted",
+        stage="Mandate",
+        source="HumanWire",
+        destination="Decision Room",
+        data_point=data_point,
+        description=f"Mandate: {data_point}",
+        highlight_target="origin",
+    )
+
+
+def _snapshot_with_persisted(
+    initial: SyntheticProgressSnapshot,
+    events: tuple[SyntheticProgressEvent, ...],
+    *,
+    run_state: SyntheticRunState = SyntheticRunState.RUNNING,
+    final_trace_sha256: str | None = None,
+) -> SyntheticProgressSnapshot:
+    return initial.model_copy(
+        update={
+            "run_state": run_state,
+            "final_trace_sha256": final_trace_sha256,
+            "saved_event_count": len(events),
+            "timeline_event_count": len(events),
+            "current_timeline_ordinal": len(events),
+            "current_persisted_ordinal": len(events),
+            "events": events,
+            "aggregate_counts": SyntheticAggregateCounts(
+                personas=len(initial.personas),
+                persisted_events=len(events),
+                inert_attempts=0,
+                complete_assignments=0,
+                pending_assignments=0,
+                terminal_mandates=0,
+            ),
+        }
+    )
 
 
 def test_shared_labels_preserve_existing_reach_contract() -> None:
@@ -102,6 +178,12 @@ def test_mid_run_snapshot_contains_only_persisted_steps(tmp_path) -> None:
     )
     assert snapshot.final_trace_sha256 is None
     assert observer.published_counts[-2] < 5
+    expected_saved = observer.persisted_boundaries[-1]
+    assert len(expected_saved) == snapshot.saved_event_count
+    assert [(event.created_at, event.data_point) for event in snapshot.events] == [
+        (created_at, project_replay_labels(event_type, None).data_point)
+        for created_at, event_type in expected_saved
+    ]
 
     observer.release()
     worker.join(timeout=10)
@@ -145,6 +227,170 @@ def test_terminal_evidence_uses_the_scenario_identity_seed(completed_progress) -
     assert evidence.trace_sha256 == completed_progress.final_trace_sha256
 
 
+@pytest.mark.parametrize(
+    "leaked_uuid",
+    [
+        "1f0d5584-9b8e-4c73-b2e7-3a9f5c1d7e42",
+        "00000000-0000-0000-0000-000000000101",
+    ],
+)
+def test_uuid_shaped_scenario_alias_never_leaves_progress_or_evidence(leaked_uuid) -> None:
+    """Break caught: a UUID-shaped run alias reaches a public progress artifact."""
+    scenario = default_synthetic_scenario(seed=11).model_copy(
+        update={"scenario_id": leaked_uuid}
+    )
+    initial = initial_progress(scenario)
+    complete = _snapshot_with_persisted(
+        initial,
+        (),
+        run_state=SyntheticRunState.COMPLETE,
+        final_trace_sha256="a" * 64,
+    )
+    evidence = evidence_bundle(complete)
+
+    assert initial.run_alias == "synthetic-run"
+    uuid_pattern = re.compile(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        re.IGNORECASE,
+    )
+    assert uuid_pattern.search(complete.model_dump_json()) is None
+    assert evidence is not None
+    assert uuid_pattern.search(evidence.model_dump_json()) is None
+
+
+@pytest.mark.parametrize("state", [SyntheticRunState.RUNNING, SyntheticRunState.FAILED])
+def test_nonterminal_states_reject_final_trace_and_terminal_evidence(state) -> None:
+    """Break caught: a nonterminal projection advertises a final proof artifact."""
+    initial = initial_progress(default_synthetic_scenario(seed=12))
+    payload = initial.model_dump()
+    payload.update({"run_state": state, "final_trace_sha256": "b" * 64})
+
+    with pytest.raises(ValidationError, match="final trace"):
+        SyntheticProgressSnapshot.model_validate(payload)
+
+    bypassed = initial.model_copy(update={"run_state": state, "final_trace_sha256": "b" * 64})
+    assert evidence_bundle(bypassed) is None
+
+
+def test_store_rejects_same_length_persisted_rewrite() -> None:
+    """Break caught: a later publication rewrites an already saved event in place."""
+    initial = initial_progress(default_synthetic_scenario(seed=13))
+    store = SyntheticProgressStore(initial)
+    first = _snapshot_with_persisted(initial, (_persisted_event(1),))
+    rewritten = _snapshot_with_persisted(
+        initial,
+        (_persisted_event(1, data_point="Mandate received"),),
+    )
+    store.publish(first)
+
+    with pytest.raises(ValueError, match="persisted prefix"):
+        store.publish(rewritten)
+
+
+def test_store_copies_a_published_terminal_snapshot_before_private_state_changes() -> None:
+    """Break caught: a caller-held published object can alter the stored terminal evidence."""
+    initial = initial_progress(default_synthetic_scenario(seed=14))
+    store = SyntheticProgressStore(initial)
+    published = _snapshot_with_persisted(
+        _snapshot_with_persisted(initial, (_persisted_event(1),)),
+        (_persisted_event(1),),
+        run_state=SyntheticRunState.COMPLETE,
+        final_trace_sha256="c" * 64,
+    )
+    store.publish(_snapshot_with_persisted(initial, (_persisted_event(1),)))
+    store.publish(published)
+    published._identity_seed = 999
+
+    evidence = store.evidence_bundle()
+    assert evidence is not None
+    assert evidence.identity_seed == 14
+
+
+def test_store_never_regresses_from_terminal_to_running() -> None:
+    """Break caught: an old running snapshot replaces a complete public run."""
+    initial = initial_progress(default_synthetic_scenario(seed=15))
+    store = SyntheticProgressStore(initial)
+    complete = _snapshot_with_persisted(
+        _snapshot_with_persisted(initial, (_persisted_event(1),)),
+        (_persisted_event(1),),
+        run_state=SyntheticRunState.COMPLETE,
+        final_trace_sha256="d" * 64,
+    )
+    store.publish(_snapshot_with_persisted(initial, (_persisted_event(1),)))
+    store.publish(complete)
+
+    with pytest.raises(ValueError, match="state"):
+        store.publish(_snapshot_with_persisted(initial, (_persisted_event(1),)))
+
+
+def test_store_rejects_skipping_from_starting_to_complete() -> None:
+    """Break caught: final evidence can be published before a run is observed running."""
+    initial = initial_progress(default_synthetic_scenario(seed=17))
+    store = SyntheticProgressStore(initial)
+
+    with pytest.raises(ValueError, match="state"):
+        store.publish(
+            _snapshot_with_persisted(
+                initial,
+                (),
+                run_state=SyntheticRunState.COMPLETE,
+                final_trace_sha256="e" * 64,
+            )
+        )
+
+
+def test_persisted_ordinals_follow_global_saved_event_order() -> None:
+    """Break caught: mandate grouping assigns persisted ordinals before global event sorting."""
+    scenario = default_synthetic_scenario(seed=16)
+    start = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
+    first_mandate = SimpleNamespace(
+        mandate_id=object(), created_at=start, state=SimpleNamespace(value="meeting_ready")
+    )
+    second_mandate = SimpleNamespace(
+        mandate_id=object(),
+        created_at=start + timedelta(seconds=1),
+        state=SimpleNamespace(value="partial"),
+    )
+    first_event = SimpleNamespace(
+        event_type="mandate.created",
+        created_at=start + timedelta(seconds=3),
+        assignment_id=None,
+        person_id=None,
+        channel=None,
+        direction=None,
+    )
+    second_event = SimpleNamespace(
+        event_type="mandate.received",
+        created_at=start + timedelta(seconds=2),
+        assignment_id=None,
+        person_id=None,
+        channel=None,
+        direction=None,
+    )
+    repository = SimpleNamespace(
+        list_recent_mandates=lambda _limit: [first_mandate, second_mandate],
+        list_assignments=lambda _mandate_id: [],
+        list_events=lambda mandate_id: (
+            [first_event] if mandate_id is first_mandate.mandate_id else [second_event]
+        ),
+    )
+    observer = RepositoryProgressObserver(SyntheticProgressStore(initial_progress(scenario)))
+
+    observer.capture(
+        repository,
+        scenario,
+        mode=SyntheticGenerationMode.DETERMINISTIC,
+        run_state=SyntheticRunState.RUNNING,
+        runtime_status=SyntheticRuntimeStatus.PERSISTED,
+    )
+
+    snapshot = observer.snapshot()
+    assert [(event.persisted_ordinal, event.data_point) for event in snapshot.events] == [
+        (1, "Mandate received"),
+        (2, "Mandate created"),
+    ]
+
+
 def test_store_returns_immutable_independent_snapshots() -> None:
     """Break caught: a caller can mutate a published snapshot shared with another reader."""
     store = SyntheticProgressStore(initial_progress(default_synthetic_scenario(seed=5)))
@@ -162,8 +408,8 @@ def test_invalid_person_bindings_remain_saved_but_neutral() -> None:
     base = default_synthetic_scenario(seed=23)
     ack = next(persona for persona in base.personas if persona.persona_id == "ack")
     quick = next(persona for persona in base.personas if persona.persona_id == "quick-a")
-    mandate_id = UUID("00000000-0000-0000-0000-000000000101")
-    assignment_id = UUID("00000000-0000-0000-0000-000000000102")
+    mandate_id = object()
+    assignment_id = object()
     created_at = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
     assignment = SimpleNamespace(
         mandate_id=mandate_id,
