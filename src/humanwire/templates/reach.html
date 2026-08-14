@@ -44,17 +44,19 @@
       <p>One mandate, routed through the minimum engagement each person needed.</p>
     </header>
 
-    <aside class="proof-provenance" aria-label="Synthetic proof provenance">
-      <strong>Synthetic replay provenance</strong>
-      <ul>
-        <li><code>proof_class=synthetic_multi_persona</code></li>
-        <li><code>actor_type=simulated_persona</code></li>
-        <li><code>identity_source=synthetic_fixture</code></li>
-        <li><code>transport=fake_caspian</code></li>
-        <li><code>human_attested=false</code></li>
-        <li><code>live_provider_verified=false</code></li>
-      </ul>
-    </aside>
+    {% if demo_mode %}
+      <aside class="proof-provenance" aria-label="Synthetic proof provenance">
+        <strong>Synthetic replay provenance</strong>
+        <ul>
+          <li><code>proof_class=synthetic_multi_persona</code></li>
+          <li><code>actor_type=simulated_persona</code></li>
+          <li><code>identity_source=synthetic_fixture</code></li>
+          <li><code>transport=fake_caspian</code></li>
+          <li><code>human_attested=false</code></li>
+          <li><code>live_provider_verified=false</code></li>
+        </ul>
+      </aside>
+    {% endif %}
 
     <section class="reach-origin" data-testid="reach-origin" aria-labelledby="origin-heading">
       <h2 id="origin-heading" class="sr-only">Mandate origin</h2>

@@ -196,6 +196,25 @@ def test_reach_renders_all_exact_synthetic_provenance_labels(web_client) -> None
     assert "flex-direction: column" in responsive_styles
 
 
+def test_private_reach_does_not_claim_synthetic_demo_provenance(demo_app) -> None:
+    """Break caught: private/live Reach screenshots are mislabeled as fake transport."""
+    private_app = create_app(
+        demo_app.state.repository,
+        demo_app.state.settings,
+        clock=lambda: NOW,
+        demo_mode=False,
+    )
+
+    response = TestClient(private_app).get("/mandates/HW-2411/reach")
+
+    assert response.status_code == 200
+    visible_text = html_lib.unescape(re.sub(r"<[^>]+>", " ", response.text))
+    visible_text = " ".join(visible_text.split())
+    assert "proof_class=synthetic_multi_persona" not in visible_text
+    assert "transport=fake_caspian" not in visible_text
+    assert 'aria-label="Synthetic proof provenance"' not in response.text
+
+
 def test_csv_route_and_data_table_are_get_only_with_stable_contract(
     web_client, demo_app
 ) -> None:
