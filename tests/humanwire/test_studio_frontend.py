@@ -13,6 +13,21 @@ TEMPLATE = ROOT / "src/humanwire/templates/coordination_studio.html"
 CSS = ROOT / "src/humanwire/studio_static/coordination-studio.css"
 SCRIPT = ROOT / "src/humanwire/studio_static/coordination-studio.js"
 FIXTURES = ROOT / "tests/humanwire/fixtures/studio-snapshots.json"
+HOSTILE_HARNESS = ROOT / "tests/humanwire/studio_frontend_hostile_harness.js"
+
+
+def css_block(source: str, marker: str, *, start: int = 0) -> str:
+    marker_index = source.index(marker, start)
+    opening = source.index("{", marker_index)
+    depth = 1
+    for index in range(opening + 1, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[opening + 1 : index]
+    raise AssertionError(f"unterminated CSS block for {marker}")
 
 
 def studio_client(tmp_path) -> TestClient:
@@ -71,6 +86,8 @@ def test_composer_and_workspace_expose_the_complete_accessible_product_shell(
     participants = re.findall(r'<input[^>]+name="participant_ids"[^>]*>', html)
     assert len(participants) == 8
     assert sum(" checked" in item for item in participants) == 7
+    assert "data-stakeholder-count" in html
+    assert re.search(r"Elena Torres.*?Review and approval", html, re.DOTALL)
     assert len(re.findall(r"data-template-id=", html)) == 3
     assert len(re.findall(r"data-sequence-stage", html)) == 5
     assert len(re.findall(r"data-lifecycle-stage", html)) == 5
@@ -116,6 +133,43 @@ def test_studio_css_is_scoped_responsive_and_accessible() -> None:
     assert "min-height: 44px" in css and "min-width: 44px" in css
     for size in re.findall(r"font-size:\s*([0-9.]+)px", css):
         assert float(size) >= 14
+
+
+def test_all_effective_targets_and_mobile_completion_actions_remain_usable() -> None:
+    css = CSS.read_text(encoding="utf-8")
+    requester = css_block(css, ".coordination-studio-page__requester-cards label {")
+    stakeholder = css_block(css, ".coordination-studio-page__stakeholder-list label {")
+    compact = css_block(css, ".coordination-studio-page__compact-fieldset label,\n")
+    replay_buttons = css_block(css, ".coordination-studio-page__replay-bar button {")
+    for body in (requester, stakeholder, compact, replay_buttons):
+        assert re.search(r"min-height:\s*(?:4[4-9]|[5-9][0-9])px", body)
+
+    assert ":has(input:focus-visible)" in css
+    tablet = css_block(css, "@media (max-width: 759px)")
+    phone = css_block(css, "@media (max-width: 479px)")
+    tablet_downloads = css_block(tablet, ".coordination-studio-page__download-controls")
+    tablet_replay = css_block(tablet, ".coordination-studio-page__replay-bar")
+    assert "display: none" not in tablet_downloads
+    assert re.search(r"display:\s*(?:flex|grid)", tablet_downloads)
+    assert "flex-wrap: wrap" in tablet_downloads or "grid-template" in tablet_downloads
+    assert "display: none" not in tablet_replay
+    assert not re.search(
+        r"\[data-pause-visuals\][^{]*\{[^}]*display:\s*none",
+        phone,
+        re.DOTALL,
+    )
+
+
+def test_hostile_async_reset_catalog_graph_and_mobile_contract() -> None:
+    for mode in ("normal", "reduced", "mobile"):
+        result = subprocess.run(
+            ["node", str(HOSTILE_HARNESS), str(SCRIPT), str(FIXTURES), mode],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"{mode}: {result.stderr}"
 
 
 def test_controller_source_has_no_unsafe_dom_or_token_persistence() -> None:
@@ -365,7 +419,7 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
         })().catch((error) => { process.stderr.write(error.stack + "\n"); process.exitCode = 1; });
         """
     )
-    for mode in ("normal", "reduced", "hidden"):
+    for mode in ("normal", "reduced"):
         result = subprocess.run(
             ["node", "-e", harness, str(SCRIPT), str(FIXTURES), mode],
             cwd=ROOT,

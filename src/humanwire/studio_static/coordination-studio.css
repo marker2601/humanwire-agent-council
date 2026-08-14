@@ -67,7 +67,57 @@
   opacity: 0.48;
 }
 
+.coordination-studio-page input[type="radio"],
+.coordination-studio-page input[type="checkbox"] {
+  display: grid;
+  place-items: center;
+  appearance: none;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.coordination-studio-page input[type="radio"]::before,
+.coordination-studio-page input[type="checkbox"]::before {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border: 1px solid #7591ae;
+  border-radius: 3px;
+  background: #07182c;
+  color: #fff;
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1;
+  content: "";
+}
+
+.coordination-studio-page input[type="radio"]::before {
+  border-radius: 50%;
+}
+
+.coordination-studio-page input[type="radio"]:checked::before {
+  border-color: var(--blue);
+  background: var(--blue);
+  box-shadow: inset 0 0 0 4px #07182c;
+}
+
+.coordination-studio-page input[type="checkbox"]:checked::before {
+  border-color: var(--blue);
+  background: var(--blue);
+  content: "✓";
+}
+
 .coordination-studio-page :focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 3px;
+}
+
+.coordination-studio-page__requester-cards label:has(input:focus-visible),
+.coordination-studio-page__stakeholder-list label:has(input:focus-visible),
+.coordination-studio-page__compact-fieldset label:has(input:focus-visible),
+.coordination-studio-page__switch-row:has(input:focus-visible) {
   outline: 2px solid var(--cyan);
   outline-offset: 3px;
 }
@@ -172,8 +222,8 @@
 
 .coordination-studio-page__form {
   display: grid;
-  gap: 12px;
-  margin-top: 14px;
+  gap: 8px;
+  margin-top: 10px;
 }
 
 .coordination-studio-page__field,
@@ -190,7 +240,7 @@
 .coordination-studio-page__field label,
 .coordination-studio-page legend {
   display: block;
-  margin-bottom: 9px;
+  margin-bottom: 5px;
   color: var(--ice);
   font-size: 15px;
   font-weight: 700;
@@ -222,8 +272,8 @@
   position: relative;
   display: flex;
   align-items: center;
-  min-height: 50px;
-  padding: 9px 12px;
+  min-height: 44px;
+  padding: 6px 12px;
   border-right: 1px solid var(--line);
   cursor: pointer;
 }
@@ -233,11 +283,11 @@
 }
 
 .coordination-studio-page__requester-cards input {
-  width: 18px;
-  min-width: 18px;
-  height: 18px;
-  min-height: 18px;
-  margin: 0 10px 0 0;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  min-height: 44px;
+  margin: -6px 2px -6px -8px;
   accent-color: var(--blue);
 }
 
@@ -280,7 +330,7 @@
   grid-template-columns: 24px 34px minmax(190px, 1fr) minmax(130px, 0.55fr);
   align-items: center;
   gap: 11px;
-  min-height: 43px;
+  min-height: 44px;
   padding: 5px 13px;
   border-bottom: 1px solid var(--line-soft);
   cursor: pointer;
@@ -295,11 +345,11 @@
 }
 
 .coordination-studio-page__stakeholder-list input {
-  width: 18px;
-  min-width: 18px;
-  height: 18px;
-  min-height: 18px;
-  margin: 0;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  min-height: 44px;
+  margin: -6px -10px;
   accent-color: var(--blue);
 }
 
@@ -382,12 +432,13 @@
   cursor: pointer;
 }
 
-.coordination-studio-page__compact-fieldset input,
+.coordination-studio-page__compact-fieldset input:not([type="date"]),
 .coordination-studio-page__switch-row input {
-  width: 18px;
-  min-width: 18px;
-  height: 18px;
-  min-height: 18px;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  min-height: 44px;
+  margin: -7px -8px;
   accent-color: var(--blue);
 }
 
@@ -419,8 +470,8 @@
 }
 
 .coordination-studio-page__templates button {
-  min-height: 64px;
-  padding: 8px 13px;
+  min-height: 56px;
+  padding: 6px 13px;
   text-align: left;
 }
 
@@ -1155,7 +1206,7 @@
   .coordination-studio-page__workspace {
     width: min(100% - 28px, 680px);
     padding-top: 18px;
-    padding-bottom: 112px;
+    padding-bottom: 210px;
   }
 
   .coordination-studio-page__workspace-heading {
@@ -1271,6 +1322,8 @@
     grid-template-columns: 1fr;
     gap: 5px;
     padding: 8px 14px;
+    max-height: 46vh;
+    overflow-y: auto;
   }
 
   .coordination-studio-page__replay-controls {
@@ -1288,7 +1341,12 @@
   }
 
   .coordination-studio-page__download-controls {
-    display: none;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .coordination-studio-page__download-controls button {
+    min-width: 0;
   }
 }
 
@@ -1301,6 +1359,10 @@
   .coordination-studio-page__composer,
   .coordination-studio-page__workspace {
     width: min(100% - 24px, 440px);
+  }
+
+  .coordination-studio-page__workspace {
+    padding-bottom: 310px;
   }
 
   .coordination-studio-page__page-heading h1 {
@@ -1388,11 +1450,7 @@
   }
 
   .coordination-studio-page__replay-controls {
-    grid-template-columns: repeat(4, 1fr);
-  }
-
-  .coordination-studio-page__replay-controls [data-pause-visuals] {
-    display: none;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
 

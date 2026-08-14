@@ -19,6 +19,7 @@ document.addEventListener("DOMContentLoaded", () => {
     playing: false,
     pollTimer: null,
     playTimer: null,
+    renderTimer: null,
     renderQueue: [],
     rendering: false,
   };
@@ -60,6 +61,36 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
+  function updateStakeholderCount() {
+    const count = document.querySelectorAll('[name="participant_ids"]:checked').length;
+    const numberWords = ["Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight"];
+    setText("[data-stakeholder-count]", `${numberWords[count] || String(count)} selected`);
+  }
+
+  function syncStakeholderCatalog(stakeholders) {
+    const byId = new Map(stakeholders.map((person) => [person.persona_id, person]));
+    document.querySelectorAll('[name="participant_ids"]').forEach((input) => {
+      const person = byId.get(input.value);
+      const label = input.parentNode;
+      if (person === undefined || label === null) {
+        return;
+      }
+      const name = label.querySelector("strong");
+      const role = label.querySelector("small");
+      const engagement = label.querySelector("em");
+      if (name !== null) {
+        name.textContent = person.display_name;
+      }
+      if (role !== null) {
+        role.textContent = person.role;
+      }
+      if (engagement !== null) {
+        engagement.textContent = person.engagement_label;
+      }
+    });
+    updateStakeholderCount();
+  }
+
   function applyTemplate(template) {
     if (template === undefined || template === null) {
       return;
@@ -74,6 +105,7 @@ document.addEventListener("DOMContentLoaded", () => {
     document.querySelectorAll('[name="participant_ids"]').forEach((input) => {
       input.checked = template.participant_ids.includes(input.value);
     });
+    updateStakeholderCount();
     const conflict = one("[data-include-conflict]");
     if (conflict !== null) {
       conflict.checked = template.include_conflict;
@@ -103,6 +135,7 @@ document.addEventListener("DOMContentLoaded", () => {
         throw new Error("catalog_invalid");
       }
       state.catalog = catalog;
+      syncStakeholderCatalog(catalog.stakeholders);
       const current = one("[data-current-template]");
       const templateId = current === null
         ? "launch-decision"
@@ -259,11 +292,15 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     });
 
+    if (state.selectedOrdinal > 0) {
+      renderEvent(Math.min(state.selectedOrdinal, state.events.length));
+    }
+
     if (state.events.length === 0) {
       setText("[data-event-progress]", "Event 0 of 0");
       setText("[data-current-stage]", titleCase(snapshot.lifecycle.current));
       renderVisibleRows(0);
-    } else if (state.followLive && !state.visualsPaused) {
+    } else if (state.followLive && !state.visualsPaused && !document.hidden) {
       state.renderQueue.push(...unseen);
       drainRenderQueue();
     } else if (state.selectedOrdinal === 0) {
@@ -276,8 +313,23 @@ document.addEventListener("DOMContentLoaded", () => {
     updateControls();
   }
 
+  function cancelRenderQueue() {
+    if (state.renderTimer !== null) {
+      clearTimeout(state.renderTimer);
+      state.renderTimer = null;
+    }
+    state.renderQueue.length = 0;
+    state.rendering = false;
+  }
+
   function drainRenderQueue() {
-    if (state.rendering || state.renderQueue.length === 0) {
+    if (
+      state.rendering
+      || state.renderQueue.length === 0
+      || state.visualsPaused
+      || !state.followLive
+      || document.hidden
+    ) {
       return;
     }
     state.rendering = true;
@@ -285,7 +337,10 @@ document.addEventListener("DOMContentLoaded", () => {
     renderEvent(event.timeline_ordinal);
     state.rendering = false;
     if (state.renderQueue.length > 0) {
-      setTimeout(drainRenderQueue, 520);
+      state.renderTimer = setTimeout(() => {
+        state.renderTimer = null;
+        drainRenderQueue();
+      }, 520);
     }
   }
 
@@ -295,33 +350,44 @@ document.addEventListener("DOMContentLoaded", () => {
       const people = nodes.filter((item) => item.kind === "stakeholder");
       const artifacts = nodes.filter((item) => item.kind === "artifact");
       positions.request = { x: 120, y: 20 };
-      positions.humanwire = { x: 120, y: 100 };
-      positions["caspian-gateway"] = { x: 120, y: 180 };
+      positions.humanwire = { x: 120, y: 92 };
+      positions["caspian-gateway"] = { x: 120, y: 164 };
       people.forEach((item, index) => {
-        positions[item.node_id] = { x: index % 2 === 0 ? 12 : 218, y: 280 + Math.floor(index / 2) * 68 };
+        positions[item.node_id] = { x: index % 2 === 0 ? 12 : 218, y: 260 + Math.floor(index / 2) * 68 };
       });
+      const peopleBottom = 260 + Math.ceil(people.length / 2) * 68;
+      const artifactStart = peopleBottom + 52;
       artifacts.forEach((item, index) => {
-        positions[item.node_id] = { x: index % 2 === 0 ? 12 : 218, y: 590 + Math.floor(index / 2) * 78 };
+        positions[item.node_id] = { x: index % 2 === 0 ? 12 : 218, y: artifactStart + Math.floor(index / 2) * 72 };
       });
-      return positions;
+      return {
+        height: Math.max(920, artifactStart + Math.ceil(artifacts.length / 2) * 72 + 20),
+        positions,
+      };
     }
-    positions.request = { x: 10, y: 132 };
-    positions.humanwire = { x: 180, y: 132 };
-    positions["caspian-gateway"] = { x: 350, y: 132 };
-    nodes.filter((item) => item.kind === "stakeholder").forEach((item, index) => {
-      positions[item.node_id] = { x: 530, y: 3 + index * 36 };
+    const people = nodes.filter((item) => item.kind === "stakeholder");
+    const pitch = 47;
+    const height = Math.max(360, people.length * pitch + 16);
+    const centerY = (height - 39) / 2;
+    positions.request = { x: 10, y: centerY };
+    positions.humanwire = { x: 180, y: centerY };
+    positions["caspian-gateway"] = { x: 350, y: centerY };
+    people.forEach((item, index) => {
+      positions[item.node_id] = { x: 530, y: 8 + index * pitch };
     });
+    const artifactPitch = 47;
+    const artifactStart = Math.max(8, (height - 4 * 39 - 3 * 8) / 2);
     const artifactPositions = {
-      conflict: { x: 710, y: 4 },
-      interview: { x: 710, y: 46 },
-      evidence: { x: 710, y: 88 },
-      proposal: { x: 710, y: 130 },
-      approval: { x: 850, y: 84 },
-      availability: { x: 850, y: 168 },
-      meeting: { x: 850, y: 252 },
+      conflict: { x: 700, y: artifactStart },
+      interview: { x: 700, y: artifactStart + artifactPitch },
+      evidence: { x: 700, y: artifactStart + artifactPitch * 2 },
+      proposal: { x: 700, y: artifactStart + artifactPitch * 3 },
+      approval: { x: 855, y: centerY - 82 },
+      availability: { x: 855, y: centerY },
+      meeting: { x: 855, y: centerY + 82 },
     };
     Object.assign(positions, artifactPositions);
-    return positions;
+    return { height, positions };
   }
 
   function svgElement(name, attributes) {
@@ -339,10 +405,11 @@ document.addEventListener("DOMContentLoaded", () => {
     }
     const isMobile = mobileLayout.matches;
     const width = isMobile ? 420 : 1000;
-    const height = isMobile ? 920 : 305;
     const nodeWidth = isMobile ? 190 : 140;
     const nodeHeight = isMobile ? 54 : 39;
-    const positions = graphPositions(snapshot.graph_nodes, isMobile);
+    const layout = graphPositions(snapshot.graph_nodes, isMobile);
+    const height = layout.height;
+    const positions = layout.positions;
     canvas.setAttribute("viewBox", `0 0 ${width} ${height}`);
     canvas.replaceChildren();
     const title = svgElement("title", {});
@@ -351,7 +418,7 @@ document.addEventListener("DOMContentLoaded", () => {
     description.textContent = "The highlighted path is the selected saved transition. Labels remain available in the From, To, and Generated summary.";
     canvas.append(title, description);
 
-    snapshot.graph_edges.forEach((edge) => {
+    snapshot.graph_edges.forEach((edge, index) => {
       const source = positions[edge.source];
       const destination = positions[edge.destination];
       if (source === undefined || destination === undefined) {
@@ -362,6 +429,7 @@ document.addEventListener("DOMContentLoaded", () => {
         "data-flow-edge": "",
         "data-source": edge.source,
         "data-destination": edge.destination,
+        "data-lane": String(index),
       });
       const startX = source.x + nodeWidth;
       const startY = source.y + nodeHeight / 2;
@@ -370,13 +438,13 @@ document.addEventListener("DOMContentLoaded", () => {
       if (isMobile) {
         const verticalStartX = source.x + nodeWidth / 2;
         const verticalEndX = destination.x + nodeWidth / 2;
-        const middleY = (startY + endY) / 2;
+        const middleY = (startY + endY) / 2 + ((index % 5) - 2) * 4;
         path.setAttribute(
           "d",
           `M ${verticalStartX} ${source.y + nodeHeight} C ${verticalStartX} ${middleY}, ${verticalEndX} ${middleY}, ${verticalEndX} ${destination.y}`,
         );
       } else {
-        const middleX = (startX + endX) / 2;
+        const middleX = (startX + endX) / 2 + ((index % 7) - 3) * 3;
         path.setAttribute("d", `M ${startX} ${startY} C ${middleX} ${startY}, ${middleX} ${endY}, ${endX} ${endY}`);
       }
       canvas.append(path);
@@ -575,6 +643,7 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   function selectManual(ordinal) {
+    cancelRenderQueue();
     state.followLive = false;
     state.visualsPaused = true;
     stopPlayback();
@@ -600,6 +669,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (!terminal && !state.visualsPaused) {
       return;
     }
+    cancelRenderQueue();
     if (state.selectedOrdinal >= state.events.length) {
       state.selectedOrdinal = 0;
     }
@@ -631,6 +701,7 @@ document.addEventListener("DOMContentLoaded", () => {
   function newCoordination() {
     stopPolling();
     stopPlayback();
+    cancelRenderQueue();
     state.runAlias = null;
     state.snapshot = null;
     state.events.length = 0;
@@ -638,7 +709,7 @@ document.addEventListener("DOMContentLoaded", () => {
     state.etag = null;
     state.followLive = true;
     state.visualsPaused = false;
-    state.renderQueue.length = 0;
+    clearPresentation();
     setStudioState("composer");
     history.replaceState({}, "", "/");
     setText("[data-form-status]", "");
@@ -646,6 +717,49 @@ document.addEventListener("DOMContentLoaded", () => {
     if (start !== null) {
       start.disabled = false;
     }
+    updateControls();
+  }
+
+  function clearPresentation() {
+    const canvas = one("[data-flow-canvas]");
+    const conversation = one("[data-conversation-list]");
+    const data = one("[data-data-list]");
+    if (canvas !== null) {
+      canvas.replaceChildren();
+      canvas.setAttribute("viewBox", "0 0 1000 360");
+    }
+    if (conversation !== null) {
+      conversation.replaceChildren();
+    }
+    if (data !== null) {
+      data.replaceChildren();
+    }
+    document.querySelectorAll("[data-lifecycle-stage]").forEach((item) => {
+      item.classList.remove("is-complete", "is-current");
+      const status = item.querySelector("small");
+      if (status !== null) {
+        status.textContent = "Pending";
+      }
+    });
+    document.querySelectorAll("[data-persona-card]").forEach((card) => {
+      card.classList.remove("is-active");
+    });
+    [
+      "[data-workspace-objective]",
+      "[data-workspace-requester]",
+      "[data-run-state]",
+      "[data-connection-label]",
+      "[data-current-stage]",
+      "[data-flow-from]",
+      "[data-flow-to]",
+      "[data-flow-generated]",
+      "[data-flow-live]",
+      "[data-outcome-headline]",
+      "[data-outcome-summary]",
+    ].forEach((selector) => setText(selector, ""));
+    setText("[data-event-progress]", "Event 0 of 0");
+    updateDownloads(false);
+    showMobileTab("conversation");
   }
 
   function updateCustomDate() {
@@ -684,10 +798,14 @@ document.addEventListener("DOMContentLoaded", () => {
   document.querySelectorAll('[name="target_timing"]').forEach((input) => {
     input.addEventListener("change", updateCustomDate);
   });
+  document.querySelectorAll('[name="participant_ids"]').forEach((input) => {
+    input.addEventListener("change", updateStakeholderCount);
+  });
   one("[data-pause-visuals]").addEventListener("click", () => {
     state.visualsPaused = !state.visualsPaused;
     if (state.visualsPaused) {
       state.followLive = false;
+      cancelRenderQueue();
     } else if (state.snapshot !== null && state.events.length > 0) {
       state.followLive = true;
       renderEvent(state.events.length);
@@ -695,6 +813,7 @@ document.addEventListener("DOMContentLoaded", () => {
     updateControls();
   });
   one("[data-follow-live]").addEventListener("click", () => {
+    cancelRenderQueue();
     state.followLive = true;
     state.visualsPaused = false;
     stopPlayback();
@@ -721,10 +840,13 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
+      cancelRenderQueue();
       stopPlayback();
       document.querySelectorAll("[data-flow-edge]").forEach((edge) => {
         edge.classList.remove("is-travelling");
       });
+    } else if (state.followLive && state.events.length > 0) {
+      renderEvent(state.events.length);
     }
   });
   window.addEventListener("resize", () => {
