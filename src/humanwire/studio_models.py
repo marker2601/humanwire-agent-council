@@ -125,7 +125,7 @@ _STAKEHOLDERS = (
         persona_id="approval-change",
         display_name="Elena Torres",
         role="Business owner",
-        engagement_label="Change authority",
+        engagement_label="Review and approval",
     ),
 )
 

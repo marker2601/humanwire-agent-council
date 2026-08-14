@@ -1,6 +1,8 @@
 import pytest
 from pydantic import ValidationError
 
+import humanwire.synthetic as synthetic_module
+from humanwire.domain import EngagementType
 from humanwire.studio_models import (
     CoordinationRequest,
     RequesterRole,
@@ -32,13 +34,27 @@ def test_product_catalog_uses_approved_names_templates_and_copy() -> None:
         "Structured interview",
         "Review and approval",
         "Availability",
-        "Change authority",
+        "Review and approval",
     ]
     launch = next(item for item in catalog.templates if item.template_id == "launch-decision")
     assert launch.objective == "Set up a decision meeting tomorrow to approve the launch plan."
     assert launch.requester_role is RequesterRole.MANAGER
     assert launch.target_timing is TargetTiming.TOMORROW
     assert launch.include_conflict is True
+
+
+def test_approval_change_catalog_label_matches_its_existing_contract() -> None:
+    change_persona = next(
+        item
+        for item in synthetic_module.default_synthetic_scenario().personas
+        if item.persona_id == "approval-change"
+    )
+    change_card = next(
+        item for item in product_catalog().stakeholders if item.persona_id == "approval-change"
+    )
+
+    assert synthetic_module._contract_for(change_persona) is EngagementType.REVIEW_APPROVAL
+    assert change_card.engagement_label == "Review and approval"
 
 
 def test_coordination_request_is_strict_bounded_and_unique() -> None:
