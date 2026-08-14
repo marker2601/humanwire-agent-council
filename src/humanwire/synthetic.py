@@ -69,6 +69,11 @@ from humanwire.synthetic_identities import (
     IDENTITY_GENERATOR_VERSION,
     seeded_identity_map,
 )
+from humanwire.synthetic_progress import (
+    SyntheticProgressObserver,
+    SyntheticRunState,
+    SyntheticRuntimeStatus,
+)
 from humanwire.workflow import HumanWireWorkflow
 
 SUPPORTED_SCHEMA_VERSION = "humanwire.synthetic/v1"
@@ -912,6 +917,66 @@ def _emit_persona_inbound_attempts(
     client.emit_inbound(envelope)
 
 
+def _publish_progress(
+    observer: SyntheticProgressObserver | None,
+    repository: SqlAlchemyHumanWireRepository,
+    scenario: SyntheticScenario,
+    **state: object,
+) -> None:
+    """Publish read-only progress without affecting workflow authority or retries."""
+    if observer is None:
+        return
+    try:
+        observer.capture(repository, scenario, **state)
+    except Exception:  # noqa: BLE001 - observer failure is explicitly presentation-only
+        try:
+            observer.mark_unavailable()
+        except Exception:  # noqa: BLE001, S110 - a broken observer stays non-authoritative
+            pass
+
+
+def _record_inert_progress(
+    observer: SyntheticProgressObserver | None,
+    **attempt: object,
+) -> None:
+    """Keep a failed presentation publication from affecting a workflow attempt."""
+    if observer is None:
+        return
+    try:
+        observer.record_inert_attempt(**attempt)
+    except Exception:  # noqa: BLE001 - observer failure is explicitly presentation-only
+        try:
+            observer.mark_unavailable()
+        except Exception:  # noqa: BLE001, S110 - a broken observer stays non-authoritative
+            pass
+
+
+def _persisted_event_count(repository: SqlAlchemyHumanWireRepository) -> int:
+    return sum(
+        len(repository.list_events(mandate.mandate_id))
+        for mandate in repository.list_recent_mandates(1000)
+    )
+
+
+def _progress_story(
+    repository: SqlAlchemyHumanWireRepository,
+    mandate_token: str,
+) -> Literal["primary", "change"]:
+    mandates = sorted(repository.list_recent_mandates(1000), key=lambda item: item.created_at)
+    for index, mandate in enumerate(mandates):
+        if mandate.token == mandate_token:
+            return "primary" if index == 0 else "change"
+    return "primary"
+
+
+def _inert_runtime_status(action: SyntheticAction) -> tuple[SyntheticRuntimeStatus, str]:
+    if action.intent is SyntheticIntent.SILENCE:
+        return SyntheticRuntimeStatus.SYNTHETIC_SILENCE, "No response recorded"
+    if action.content in {"synthetic_timeout", "synthetic_model_timeout"}:
+        return SyntheticRuntimeStatus.SYNTHETIC_TIMEOUT, "No response before timeout"
+    return SyntheticRuntimeStatus.MODEL_ERROR, "Model response unavailable"
+
+
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -1184,9 +1249,15 @@ def generate_scenario(
     *,
     decision_engine: PersonaDecisionEngine | None = None,
     max_decision_workers: int = 1,
+    progress_observer: SyntheticProgressObserver | None = None,
 ) -> SyntheticRunResult:
     """Generate an isolated run through the one offline gateway boundary."""
     scenario = SyntheticScenario.model_validate(scenario)
+    mode = (
+        SyntheticGenerationMode.MODEL_ASSISTED
+        if decision_engine is not None
+        else SyntheticGenerationMode.DETERMINISTIC
+    )
     model_identifier: str | None = None
     if decision_engine is not None:
         model_identifier = getattr(decision_engine, "model_identifier", None)
@@ -1229,8 +1300,24 @@ def generate_scenario(
         text="/mandate\nCoordinate the deterministic synthetic launch",
     )
     client.emit_inbound(manager_message)
+    _publish_progress(
+        progress_observer,
+        repository,
+        scenario,
+        mode=mode,
+        run_state=SyntheticRunState.RUNNING,
+        runtime_status=SyntheticRuntimeStatus.PERSISTED,
+    )
     released = workflow.process_due(clock[0])
     gateway.dispatch_all(released)
+    _publish_progress(
+        progress_observer,
+        repository,
+        scenario,
+        mode=mode,
+        run_state=SyntheticRunState.RUNNING,
+        runtime_status=SyntheticRuntimeStatus.PERSISTED,
+    )
 
     persona_by_id = {persona.persona_id: persona for persona in scenario.personas}
     policies = (
@@ -1267,6 +1354,15 @@ def generate_scenario(
         def commit_model_batch() -> None:
             if not model_batch or decision_engine is None:
                 return
+            _publish_progress(
+                progress_observer,
+                repository,
+                scenario,
+                mode=mode,
+                run_state=SyntheticRunState.RUNNING,
+                runtime_status=SyntheticRuntimeStatus.WAITING_FOR_AGENT,
+                active_persona_id=model_batch[0].persona_id,
+            )
             results, deadline = _evaluate_model_batch(
                 decision_engine,
                 model_batch,
@@ -1457,7 +1553,23 @@ def generate_scenario(
                         ),
                     )
                 )
+                _publish_progress(
+                    progress_observer,
+                    repository,
+                    scenario,
+                    mode=mode,
+                    run_state=SyntheticRunState.RUNNING,
+                    runtime_status=SyntheticRuntimeStatus.PERSISTED,
+                )
                 gateway.dispatch_all(workflow.process_due(clock[0]))
+                _publish_progress(
+                    progress_observer,
+                    repository,
+                    scenario,
+                    mode=mode,
+                    run_state=SyntheticRunState.RUNNING,
+                    runtime_status=SyntheticRuntimeStatus.PERSISTED,
+                )
                 collect_deliveries(clock[0])
                 continue
 
@@ -1475,6 +1587,14 @@ def generate_scenario(
                     raise ValueError("synthetic due-work progression exceeded its bound")
                 clock[0] = min(due_times)
                 gateway.dispatch_all(workflow.process_due(clock[0]))
+                _publish_progress(
+                    progress_observer,
+                    repository,
+                    scenario,
+                    mode=mode,
+                    run_state=SyntheticRunState.RUNNING,
+                    runtime_status=SyntheticRuntimeStatus.PERSISTED,
+                )
                 collect_deliveries(clock[0])
                 continue
             break
@@ -1509,7 +1629,10 @@ def generate_scenario(
             queued_action.raw_delivery,
             queued_action.mandate_token,
         )
+        story = _progress_story(repository, queued_action.mandate_token)
+        contract = _contract_for(persona_by_id[persona_id]).value
         if command is not None:
+            before_event_count = _persisted_event_count(repository)
             message_id = f"synthetic-{persona_id}-{action.local_sequence}"
             channel = action.channel
             envelope_args = {
@@ -1545,7 +1668,38 @@ def generate_scenario(
                 )
 
             _emit_persona_inbound_attempts(client, envelope, record_attempt)
+            after_event_count = _persisted_event_count(repository)
+            if after_event_count == before_event_count:
+                _record_inert_progress(
+                    progress_observer,
+                    virtual_time=action.timestamp,
+                    story=story,
+                    persona_id=action.persona_id,
+                    contract=contract,
+                    runtime_status=SyntheticRuntimeStatus.WORKFLOW_REJECTED,
+                    data_point="No workflow data saved",
+                )
+            _publish_progress(
+                progress_observer,
+                repository,
+                scenario,
+                mode=mode,
+                run_state=SyntheticRunState.RUNNING,
+                runtime_status=SyntheticRuntimeStatus.PERSISTED,
+                active_persona_id=action.persona_id,
+            )
             collect_deliveries(clock[0])
+        else:
+            runtime_status, data_point = _inert_runtime_status(action)
+            _record_inert_progress(
+                progress_observer,
+                virtual_time=action.timestamp,
+                story=story,
+                persona_id=action.persona_id,
+                contract=contract,
+                runtime_status=runtime_status,
+                data_point=data_point,
+            )
 
     transcript = SyntheticTranscript.create(
         scenario=_safe_scenario(scenario),
@@ -1556,11 +1710,6 @@ def generate_scenario(
         output,
         root,
         transcript.model_dump_json(indent=2) + "\n",
-    )
-    mode = (
-        SyntheticGenerationMode.MODEL_ASSISTED
-        if decision_engine is not None
-        else SyntheticGenerationMode.DETERMINISTIC
     )
     provenance_path: Path | None = None
     if decision_engine is not None:
@@ -1585,8 +1734,7 @@ def generate_scenario(
     latest = repository.list_recent_mandates(1)
     final_state = latest[0].state.value if latest else "missing"
     terminal_states = tuple(item.state.value for item in all_mandates)
-    session_factory.kw["bind"].dispose()
-    return SyntheticRunResult(
+    result = SyntheticRunResult(
         transcript=transcript,
         database_path=database_path,
         gateway_handler_count=client.on_message_registration_count,
@@ -1599,15 +1747,30 @@ def generate_scenario(
         model_identifier=model_identifier,
         provenance_path=provenance_path,
     )
+    if progress_observer is not None:
+        _publish_progress(
+            progress_observer,
+            repository,
+            scenario,
+            mode=mode,
+            run_state=SyntheticRunState.COMPLETE,
+            runtime_status=SyntheticRuntimeStatus.PERSISTED,
+            final_trace_sha256=semantic_trace_hash(result),
+        )
+    session_factory.kw["bind"].dispose()
+    return result
 
 
 def replay_transcript(
     path: str | Path,
     run_root: str | Path,
+    *,
+    progress_observer: SyntheticProgressObserver | None = None,
 ) -> SyntheticRunResult:
     """Reinject a validated frozen transcript through the offline gateway boundary."""
     transcript = load_transcript(path)
     scenario = transcript.scenario
+    mode = SyntheticGenerationMode.FROZEN_REPLAY
     root = _prepare_fresh_run_root(run_root)
     database_path = _reserve_database_path(root)
 
@@ -1645,7 +1808,23 @@ def replay_transcript(
             text="/mandate\nCoordinate the deterministic synthetic launch",
         )
     )
+    _publish_progress(
+        progress_observer,
+        repository,
+        scenario,
+        mode=mode,
+        run_state=SyntheticRunState.RUNNING,
+        runtime_status=SyntheticRuntimeStatus.PERSISTED,
+    )
     gateway.dispatch_all(workflow.process_due(clock[0]))
+    _publish_progress(
+        progress_observer,
+        repository,
+        scenario,
+        mode=mode,
+        run_state=SyntheticRunState.RUNNING,
+        runtime_status=SyntheticRuntimeStatus.PERSISTED,
+    )
 
     persona_by_id = {persona.persona_id: persona for persona in scenario.personas}
     actions_by_trigger = {action.trigger_id: action for action in transcript.actions}
@@ -1733,7 +1912,23 @@ def replay_transcript(
                         ),
                     )
                 )
+                _publish_progress(
+                    progress_observer,
+                    repository,
+                    scenario,
+                    mode=mode,
+                    run_state=SyntheticRunState.RUNNING,
+                    runtime_status=SyntheticRuntimeStatus.PERSISTED,
+                )
                 gateway.dispatch_all(workflow.process_due(clock[0]))
+                _publish_progress(
+                    progress_observer,
+                    repository,
+                    scenario,
+                    mode=mode,
+                    run_state=SyntheticRunState.RUNNING,
+                    runtime_status=SyntheticRuntimeStatus.PERSISTED,
+                )
                 collect_frozen_deliveries()
                 continue
 
@@ -1751,6 +1946,14 @@ def replay_transcript(
                     raise ValueError("synthetic due-work progression exceeded its bound")
                 clock[0] = min(due_times)
                 gateway.dispatch_all(workflow.process_due(clock[0]))
+                _publish_progress(
+                    progress_observer,
+                    repository,
+                    scenario,
+                    mode=mode,
+                    run_state=SyntheticRunState.RUNNING,
+                    runtime_status=SyntheticRuntimeStatus.PERSISTED,
+                )
                 collect_frozen_deliveries()
                 continue
             break
@@ -1766,7 +1969,10 @@ def replay_transcript(
             queued_action.raw_delivery,
             queued_action.mandate_token,
         )
+        story = _progress_story(repository, queued_action.mandate_token)
+        contract = _contract_for(persona_by_id[persona_id]).value
         if command is not None:
+            before_event_count = _persisted_event_count(repository)
             message_id = f"synthetic-{persona_id}-{action.local_sequence}"
             envelope_args = {
                 "message_id": message_id,
@@ -1792,7 +1998,38 @@ def replay_transcript(
                 )
             )
             client.emit_inbound(envelope)
+            after_event_count = _persisted_event_count(repository)
+            if after_event_count == before_event_count:
+                _record_inert_progress(
+                    progress_observer,
+                    virtual_time=action.timestamp,
+                    story=story,
+                    persona_id=action.persona_id,
+                    contract=contract,
+                    runtime_status=SyntheticRuntimeStatus.WORKFLOW_REJECTED,
+                    data_point="No workflow data saved",
+                )
+            _publish_progress(
+                progress_observer,
+                repository,
+                scenario,
+                mode=mode,
+                run_state=SyntheticRunState.RUNNING,
+                runtime_status=SyntheticRuntimeStatus.PERSISTED,
+                active_persona_id=action.persona_id,
+            )
             collect_frozen_deliveries()
+        else:
+            runtime_status, data_point = _inert_runtime_status(action)
+            _record_inert_progress(
+                progress_observer,
+                virtual_time=action.timestamp,
+                story=story,
+                persona_id=action.persona_id,
+                contract=contract,
+                runtime_status=runtime_status,
+                data_point=data_point,
+            )
 
     if actions_by_trigger:
         raise ValueError("replay did not reproduce every frozen outbound trigger")
@@ -1802,8 +2039,7 @@ def replay_transcript(
     latest = repository.list_recent_mandates(1)
     final_state = latest[0].state.value if latest else "missing"
     terminal_states = tuple(item.state.value for item in all_mandates)
-    session_factory.kw["bind"].dispose()
-    return SyntheticRunResult(
+    result = SyntheticRunResult(
         transcript=transcript,
         database_path=database_path,
         gateway_handler_count=client.on_message_registration_count,
@@ -1812,10 +2048,22 @@ def replay_transcript(
         model_client_configured=False,
         final_state=final_state,
         terminal_states=terminal_states,
-        mode=SyntheticGenerationMode.FROZEN_REPLAY,
+        mode=mode,
         model_identifier=None,
         provenance_path=None,
     )
+    if progress_observer is not None:
+        _publish_progress(
+            progress_observer,
+            repository,
+            scenario,
+            mode=mode,
+            run_state=SyntheticRunState.COMPLETE,
+            runtime_status=SyntheticRuntimeStatus.PERSISTED,
+            final_trace_sha256=semantic_trace_hash(result),
+        )
+    session_factory.kw["bind"].dispose()
+    return result
 
 
 def _semantic_time(value: datetime | None) -> str | None:

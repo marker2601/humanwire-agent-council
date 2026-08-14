@@ -42,6 +42,10 @@ from humanwire.domain import (
 from humanwire.evidence import private_blocker_count, shareable_evidence
 from humanwire.meetings import MeetingCoordinator, render_ics
 from humanwire.redaction import redact_sensitive
+from humanwire.replay_projection import (
+    REPLAY_EVENT_EXPLANATIONS as _REPLAY_EVENT_EXPLANATIONS,
+)
+from humanwire.replay_projection import project_replay_labels
 from humanwire.repository import SqlAlchemyHumanWireRepository
 
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -1508,73 +1512,21 @@ _MANDATE_LEVEL_EVENT_TYPES = frozenset(
     }
 )
 
-_REPLAY_EVENT_EXPLANATIONS = {
-    "mandate.created": ("Mandate", "Mandate created", "HumanWire", "Decision Room"),
-    "mandate.received": ("Mandate", "Mandate received", "HumanWire", "Decision Room"),
-    "engagement.plan_previewed": ("Plan", "Plan previewed", "HumanWire", "Decision Room"),
-    "engagement.plan_released": ("Plan", "Plan released", "HumanWire", "Decision Room"),
-    "mandate.planned": ("Plan", "Plan prepared", "HumanWire", "Decision Room"),
-    "mandate.interviewing": ("Outreach", "Coordination started", "HumanWire", "Decision Room"),
-    "engagement.quick_response_sent": ("Outreach", "Outreach sent", "HumanWire", "person"),
-    "engagement.structured_interview_sent": ("Outreach", "Interview requested", "HumanWire", "person"),
-    "engagement.acknowledgement_sent": ("Outreach", "Acknowledgement requested", "HumanWire", "person"),
-    "engagement.inform_delivered": ("Outreach", "Update delivered", "HumanWire", "person"),
-    "engagement.structured_interview_reminder": ("Outreach", "Reminder sent", "HumanWire", "person"),
-    "engagement.structured_interview_alternate_selected": (
-        "Outreach",
-        "Alternate channel selected",
-        "HumanWire",
-        "person",
-    ),
-    "engagement.quick_response_completed": ("Response", "Response completed", "person", "HumanWire"),
-    "engagement.acknowledged": ("Response", "Acknowledgement received", "person", "HumanWire"),
-    "engagement.structured_interview_progressed": ("Response", "Interview progressed", "person", "HumanWire"),
-    "interview.answer_recorded": ("Response", "Answer recorded", "person", "HumanWire"),
-    "interview.evidence_confirmed": ("Evidence", "Evidence confirmed", "person", "HumanWire"),
-    "engagement.approval_pending": ("Decision", "Decision requested", "HumanWire", "person"),
-    "engagement.override_recorded": ("Decision", "Decision updated", "HumanWire", "person"),
-    "engagement.decision_recorded": ("Decision", "Decision recorded", "person", "HumanWire"),
-    "proposal.response_recorded": ("Decision", "Proposal response recorded", "person", "HumanWire"),
-    "proposal.created": ("Proposal", "Proposal prepared", "HumanWire", "Decision Room"),
-    "mandate.negotiating": ("Proposal", "Proposal review started", "HumanWire", "Decision Room"),
-    "mandate.meeting_required": ("Scheduling", "Meeting required", "HumanWire", "Decision Room"),
-    "mandate.scheduling": ("Scheduling", "Scheduling started", "HumanWire", "Decision Room"),
-    "availability.recorded": ("Scheduling", "Availability recorded", "person", "HumanWire"),
-    "meeting.package_created": ("Scheduling", "Meeting prepared", "HumanWire", "Decision Room"),
-    "mandate.meeting_ready": ("Scheduling", "Meeting ready", "HumanWire", "Decision Room"),
-    "mandate.aligned": ("Outcome", "Outcome recorded", "HumanWire", "Decision Room"),
-    "mandate.partial": ("Outcome", "Partial outcome recorded", "HumanWire", "Decision Room"),
-    "mandate.cancelled": ("Outcome", "Mandate cancelled", "HumanWire", "Decision Room"),
-    "mandate.expired": ("Outcome", "Mandate expired", "HumanWire", "Decision Room"),
-}
-
-
 def _replay_explanation(
     event_type: Any, bound_row: Mapping[str, Any] | None
 ) -> dict[str, str]:
     """Return public replay labels using only allowlisted event types and bindings."""
-    explanation = _REPLAY_EVENT_EXPLANATIONS.get(str(event_type or ""))
-    if explanation is None:
-        return {
-            "stage_label": "Saved event",
-            "source_label": "HumanWire",
-            "destination_label": "Decision Room",
-            "data_point_label": "No public data point",
-        }
     person_name = (
         str(bound_row.get("name") or "").strip()
         if isinstance(bound_row, Mapping)
         else ""
     )
-    source = person_name if explanation[2] == "person" else explanation[2]
-    destination = person_name if explanation[3] == "person" else explanation[3]
-    if not source or not destination:
-        return _replay_explanation("", None)
+    labels = project_replay_labels(str(event_type or ""), person_name or None)
     return {
-        "stage_label": explanation[0],
-        "source_label": source,
-        "destination_label": destination,
-        "data_point_label": explanation[1],
+        "stage_label": labels.stage,
+        "source_label": labels.source,
+        "destination_label": labels.destination,
+        "data_point_label": labels.data_point,
     }
 
 
