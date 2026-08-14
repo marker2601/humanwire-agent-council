@@ -20,8 +20,10 @@ from persona_engine_fixtures import FixtureDecisionEngineFactory
 from pydantic import ValidationError
 
 import humanwire.synthetic as synthetic_module
+from humanwire.database import create_session_factory
 from humanwire.domain import Channel, EngagementType
 from humanwire.persona_runtime import PersonaVisibility
+from humanwire.repository import SqlAlchemyHumanWireRepository
 from humanwire.synthetic import (
     SUPPORTED_SCHEMA_VERSION,
     SyntheticAction,
@@ -30,9 +32,11 @@ from humanwire.synthetic import (
     SyntheticProvenance,
     SyntheticScenario,
     SyntheticTranscript,
+    default_synthetic_scenario,
     generate_scenario,
     load_transcript,
 )
+from tests.humanwire.studio_fixtures import launch_request
 
 NOW = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
 TRIGGER_DIGEST = "a" * 64
@@ -96,6 +100,38 @@ def make_transcript(**changes: object) -> SyntheticTranscript:
     }
     values.update(changes)
     return SyntheticTranscript.create(**values)
+
+
+def test_generate_scenario_uses_submitted_objective_and_only_one_mandate(tmp_path) -> None:
+    request = launch_request()
+    scenario = synthetic_module.build_coordination_scenario(
+        request, seed=7, scenario_id="launch-run-001"
+    )
+    result = generate_scenario(
+        scenario,
+        tmp_path / "run" / "transcript.json",
+        tmp_path / "run",
+        mandate_request=request.objective,
+        include_change_story=False,
+    )
+    assert result.terminal_states == ("meeting_ready",)
+    session_factory = create_session_factory(
+        "sqlite:///" + result.database_path.as_posix()
+    )
+    repository = SqlAlchemyHumanWireRepository(session_factory)
+    mandates = repository.list_recent_mandates(10)
+    assert len(mandates) == 1
+    assert mandates[0].redacted_request == request.objective
+    session_factory.kw["bind"].dispose()
+
+
+def test_generate_scenario_defaults_preserve_frozen_proof_contract(tmp_path) -> None:
+    result = generate_scenario(
+        default_synthetic_scenario(seed=0),
+        tmp_path / "proof" / "transcript.json",
+        tmp_path / "proof",
+    )
+    assert result.terminal_states == ("meeting_ready", "partial")
 
 
 def test_schema_rejects_unsupported_version() -> None:

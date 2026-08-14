@@ -68,6 +68,7 @@ from humanwire.persona_runtime import (
 )
 from humanwire.planning import ResolvedPlan
 from humanwire.repository import SqlAlchemyHumanWireRepository
+from humanwire.studio_models import CoordinationRequest, RequesterRole, product_catalog
 from humanwire.synthetic_identities import (
     IDENTITY_GENERATOR_VERSION,
     seeded_identity_map,
@@ -287,6 +288,66 @@ def default_synthetic_scenario(seed: int = 0) -> SyntheticScenario:
         identity_generator_version=IDENTITY_GENERATOR_VERSION,
         personas=personas,
         provenance=_synthetic_provenance(),
+    )
+
+
+_REQUESTER_ROLE_LABELS = {
+    RequesterRole.MANAGER: "Strategy manager",
+    RequesterRole.EXECUTIVE: "Executive",
+    RequesterRole.PROGRAM_LEAD: "Program lead",
+    RequesterRole.TEAM_LEAD: "Team lead",
+}
+
+
+def build_coordination_scenario(
+    request: CoordinationRequest,
+    *,
+    seed: int,
+    scenario_id: str,
+) -> SyntheticScenario:
+    """Build one product-facing story from the isolated synthetic contracts."""
+    request = CoordinationRequest.model_validate(request)
+    default = default_synthetic_scenario(seed)
+    stakeholder_by_id = {
+        stakeholder.persona_id: stakeholder
+        for stakeholder in product_catalog().stakeholders
+    }
+    selected_ids = {"synthetic-manager", *request.participant_ids}
+    selected_template = next(
+        (template for template in product_catalog().templates if template.template_id == request.template_id),
+        None,
+    )
+    if selected_template is None or "approval-change" not in selected_template.participant_ids:
+        selected_ids.discard("approval-change")
+    personas: list[SyntheticPersona] = []
+    for persona in default.personas:
+        if persona.persona_id not in selected_ids:
+            continue
+        if persona.persona_id == "synthetic-manager":
+            personas.append(
+                persona.model_copy(
+                    update={
+                        "display_name": request.requester_name,
+                        "role": _REQUESTER_ROLE_LABELS[request.requester_role],
+                    }
+                )
+            )
+            continue
+        stakeholder = stakeholder_by_id[persona.persona_id]
+        personas.append(
+            persona.model_copy(
+                update={
+                    "display_name": stakeholder.display_name,
+                    "role": stakeholder.role,
+                }
+            )
+        )
+    return SyntheticScenario.model_validate(
+        {
+            **default.model_dump(mode="python"),
+            "scenario_id": scenario_id,
+            "personas": personas,
+        }
     )
 
 
@@ -1405,6 +1466,8 @@ def generate_scenario(
     decision_engine: PersonaDecisionEngineFactory | None = None,
     max_decision_workers: int = 1,
     progress_observer: SyntheticProgressObserver | None = None,
+    mandate_request: str | None = None,
+    include_change_story: bool | None = None,
 ) -> SyntheticRunResult:
     """Generate an isolated run through the one offline gateway boundary."""
     scenario = SyntheticScenario.model_validate(scenario)
@@ -1446,13 +1509,20 @@ def generate_scenario(
     )
     gateway.connect()
     manager = _manager_persona(scenario)
+    request_text = (
+        "Coordinate the deterministic synthetic launch"
+        if mandate_request is None
+        else mandate_request.strip()
+    )
+    if not 12 <= len(request_text) <= 1000:
+        raise ValueError("mandate request must be between 12 and 1000 characters")
 
     manager_message = email_envelope(
         message_id="synthetic-manager-mandate",
         conversation_id="synthetic-manager-conversation",
         sender_address=manager.email,
         sender_name=manager.display_name,
-        text="/mandate\nCoordinate the deterministic synthetic launch",
+        text="/mandate\n" + request_text,
     )
     client.emit_inbound(manager_message)
     _publish_progress(
@@ -1681,7 +1751,11 @@ def generate_scenario(
         commit_model_batch()
 
     collect_deliveries(clock[0])
-    change_story_enabled = "approval-change" in persona_by_id
+    change_story_enabled = (
+        "approval-change" in persona_by_id
+        if include_change_story is None
+        else include_change_story and "approval-change" in persona_by_id
+    )
     change_story_started = False
     due_advances = 0
     while True:
