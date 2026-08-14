@@ -44,7 +44,15 @@ def request_body(**updates: object) -> str:
     return json.dumps(body)
 
 
-def raw_post_status(app, headers: list[tuple[bytes, bytes]], body: bytes) -> int:
+def raw_post_response(
+    app,
+    headers: list[tuple[bytes, bytes]],
+    body: bytes,
+    *,
+    path: str = "/api/runs",
+    raw_path: bytes = b"/api/runs",
+    query_string: bytes = b"",
+):
     messages = []
     delivered = False
 
@@ -64,16 +72,25 @@ def raw_post_status(app, headers: list[tuple[bytes, bytes]], body: bytes) -> int
         "http_version": "1.1",
         "method": "POST",
         "scheme": "http",
-        "path": "/api/runs",
-        "raw_path": b"/api/runs",
-        "query_string": b"",
+        "path": path,
+        "raw_path": raw_path,
+        "query_string": query_string,
         "root_path": "",
         "headers": [(b"host", b"127.0.0.1"), *headers],
         "client": ("127.0.0.1", 10000),
         "server": ("127.0.0.1", 80),
     }
     asyncio.run(app(scope, receive, send))
-    return next(item["status"] for item in messages if item["type"] == "http.response.start")
+    started = next(item for item in messages if item["type"] == "http.response.start")
+    content = b"".join(
+        item.get("body", b"") for item in messages if item["type"] == "http.response.body"
+    )
+    return SimpleNamespace(
+        status_code=started["status"],
+        headers={name.decode("ascii"): value.decode("ascii") for name, value in started["headers"]},
+        content=content,
+        text=content.decode("utf-8"),
+    )
 
 
 def test_studio_home_is_idle_product_and_has_no_started_run(tmp_path) -> None:
@@ -214,7 +231,7 @@ def test_post_rejects_truly_missing_content_length_at_the_asgi_boundary(tmp_path
     manager = StudioRunManager(workspace_root=tmp_path)
     app = create_coordination_studio_app(manager, action_token="test-action-token")
 
-    status = raw_post_status(
+    response = raw_post_response(
         app,
         [
             (b"content-type", b"application/json"),
@@ -223,7 +240,119 @@ def test_post_rejects_truly_missing_content_length_at_the_asgi_boundary(tmp_path
         request_body().encode(),
     )
 
-    assert status == 400
+    assert response.status_code == 400
+    assert manager.list_runs() == ()
+
+
+def test_post_rejects_present_non_ascii_origin_instead_of_treating_it_as_absent(
+    tmp_path,
+) -> None:
+    manager = StudioRunManager(
+        workspace_root=tmp_path,
+        alias_factory=iter(["launch-001"]).__next__,
+        step_delay_ms=0,
+    )
+    app = create_coordination_studio_app(manager, action_token="test-action-token")
+    body = request_body().encode()
+
+    response = raw_post_response(
+        app,
+        [
+            (b"content-length", str(len(body)).encode()),
+            (b"content-type", b"application/json"),
+            (b"x-humanwire-action", b"test-action-token"),
+            (b"origin", b"http://127.0.0.1:\xff"),
+        ],
+        body,
+    )
+    for run_alias in manager.list_runs():
+        manager.join(run_alias, timeout=20)
+
+    assert response.status_code == 403
+    assert json.loads(response.text) == {"error": "origin_forbidden"}
+    assert manager.list_runs() == ()
+
+
+@pytest.mark.parametrize("raw_path", [b"/api%2Fruns", b"/%61pi/runs"])
+def test_post_rejects_encoded_raw_path_aliases(tmp_path, raw_path) -> None:
+    manager = StudioRunManager(
+        workspace_root=tmp_path,
+        alias_factory=iter(["launch-001"]).__next__,
+        step_delay_ms=0,
+    )
+    app = create_coordination_studio_app(manager, action_token="test-action-token")
+    body = request_body().encode()
+
+    response = raw_post_response(
+        app,
+        [
+            (b"content-length", str(len(body)).encode()),
+            (b"content-type", b"application/json"),
+            (b"x-humanwire-action", b"test-action-token"),
+        ],
+        body,
+        path="/api/runs",
+        raw_path=raw_path,
+    )
+    for run_alias in manager.list_runs():
+        manager.join(run_alias, timeout=20)
+
+    assert response.status_code == 405
+    assert json.loads(response.text) == {"error": "method_not_allowed"}
+    assert manager.list_runs() == ()
+
+
+@pytest.mark.parametrize("path", ["/api/run", "/api/runs/"])
+def test_post_rejects_wrong_path_and_query_string(tmp_path, path) -> None:
+    client, manager = studio_client(tmp_path)
+
+    wrong_path = client.post(path, headers=ACTION_HEADERS, content=request_body())
+    query = client.post("/api/runs?start=true", headers=ACTION_HEADERS, content=request_body())
+
+    assert wrong_path.status_code == 405
+    assert query.status_code == 405
+    assert manager.list_runs() == ()
+
+
+@pytest.mark.parametrize("encoding_header", [b"transfer-encoding", b"content-encoding"])
+def test_post_rejects_transfer_and_content_encodings(tmp_path, encoding_header) -> None:
+    manager = StudioRunManager(workspace_root=tmp_path)
+    app = create_coordination_studio_app(manager, action_token="test-action-token")
+    body = request_body().encode()
+
+    response = raw_post_response(
+        app,
+        [
+            (b"content-length", str(len(body)).encode()),
+            (b"content-type", b"application/json"),
+            (b"x-humanwire-action", b"test-action-token"),
+            (encoding_header, b"identity"),
+        ],
+        body,
+    )
+
+    assert response.status_code == 400
+    assert json.loads(response.text) == {"error": "invalid_request"}
+    assert manager.list_runs() == ()
+
+
+def test_post_rejects_actual_body_length_mismatch(tmp_path) -> None:
+    manager = StudioRunManager(workspace_root=tmp_path)
+    app = create_coordination_studio_app(manager, action_token="test-action-token")
+    body = request_body().encode()
+
+    response = raw_post_response(
+        app,
+        [
+            (b"content-length", str(len(body) + 1).encode()),
+            (b"content-type", b"application/json"),
+            (b"x-humanwire-action", b"test-action-token"),
+        ],
+        body,
+    )
+
+    assert response.status_code == 400
+    assert json.loads(response.text) == {"error": "invalid_request"}
     assert manager.list_runs() == ()
 
 
@@ -336,6 +465,68 @@ def test_security_headers_and_disabled_docs_apply_to_every_response(tmp_path) ->
 
     assert client.get("/openapi.json").json() == {"error": "not_found"}
     assert client.get("/api/runs").json() == {"error": "method_not_allowed"}
+
+
+def test_head_is_supported_for_pages_api_static_and_final_attachments(tmp_path) -> None:
+    client, manager = studio_client(tmp_path)
+
+    assert client.head("/").status_code == 200
+    assert client.head("/api/catalog").status_code == 200
+    assert client.head("/studio-static/coordination-studio.js").status_code == 200
+    created = client.post("/api/runs", headers=ACTION_HEADERS, content=request_body())
+    manager.join(created.json()["run_alias"], timeout=20)
+
+    for path in (
+        "/runs/launch-001",
+        "/api/runs/launch-001",
+        "/api/runs/launch-001/evidence.json",
+        "/api/runs/launch-001/events.csv",
+    ):
+        response = client.head(path)
+        assert response.status_code == 200
+        assert response.content == b""
+
+
+@pytest.mark.parametrize("failure_source", ["route", "render"])
+def test_outer_exception_envelope_is_fixed_non_reflective_and_keeps_safe_headers(
+    tmp_path, monkeypatch, caplog, failure_source
+) -> None:
+    manager = StudioRunManager(workspace_root=tmp_path)
+    app = create_coordination_studio_app(manager, action_token="test-action-token")
+
+    def fail_route():
+        raise RuntimeError("PRIVATE route credential and request body")
+
+    def fail_render(*_args, **_kwargs):
+        raise RuntimeError("PRIVATE render credential and request body")
+
+    if failure_source == "route":
+        app.add_api_route("/explode", fail_route, methods=["GET"])
+        path = "/explode"
+    else:
+        monkeypatch.setattr(
+            "humanwire.studio_app.Jinja2Templates.TemplateResponse", fail_render
+        )
+        path = "/"
+    client = TestClient(
+        app,
+        base_url="http://127.0.0.1",
+        raise_server_exceptions=False,
+    )
+
+    response = client.get(path)
+
+    assert response.status_code == 500
+    assert response.json() == {"error": "request_failed"}
+    assert "PRIVATE" not in response.text
+    assert response.headers["cache-control"] == "no-store"
+    assert "default-src 'self'" in response.headers["content-security-policy"]
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["permissions-policy"]
+    assert response.headers["x-frame-options"] == "DENY"
+    assert "content-disposition" not in response.headers
+    assert "PRIVATE" not in caplog.text
 
 
 def test_public_demo_has_no_studio_api_or_controller() -> None:

@@ -166,56 +166,67 @@ def create_coordination_studio_app(
 
     @app.middleware("http")
     async def private_loopback_boundary(request: Request, call_next):
-        host = _ascii_header(_raw_headers(request, b"host"))
-        if not _literal_loopback(host, _HOST):
-            response = _fixed_error(400, "invalid_host")
-        elif request.method not in {"GET", "HEAD", "POST"} or request.method == "POST" and (
-            request.url.path != "/api/runs" or bool(request.scope.get("query_string"))
-        ):
-            response = _fixed_error(405, "method_not_allowed")
-        elif request.method == "POST":
-            lengths = _raw_headers(request, b"content-length")
-            length_text = _ascii_header(lengths)
-            if (
-                length_text is None
-                or not length_text.isdecimal()
-                or len(length_text) > 4
-                or int(length_text) < 1
+        try:
+            host = _ascii_header(_raw_headers(request, b"host"))
+            if not _literal_loopback(host, _HOST):
+                response = _fixed_error(400, "invalid_host")
+            elif request.method not in {
+                "GET",
+                "HEAD",
+                "POST",
+            } or request.method == "POST" and (
+                request.scope.get("path") != "/api/runs"
+                or request.scope.get("raw_path") != b"/api/runs"
+                or bool(request.scope.get("query_string"))
             ):
-                response = _fixed_error(400, "invalid_request")
-            elif int(length_text) > _MAX_BODY_BYTES:
-                response = _fixed_error(413, "request_too_large")
-            elif _raw_headers(request, b"transfer-encoding") or _raw_headers(
-                request, b"content-encoding"
-            ):
-                response = _fixed_error(400, "invalid_request")
-            else:
-                actions = _raw_headers(request, b"x-humanwire-action")
-                supplied_action = _ascii_header(actions)
-                if supplied_action is None or not hmac.compare_digest(
-                    supplied_action, action_token
+                response = _fixed_error(405, "method_not_allowed")
+            elif request.method == "POST":
+                lengths = _raw_headers(request, b"content-length")
+                length_text = _ascii_header(lengths)
+                if (
+                    length_text is None
+                    or not length_text.isdecimal()
+                    or len(length_text) > 4
+                    or int(length_text) < 1
                 ):
-                    response = _fixed_error(403, "action_forbidden")
+                    response = _fixed_error(400, "invalid_request")
+                elif int(length_text) > _MAX_BODY_BYTES:
+                    response = _fixed_error(413, "request_too_large")
+                elif _raw_headers(request, b"transfer-encoding") or _raw_headers(
+                    request, b"content-encoding"
+                ):
+                    response = _fixed_error(400, "invalid_request")
                 else:
-                    origins = _raw_headers(request, b"origin")
-                    origin = _ascii_header(origins) if origins else None
-                    if len(origins) > 1 or (
-                        origin is not None and not _literal_loopback(origin, _ORIGIN)
+                    actions = _raw_headers(request, b"x-humanwire-action")
+                    supplied_action = _ascii_header(actions)
+                    if supplied_action is None or not hmac.compare_digest(
+                        supplied_action, action_token
                     ):
-                        response = _fixed_error(403, "origin_forbidden")
+                        response = _fixed_error(403, "action_forbidden")
                     else:
-                        types = _raw_headers(request, b"content-type")
-                        content_type = _ascii_header(types)
-                        if len(types) != 1:
-                            response = _fixed_error(400, "invalid_request")
-                        elif content_type is None or content_type.split(";", 1)[
-                            0
-                        ].strip().casefold() != "application/json":
-                            response = _fixed_error(415, "unsupported_media_type")
+                        origins = _raw_headers(request, b"origin")
+                        origin = _ascii_header(origins) if origins else None
+                        if origins and (
+                            len(origins) != 1
+                            or origin is None
+                            or not _literal_loopback(origin, _ORIGIN)
+                        ):
+                            response = _fixed_error(403, "origin_forbidden")
                         else:
-                            response = await call_next(request)
-        else:
-            response = await call_next(request)
+                            types = _raw_headers(request, b"content-type")
+                            content_type = _ascii_header(types)
+                            if len(types) != 1:
+                                response = _fixed_error(400, "invalid_request")
+                            elif content_type is None or content_type.split(";", 1)[
+                                0
+                            ].strip().casefold() != "application/json":
+                                response = _fixed_error(415, "unsupported_media_type")
+                            else:
+                                response = await call_next(request)
+            else:
+                response = await call_next(request)
+        except Exception:  # noqa: BLE001 - boundary failures must not retain private details
+            response = _fixed_error(500, "request_failed")
         for name, value in _SAFE_HEADERS.items():
             response.headers[name] = value
         return response
