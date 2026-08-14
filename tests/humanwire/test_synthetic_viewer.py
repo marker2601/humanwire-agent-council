@@ -138,7 +138,7 @@ def test_get_and_head_responses_have_safe_headers_and_head_has_no_body(
         "/evidence.json",
         "/events.csv",
         "/static/styles.css",
-        "/static/synthetic-progress.js",
+        "/viewer-static/synthetic-progress.js",
     ):
         response = client.get(path)
         head = client.head(path)
@@ -174,7 +174,7 @@ def test_get_and_head_responses_have_safe_headers_and_head_has_no_body(
         "/evidence.json",
         "/events.csv",
         "/static/styles.css",
-        "/static/synthetic-progress.js",
+        "/viewer-static/synthetic-progress.js",
     ),
 )
 @pytest.mark.parametrize(
@@ -228,7 +228,8 @@ def test_completed_json_and_csv_are_attachments(completed_viewer_client) -> None
     assert "actions" not in evidence
     assert "outbound_digests" not in evidence
     assert csv_response.text.startswith(
-        "ordinal,created_at,story,stage,source,destination,data_point"
+        "timeline_ordinal,persisted_ordinal,effect,created_at,story,stage,source,"
+        "destination,data_point"
     )
     for path in ("/evidence.json", "/events.csv"):
         head = completed_viewer_client.head(path)
@@ -262,16 +263,20 @@ def test_private_transcript_binding_never_reaches_any_http_surface(
     assert "transcript_sha256" not in public_surface
 
 
-def test_completed_csv_carries_exact_synthetic_provenance_on_every_row(
+def test_completed_csv_has_row_for_row_timeline_and_provenance_parity(
     completed_viewer_client,
 ) -> None:
-    response = completed_viewer_client.get("/events.csv")
-    reader = csv.DictReader(io.StringIO(response.text))
+    json_response = completed_viewer_client.get("/evidence.json")
+    csv_response = completed_viewer_client.get("/events.csv")
+    evidence = json_response.json()
+    reader = csv.DictReader(io.StringIO(csv_response.text))
     rows = list(reader)
 
-    assert response.status_code == 200
+    assert json_response.status_code == csv_response.status_code == 200
     assert reader.fieldnames == [
-        "ordinal",
+        "timeline_ordinal",
+        "persisted_ordinal",
+        "effect",
         "created_at",
         "story",
         "stage",
@@ -285,9 +290,24 @@ def test_completed_csv_carries_exact_synthetic_provenance_on_every_row(
         "human_attested",
         "live_provider_verified",
     ]
-    assert rows
-    for row in rows:
-        assert {key: row[key] for key in reader.fieldnames[7:]} == {
+    assert len(rows) == len(evidence["events"])
+    assert any(event["effect"] == "inert_attempt" for event in evidence["events"])
+    assert [int(row["timeline_ordinal"]) for row in rows] == list(
+        range(1, len(rows) + 1)
+    )
+    for event, row in zip(evidence["events"], rows, strict=True):
+        assert row["timeline_ordinal"] == str(event["timeline_ordinal"])
+        assert row["persisted_ordinal"] == (
+            "" if event["persisted_ordinal"] is None else str(event["persisted_ordinal"])
+        )
+        assert row["effect"] == event["effect"]
+        assert row["created_at"] == event["created_at"]
+        assert row["story"] == event["story"]
+        assert row["stage"] == event["stage"]
+        assert row["source"] == event["source"]
+        assert row["destination"] == event["destination"]
+        assert row["data_point"] == event["data_point"]
+        assert {key: row[key] for key in reader.fieldnames[9:]} == {
             "proof_class": "synthetic_multi_persona",
             "actor_type": "simulated_persona",
             "identity_source": "synthetic_fixture",
@@ -377,7 +397,9 @@ def test_csv_neutralizes_formula_cells_and_exports_only_allowlisted_fields(
     assert rows[1]["data_point"] == "'\rprivate"
     assert rows[2]["source"] == "'\nprivate"
     assert set(rows[0]) == {
-        "ordinal",
+        "timeline_ordinal",
+        "persisted_ordinal",
+        "effect",
         "created_at",
         "story",
         "stage",
@@ -423,6 +445,19 @@ def test_public_demo_has_no_local_progress_surface() -> None:
     assert web_client.get("/progress.json").status_code == 404
     assert web_client.get("/evidence.json").status_code == 404
     assert web_client.get("/events.csv").status_code == 404
+    assert web_client.get("/static/synthetic-progress.js").status_code == 404
+    assert web_client.get("/viewer-static/synthetic-progress.js").status_code == 404
+
+
+def test_progress_controller_is_served_only_by_the_local_viewer(
+    completed_viewer_client,
+) -> None:
+    """Break caught: the public demo exposes the local progress controller asset."""
+    response = completed_viewer_client.get("/viewer-static/synthetic-progress.js")
+
+    assert response.status_code == 200
+    assert "javascript" in response.headers["content-type"]
+    assert "data-synthetic-viewer" in response.text
 
 
 def _css_rule_selectors(source: str) -> list[str]:
@@ -529,7 +564,7 @@ def test_viewer_template_is_truthful_accessible_and_download_first(
     assert re.search(r'<a[^>]+href="/evidence.json"[^>]+download[^>]+aria-disabled="true"', html)
     assert re.search(r'<a[^>]+href="/events.csv"[^>]+download[^>]+aria-disabled="true"', html)
     assert '<ol class="replay-events" data-replay-list hidden' in html
-    assert '<script src="/static/synthetic-progress.js" defer></script>' in html
+    assert '<script src="/viewer-static/synthetic-progress.js" defer></script>' in html
 
 
 def test_viewer_styles_have_accessible_controls_and_responsive_no_overflow_layout(
@@ -619,7 +654,10 @@ def test_every_focusable_viewer_control_has_a_44px_target_contract(
 
 
 def test_progress_controller_exercises_live_manual_playback_and_download_states() -> None:
-    script_path = Path(__file__).resolve().parents[2] / "src/humanwire/static/synthetic-progress.js"
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "src/humanwire/viewer_static/synthetic-progress.js"
+    )
     harness = r"""
 const fs = require("fs");
 const scriptPath = process.argv[1];

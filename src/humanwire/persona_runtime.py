@@ -11,10 +11,10 @@ from enum import StrEnum
 from threading import Event
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from humanwire.domain import EngagementType
-from humanwire.model_client import JsonModelClient, ModelFailure
+from humanwire.model_client import FeatherlessJsonClient, JsonModelClient, ModelFailure
 
 MAX_PERSONA_CONTENT_LENGTH = 600
 PERSONA_PROMPT_VERSION = "humanwire.persona-decision/v1"
@@ -101,6 +101,15 @@ class PersonaDecisionEngine(Protocol):
         raise NotImplementedError
 
 
+class PersonaDecisionEngineFactory(Protocol):
+    """Spawn-safe description that constructs an engine inside an isolated worker."""
+
+    model_identifier: str
+
+    def build(self) -> PersonaDecisionEngine:
+        raise NotImplementedError
+
+
 def validate_persona_decision(
     profile: PersonaProfile,
     decision: PersonaDecision,
@@ -184,3 +193,21 @@ class FeatherlessPersonaDecisionEngine:
         if cancellation.is_set() or time.monotonic() >= deadline:
             raise ModelFailure("timeout")
         return validate_persona_decision(profile, decision)
+
+
+class FeatherlessPersonaDecisionEngineFactory(StrictPersonaModel):
+    """Serializable private configuration for constructing the direct adapter in a child."""
+
+    api_key: SecretStr
+    model_identifier: str = Field(min_length=1, max_length=200)
+    base_url: str = Field(min_length=1, max_length=2048)
+    max_tokens: int = Field(default=900, ge=1, le=4096)
+
+    def build(self) -> FeatherlessPersonaDecisionEngine:
+        client = FeatherlessJsonClient(
+            api_key=self.api_key.get_secret_value(),
+            model=self.model_identifier,
+            base_url=self.base_url,
+            max_tokens=self.max_tokens,
+        )
+        return FeatherlessPersonaDecisionEngine(client, self.model_identifier)

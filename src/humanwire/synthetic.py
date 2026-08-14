@@ -6,12 +6,14 @@ import hashlib
 import heapq
 import inspect
 import json
+import multiprocessing
 import os
+import pickle
 import re
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -45,6 +47,7 @@ from humanwire.offline_caspian import (
 from humanwire.persona_runtime import (
     PERSONA_PROMPT_VERSION,
     PersonaDecisionEngine,
+    PersonaDecisionEngineFactory,
     PersonaVisibility,
     SyntheticGenerationMode,
     SyntheticIntent,
@@ -85,6 +88,10 @@ _EMAIL_PATTERN = re.compile(r"\b[^\s@]+@[^\s@]+\b")
 _FIXED_TIME = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
 MODEL_DECISION_TIMEOUT_SECONDS = 15.0
 MODEL_DECISION_CANCELLATION_GRACE_SECONDS = 1.0
+_SAFE_MODEL_FAILURE_REASONS = frozenset(
+    {"timeout", "network_error", "invalid_response", "invalid_json", "invalid_schema"}
+)
+_MAX_ISOLATED_RESULT_BYTES = 4096
 
 
 class _StrictModel(BaseModel):
@@ -755,9 +762,6 @@ def _safe_decide(
         )
         if cancellation.is_set() or time.monotonic() >= deadline:
             raise ModelFailure("timeout")
-        decision = validate_persona_decision(profile, decision)
-        if cancellation.is_set() or time.monotonic() >= deadline:
-            raise ModelFailure("timeout")
         return decision
     except Exception as error:  # noqa: BLE001 - converted to a safe inert action
         return error
@@ -779,72 +783,227 @@ def _supports_cooperative_deadline(
     return True
 
 
+def _isolated_result_packet(index: int, result: _PersonaDecision | Exception) -> bytes:
+    if isinstance(result, _PersonaDecision):
+        payload: dict[str, object] = {
+            "index": index,
+            "kind": "decision",
+            "decision": result.model_dump(mode="json"),
+        }
+    else:
+        reason = (
+            result.reason
+            if isinstance(result, ModelFailure) and result.reason in _SAFE_MODEL_FAILURE_REASONS
+            else "invalid_output"
+        )
+        payload = {"index": index, "kind": "error", "reason": reason}
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _run_isolated_model_batch(
+    connection,
+    engine_factory: PersonaDecisionEngineFactory,
+    candidates: list[_DecisionCandidate],
+    max_workers: int,
+    deadline: float,
+    cancellation,
+) -> None:
+    """Build and invoke the direct engine only inside this disposable process."""
+    try:
+        try:
+            engine = engine_factory.build()
+        except Exception:  # noqa: BLE001 - child sends only a fixed safe failure
+            for index in range(len(candidates)):
+                connection.send_bytes(
+                    _isolated_result_packet(index, ValueError("invalid engine factory"))
+                )
+            return
+        if not candidates or not _supports_cooperative_deadline(engine, candidates[0]):
+            for index in range(len(candidates)):
+                connection.send_bytes(
+                    _isolated_result_packet(index, ValueError("invalid engine contract"))
+                )
+            return
+
+        workers = max(1, min(max_workers, len(candidates), 8))
+        pool = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="humanwire-persona",
+        )
+        futures = {
+            pool.submit(
+                _safe_decide,
+                engine,
+                candidate.profile,
+                candidate.context,
+                deadline,
+                cancellation,
+            ): index
+            for index, candidate in enumerate(candidates)
+        }
+        pending = set(futures)
+        while pending:
+            done, pending = wait(
+                pending,
+                timeout=max(0.0, deadline - time.monotonic()),
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                break
+            for future in sorted(done, key=futures.__getitem__):
+                connection.send_bytes(
+                    _isolated_result_packet(futures[future], future.result())
+                )
+        if pending:
+            cancellation.set()
+            pool.shutdown(wait=False, cancel_futures=True)
+        else:
+            pool.shutdown(wait=True, cancel_futures=True)
+    except Exception:  # noqa: BLE001 - parent converts missing results to a safe failure
+        return
+    finally:
+        connection.close()
+
+
+def _decode_isolated_result(
+    raw: bytes,
+    candidates: list[_DecisionCandidate],
+) -> tuple[int, _PersonaDecision | Exception]:
+    index = -1
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise TypeError("isolated result must be an object")
+        index = payload.get("index")
+        if type(index) is not int or not 0 <= index < len(candidates):
+            raise ValueError("isolated result index is invalid")
+        kind = payload.get("kind")
+        if kind == "decision" and set(payload) == {"index", "kind", "decision"}:
+            decision = _PersonaDecision.model_validate_json(
+                json.dumps(payload["decision"], ensure_ascii=False, separators=(",", ":"))
+            )
+            return index, validate_persona_decision(candidates[index].profile, decision)
+        if kind == "error" and set(payload) == {"index", "kind", "reason"}:
+            reason = payload["reason"]
+            if reason in _SAFE_MODEL_FAILURE_REASONS:
+                return index, ModelFailure(str(reason))
+            if reason == "invalid_output":
+                return index, ValueError("persona model output was invalid")
+        raise ValueError("isolated result shape is invalid")
+    except Exception as error:  # noqa: BLE001 - always becomes an inert action
+        return index, error
+
+
+def _stop_isolated_process(
+    process: multiprocessing.Process,
+    *,
+    timed_out: bool,
+    cancellation,
+) -> None:
+    grace = MODEL_DECISION_CANCELLATION_GRACE_SECONDS
+    if timed_out:
+        cancellation.set()
+    process.join(timeout=grace)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=grace)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=grace)
+    if process.is_alive():
+        raise RuntimeError("isolated persona worker could not be reaped")
+    process.close()
+
+
 def _evaluate_model_batch(
-    engine: PersonaDecisionEngine,
+    engine_factory: PersonaDecisionEngineFactory,
     candidates: list[_DecisionCandidate],
     max_workers: int,
 ) -> tuple[list[_PersonaDecision | Exception], float]:
     if not candidates:
         return [], time.monotonic()
     deadline = time.monotonic() + MODEL_DECISION_TIMEOUT_SECONDS
-    if not _supports_cooperative_deadline(engine, candidates[0]):
-        return (
-            [
-                ValueError("persona engine lacks cooperative deadline support")
-                for _ in candidates
-            ],
-            deadline,
-        )
-    workers = max(1, min(max_workers, len(candidates), 8))
-    cancellation = threading.Event()
-    pool = ThreadPoolExecutor(
-        max_workers=workers,
-        thread_name_prefix="humanwire-persona",
-    )
     try:
-        futures = [
-            pool.submit(
-                _safe_decide,
-                engine,
-                item.profile,
-                item.context,
-                deadline,
-                cancellation,
-            )
-            for item in candidates
-        ]
-        _, pending = wait(
-            futures,
-            timeout=max(0.0, deadline - time.monotonic()),
-        )
-        timed_out = set(pending)
-        if timed_out:
-            cancellation.set()
-            _, not_cleaned = wait(
-                timed_out,
-                timeout=MODEL_DECISION_CANCELLATION_GRACE_SECONDS,
-            )
-            if not_cleaned:
-                raise RuntimeError("persona engine violated cooperative cancellation")
-        return (
-            [
-                ModelFailure("timeout") if future in timed_out else future.result()
-                for future in futures
-            ],
+        pickle.dumps((engine_factory, candidates), protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:  # noqa: BLE001 - non-serializable factories fail closed pre-spawn
+        return ([ValueError("persona engine isolation failed") for _ in candidates], deadline)
+    context = multiprocessing.get_context("spawn")
+    parent_connection, child_connection = context.Pipe(duplex=False)
+    cancellation = context.Event()
+    process = context.Process(
+        target=_run_isolated_model_batch,
+        args=(
+            child_connection,
+            engine_factory,
+            candidates,
+            max_workers,
             deadline,
-        )
+            cancellation,
+        ),
+        name="humanwire-persona-batch",
+        daemon=False,
+    )
+    results: dict[int, _PersonaDecision | Exception] = {}
+    timed_out = False
+    started = False
+    try:
+        try:
+            process.start()
+            started = True
+        except Exception:  # noqa: BLE001 - spawn/pickle failures fail closed
+            return ([ValueError("persona engine isolation failed") for _ in candidates], deadline)
+        finally:
+            child_connection.close()
+
+        while len(results) < len(candidates):
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                timed_out = process.is_alive()
+                break
+            try:
+                ready = parent_connection.poll(remaining)
+            except OSError:
+                break
+            if not ready:
+                timed_out = process.is_alive()
+                break
+            try:
+                raw = parent_connection.recv_bytes(_MAX_ISOLATED_RESULT_BYTES)
+            except (EOFError, OSError):
+                break
+            index, result = _decode_isolated_result(raw, candidates)
+            if index < 0:
+                break
+            if not isinstance(result, Exception) and time.monotonic() >= deadline:
+                result = ModelFailure("timeout")
+            if index in results:
+                results[index] = ValueError("duplicate isolated result")
+            else:
+                results[index] = result
     finally:
-        pool.shutdown(wait=True, cancel_futures=True)
+        parent_connection.close()
+        if started:
+            _stop_isolated_process(
+                process,
+                timed_out=timed_out,
+                cancellation=cancellation,
+            )
+
+    missing: Exception = (
+        ModelFailure("timeout")
+        if timed_out or time.monotonic() >= deadline
+        else ValueError("persona engine isolation failed")
+    )
+    return ([results.get(index, missing) for index in range(len(candidates))], deadline)
 
 
 def _safe_model_failure(error: Exception) -> tuple[SyntheticIntent, str]:
-    if isinstance(error, ModelFailure) and error.reason in {
-        "timeout",
-        "network_error",
-        "invalid_response",
-        "invalid_json",
-        "invalid_schema",
-    }:
+    if isinstance(error, ModelFailure) and error.reason in _SAFE_MODEL_FAILURE_REASONS:
         return SyntheticIntent.ERROR, f"synthetic_model_{error.reason}"
     return SyntheticIntent.ERROR, "synthetic_model_invalid_output"
 
@@ -852,11 +1011,7 @@ def _safe_model_failure(error: Exception) -> tuple[SyntheticIntent, str]:
 def _model_action(
     candidate: _DecisionCandidate,
     result: _PersonaDecision | Exception,
-    *,
-    deadline: float,
 ) -> SyntheticAction:
-    if not isinstance(result, Exception) and time.monotonic() >= deadline:
-        result = ModelFailure("timeout")
     if isinstance(result, Exception):
         intent, content = _safe_model_failure(result)
         offset = 1
@@ -1247,7 +1402,7 @@ def generate_scenario(
     output_path: str | Path,
     run_root: str | Path,
     *,
-    decision_engine: PersonaDecisionEngine | None = None,
+    decision_engine: PersonaDecisionEngineFactory | None = None,
     max_decision_workers: int = 1,
     progress_observer: SyntheticProgressObserver | None = None,
 ) -> SyntheticRunResult:
@@ -1363,13 +1518,13 @@ def generate_scenario(
                 runtime_status=SyntheticRuntimeStatus.WAITING_FOR_AGENT,
                 active_persona_id=model_batch[0].persona_id,
             )
-            results, deadline = _evaluate_model_batch(
+            results, _ = _evaluate_model_batch(
                 decision_engine,
                 model_batch,
                 max_decision_workers,
             )
             for candidate, result in zip(model_batch, results, strict=True):
-                action = _model_action(candidate, result, deadline=deadline)
+                action = _model_action(candidate, result)
                 visible_delivery, mandate_token = delivery_authority_by_trigger.pop(
                     candidate.trigger_id
                 )

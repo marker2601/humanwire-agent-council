@@ -29,7 +29,9 @@ _SAFE_HEADERS = {
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
 }
 _CSV_FIELDS = (
-    "ordinal",
+    "timeline_ordinal",
+    "persisted_ordinal",
+    "effect",
     "created_at",
     "story",
     "stage",
@@ -82,6 +84,8 @@ def _validated_final_evidence(
 
 
 def _csv_cell(value: object) -> str:
+    if value is None:
+        return ""
     if isinstance(value, bool):
         return str(value).lower()
     rendered = str(value)
@@ -96,9 +100,12 @@ def _events_csv(bundle: SyntheticEvidenceBundle) -> str:
     writer.writeheader()
     provenance = bundle.provenance.model_dump(mode="json")
     for event in bundle.events:
+        public_event = event.model_dump(mode="json")
         row = {
-            "ordinal": event.persisted_ordinal or event.timeline_ordinal,
-            "created_at": event.created_at.isoformat(),
+            "timeline_ordinal": event.timeline_ordinal,
+            "persisted_ordinal": event.persisted_ordinal,
+            "effect": event.effect,
+            "created_at": public_event["created_at"],
             "story": event.story,
             "stage": event.stage,
             "source": event.source,
@@ -121,6 +128,11 @@ def create_synthetic_viewer_app(
         "/static",
         StaticFiles(directory=str(_PACKAGE_DIR / "static")),
         name="static",
+    )
+    app.mount(
+        "/viewer-static",
+        StaticFiles(directory=str(_PACKAGE_DIR / "viewer_static")),
+        name="viewer-static",
     )
 
     @app.middleware("http")

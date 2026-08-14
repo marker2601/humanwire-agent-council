@@ -12,10 +12,9 @@ from typing import Literal
 import uvicorn
 
 from humanwire.config import Settings
-from humanwire.model_client import FeatherlessJsonClient
 from humanwire.persona_runtime import (
-    FeatherlessPersonaDecisionEngine,
-    PersonaDecisionEngine,
+    FeatherlessPersonaDecisionEngineFactory,
+    PersonaDecisionEngineFactory,
     SyntheticGenerationMode,
 )
 from humanwire.synthetic import default_synthetic_scenario, generate_scenario
@@ -93,7 +92,7 @@ class _PacedProgressObserver:
         self._delegate.record_inert_attempt(**attempt)
 
 
-def _decision_engine(mode: AgentMode) -> PersonaDecisionEngine | None:
+def _decision_engine(mode: AgentMode) -> PersonaDecisionEngineFactory | None:
     if mode == "deterministic":
         return None
     settings = Settings()
@@ -102,12 +101,11 @@ def _decision_engine(mode: AgentMode) -> PersonaDecisionEngine | None:
     api_key = settings.featherless_api_key.get_secret_value()
     if not api_key.strip():
         raise ModelRuntimeUnavailable("model_credentials_missing")
-    client = FeatherlessJsonClient(
+    return FeatherlessPersonaDecisionEngineFactory(
         api_key=api_key,
-        model=settings.featherless_model,
+        model_identifier=settings.featherless_model,
         base_url=settings.featherless_base_url,
     )
-    return FeatherlessPersonaDecisionEngine(client, settings.featherless_model)
 
 
 def _publish_terminal_failure(store: SyntheticProgressStore) -> None:
@@ -133,7 +131,7 @@ def _run_generation_safely(
     scenario,
     output_path: Path,
     run_root: Path,
-    decision_engine: PersonaDecisionEngine | None,
+    decision_engine: PersonaDecisionEngineFactory | None,
     max_decision_workers: int,
     progress_observer: _PacedProgressObserver,
     store: SyntheticProgressStore,

@@ -95,7 +95,12 @@ def test_installed_distribution_exposes_only_the_humanwire_product() -> None:
         "AI chief of staff for adaptive human coordination"
     )
     assert project["tool"]["setuptools"]["package-data"] == {
-        "humanwire": ["templates/*.html", "static/*.css", "static/*.js"]
+        "humanwire": [
+            "templates/*.html",
+            "static/*.css",
+            "static/*.js",
+            "viewer_static/*.js",
+        ]
     }
 
 

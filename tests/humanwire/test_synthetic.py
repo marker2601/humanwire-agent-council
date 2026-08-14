@@ -16,12 +16,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from persona_engine_fixtures import FixtureDecisionEngineFactory
 from pydantic import ValidationError
 
 import humanwire.synthetic as synthetic_module
 from humanwire.domain import Channel, EngagementType
-from humanwire.model_client import ModelFailure
-from humanwire.persona_runtime import PersonaDecision, PersonaVisibility
+from humanwire.persona_runtime import PersonaVisibility
 from humanwire.synthetic import (
     SUPPORTED_SCHEMA_VERSION,
     SyntheticAction,
@@ -342,63 +342,40 @@ def one_person_generation_scenario() -> SyntheticScenario:
     )
 
 
-def scripted_decision_for(profile, context) -> PersonaDecision:
-    del profile, context
-    return PersonaDecision(
-        time_offset_seconds=1,
-        intent=SyntheticIntent.ACKNOWLEDGE,
-        content="Acknowledged.",
-    )
-
-
-class BarrierDecisionEngine:
-    model_identifier = "fixture/barrier"
-
-    def __init__(self) -> None:
-        self.barrier = threading.Barrier(2)
-        self.active = 0
-        self.maximum_active = 0
-        self.lock = threading.Lock()
-
-    def decide(
-        self,
-        profile,
-        context,
-        *,
-        deadline=None,
-        cancellation=None,
-    ) -> PersonaDecision:
-        del deadline, cancellation
-        with self.lock:
-            self.active += 1
-            self.maximum_active = max(self.maximum_active, self.active)
-        self.barrier.wait(timeout=2)
-        if profile.role == "Beta owner":
-            time.sleep(0.02)
-        with self.lock:
-            self.active -= 1
-        return scripted_decision_for(profile, context)
-
-
 def test_model_decisions_may_overlap_but_commit_in_canonical_order(tmp_path) -> None:
     """Break caught: worker completion timing determines public action order."""
-    engine = BarrierDecisionEngine()
+    factory = FixtureDecisionEngineFactory(
+        mode="ack",
+        delay_seconds=0.35,
+        model_identifier="fixture/delayed",
+    )
+    serial_started = time.monotonic()
+    generate_scenario(
+        concurrent_generation_scenario(),
+        tmp_path / "serial" / "transcript.json",
+        tmp_path / "serial",
+        decision_engine=factory,
+        max_decision_workers=1,
+    )
+    serial_elapsed = time.monotonic() - serial_started
+    parallel_started = time.monotonic()
     first = generate_scenario(
         concurrent_generation_scenario(),
         tmp_path / "a" / "transcript.json",
         tmp_path / "a",
-        decision_engine=engine,
+        decision_engine=factory,
         max_decision_workers=2,
     )
+    parallel_elapsed = time.monotonic() - parallel_started
     second = generate_scenario(
         concurrent_generation_scenario(),
         tmp_path / "b" / "transcript.json",
         tmp_path / "b",
-        decision_engine=BarrierDecisionEngine(),
+        decision_engine=factory,
         max_decision_workers=2,
     )
 
-    assert engine.maximum_active == 2
+    assert parallel_elapsed + 0.15 < serial_elapsed
     assert first.transcript.model_dump_json() == second.transcript.model_dump_json()
     keys = [
         synthetic_module.canonical_action_order(first.transcript.scenario, action)
@@ -410,35 +387,6 @@ def test_model_decisions_may_overlap_but_commit_in_canonical_order(tmp_path) -> 
 
 def test_model_decision_worker_bound_is_clamped_to_eight(tmp_path) -> None:
     """Break caught: an operator-supplied worker count creates unbounded model calls."""
-
-    class MeasuringEngine:
-        model_identifier = "fixture/measuring"
-
-        def __init__(self) -> None:
-            self.lock = threading.Lock()
-            self.release = threading.Event()
-            self.active = 0
-            self.maximum_active = 0
-
-        def decide(
-            self,
-            profile,
-            context,
-            *,
-            deadline=None,
-            cancellation=None,
-        ) -> PersonaDecision:
-            del deadline, cancellation
-            with self.lock:
-                self.active += 1
-                self.maximum_active = max(self.maximum_active, self.active)
-                if self.active == 8:
-                    self.release.set()
-            self.release.wait(timeout=2)
-            with self.lock:
-                self.active -= 1
-            return scripted_decision_for(profile, context)
-
     scenario = concurrent_generation_scenario()
     contracts = list(scenario.personas)
     for index in range(3, 10):
@@ -452,72 +400,29 @@ def test_model_decision_worker_bound_is_clamped_to_eight(tmp_path) -> None:
                 allowed_intents=[SyntheticIntent.ACKNOWLEDGE],
             )
         )
-    engine = MeasuringEngine()
-
-    generate_scenario(
+    result = generate_scenario(
         scenario.model_copy(update={"personas": contracts}),
         tmp_path / "run" / "transcript.json",
         tmp_path / "run",
-        decision_engine=engine,
+        decision_engine=FixtureDecisionEngineFactory(
+            mode="concurrency_probe",
+            delay_seconds=0.25,
+            concurrency_target=9,
+            model_identifier="fixture/measuring",
+        ),
         max_decision_workers=100,
     )
 
-    assert engine.maximum_active == 8
+    assert len(result.transcript.actions) == 9
+    assert {action.content for action in result.transcript.actions} == {
+        "Observed concurrency 8."
+    }
 
 
 def test_one_persona_has_only_one_model_decision_in_flight(tmp_path) -> None:
     """Break caught: duplicate deliveries concurrently mutate one persona's local state."""
-
-    class TrackingEngine:
-        model_identifier = "fixture/tracking"
-
-        def __init__(self) -> None:
-            self.active_by_role: dict[str, int] = {}
-            self.maximum_by_role: dict[str, int] = {}
-            self.call_count = 0
-            self.lock = threading.Lock()
-
-        def decide(
-            self,
-            profile,
-            context,
-            *,
-            deadline=None,
-            cancellation=None,
-        ) -> PersonaDecision:
-            del deadline, cancellation
-            with self.lock:
-                active = self.active_by_role.get(profile.role, 0) + 1
-                self.active_by_role[profile.role] = active
-                self.maximum_by_role[profile.role] = max(
-                    self.maximum_by_role.get(profile.role, 0), active
-                )
-                self.call_count += 1
-            time.sleep(0.01)
-            with self.lock:
-                self.active_by_role[profile.role] -= 1
-            prompt = context.delivered_message.casefold()
-            if prompt.startswith("question "):
-                return PersonaDecision(
-                    time_offset_seconds=1,
-                    intent=SyntheticIntent.ANSWER,
-                    content="Launch date is 2026-09-01.",
-                )
-            if "evidence confirmation" in prompt:
-                return PersonaDecision(
-                    time_offset_seconds=1,
-                    intent=SyntheticIntent.CONFIRM_EVIDENCE,
-                    content="Confirmed.",
-                )
-            return PersonaDecision(
-                time_offset_seconds=1,
-                intent=SyntheticIntent.ACKNOWLEDGE,
-                content="Acknowledged.",
-            )
-
-    engine = TrackingEngine()
     scenario = make_generation_scenario()
-    generate_scenario(
+    result = generate_scenario(
         scenario.model_copy(
             update={
                 "personas": [
@@ -529,30 +434,23 @@ def test_one_persona_has_only_one_model_decision_in_flight(tmp_path) -> None:
         ),
         tmp_path / "run" / "transcript.json",
         tmp_path / "run",
-        decision_engine=engine,
+        decision_engine=FixtureDecisionEngineFactory(
+            mode="tracking",
+            delay_seconds=0.01,
+            model_identifier="fixture/tracking",
+        ),
         max_decision_workers=8,
     )
 
-    assert engine.call_count == 3
-    assert engine.maximum_by_role == {"Program owner": 1}
-
-
-class FailingDecisionEngine:
-    model_identifier = "fixture/failing"
-
-    def __init__(self, failure: Exception) -> None:
-        self.failure = failure
-
-    def decide(
-        self,
-        profile,
-        context,
-        *,
-        deadline=None,
-        cancellation=None,
-    ) -> PersonaDecision:
-        del profile, context, deadline, cancellation
-        raise self.failure
+    quick_actions = [
+        action for action in result.transcript.actions if action.persona_id == "quick"
+    ]
+    assert [action.local_sequence for action in quick_actions] == [1, 2, 3]
+    assert [action.trigger_id for action in quick_actions] == [
+        "outbound-1",
+        "outbound-2",
+        "outbound-3",
+    ]
 
 
 def test_model_failure_records_error_without_gateway_authority(tmp_path) -> None:
@@ -561,7 +459,11 @@ def test_model_failure_records_error_without_gateway_authority(tmp_path) -> None
         one_person_generation_scenario(),
         tmp_path / "run" / "transcript.json",
         tmp_path / "run",
-        decision_engine=FailingDecisionEngine(ModelFailure("timeout")),
+        decision_engine=FixtureDecisionEngineFactory(
+            mode="failure",
+            value="timeout",
+            model_identifier="fixture/failing",
+        ),
     )
 
     action = result.transcript.actions[0]
@@ -573,29 +475,14 @@ def test_model_failure_records_error_without_gateway_authority(tmp_path) -> None
 def test_model_decision_disallowed_intent_is_inert(tmp_path) -> None:
     """Break caught: an injected engine bypasses the persona intent contract."""
 
-    class DisallowedDecisionEngine:
-        model_identifier = "fixture/disallowed"
-
-        def decide(
-            self,
-            profile,
-            context,
-            *,
-            deadline=None,
-            cancellation=None,
-        ) -> PersonaDecision:
-            del profile, context, deadline, cancellation
-            return PersonaDecision(
-                time_offset_seconds=1,
-                intent=SyntheticIntent.CHANGE,
-                content="Forged change.",
-            )
-
     result = generate_scenario(
         one_person_generation_scenario(),
         tmp_path / "run" / "transcript.json",
         tmp_path / "run",
-        decision_engine=DisallowedDecisionEngine(),
+        decision_engine=FixtureDecisionEngineFactory(
+            mode="disallowed",
+            model_identifier="fixture/disallowed",
+        ),
     )
 
     assert result.transcript.actions[0].intent is SyntheticIntent.ERROR
@@ -612,24 +499,6 @@ def test_generic_engine_private_or_identity_content_is_inert(
 ) -> None:
     """Break caught: central generation trusts privacy checks unique to one adapter."""
 
-    class UnsafeContentEngine:
-        model_identifier = "fixture/unsafe-content"
-
-        def decide(
-            self,
-            profile,
-            context,
-            *,
-            deadline=None,
-            cancellation=None,
-        ) -> PersonaDecision:
-            del profile, context, deadline, cancellation
-            return PersonaDecision(
-                time_offset_seconds=1,
-                intent=SyntheticIntent.ACKNOWLEDGE,
-                content=unsafe_content,
-            )
-
     scenario = one_person_generation_scenario()
     personas = list(scenario.personas)
     personas[1] = personas[1].model_copy(
@@ -639,7 +508,11 @@ def test_generic_engine_private_or_identity_content_is_inert(
         scenario.model_copy(update={"personas": personas}),
         tmp_path / "run" / "transcript.json",
         tmp_path / "run",
-        decision_engine=UnsafeContentEngine(),
+        decision_engine=FixtureDecisionEngineFactory(
+            mode="unsafe",
+            value=unsafe_content,
+            model_identifier="fixture/unsafe-content",
+        ),
     )
 
     assert result.transcript.actions[0].intent is SyntheticIntent.ERROR
@@ -651,31 +524,19 @@ def test_generic_engine_private_or_identity_content_is_inert(
 
 def test_engine_without_cooperative_deadline_contract_is_never_called(tmp_path) -> None:
     """Break caught: generation silently invokes an unbounded legacy engine shape."""
-
-    class LegacyBlockingShapeEngine:
-        model_identifier = "fixture/legacy-shape"
-
-        def __init__(self) -> None:
-            self.called = False
-
-        def decide(self, profile, context) -> PersonaDecision:
-            del profile, context
-            self.called = True
-            return PersonaDecision(
-                time_offset_seconds=1,
-                intent=SyntheticIntent.ACKNOWLEDGE,
-                content="Acknowledged.",
-            )
-
-    engine = LegacyBlockingShapeEngine()
+    marker = tmp_path / "legacy-engine-was-called"
     result = generate_scenario(
         one_person_generation_scenario(),
         tmp_path / "run" / "transcript.json",
         tmp_path / "run",
-        decision_engine=engine,
+        decision_engine=FixtureDecisionEngineFactory(
+            mode="legacy",
+            value=str(marker),
+            model_identifier="fixture/legacy-shape",
+        ),
     )
 
-    assert engine.called is False
+    assert not marker.exists()
     assert result.transcript.actions[0].intent is SyntheticIntent.ERROR
     assert result.transcript.actions[0].content == "synthetic_model_invalid_output"
     assert result.inbound_envelopes == ()
@@ -685,32 +546,6 @@ def test_cooperative_late_result_is_cancelled_and_never_committed(
     tmp_path, monkeypatch
 ) -> None:
     """Break caught: a late valid decision is accepted or leaves model work running."""
-
-    class CooperativeLateEngine:
-        model_identifier = "fixture/cooperative-late"
-
-        def __init__(self) -> None:
-            self.finished = threading.Event()
-
-        def decide(
-            self,
-            profile,
-            context,
-            *,
-            deadline=None,
-            cancellation=None,
-        ) -> PersonaDecision:
-            del profile, context, deadline
-            if cancellation is None:
-                time.sleep(0.35)
-            else:
-                cancellation.wait(timeout=1)
-            self.finished.set()
-            return PersonaDecision(
-                time_offset_seconds=1,
-                intent=SyntheticIntent.ACKNOWLEDGE,
-                content="Late acknowledgement must be discarded.",
-            )
 
     monkeypatch.setattr(
         synthetic_module,
@@ -724,18 +559,19 @@ def test_cooperative_late_result_is_cancelled_and_never_committed(
         0.2,
         raising=False,
     )
-    engine = CooperativeLateEngine()
     started = time.monotonic()
     result = generate_scenario(
         one_person_generation_scenario(),
         tmp_path / "run" / "transcript.json",
         tmp_path / "run",
-        decision_engine=engine,
+        decision_engine=FixtureDecisionEngineFactory(
+            mode="cooperative_late",
+            model_identifier="fixture/cooperative-late",
+        ),
     )
     elapsed = time.monotonic() - started
 
-    assert elapsed < 0.40
-    assert engine.finished.is_set()
+    assert elapsed < 1.0
     assert result.transcript.actions[0].intent is SyntheticIntent.ERROR
     assert result.transcript.actions[0].content == "synthetic_model_timeout"
     transcript_bytes = (tmp_path / "run" / "transcript.json").read_bytes()
@@ -748,31 +584,95 @@ def test_cooperative_late_result_is_cancelled_and_never_committed(
     )
 
 
+def test_uncooperative_engine_is_hard_timed_out_without_a_surviving_worker(
+    tmp_path: Path,
+) -> None:
+    """Break caught: a lying cooperative engine blocks generation and leaks its worker."""
+    probe = Path(__file__).with_name("persona_timeout_probe.py")
+    process = subprocess.Popen(
+        [sys.executable, str(probe), str(tmp_path / "run")],
+        cwd=Path(__file__).resolve().parents[2],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate(timeout=5)
+        pytest.fail(
+            "uncooperative persona decision exceeded the subprocess bound; "
+            f"stdout={stdout!r}, stderr={stderr!r}"
+        )
+
+    assert process.returncode == 0, stderr
+    payload = json.loads(stdout)
+    assert payload["elapsed_seconds"] < 2
+    assert payload["actions"] == [
+        {"intent": "error", "content": "synthetic_model_timeout"}
+    ]
+    assert payload["inbound_count"] == 0
+    assert payload["live_children"] == []
+    assert payload["live_workers"] == []
+
+
+def test_hard_batch_timeout_preserves_only_decisions_completed_before_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: one hung persona discards a distinct persona's timely decision."""
+    monkeypatch.setattr(synthetic_module, "MODEL_DECISION_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(synthetic_module, "MODEL_DECISION_CANCELLATION_GRACE_SECONDS", 0.1)
+
+    result = generate_scenario(
+        concurrent_generation_scenario(),
+        tmp_path / "run" / "transcript.json",
+        tmp_path / "run",
+        decision_engine=FixtureDecisionEngineFactory(
+            mode="partial_timeout",
+            model_identifier="fixture/partial-timeout",
+        ),
+        max_decision_workers=2,
+    )
+
+    actions = {action.persona_id: action for action in result.transcript.actions}
+    assert actions["beta"].intent is SyntheticIntent.ACKNOWLEDGE
+    assert actions["beta"].content == "Acknowledged."
+    assert actions["alpha"].intent is SyntheticIntent.ERROR
+    assert actions["alpha"].content == "synthetic_model_timeout"
+    assert [attempt.persona_id for attempt in result.inbound_envelopes] == ["beta"]
+    assert not synthetic_module.multiprocessing.active_children()
+
+
 def test_completed_decision_expiring_before_final_acceptance_is_inert(
     tmp_path, monkeypatch
 ) -> None:
     """Break caught: coordinator wake-up accepts a decision after its batch deadline."""
-    real_wait = synthetic_module.wait
+    real_decode = synthetic_module._decode_isolated_result
 
-    def delayed_coordinator_wake(futures, *, timeout=None):
-        done, pending = real_wait(futures, timeout=timeout)
-        if done and not pending:
-            time.sleep(0.06)
-        return done, pending
+    def delayed_coordinator_wake(raw, candidates):
+        result = real_decode(raw, candidates)
+        time.sleep(0.6)
+        return result
 
     monkeypatch.setattr(
         synthetic_module,
         "MODEL_DECISION_TIMEOUT_SECONDS",
-        0.03,
+        0.5,
         raising=False,
     )
-    monkeypatch.setattr(synthetic_module, "wait", delayed_coordinator_wake)
+    monkeypatch.setattr(
+        synthetic_module,
+        "_decode_isolated_result",
+        delayed_coordinator_wake,
+    )
 
     result = generate_scenario(
         one_person_generation_scenario(),
         tmp_path / "run" / "transcript.json",
         tmp_path / "run",
-        decision_engine=BarrierFreeDecisionEngine(),
+        decision_engine=FixtureDecisionEngineFactory(),
     )
 
     assert result.transcript.actions[0].intent is SyntheticIntent.ERROR
@@ -782,71 +682,25 @@ def test_completed_decision_expiring_before_final_acceptance_is_inert(
 
 def test_zero_offset_uses_the_decision_context_virtual_time(tmp_path) -> None:
     """Break caught: a valid zero offset creates an action before its own context."""
-
-    class ZeroOffsetEngine:
-        model_identifier = "fixture/zero-offset"
-
-        def __init__(self) -> None:
-            self.virtual_time = None
-
-        def decide(
-            self,
-            profile,
-            context,
-            *,
-            deadline=None,
-            cancellation=None,
-        ) -> PersonaDecision:
-            del profile, deadline, cancellation
-            self.virtual_time = context.virtual_time
-            return PersonaDecision(
-                time_offset_seconds=0,
-                intent=SyntheticIntent.ACKNOWLEDGE,
-                content="Acknowledged at context time.",
-            )
-
-    engine = ZeroOffsetEngine()
     result = generate_scenario(
         one_person_generation_scenario(),
         tmp_path / "run" / "transcript.json",
         tmp_path / "run",
-        decision_engine=engine,
+        decision_engine=FixtureDecisionEngineFactory(
+            mode="zero",
+            model_identifier="fixture/zero-offset",
+        ),
     )
 
-    assert result.transcript.actions[0].timestamp == engine.virtual_time
+    action = result.transcript.actions[0]
+    assert action.timestamp == datetime.fromisoformat(
+        action.content.removeprefix("Context time ")
+    )
     assert result.inbound_envelopes
 
 
 def test_worker_count_preserves_repeated_trigger_order_and_transcript(tmp_path) -> None:
     """Break caught: parallelism changes saved trigger order for a repeated persona."""
-
-    class WorkflowScriptEngine:
-        model_identifier = "fixture/worker-invariance"
-
-        def decide(
-            self,
-            profile,
-            context,
-            *,
-            deadline=None,
-            cancellation=None,
-        ) -> PersonaDecision:
-            del profile, deadline, cancellation
-            prompt = context.delivered_message.casefold()
-            if prompt.startswith("question "):
-                intent = SyntheticIntent.ANSWER
-                content = "Launch date is 2026-09-01."
-            elif "evidence confirmation" in prompt:
-                intent = SyntheticIntent.CONFIRM_EVIDENCE
-                content = "Confirmed."
-            else:
-                intent = SyntheticIntent.ACKNOWLEDGE
-                content = "Acknowledged."
-            return PersonaDecision(
-                time_offset_seconds=1,
-                intent=intent,
-                content=content,
-            )
 
     scenario = make_generation_scenario()
     scenario = scenario.model_copy(
@@ -862,14 +716,20 @@ def test_worker_count_preserves_repeated_trigger_order_and_transcript(tmp_path) 
         scenario,
         tmp_path / "serial" / "transcript.json",
         tmp_path / "serial",
-        decision_engine=WorkflowScriptEngine(),
+        decision_engine=FixtureDecisionEngineFactory(
+            mode="workflow",
+            model_identifier="fixture/worker-invariance",
+        ),
         max_decision_workers=1,
     )
     parallel = generate_scenario(
         scenario,
         tmp_path / "parallel" / "transcript.json",
         tmp_path / "parallel",
-        decision_engine=WorkflowScriptEngine(),
+        decision_engine=FixtureDecisionEngineFactory(
+            mode="workflow",
+            model_identifier="fixture/worker-invariance",
+        ),
         max_decision_workers=8,
     )
 
@@ -892,21 +752,6 @@ def test_worker_count_preserves_repeated_trigger_order_and_transcript(tmp_path) 
     )
 
 
-class BarrierFreeDecisionEngine:
-    model_identifier = "fixture/immediate"
-
-    def decide(
-        self,
-        profile,
-        context,
-        *,
-        deadline=None,
-        cancellation=None,
-    ) -> PersonaDecision:
-        del deadline, cancellation
-        return scripted_decision_for(profile, context)
-
-
 def test_same_trigger_retry_is_visible_once_only_and_worker_invariant(
     tmp_path, monkeypatch
 ) -> None:
@@ -926,14 +771,14 @@ def test_same_trigger_retry_is_visible_once_only_and_worker_invariant(
         one_person_generation_scenario(),
         tmp_path / "serial" / "transcript.json",
         tmp_path / "serial",
-        decision_engine=BarrierFreeDecisionEngine(),
+        decision_engine=FixtureDecisionEngineFactory(),
         max_decision_workers=1,
     )
     parallel = generate_scenario(
         one_person_generation_scenario(),
         tmp_path / "parallel" / "transcript.json",
         tmp_path / "parallel",
-        decision_engine=BarrierFreeDecisionEngine(),
+        decision_engine=FixtureDecisionEngineFactory(),
         max_decision_workers=8,
     )
 
@@ -970,7 +815,11 @@ def test_model_decision_writes_only_strict_private_provenance_sidecar(tmp_path) 
         one_person_generation_scenario(),
         tmp_path / "run" / "transcript.json",
         tmp_path / "run",
-        decision_engine=FailingDecisionEngine(ModelFailure("timeout")),
+        decision_engine=FixtureDecisionEngineFactory(
+            mode="failure",
+            value="timeout",
+            model_identifier="fixture/failing",
+        ),
     )
 
     assert result.mode.value == "model_assisted"
@@ -1018,7 +867,11 @@ def test_model_sidecar_write_failure_does_not_rewrite_transcript(
             one_person_generation_scenario(),
             transcript_path,
             tmp_path / "run",
-            decision_engine=FailingDecisionEngine(ModelFailure("timeout")),
+            decision_engine=FixtureDecisionEngineFactory(
+                mode="failure",
+                value="timeout",
+                model_identifier="fixture/failing",
+            ),
         )
 
     assert load_transcript(transcript_path).actions[0].content == "synthetic_model_timeout"
@@ -1677,7 +1530,10 @@ def test_deterministic_watch_ignores_ambient_featherless_key(
 
     monkeypatch.setenv("FEATHERLESS_API_KEY", "DO-NOT-READ")
     monkeypatch.setattr("humanwire.synthetic_watch.Settings", forbidden)
-    monkeypatch.setattr("humanwire.synthetic_watch.FeatherlessJsonClient", forbidden)
+    monkeypatch.setattr(
+        "humanwire.synthetic_watch.FeatherlessPersonaDecisionEngineFactory",
+        forbidden,
+    )
     monkeypatch.setattr("humanwire.synthetic_watch.uvicorn.run", lambda *_a, **_k: None)
     run_root = tmp_path / "deterministic-run"
 
@@ -1978,7 +1834,10 @@ def test_featherless_watch_uses_central_client_without_exposing_key(
     from pydantic import SecretStr
 
     from humanwire.model_client import FeatherlessJsonClient
-    from humanwire.persona_runtime import FeatherlessPersonaDecisionEngine
+    from humanwire.persona_runtime import (
+        FeatherlessPersonaDecisionEngine,
+        FeatherlessPersonaDecisionEngineFactory,
+    )
     from humanwire.synthetic_watch import SyntheticWatchOptions, run_synthetic_watch
 
     key = "PRIVATE-FEATHERLESS-WATCH-KEY"
@@ -2013,11 +1872,19 @@ def test_featherless_watch_uses_central_client_without_exposing_key(
         )
     ) == 0
     capture = capsys.readouterr()
-    engine = captured["engine"]
+    factory = captured["engine"]
 
-    assert isinstance(engine, FeatherlessPersonaDecisionEngine)
-    assert isinstance(engine._client, FeatherlessJsonClient)
-    assert engine.model_identifier == "fixture/model-v1"
+    assert isinstance(factory, FeatherlessPersonaDecisionEngineFactory)
+    assert factory.model_identifier == "fixture/model-v1"
+    assert factory.base_url == "https://models.example.test/v1"
+    assert key not in repr(factory)
+    engine = factory.build()
+    try:
+        assert isinstance(engine, FeatherlessPersonaDecisionEngine)
+        assert isinstance(engine._client, FeatherlessJsonClient)
+        assert engine.model_identifier == "fixture/model-v1"
+    finally:
+        engine._client._client.close()
     assert key not in capture.out + capture.err
     assert key not in captured["store"].snapshot().model_dump_json()
 
