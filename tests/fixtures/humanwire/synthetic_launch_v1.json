@@ -2,12 +2,14 @@
   "scenario": {
     "schema_version": "humanwire.synthetic/v1",
     "scenario_id": "launch-v1",
+    "identity_seed": 0,
+    "identity_generator_version": "humanwire.synthetic-identities/v1",
     "personas": [
       {
         "persona_id": "synthetic-manager",
-        "display_name": "Synthetic Manager",
+        "display_name": "Inez Ward",
         "role": "Simulation manager",
-        "email": "synthetic-manager@example.test",
+        "email": "inez-ward@example.test",
         "channels": [
           "email"
         ],
@@ -18,9 +20,9 @@
       },
       {
         "persona_id": "inform",
-        "display_name": "Inform Persona",
+        "display_name": "Anika Rao",
         "role": "Delivery owner",
-        "email": "inform@example.test",
+        "email": "anika-rao@example.test",
         "channels": [
           "email"
         ],
@@ -31,9 +33,9 @@
       },
       {
         "persona_id": "ack",
-        "display_name": "Acknowledge Persona",
+        "display_name": "Nora Jensen",
         "role": "Executive owner",
-        "email": "ack@example.test",
+        "email": "nora-jensen@example.test",
         "channels": [
           "email"
         ],
@@ -45,9 +47,9 @@
       },
       {
         "persona_id": "quick-a",
-        "display_name": "Quick Persona A",
+        "display_name": "Nadia Patel",
         "role": "Program owner",
-        "email": "quick-a@example.test",
+        "email": "nadia-patel@example.test",
         "channels": [
           "email"
         ],
@@ -61,9 +63,9 @@
       },
       {
         "persona_id": "quick-b",
-        "display_name": "Quick Persona B",
+        "display_name": "Talia Green",
         "role": "Operations owner",
-        "email": "quick-b@example.test",
+        "email": "talia-green@example.test",
         "channels": [
           "email"
         ],
@@ -77,9 +79,9 @@
       },
       {
         "persona_id": "structured",
-        "display_name": "Structured Persona",
+        "display_name": "Avery Chen",
         "role": "People owner",
-        "email": "structured@example.test",
+        "email": "avery-chen@example.test",
         "channels": [
           "email",
           "telegram"
@@ -98,9 +100,9 @@
       },
       {
         "persona_id": "approval",
-        "display_name": "Approval Persona",
+        "display_name": "Marco Silva",
         "role": "Approval owner",
-        "email": "approval@example.test",
+        "email": "marco-silva@example.test",
         "channels": [
           "email"
         ],
@@ -112,9 +114,9 @@
       },
       {
         "persona_id": "availability",
-        "display_name": "Availability Persona",
+        "display_name": "Priya Shah",
         "role": "Scheduling owner",
-        "email": "availability@example.test",
+        "email": "priya-shah@example.test",
         "channels": [
           "email"
         ],
@@ -126,9 +128,9 @@
       },
       {
         "persona_id": "approval-change",
-        "display_name": "Change Persona",
+        "display_name": "Jonah Reed",
         "role": "Independent change authority",
-        "email": "approval-change@example.test",
+        "email": "jonah-reed@example.test",
         "channels": [
           "email"
         ],
@@ -567,5 +569,5 @@
       "content": "Use the reviewed launch plan."
     }
   ],
-  "digest": "0d83f9be04a782fe155c07a624cf26c7cda7f42883656cff84e8916e1b74ad3a"
+  "digest": "feb1830faa9810dd291e70ff41596c1626cba0beded2f5b0199828f82bb0332b"
 }

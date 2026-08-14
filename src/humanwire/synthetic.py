@@ -38,6 +38,10 @@ from humanwire.offline_caspian import (
 )
 from humanwire.planning import ResolvedPlan
 from humanwire.repository import SqlAlchemyHumanWireRepository
+from humanwire.synthetic_identities import (
+    IDENTITY_GENERATOR_VERSION,
+    seeded_identity_map,
+)
 from humanwire.workflow import HumanWireWorkflow
 
 SUPPORTED_SCHEMA_VERSION = "humanwire.synthetic/v1"
@@ -106,6 +110,8 @@ class SyntheticPersona(_StrictModel):
 class SyntheticScenario(_StrictModel):
     schema_version: Literal["humanwire.synthetic/v1"]
     scenario_id: str = Field(pattern=_STABLE_ID_PATTERN)
+    identity_seed: int = Field(ge=0, le=2_147_483_647)
+    identity_generator_version: Literal["humanwire.synthetic-identities/v1"]
     personas: list[SyntheticPersona] = Field(min_length=1, max_length=32)
     provenance: SyntheticProvenance
 
@@ -117,12 +123,8 @@ class SyntheticScenario(_StrictModel):
         return self
 
 
-def default_synthetic_scenario() -> SyntheticScenario:
-    """Return the isolated six-contract scenario used by the public CLI proof."""
-    return SyntheticScenario(
-        schema_version=SUPPORTED_SCHEMA_VERSION,
-        scenario_id="launch-v1",
-        personas=[
+def _default_persona_contracts() -> list[SyntheticPersona]:
+    return [
             SyntheticPersona(
                 persona_id="synthetic-manager",
                 display_name="Synthetic Manager",
@@ -222,15 +224,43 @@ def default_synthetic_scenario() -> SyntheticScenario:
                 channels=[Channel.EMAIL],
                 allowed_intents=[SyntheticIntent.CHANGE],
             ),
-        ],
-        provenance=SyntheticProvenance(
-            proof_class="synthetic_multi_persona",
-            actor_type="simulated_persona",
-            identity_source="synthetic_fixture",
-            transport="fake_caspian",
-            human_attested=False,
-            live_provider_verified=False,
-        ),
+    ]
+
+
+def _synthetic_provenance() -> SyntheticProvenance:
+    return SyntheticProvenance(
+        proof_class="synthetic_multi_persona",
+        actor_type="simulated_persona",
+        identity_source="synthetic_fixture",
+        transport="fake_caspian",
+        human_attested=False,
+        live_provider_verified=False,
+    )
+
+
+def default_synthetic_scenario(seed: int = 0) -> SyntheticScenario:
+    """Return the isolated nine-person scenario used by the public CLI proof."""
+    persona_ids = (
+        "synthetic-manager", "inform", "ack", "quick-a", "quick-b",
+        "structured", "approval", "availability", "approval-change",
+    )
+    identities = seeded_identity_map(seed, persona_ids)
+    personas = [
+        persona.model_copy(
+            update={
+                "display_name": identities[persona.persona_id].display_name,
+                "email": identities[persona.persona_id].email,
+            }
+        )
+        for persona in _default_persona_contracts()
+    ]
+    return SyntheticScenario(
+        schema_version=SUPPORTED_SCHEMA_VERSION,
+        scenario_id="launch-v1",
+        identity_seed=seed,
+        identity_generator_version=IDENTITY_GENERATOR_VERSION,
+        personas=personas,
+        provenance=_synthetic_provenance(),
     )
 
 
@@ -673,6 +703,17 @@ def _safe_scenario(scenario: SyntheticScenario) -> SyntheticScenario:
     return scenario.model_copy(update={"personas": personas})
 
 
+def _manager_persona(scenario: SyntheticScenario) -> SyntheticPersona:
+    matches = [
+        persona
+        for persona in scenario.personas
+        if persona.persona_id == "synthetic-manager"
+    ]
+    if len(matches) != 1:
+        raise ValueError("synthetic scenario requires exactly one manager")
+    return matches[0]
+
+
 def _persona_visible_message(text: str, private_facts: list[str]) -> str:
     visible = _TOKEN_PATTERN.sub("[MANDATE_TOKEN]", text)
     visible = _EMAIL_PATTERN.sub("[SYNTHETIC_IDENTITY]", visible)
@@ -684,18 +725,19 @@ def _persona_visible_message(text: str, private_facts: list[str]) -> str:
 def _synthetic_directory(
     scenario: SyntheticScenario,
 ) -> tuple[OrganizationDirectory, dict[str, Person]]:
+    manager_persona = _manager_persona(scenario)
     manager = Person(
-        person_id="synthetic-manager",
-        display_name="Synthetic Manager",
-        role="Simulation manager",
+        person_id=manager_persona.persona_id,
+        display_name=manager_persona.display_name,
+        role=manager_persona.role,
         department="Synthetic",
         timezone="UTC",
         routes=[
             ContactRoute(
                 route_id="synthetic-manager-email",
                 channel=Channel.EMAIL,
-                sender_address="synthetic-manager@example.test",
-                recipient="synthetic-manager@example.test",
+                sender_address=manager_persona.email,
+                recipient=manager_persona.email,
                 preferred=True,
             )
         ],
@@ -930,12 +972,13 @@ def generate_scenario(
         clock=lambda: clock[0],
     )
     gateway.connect()
+    manager = _manager_persona(scenario)
 
     manager_message = email_envelope(
         message_id="synthetic-manager-mandate",
         conversation_id="synthetic-manager-conversation",
-        sender_address="synthetic-manager@example.test",
-        sender_name="Synthetic Manager",
+        sender_address=manager.email,
+        sender_name=manager.display_name,
         text="/mandate\nCoordinate the deterministic synthetic launch",
     )
     client.emit_inbound(manager_message)
@@ -1091,8 +1134,8 @@ def generate_scenario(
                     email_envelope(
                         message_id="synthetic-manager-change-mandate",
                         conversation_id="synthetic-manager-change-conversation",
-                        sender_address="synthetic-manager@example.test",
-                        sender_name="Synthetic Manager",
+                        sender_address=manager.email,
+                        sender_name=manager.display_name,
                         text=(
                             "/mandate\nRecord the required approval change safely"
                         ),
@@ -1234,13 +1277,14 @@ def replay_transcript(
         clock=lambda: clock[0],
     )
     gateway.connect()
+    manager = _manager_persona(scenario)
 
     client.emit_inbound(
         email_envelope(
             message_id="synthetic-manager-mandate",
             conversation_id="synthetic-manager-conversation",
-            sender_address="synthetic-manager@example.test",
-            sender_name="Synthetic Manager",
+            sender_address=manager.email,
+            sender_name=manager.display_name,
             text="/mandate\nCoordinate the deterministic synthetic launch",
         )
     )
@@ -1327,8 +1371,8 @@ def replay_transcript(
                     email_envelope(
                         message_id="synthetic-manager-change-mandate",
                         conversation_id="synthetic-manager-change-conversation",
-                        sender_address="synthetic-manager@example.test",
-                        sender_name="Synthetic Manager",
+                        sender_address=manager.email,
+                        sender_name=manager.display_name,
                         text=(
                             "/mandate\nRecord the required approval change safely"
                         ),
@@ -1968,6 +2012,8 @@ def _semantic_trace(result: SyntheticRunResult) -> dict[str, object]:
         "schema_version": SUPPORTED_SCHEMA_VERSION,
         "scenario": {
             "scenario_id": scenario.scenario_id,
+            "identity_seed": scenario.identity_seed,
+            "identity_generator_version": scenario.identity_generator_version,
             "provenance": scenario.provenance.model_dump(mode="json"),
             "personas": [
                 {

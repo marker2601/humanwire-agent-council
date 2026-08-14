@@ -49,6 +49,8 @@ def make_scenario(**changes: object) -> SyntheticScenario:
     values: dict[str, object] = {
         "schema_version": SUPPORTED_SCHEMA_VERSION,
         "scenario_id": "launch-v1",
+        "identity_seed": 0,
+        "identity_generator_version": "humanwire.synthetic-identities/v1",
         "personas": [
             SyntheticPersona(
                 persona_id="owner",
@@ -167,6 +169,43 @@ def test_provenance_requires_all_labels() -> None:
         SyntheticScenario.model_validate(payload)
 
 
+def test_seeded_identities_are_stable_distinct_and_synthetic() -> None:
+    """Break caught: identities become ambient or omit generator provenance."""
+    first = synthetic_module.default_synthetic_scenario(seed=8842)
+    second = synthetic_module.default_synthetic_scenario(seed=8842)
+    changed = synthetic_module.default_synthetic_scenario(seed=8843)
+
+    assert first.model_dump_json() == second.model_dump_json()
+    assert first.identity_seed == 8842
+    assert first.identity_generator_version == "humanwire.synthetic-identities/v1"
+    assert [persona.persona_id for persona in first.personas] == [
+        persona.persona_id for persona in changed.personas
+    ]
+    assert len({persona.display_name for persona in first.personas}) == 9
+    assert all(persona.email.endswith("@example.test") for persona in first.personas)
+    assert [persona.display_name for persona in first.personas] != [
+        persona.display_name for persona in changed.personas
+    ]
+
+
+def test_generation_never_reads_or_writes_private_live_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: synthetic generation consults an ambient live directory."""
+    private_directory = tmp_path / "private-organization.json"
+    private_directory.write_bytes(b'{"sentinel":"LIVE-DIRECTORY-BYTES"}')
+    monkeypatch.setenv("ORGANIZATION_PATH", str(private_directory))
+
+    result = generate_scenario(
+        synthetic_module.default_synthetic_scenario(seed=77),
+        tmp_path / "run" / "transcript.json",
+        tmp_path / "run",
+    )
+
+    assert result.transcript.scenario.identity_seed == 77
+    assert private_directory.read_bytes() == b'{"sentinel":"LIVE-DIRECTORY-BYTES"}'
+
+
 def test_tampered_transcript_digest_fails_closed(tmp_path) -> None:
     path = tmp_path / "transcript.json"
     payload = make_transcript().model_dump(mode="json")
@@ -180,6 +219,14 @@ def test_tampered_transcript_digest_fails_closed(tmp_path) -> None:
 def make_generation_scenario() -> SyntheticScenario:
     return make_scenario(
         personas=[
+            SyntheticPersona(
+                persona_id="synthetic-manager",
+                display_name="Manager Persona",
+                role="Simulation manager",
+                email="manager@example.test",
+                channels=[Channel.EMAIL],
+                allowed_intents=[SyntheticIntent.AVAILABILITY],
+            ),
             SyntheticPersona(
                 persona_id="inform",
                 display_name="Inform Persona",
@@ -465,6 +512,7 @@ def test_each_engagement_contract_uses_a_distinct_policy_strategy() -> None:
     policies = [
         synthetic_module._build_policy(persona)
         for persona in make_generation_scenario().personas
+        if persona.persona_id != "synthetic-manager"
     ]
 
     assert len({type(policy) for policy in policies}) == 6
