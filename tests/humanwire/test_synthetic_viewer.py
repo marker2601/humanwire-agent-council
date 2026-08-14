@@ -6,6 +6,7 @@ import json
 import re
 import subprocess
 from datetime import UTC, datetime
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
@@ -425,6 +426,21 @@ def test_public_demo_has_no_local_progress_surface() -> None:
 
 
 def _css_rule_selectors(source: str) -> list[str]:
+    def split_selector_list(header: str) -> list[str]:
+        selectors: list[str] = []
+        token_start = 0
+        parenthesis_depth = 0
+        for index, character in enumerate(header):
+            if character == "(":
+                parenthesis_depth += 1
+            elif character == ")":
+                parenthesis_depth -= 1
+            elif character == "," and parenthesis_depth == 0:
+                selectors.append(header[token_start:index].strip())
+                token_start = index + 1
+        selectors.append(header[token_start:].strip())
+        return [selector for selector in selectors if selector]
+
     selectors: list[str] = []
     token_start = 0
     for index, character in enumerate(source):
@@ -433,9 +449,28 @@ def _css_rule_selectors(source: str) -> list[str]:
         elif character == "{":
             header = source[token_start:index].strip()
             if header and not header.startswith("@"):
-                selectors.extend(item.strip() for item in header.split(","))
+                selectors.extend(split_selector_list(header))
             token_start = index + 1
     return selectors
+
+
+class _FocusableControlParser(HTMLParser):
+    """Collect controls that can participate in the viewer's focus order."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.controls: list[tuple[str, dict[str, str | None]]] = []
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        attributes = dict(attrs)
+        if (
+            (tag == "a" and "href" in attributes)
+            or tag in {"button", "input", "select", "textarea"}
+            or "tabindex" in attributes
+        ):
+            self.controls.append((tag, attributes))
 
 
 def test_viewer_css_rules_cannot_match_the_public_reach_page() -> None:
@@ -446,9 +481,14 @@ def test_viewer_css_rules_cannot_match_the_public_reach_page() -> None:
 
     assert 'class="reach-page' in reach.text
     assert "synthetic-progress-page" not in reach.text
+    assert "synthetic-viewer-body" not in reach.text
     selectors = _css_rule_selectors(viewer_styles)
     assert selectors
-    assert all(".synthetic-progress-page" in selector for selector in selectors)
+    assert all(
+        ".synthetic-progress-page" in selector
+        or ".synthetic-viewer-body" in selector
+        for selector in selectors
+    )
 
 
 def test_viewer_template_is_truthful_accessible_and_download_first(
@@ -532,6 +572,50 @@ def test_viewer_styles_have_accessible_controls_and_responsive_no_overflow_layou
     assert reduced is not None
     assert "transition-duration: 0.01ms !important" in reduced.group(1)
     assert "animation-duration: 0.01ms !important" in reduced.group(1)
+
+
+def test_every_focusable_viewer_control_has_a_44px_target_contract(
+    running_viewer_client,
+) -> None:
+    """Break caught: a focusable link falls below the 44 by 44 target floor."""
+    html = running_viewer_client.get("/").text
+    css = running_viewer_client.get("/static/styles.css").text
+    parser = _FocusableControlParser()
+    parser.feed(html)
+
+    assert parser.controls
+    assert any(
+        tag == "a" and "skip-link" in (attributes.get("class") or "").split()
+        for tag, attributes in parser.controls
+    )
+    rule = re.search(
+        r"\.synthetic-viewer-body\s+:is\(([^)]*)\)\s*\{([^}]*)\}",
+        css,
+        re.DOTALL,
+    )
+    assert rule is not None
+    selector_list, declarations = rule.groups()
+    focusable_kinds = {
+        "a[href]"
+        if tag == "a" and "href" in attributes
+        else tag
+        if tag in {"button", "input", "select", "textarea"}
+        else "[tabindex]"
+        for tag, attributes in parser.controls
+    }
+    required_focusable_kinds = {
+        "a[href]",
+        "button",
+        "input",
+        "select",
+        "textarea",
+        "[tabindex]",
+    }
+    assert focusable_kinds <= required_focusable_kinds
+    assert all(kind in selector_list for kind in required_focusable_kinds)
+    assert re.search(r"\bdisplay:\s*inline-flex\b", declarations)
+    assert re.search(r"\bmin-width:\s*44px\b", declarations)
+    assert re.search(r"\bmin-height:\s*44px\b", declarations)
 
 
 def test_progress_controller_exercises_live_manual_playback_and_download_states() -> None:

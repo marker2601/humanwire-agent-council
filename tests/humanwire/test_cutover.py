@@ -183,8 +183,18 @@ def test_agent_runtime_readme_preserves_exact_watch_commands() -> None:
     assert FEATHERLESS_WATCH_COMMAND in readme
 
 
-def test_agent_runtime_claim_ledger_keeps_viewer_local_and_synthetic() -> None:
+def test_agent_runtime_claim_ledger_classifies_local_viewer_only() -> None:
     claims = (ROOT / "submission/verified-claims.md").read_text(encoding="utf-8")
+    viewer_rows = [
+        tuple(cell.strip() for cell in line.strip().strip("|").split("|"))
+        for line in claims.splitlines()
+        if line.startswith("| `humanwire synthetic watch`")
+    ]
 
-    assert "local synthetic proof" in claims
-    assert "not live-provider proof" in claims
+    assert len(viewer_rows) == 1
+    wording, sources, proof_class, prohibited_claims = viewer_rows[0]
+    assert wording.startswith("`humanwire synthetic watch` presents a literal-loopback")
+    assert "runtime operator guide" in sources
+    assert proof_class == "local synthetic proof; not live-provider proof"
+    assert "live Caspian/email/Telegram was exercised" in prohibited_claims
+    assert "real people participated" in prohibited_claims

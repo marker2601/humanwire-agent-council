@@ -3220,6 +3220,14 @@ progress::-moz-progress-bar {
 }
 
 /* Loopback-only synthetic progress viewer */
+.synthetic-viewer-body :is(a[href], button, input, select, textarea, [tabindex]) {
+  display: inline-flex;
+  min-width: 44px;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+}
+
 .synthetic-progress-page {
   width: min(1180px, calc(100% - 32px));
   max-width: 100%;
