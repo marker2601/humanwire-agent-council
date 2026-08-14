@@ -12,7 +12,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from humanwire.demo import create_demo_app
-from humanwire.synthetic import default_synthetic_scenario, generate_scenario
+from humanwire.synthetic import (
+    SyntheticTranscript,
+    default_synthetic_scenario,
+    generate_scenario,
+    load_transcript,
+)
 from humanwire.synthetic_progress import (
     RepositoryProgressObserver,
     SyntheticAggregateCounts,
@@ -117,15 +122,34 @@ def test_viewer_is_get_only_and_progress_is_no_store(running_viewer_client) -> N
         assert response.headers["cache-control"] == "no-store"
 
 
+@pytest.mark.parametrize(
+    "client_fixture",
+    ("running_viewer_client", "completed_viewer_client"),
+)
 def test_get_and_head_responses_have_safe_headers_and_head_has_no_body(
-    running_viewer_client,
+    client_fixture: str,
+    request: pytest.FixtureRequest,
 ) -> None:
-    for path in ("/", "/progress.json", "/static/synthetic-progress.js"):
-        response = running_viewer_client.get(path)
-        head = running_viewer_client.head(path)
+    client = request.getfixturevalue(client_fixture)
+    for path in (
+        "/",
+        "/progress.json",
+        "/evidence.json",
+        "/events.csv",
+        "/static/styles.css",
+        "/static/synthetic-progress.js",
+    ):
+        response = client.get(path)
+        head = client.head(path)
+        expected_status = (
+            409
+            if client_fixture == "running_viewer_client"
+            and path in {"/evidence.json", "/events.csv"}
+            else 200
+        )
 
-        assert response.status_code == 200
-        assert head.status_code == 200
+        assert response.status_code == expected_status
+        assert head.status_code == expected_status
         assert head.content == b""
         for candidate in (response, head):
             assert candidate.headers["cache-control"] == "no-store"
@@ -141,13 +165,46 @@ def test_get_and_head_responses_have_safe_headers_and_head_has_no_body(
             )
 
 
+@pytest.mark.parametrize(
+    "path",
+    (
+        "/",
+        "/progress.json",
+        "/evidence.json",
+        "/events.csv",
+        "/static/styles.css",
+        "/static/synthetic-progress.js",
+    ),
+)
+@pytest.mark.parametrize(
+    "client_fixture",
+    ("running_viewer_client", "completed_viewer_client"),
+)
+def test_every_viewer_route_rejects_every_mutation_method(
+    path: str,
+    client_fixture: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    client = request.getfixturevalue(client_fixture)
+    for method in ("post", "put", "patch", "delete", "options"):
+        response = getattr(client, method)(path)
+
+        assert response.status_code == 405
+        assert response.json() == {"detail": "Method not allowed"}
+        assert response.headers["cache-control"] == "no-store"
+
+
 def test_final_downloads_are_unavailable_until_completion(running_viewer_client) -> None:
     for path in ("/evidence.json", "/events.csv"):
         response = running_viewer_client.get(path)
+        head = running_viewer_client.head(path)
 
         assert response.status_code == 409
         assert response.json() == {"detail": "Final evidence unavailable"}
         assert "content-disposition" not in response.headers
+        assert head.status_code == 409
+        assert head.content == b""
+        assert "content-disposition" not in head.headers
 
 
 def test_completed_json_and_csv_are_attachments(completed_viewer_client) -> None:
@@ -172,6 +229,71 @@ def test_completed_json_and_csv_are_attachments(completed_viewer_client) -> None
     assert csv_response.text.startswith(
         "ordinal,created_at,story,stage,source,destination,data_point"
     )
+    for path in ("/evidence.json", "/events.csv"):
+        head = completed_viewer_client.head(path)
+        assert head.status_code == 200
+        assert head.content == b""
+        assert head.headers["content-disposition"].startswith("attachment; filename=")
+
+
+def test_private_transcript_binding_never_reaches_any_http_surface(
+    completed_viewer_material,
+) -> None:
+    store, transcript_path = completed_viewer_material
+    transcript_sha256 = load_transcript(transcript_path).digest
+    client = TestClient(create_synthetic_viewer_app(store, transcript_path))
+
+    responses = [
+        client.get(path)
+        for path in (
+            "/",
+            "/progress.json",
+            "/evidence.json",
+            "/events.csv",
+            "/missing",
+        )
+    ]
+    public_surface = "".join(
+        response.text + json.dumps(dict(response.headers)) for response in responses
+    )
+
+    assert transcript_sha256 not in public_surface
+    assert "transcript_sha256" not in public_surface
+
+
+def test_completed_csv_carries_exact_synthetic_provenance_on_every_row(
+    completed_viewer_client,
+) -> None:
+    response = completed_viewer_client.get("/events.csv")
+    reader = csv.DictReader(io.StringIO(response.text))
+    rows = list(reader)
+
+    assert response.status_code == 200
+    assert reader.fieldnames == [
+        "ordinal",
+        "created_at",
+        "story",
+        "stage",
+        "source",
+        "destination",
+        "data_point",
+        "proof_class",
+        "actor_type",
+        "identity_source",
+        "transport",
+        "human_attested",
+        "live_provider_verified",
+    ]
+    assert rows
+    for row in rows:
+        assert {key: row[key] for key in reader.fieldnames[7:]} == {
+            "proof_class": "synthetic_multi_persona",
+            "actor_type": "simulated_persona",
+            "identity_source": "synthetic_fixture",
+            "transport": "fake_caspian",
+            "human_attested": "false",
+            "live_provider_verified": "false",
+        }
 
 
 def test_downloads_fail_closed_for_invalid_or_mismatched_transcript(
@@ -198,15 +320,45 @@ def test_downloads_fail_closed_for_invalid_or_mismatched_transcript(
             assert "private-path" not in response.text
 
 
+def test_downloads_reject_a_different_valid_same_seed_transcript(
+    completed_viewer_material, tmp_path: Path
+) -> None:
+    store, transcript_path = completed_viewer_material
+    transcript = load_transcript(transcript_path)
+    altered_action = transcript.actions[0].model_copy(
+        update={"content": f"{transcript.actions[0].content} altered"}
+    )
+    altered = SyntheticTranscript.create(
+        scenario=transcript.scenario,
+        outbound_digests=transcript.outbound_digests,
+        actions=[altered_action, *transcript.actions[1:]],
+    )
+    assert altered.digest != transcript.digest
+    altered_path = tmp_path / "same-seed-valid-transcript.json"
+    altered_path.write_text(altered.model_dump_json(), encoding="utf-8")
+    client = TestClient(create_synthetic_viewer_app(store, altered_path))
+
+    for path in ("/evidence.json", "/events.csv"):
+        response = client.get(path)
+        assert response.status_code == 409
+        assert response.json() == {"detail": "Final evidence unavailable"}
+        assert "content-disposition" not in response.headers
+        assert altered.digest not in response.text
+
+
 def test_csv_neutralizes_formula_cells_and_exports_only_allowlisted_fields(
     completed_viewer_material,
 ) -> None:
     store, transcript_path = completed_viewer_material
     completed = store.snapshot()
-    injected = completed.events[0].model_copy(
-        update={"source": "=2+2", "destination": "\tprivate", "data_point": "@SUM(A1)"}
+    first = completed.events[0].model_copy(
+        update={"source": "=2+2", "destination": "+2", "data_point": "-2"}
     )
-    changed = completed.model_copy(update={"events": (injected, *completed.events[1:])})
+    second = completed.events[1].model_copy(
+        update={"source": "@SUM(A1)", "destination": "\tprivate", "data_point": "\rprivate"}
+    )
+    third = completed.events[2].model_copy(update={"source": "\nprivate"})
+    changed = completed.model_copy(update={"events": (first, second, third, *completed.events[3:])})
     changed._identity_seed = completed._identity_seed
     client = TestClient(
         create_synthetic_viewer_app(SyntheticProgressStore(changed), transcript_path)
@@ -217,8 +369,12 @@ def test_csv_neutralizes_formula_cells_and_exports_only_allowlisted_fields(
 
     assert response.status_code == 200
     assert rows[0]["source"] == "'=2+2"
-    assert rows[0]["destination"] == "'\tprivate"
-    assert rows[0]["data_point"] == "'@SUM(A1)"
+    assert rows[0]["destination"] == "'+2"
+    assert rows[0]["data_point"] == "'-2"
+    assert rows[1]["source"] == "'@SUM(A1)"
+    assert rows[1]["destination"] == "'\tprivate"
+    assert rows[1]["data_point"] == "'\rprivate"
+    assert rows[2]["source"] == "'\nprivate"
     assert set(rows[0]) == {
         "ordinal",
         "created_at",
@@ -227,21 +383,37 @@ def test_csv_neutralizes_formula_cells_and_exports_only_allowlisted_fields(
         "source",
         "destination",
         "data_point",
+        "proof_class",
+        "actor_type",
+        "identity_source",
+        "transport",
+        "human_attested",
+        "live_provider_verified",
     }
 
 
+def test_viewer_accepts_only_the_literal_ipv4_loopback_host() -> None:
+    assert validate_viewer_host("127.0.0.1") == "127.0.0.1"
+
+
 @pytest.mark.parametrize(
-    ("host", "expected"),
-    [("127.0.0.1", "127.0.0.1"), ("::1", "::1")],
+    "host",
+    [
+        "::1",
+        "localhost",
+        "127.0.0.01",
+        "127.1",
+        "2130706433",
+        "0x7f000001",
+        "0.0.0.0",
+        "192.0.2.10",
+        "example.test",
+    ],
 )
-def test_viewer_accepts_only_explicit_loopback_ips(host: str, expected: str) -> None:
-    assert validate_viewer_host(host) == expected
-
-
-@pytest.mark.parametrize("host", ["0.0.0.0", "192.0.2.10", "example.test", "localhost"])
-def test_viewer_rejects_non_loopback_binding(host: str) -> None:
-    with pytest.raises(ValueError, match="loopback"):
+def test_viewer_rejects_every_nonliteral_host_binding(host: str) -> None:
+    with pytest.raises(ValueError) as caught:
         validate_viewer_host(host)
+    assert str(caught.value) == "synthetic viewer host must be 127.0.0.1"
 
 
 def test_public_demo_has_no_local_progress_surface() -> None:
@@ -250,6 +422,33 @@ def test_public_demo_has_no_local_progress_surface() -> None:
     assert web_client.get("/progress.json").status_code == 404
     assert web_client.get("/evidence.json").status_code == 404
     assert web_client.get("/events.csv").status_code == 404
+
+
+def _css_rule_selectors(source: str) -> list[str]:
+    selectors: list[str] = []
+    token_start = 0
+    for index, character in enumerate(source):
+        if character == ";" or character == "}":
+            token_start = index + 1
+        elif character == "{":
+            header = source[token_start:index].strip()
+            if header and not header.startswith("@"):
+                selectors.extend(item.strip() for item in header.split(","))
+            token_start = index + 1
+    return selectors
+
+
+def test_viewer_css_rules_cannot_match_the_public_reach_page() -> None:
+    public_client = TestClient(create_demo_app())
+    reach = public_client.get("/mandates/HW-2411/reach")
+    styles = public_client.get("/static/styles.css").text
+    viewer_styles = styles.split("/* Loopback-only synthetic progress viewer */", 1)[1]
+
+    assert 'class="reach-page' in reach.text
+    assert "synthetic-progress-page" not in reach.text
+    selectors = _css_rule_selectors(viewer_styles)
+    assert selectors
+    assert all(".synthetic-progress-page" in selector for selector in selectors)
 
 
 def test_viewer_template_is_truthful_accessible_and_download_first(

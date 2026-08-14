@@ -140,6 +140,7 @@ class SyntheticProgressSnapshot(_StrictProgressModel):
     terminal_states: tuple[str, ...] = ()
     final_trace_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     _identity_seed: int | None = PrivateAttr(default=None)
+    _transcript_sha256: str | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def has_consistent_public_progress(self):
@@ -198,6 +199,7 @@ class SyntheticProgressObserver(Protocol):
         runtime_status: SyntheticRuntimeStatus,
         active_persona_id: str | None = None,
         final_trace_sha256: str | None = None,
+        transcript_sha256: str | None = None,
     ) -> None:
         raise NotImplementedError
 
@@ -406,10 +408,25 @@ class SyntheticProgressStore:
     def evidence_bundle(self) -> SyntheticEvidenceBundle | None:
         return evidence_bundle(self.snapshot())
 
+    def final_evidence_binding(self) -> tuple[SyntheticEvidenceBundle, str] | None:
+        """Return final safe evidence with its nonserialized transcript binding."""
+        with self._lock:
+            snapshot = self._snapshot.model_copy(deep=True)
+        bundle = evidence_bundle(snapshot)
+        if bundle is None or snapshot._transcript_sha256 is None:
+            return None
+        return bundle, snapshot._transcript_sha256
+
     @staticmethod
     def _validated_copy(snapshot: SyntheticProgressSnapshot) -> SyntheticProgressSnapshot:
+        transcript_sha256 = snapshot._transcript_sha256
+        if transcript_sha256 is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", transcript_sha256
+        ):
+            raise ValueError("synthetic transcript binding must be a SHA-256 digest")
         validated = SyntheticProgressSnapshot.model_validate(snapshot.model_dump())
         validated._identity_seed = snapshot._identity_seed
+        validated._transcript_sha256 = transcript_sha256
         return validated.model_copy(deep=True)
 
     @staticmethod
@@ -449,6 +466,15 @@ class SyntheticProgressStore:
             candidate.final_trace_sha256 != previous.final_trace_sha256
         ):
             raise ValueError("synthetic progress final trace cannot change")
+        if candidate._transcript_sha256 is not None and (
+            candidate.run_state is not SyntheticRunState.COMPLETE
+            or candidate.final_trace_sha256 is None
+        ):
+            raise ValueError("synthetic transcript binding requires completed finality")
+        if previous._transcript_sha256 is not None and (
+            candidate._transcript_sha256 != previous._transcript_sha256
+        ):
+            raise ValueError("synthetic transcript binding cannot change")
 
 
 class RepositoryProgressObserver:
@@ -464,6 +490,7 @@ class RepositoryProgressObserver:
             SyntheticGenerationMode,
             SyntheticRunState,
             SyntheticRuntimeStatus,
+            str | None,
             str | None,
             str | None,
         ] | None = None
@@ -484,6 +511,7 @@ class RepositoryProgressObserver:
         runtime_status: SyntheticRuntimeStatus,
         active_persona_id: str | None = None,
         final_trace_sha256: str | None = None,
+        transcript_sha256: str | None = None,
     ) -> None:
         """Read persisted state and atomically publish its safe public projection."""
         typed_repository = repository  # structural protocol keeps synthetic.py out of this module
@@ -496,6 +524,7 @@ class RepositoryProgressObserver:
                 runtime_status,
                 active_persona_id,
                 final_trace_sha256,
+                transcript_sha256,
             )
             self._publish_projection(*self._last_capture)
 
@@ -533,9 +562,16 @@ class RepositoryProgressObserver:
                 )
             )
             if self._last_capture is not None:
-                repository, scenario, mode, run_state, _status, active_persona_id, trace = (
-                    self._last_capture
-                )
+                (
+                    repository,
+                    scenario,
+                    mode,
+                    run_state,
+                    _status,
+                    active_persona_id,
+                    trace,
+                    transcript_sha256,
+                ) = self._last_capture
                 self._last_capture = (
                     repository,
                     scenario,
@@ -544,6 +580,7 @@ class RepositoryProgressObserver:
                     runtime_status,
                     active_persona_id,
                     trace,
+                    transcript_sha256,
                 )
                 self._publish_projection(*self._last_capture)
 
@@ -556,6 +593,7 @@ class RepositoryProgressObserver:
         runtime_status: SyntheticRuntimeStatus,
         active_persona_id: str | None,
         final_trace_sha256: str | None,
+        transcript_sha256: str | None,
     ) -> None:
         personas = _scenario_personas(scenario)
         mandates = list(repository.list_recent_mandates(1000))
@@ -750,4 +788,5 @@ class RepositoryProgressObserver:
                 final_trace_sha256=final_trace_sha256,
             )
         snapshot._identity_seed = scenario.identity_seed
+        snapshot._transcript_sha256 = transcript_sha256
         self._store.publish(snapshot)

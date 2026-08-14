@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import csv
 import io
-import ipaddress
 from pathlib import Path
 
 import uvicorn
@@ -37,18 +36,20 @@ _CSV_FIELDS = (
     "source",
     "destination",
     "data_point",
+    "proof_class",
+    "actor_type",
+    "identity_source",
+    "transport",
+    "human_attested",
+    "live_provider_verified",
 )
 _FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "\n")
 
 
 def validate_viewer_host(host: str) -> str:
-    """Accept an explicit loopback IP and reject names or network interfaces."""
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError as error:
-        raise ValueError("synthetic viewer host must be a loopback IP") from error
-    if not address.is_loopback:
-        raise ValueError("synthetic viewer host must be loopback")
+    """Accept only the one literal host allowed by the loopback viewer contract."""
+    if host != "127.0.0.1":
+        raise ValueError("synthetic viewer host must be 127.0.0.1")
     return host
 
 
@@ -63,15 +64,17 @@ def _validated_final_evidence(
     store: SyntheticProgressStore,
     transcript_path: Path,
 ) -> SyntheticEvidenceBundle | None:
-    bundle = store.evidence_bundle()
-    if bundle is None:
+    binding = store.final_evidence_binding()
+    if binding is None:
         return None
+    bundle, transcript_sha256 = binding
     try:
         transcript = load_transcript(transcript_path)
     except (OSError, UnicodeError, ValidationError, ValueError):
         return None
     if (
-        transcript.scenario.identity_seed != bundle.identity_seed
+        transcript.digest != transcript_sha256
+        or transcript.scenario.identity_seed != bundle.identity_seed
         or transcript.scenario.provenance != bundle.provenance
     ):
         return None
@@ -79,6 +82,8 @@ def _validated_final_evidence(
 
 
 def _csv_cell(value: object) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
     rendered = str(value)
     if rendered.startswith(_FORMULA_PREFIXES):
         return f"'{rendered}"
@@ -89,6 +94,7 @@ def _events_csv(bundle: SyntheticEvidenceBundle) -> str:
     output = io.StringIO(newline="")
     writer = csv.DictWriter(output, fieldnames=_CSV_FIELDS, extrasaction="ignore")
     writer.writeheader()
+    provenance = bundle.provenance.model_dump(mode="json")
     for event in bundle.events:
         row = {
             "ordinal": event.persisted_ordinal or event.timeline_ordinal,
@@ -98,6 +104,7 @@ def _events_csv(bundle: SyntheticEvidenceBundle) -> str:
             "source": event.source,
             "destination": event.destination,
             "data_point": event.data_point,
+            **provenance,
         }
         writer.writerow({key: _csv_cell(value) for key, value in row.items()})
     return output.getvalue()

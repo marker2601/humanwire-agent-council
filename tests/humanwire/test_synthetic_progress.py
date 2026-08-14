@@ -10,7 +10,11 @@ from pydantic import ValidationError
 
 from humanwire.persona_runtime import SyntheticGenerationMode
 from humanwire.replay_projection import project_replay_labels
-from humanwire.synthetic import default_synthetic_scenario, generate_scenario
+from humanwire.synthetic import (
+    default_synthetic_scenario,
+    generate_scenario,
+    replay_transcript,
+)
 from humanwire.synthetic_progress import (
     RepositoryProgressObserver,
     SyntheticAggregateCounts,
@@ -225,6 +229,68 @@ def test_terminal_evidence_uses_the_scenario_identity_seed(completed_progress) -
     assert evidence is not None
     assert evidence.identity_seed == 19
     assert evidence.trace_sha256 == completed_progress.final_trace_sha256
+
+
+def test_completed_store_binds_exact_transcript_digest_without_serializing_it(
+    tmp_path,
+) -> None:
+    """Break caught: final evidence can be detached from the transcript that produced it."""
+    scenario = default_synthetic_scenario(seed=29)
+    store = SyntheticProgressStore(initial_progress(scenario))
+    observer = RepositoryProgressObserver(store)
+    run_root = tmp_path / "bound-run"
+    result = generate_scenario(
+        scenario,
+        run_root / "transcript.json",
+        run_root,
+        progress_observer=observer,
+    )
+
+    binding = store.final_evidence_binding()
+    public_snapshot = store.snapshot()
+
+    assert binding is not None
+    evidence, transcript_sha256 = binding
+    assert transcript_sha256 == result.transcript.digest
+    assert evidence.trace_sha256 == public_snapshot.final_trace_sha256
+    assert transcript_sha256 not in public_snapshot.model_dump_json()
+    assert transcript_sha256 not in evidence.model_dump_json()
+
+    public_snapshot._transcript_sha256 = "f" * 64
+    assert store.final_evidence_binding() == binding
+
+
+def test_incomplete_store_has_no_transcript_evidence_binding() -> None:
+    """Break caught: a transcript digest becomes available before completed finality."""
+    store = SyntheticProgressStore(
+        initial_progress(default_synthetic_scenario(seed=30))
+    )
+
+    assert store.final_evidence_binding() is None
+
+
+def test_replay_store_binds_the_validated_source_transcript_digest(tmp_path) -> None:
+    """Break caught: replay completion binds a digest other than its validated input."""
+    scenario = default_synthetic_scenario(seed=32)
+    source_root = tmp_path / "source-run"
+    generated = generate_scenario(
+        scenario,
+        source_root / "transcript.json",
+        source_root,
+    )
+    store = SyntheticProgressStore(initial_progress(scenario))
+    observer = RepositoryProgressObserver(store)
+
+    replayed = replay_transcript(
+        source_root / "transcript.json",
+        tmp_path / "replay-run",
+        progress_observer=observer,
+    )
+
+    binding = store.final_evidence_binding()
+    assert binding is not None
+    assert binding[1] == generated.transcript.digest
+    assert binding[1] == replayed.transcript.digest
 
 
 @pytest.mark.parametrize(

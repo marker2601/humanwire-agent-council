@@ -3220,11 +3220,6 @@ progress::-moz-progress-bar {
 }
 
 /* Loopback-only synthetic progress viewer */
-.synthetic-viewer-body {
-  min-width: 0;
-  overflow-x: hidden;
-}
-
 .synthetic-progress-page {
   width: min(1180px, calc(100% - 32px));
   max-width: 100%;
@@ -3233,22 +3228,22 @@ progress::-moz-progress-bar {
   font-size: 14px;
 }
 
-.synthetic-heading {
+.synthetic-progress-page .synthetic-heading {
   max-width: 720px;
   margin-bottom: 24px;
 }
 
-.synthetic-heading h1 {
+.synthetic-progress-page .synthetic-heading h1 {
   margin: 4px 0 10px;
   font-size: clamp(30px, 5vw, 52px);
   line-height: 1.05;
 }
 
-.proof-provenance,
-.synthetic-run-card,
-.synthetic-persona-panel,
-.replay-panel,
-.synthetic-downloads {
+.synthetic-progress-page .proof-provenance,
+.synthetic-progress-page .synthetic-run-card,
+.synthetic-progress-page .synthetic-persona-panel,
+.synthetic-progress-page .replay-panel,
+.synthetic-progress-page .synthetic-downloads {
   min-width: 0;
   margin-top: 16px;
   padding: 20px;
@@ -3258,12 +3253,12 @@ progress::-moz-progress-bar {
   background: var(--surface);
 }
 
-.proof-provenance {
+.synthetic-progress-page .proof-provenance {
   border-color: rgba(40, 201, 245, 0.38);
   background: rgba(40, 201, 245, 0.06);
 }
 
-.proof-provenance ul {
+.synthetic-progress-page .proof-provenance ul {
   display: flex;
   margin: 12px 0 0;
   padding: 0;
@@ -3272,7 +3267,7 @@ progress::-moz-progress-bar {
   list-style: none;
 }
 
-.proof-provenance code {
+.synthetic-progress-page .proof-provenance code {
   display: block;
   max-width: 100%;
   padding: 5px 8px;
@@ -3283,56 +3278,56 @@ progress::-moz-progress-bar {
   font-size: 14px;
 }
 
-.synthetic-section-heading,
-.synthetic-downloads,
-.synthetic-run-card {
+.synthetic-progress-page .synthetic-section-heading,
+.synthetic-progress-page .synthetic-downloads,
+.synthetic-progress-page .synthetic-run-card {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 18px;
 }
 
-.synthetic-section-heading h2,
-.synthetic-downloads h2,
-.synthetic-run-card h2 {
+.synthetic-progress-page .synthetic-section-heading h2,
+.synthetic-progress-page .synthetic-downloads h2,
+.synthetic-progress-page .synthetic-run-card h2 {
   margin: 2px 0 0;
   font-size: 22px;
 }
 
-.synthetic-run-status {
+.synthetic-progress-page .synthetic-run-status {
   margin: 0;
   color: var(--cyan-soft);
   font-weight: 650;
 }
 
-.synthetic-run-facts {
+.synthetic-progress-page .synthetic-run-facts {
   display: grid;
   margin: 0;
   grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 10px;
 }
 
-.synthetic-run-facts div,
-.replay-flow-strip div {
+.synthetic-progress-page .synthetic-run-facts div,
+.synthetic-progress-page .replay-flow-strip div {
   min-width: 0;
 }
 
-.synthetic-run-facts dt,
-.replay-flow-strip dt {
+.synthetic-progress-page .synthetic-run-facts dt,
+.synthetic-progress-page .replay-flow-strip dt {
   color: var(--slate);
   font-size: 14px;
   text-transform: uppercase;
   letter-spacing: 0.08em;
 }
 
-.synthetic-run-facts dd,
-.replay-flow-strip dd {
+.synthetic-progress-page .synthetic-run-facts dd,
+.synthetic-progress-page .replay-flow-strip dd {
   margin: 4px 0 0;
   overflow-wrap: anywhere;
   color: var(--ice);
 }
 
-.synthetic-personas {
+.synthetic-progress-page .synthetic-personas {
   display: grid;
   margin: 18px 0 0;
   padding: 0;
@@ -3341,8 +3336,8 @@ progress::-moz-progress-bar {
   list-style: none;
 }
 
-.synthetic-persona-card,
-.synthetic-origin {
+.synthetic-progress-page .synthetic-persona-card,
+.synthetic-progress-page .synthetic-origin {
   min-width: 0;
   padding: 14px;
   border: 1px solid var(--border-soft);
@@ -3351,34 +3346,34 @@ progress::-moz-progress-bar {
   transition: border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
 }
 
-.synthetic-persona-card h3 {
+.synthetic-progress-page .synthetic-persona-card h3 {
   margin: 0 0 4px;
   font-size: 17px;
 }
 
-.synthetic-persona-card p {
+.synthetic-progress-page .synthetic-persona-card p {
   margin: 5px 0 0;
   overflow-wrap: anywhere;
   color: var(--slate-strong);
 }
 
-.synthetic-persona-card .synthetic-persona-contract {
+.synthetic-progress-page .synthetic-persona-card .synthetic-persona-contract {
   color: var(--cyan-soft);
 }
 
-.synthetic-origin {
+.synthetic-progress-page .synthetic-origin {
   flex: 0 0 auto;
   font-weight: 650;
 }
 
-.synthetic-persona-card.is-replay-current,
-.synthetic-origin.is-replay-current {
+.synthetic-progress-page .synthetic-persona-card.is-replay-current,
+.synthetic-progress-page .synthetic-origin.is-replay-current {
   border-color: var(--cyan);
   box-shadow: 0 0 0 3px rgba(40, 201, 245, 0.16);
   transform: translateY(-2px);
 }
 
-.replay-flow-strip {
+.synthetic-progress-page .replay-flow-strip {
   display: grid;
   margin: 18px 0 0;
   padding: 0;
@@ -3390,12 +3385,12 @@ progress::-moz-progress-bar {
   background: var(--border-soft);
 }
 
-.replay-flow-strip div {
+.synthetic-progress-page .replay-flow-strip div {
   padding: 15px;
   background: var(--surface-raised);
 }
 
-.replay-detail {
+.synthetic-progress-page .replay-detail {
   display: flex;
   min-width: 0;
   margin-top: 12px;
@@ -3406,13 +3401,13 @@ progress::-moz-progress-bar {
   color: var(--slate-strong);
 }
 
-.replay-detail p,
-.replay-detail time {
+.synthetic-progress-page .replay-detail p,
+.synthetic-progress-page .replay-detail time {
   margin: 0;
 }
 
-.replay-controls,
-.synthetic-download-actions {
+.synthetic-progress-page .replay-controls,
+.synthetic-progress-page .synthetic-download-actions {
   display: flex;
   margin-top: 16px;
   flex-wrap: wrap;
@@ -3420,7 +3415,7 @@ progress::-moz-progress-bar {
 }
 
 .synthetic-progress-page button,
-.synthetic-download {
+.synthetic-progress-page .synthetic-download {
   display: inline-flex;
   min-height: 44px;
   padding: 9px 15px;
@@ -3440,7 +3435,7 @@ progress::-moz-progress-bar {
   color: var(--cyan-soft);
 }
 
-.synthetic-download[aria-disabled="true"] {
+.synthetic-progress-page .synthetic-download[aria-disabled="true"] {
   color: var(--slate);
   cursor: not-allowed;
   opacity: 0.62;
@@ -3451,24 +3446,24 @@ progress::-moz-progress-bar {
   outline-offset: 3px;
 }
 
-.synthetic-downloads > div:first-child p:last-child {
+.synthetic-progress-page .synthetic-downloads > div:first-child p:last-child {
   margin: 6px 0 0;
   color: var(--slate-strong);
 }
 
 @media (max-width: 980px) {
-  .synthetic-run-card {
+  .synthetic-progress-page .synthetic-run-card {
     align-items: flex-start;
     flex-direction: column;
   }
 
-  .synthetic-run-facts {
+  .synthetic-progress-page .synthetic-run-facts {
     width: 100%;
   }
 }
 
 @media (max-width: 759px) {
-  .proof-provenance {
+  .synthetic-progress-page .proof-provenance {
     padding: 15px;
     flex-direction: column;
   }
@@ -3478,50 +3473,50 @@ progress::-moz-progress-bar {
     padding-top: 20px;
   }
 
-  .synthetic-personas {
+  .synthetic-progress-page .synthetic-personas {
     grid-template-columns: 1fr;
   }
 
-  .synthetic-run-facts {
+  .synthetic-progress-page .synthetic-run-facts {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .replay-flow-strip {
+  .synthetic-progress-page .replay-flow-strip {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .replay-flow-strip div:last-child {
+  .synthetic-progress-page .replay-flow-strip div:last-child {
     grid-column: 1 / -1;
   }
 
-  .synthetic-downloads {
+  .synthetic-progress-page .synthetic-downloads {
     align-items: flex-start;
     flex-direction: column;
   }
 }
 
 @media (max-width: 430px) {
-  .proof-provenance,
-  .synthetic-run-card,
-  .synthetic-persona-panel,
-  .replay-panel,
-  .synthetic-downloads {
+  .synthetic-progress-page .proof-provenance,
+  .synthetic-progress-page .synthetic-run-card,
+  .synthetic-progress-page .synthetic-persona-panel,
+  .synthetic-progress-page .replay-panel,
+  .synthetic-progress-page .synthetic-downloads {
     padding: 15px;
   }
 
-  .synthetic-section-heading {
+  .synthetic-progress-page .synthetic-section-heading {
     align-items: flex-start;
     flex-direction: column;
   }
 
-  .synthetic-section-heading button,
-  .replay-controls button,
-  .synthetic-download {
+  .synthetic-progress-page .synthetic-section-heading button,
+  .synthetic-progress-page .replay-controls button,
+  .synthetic-progress-page .synthetic-download {
     width: 100%;
   }
 
-  .replay-controls,
-  .synthetic-download-actions {
+  .synthetic-progress-page .replay-controls,
+  .synthetic-progress-page .synthetic-download-actions {
     width: 100%;
     flex-direction: column;
   }

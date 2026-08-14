@@ -1756,6 +1756,7 @@ def generate_scenario(
             run_state=SyntheticRunState.COMPLETE,
             runtime_status=SyntheticRuntimeStatus.PERSISTED,
             final_trace_sha256=semantic_trace_hash(result),
+            transcript_sha256=transcript.digest,
         )
     session_factory.kw["bind"].dispose()
     return result
@@ -2061,6 +2062,7 @@ def replay_transcript(
             run_state=SyntheticRunState.COMPLETE,
             runtime_status=SyntheticRuntimeStatus.PERSISTED,
             final_trace_sha256=semantic_trace_hash(result),
+            transcript_sha256=transcript.digest,
         )
     session_factory.kw["bind"].dispose()
     return result
