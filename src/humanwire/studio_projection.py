@@ -655,6 +655,28 @@ class StudioProgressStore:
         with self._lock:
             return self._snapshot.model_copy(deep=True)
 
+    def publish_failed(self) -> None:
+        """Publish one fixed safe failure without retaining private exception data."""
+        with self._lock:
+            if self._snapshot.run_state in {"complete", "failed"}:
+                return
+            candidate = self._snapshot.model_copy(
+                update={
+                    "run_state": "failed",
+                    "downloads_ready": False,
+                    "outcome": StudioOutcome(
+                        state="failed",
+                        headline="Coordination stopped",
+                        summary="The saved workspace remains available for review.",
+                    ),
+                }
+            )
+            candidate._final_trace_sha256 = None
+            candidate._transcript_sha256 = None
+            validated = self._validated_copy(candidate)
+            self._assert_transition(self._snapshot, validated)
+            self._snapshot = validated
+
     def _validated_copy(self, snapshot: StudioWorkspaceSnapshot) -> StudioWorkspaceSnapshot:
         trace = snapshot._final_trace_sha256
         transcript = snapshot._transcript_sha256
@@ -995,23 +1017,7 @@ class StudioProgressObserver:
     def mark_unavailable(self) -> None:
         with self._lock:
             self._delegate.mark_unavailable()
-            current = self._store.snapshot()
-            if current.run_state == "complete":
-                return
-            failed = current.model_copy(
-                update={
-                    "run_state": "failed",
-                    "downloads_ready": False,
-                    "outcome": StudioOutcome(
-                        state="failed",
-                        headline="Coordination stopped",
-                        summary="The saved workspace remains available for review.",
-                    ),
-                }
-            )
-            failed._final_trace_sha256 = None
-            failed._transcript_sha256 = None
-            self._store.publish(failed)
+            self._store.publish_failed()
 
     def record_inert_attempt(self, **attempt: object) -> None:
         with self._lock:
