@@ -1,12 +1,12 @@
 # HumanWire agent-persona runtime design
 
 **Date:** 2026-08-14
-**Status:** Approved design; implementation pending
+**Status:** Approved design with live-progress amendment; implementation pending
 **Proof class:** Synthetic agent simulation only
 
 ## Objective
 
-Add an optional agent-in-the-middle persona runtime to HumanWire's existing synthetic proof. Fictional stakeholder agents will independently decide how to respond to HumanWire deliveries, while the existing orchestrator retains all authority over identity, transport envelopes, persistence, workflow state, and public projection.
+Add an optional agent-in-the-middle persona runtime and loopback-only live-progress viewer to HumanWire's existing synthetic proof. Fictional stakeholder agents will independently decide how to respond to HumanWire deliveries, while the existing orchestrator retains all authority over identity, transport envelopes, persistence, workflow state, and public projection.
 
 The runtime must make the simulation feel realistic and repeatable without representing synthetic actors as humans or fake transport as live Caspian, email, or Telegram proof.
 
@@ -110,6 +110,32 @@ HumanWire delivery
 
 Every non-silence persona action must correspond to exactly one captured gateway inbound attempt. Direct calls to `workflow.handle` and direct repository mutation remain prohibited.
 
+## Live-progress viewer
+
+An explicit local/private CLI option may start a viewer bound only to `127.0.0.1`. Starting a simulation remains a CLI action; the viewer has no POST route, command tool, model tool, provider credential, or workflow mutation capability.
+
+The generation process publishes an allowlisted progress snapshot after each persisted causal step. A snapshot contains only replay-safe presentation fields:
+
+- run alias, scenario label, mode, and synthetic provenance;
+- current persisted event ordinal and total saved event count;
+- safe source, destination, generated-result, phase, status, and data-point labels;
+- selected synthetic persona label and contract;
+- safe aggregate counts and completion/failure state;
+- the final semantic trace hash only after completion.
+
+It must not contain raw persona facts, prompts, answers, routes, addresses, destinations, conversation/connection/message/assignment IDs, credentials, provider bodies, database coordinates, filesystem paths, UUIDs, or model diagnostics.
+
+The local viewer polls this safe snapshot and supports two states:
+
+1. **Follow live:** automatically follows the newest persisted step, visibly updates `From -> To -> Generated`, highlights exactly one affected persona or the origin, and describes the data point saved at that stage.
+2. **Replay:** after at least one event exists, the operator can pause following, select any saved event, or use Previous, Next, Play, and Pause. After completion, the same controls replay the complete frozen story from Event 1.
+
+The UI never displays a predicted next step as completed. Waiting for an agent, model timeout, synthetic silence, workflow rejection, and terminal failure are distinct truthful states. If the viewer joins late, it receives the full safe saved-event snapshot and can immediately replay from the beginning.
+
+Motion is limited to highlighting and short opacity/position transitions. It respects `prefers-reduced-motion`, stops playback while the page is hidden, uses at least 14-pixel meaningful text and 44-by-44-pixel controls, and preserves keyboard/focus/live-region behavior.
+
+The final JSON evidence control is enabled only when generation completes and must return an attachment with `Content-Disposition`; it must not navigate the browser to raw JSON. CSV remains a download. In-progress progress JSON is an internal local polling representation, not a submission artifact.
+
 ## Scheduling and concurrency
 
 The virtual-clock priority queue remains authoritative. Decisions for distinct personas may be evaluated concurrently only when their triggering deliveries are already persisted at the same causal boundary and neither decision depends on the other.
@@ -143,11 +169,13 @@ All artifacts and UI generated from these modes retain the six exact synthetic l
 
 Model-assisted generation additionally records its mode, model identifier, prompt/schema version, seed, and transcript hash in the private provenance sidecar. It does not expose prompts, private facts, provider bodies, or credentials in public projections.
 
+Both deterministic and model-assisted generation may use the loopback viewer. Viewer state is derived from already-persisted synthetic steps; closing or refreshing the viewer cannot alter generation.
+
 ## Public and private deployment boundary
 
-The public Vercel demo remains GET-only, read-only, deterministic, and backed by frozen synthetic data. A visitor cannot start a model run, write the public database, or trigger a provider message.
+The public Vercel demo remains GET-only, read-only, deterministic, and backed by frozen synthetic data. A visitor cannot start a model run, write the public database, trigger a provider message, or access the loopback progress surface.
 
-Model-assisted generation runs only through an explicit local/private CLI command with a new atomic run root. Its output may be reviewed, privacy-scanned, frozen, and then used as a read-only replay fixture.
+Model-assisted generation runs only through an explicit local/private CLI command with a new atomic run root. The optional viewer refuses non-loopback binding. Generated output may be reviewed, privacy-scanned, frozen, and then used as a read-only replay fixture.
 
 The private Supabase/Caspian sandbox remains separate. Synthetic identities and agent decisions must never be inserted into its live directory or represented as consenting test identities. Real-provider proof still requires real operator-owned channel accounts and remains pending until its independent checklist passes.
 
@@ -160,6 +188,8 @@ The private Supabase/Caspian sandbox remains separate. Synthetic identities and 
 - Ambiguous persona or trigger identity: fail closed before injection.
 - Model content containing routes, credentials, commands, or extra fields: reject at validation and privacy boundaries.
 - Model drift: freeze only transcripts that pass all semantic, privacy, and replay checks.
+- Progress publication failure: generation remains authoritative, the viewer shows a safe unavailable/stale state, and no workflow step is retried merely to update presentation.
+- Viewer disconnect or refresh: resume from the complete safe snapshot without changing the synthetic run.
 
 ## Verification
 
@@ -174,7 +204,11 @@ Implementation is complete only when tests prove:
 7. generated transcripts validate, freeze, and replay without invoking a model;
 8. deterministic generation and replay preserve the expected `meeting_ready` plus separate `partial` stories;
 9. public projections contain the exact synthetic labels and no private facts, credentials, routes, UUIDs, or provider bodies;
-10. the private live organization, Supabase data, public deployment configuration, and existing smoke output remain unchanged.
+10. a mid-run viewer shows only persisted events, follows new steps in exact order, and can switch between Follow live and manual replay;
+11. Play/Pause/Previous/Next preserve `From -> To -> Generated`, one-card highlighting, descriptions, live copy, reduced-motion behavior, and hidden-page pause;
+12. completed JSON uses attachment download semantics, and partial polling data is not exposed as a submission export;
+13. the viewer is loopback-only, GET-only, and unable to mutate generation, workflow, repository, providers, or the public demo; and
+14. the private live organization, Supabase data, public deployment configuration, and existing smoke output remain unchanged.
 
 The focused synthetic, gateway, workflow, web, privacy, lint, and full-repository gates must pass before a fixture or public replay is updated.
 
@@ -184,8 +218,9 @@ The focused synthetic, gateway, workflow, web, privacy, lint, and full-repositor
 - autonomous access to tools, browsers, shells, repositories, files, or production systems;
 - replacing HumanWire's workflow with a general-purpose agent framework;
 - making the public demo stateful or writable;
+- exposing a remotely writable or publicly hosted simulation runner;
 - claiming that a randomized persona has consented, approved, or exercised organizational authority.
 
 ## Success criteria
 
-The result is a convincing agent-in-the-middle simulation whose stakeholders behave independently, whose causal flow is visible in replay, and whose evidence remains deterministic and auditable. It must be faster to implement and operate than adopting a general orchestration framework, while retaining PydanticAI Slim as a bounded compatibility fallback rather than an architectural dependency.
+The result is a convincing agent-in-the-middle simulation whose stakeholders behave independently, whose persisted causal flow can be watched while it develops and replayed afterward, and whose evidence remains deterministic and auditable. It must be faster to implement and operate than adopting a general orchestration framework, while retaining PydanticAI Slim as a bounded compatibility fallback rather than an architectural dependency.
