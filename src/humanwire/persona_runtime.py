@@ -146,8 +146,7 @@ class FeatherlessPersonaDecisionEngine:
     ) -> PersonaDecision:
         if cancellation.is_set() or not math.isfinite(deadline):
             raise ModelFailure("timeout")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        if time.monotonic() >= deadline:
             raise ModelFailure("timeout")
         system = (
             "You are one fictional HumanWire simulation persona. "
@@ -170,6 +169,9 @@ class FeatherlessPersonaDecisionEngine:
             sort_keys=True,
             separators=(",", ":"),
         )
+        remaining = deadline - time.monotonic()
+        if cancellation.is_set() or remaining <= 0:
+            raise ModelFailure("timeout")
         decision = PersonaDecision.model_validate_json(
             json.dumps(
                 self._client.complete_json(

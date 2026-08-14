@@ -278,6 +278,36 @@ def test_model_engine_rejects_expired_deadline_before_calling_client() -> None:
     assert client.calls == []
 
 
+def test_model_engine_recomputes_budget_after_prompt_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: prompt construction consumes a stale HTTP timeout budget."""
+    client = CapturingClient(
+        {
+            "time_offset_seconds": 1,
+            "intent": "acknowledge",
+            "content": "ACK",
+            "visibility": "shareable",
+        }
+    )
+    monotonic_values = iter((100.0, 100.6))
+
+    def serialization_clock() -> float:
+        return next(monotonic_values, 100.6)
+
+    monkeypatch.setattr(persona_runtime_module.time, "monotonic", serialization_clock)
+
+    with pytest.raises(ModelFailure, match="timeout"):
+        FeatherlessPersonaDecisionEngine(client, "fixture/model").decide(
+            _profile(),
+            _context(),
+            deadline=100.5,
+            cancellation=threading.Event(),
+        )
+
+    assert client.calls == []
+
+
 def test_persona_decision_is_frozen_and_strict() -> None:
     """Break caught: a decision can be mutated after validation or accepts coercion."""
     decision = PersonaDecision(

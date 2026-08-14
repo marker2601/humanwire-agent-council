@@ -10,6 +10,7 @@ import os
 import re
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -749,7 +750,10 @@ def _safe_decide(
         )
         if cancellation.is_set() or time.monotonic() >= deadline:
             raise ModelFailure("timeout")
-        return validate_persona_decision(profile, decision)
+        decision = validate_persona_decision(profile, decision)
+        if cancellation.is_set() or time.monotonic() >= deadline:
+            raise ModelFailure("timeout")
+        return decision
     except Exception as error:  # noqa: BLE001 - converted to a safe inert action
         return error
 
@@ -774,16 +778,19 @@ def _evaluate_model_batch(
     engine: PersonaDecisionEngine,
     candidates: list[_DecisionCandidate],
     max_workers: int,
-) -> list[_PersonaDecision | Exception]:
+) -> tuple[list[_PersonaDecision | Exception], float]:
     if not candidates:
-        return []
-    if not _supports_cooperative_deadline(engine, candidates[0]):
-        return [
-            ValueError("persona engine lacks cooperative deadline support")
-            for _ in candidates
-        ]
-    workers = max(1, min(max_workers, len(candidates), 8))
+        return [], time.monotonic()
     deadline = time.monotonic() + MODEL_DECISION_TIMEOUT_SECONDS
+    if not _supports_cooperative_deadline(engine, candidates[0]):
+        return (
+            [
+                ValueError("persona engine lacks cooperative deadline support")
+                for _ in candidates
+            ],
+            deadline,
+        )
+    workers = max(1, min(max_workers, len(candidates), 8))
     cancellation = threading.Event()
     pool = ThreadPoolExecutor(
         max_workers=workers,
@@ -814,10 +821,13 @@ def _evaluate_model_batch(
             )
             if not_cleaned:
                 raise RuntimeError("persona engine violated cooperative cancellation")
-        return [
-            ModelFailure("timeout") if future in timed_out else future.result()
-            for future in futures
-        ]
+        return (
+            [
+                ModelFailure("timeout") if future in timed_out else future.result()
+                for future in futures
+            ],
+            deadline,
+        )
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
 
@@ -837,7 +847,11 @@ def _safe_model_failure(error: Exception) -> tuple[SyntheticIntent, str]:
 def _model_action(
     candidate: _DecisionCandidate,
     result: _PersonaDecision | Exception,
+    *,
+    deadline: float,
 ) -> SyntheticAction:
+    if not isinstance(result, Exception) and time.monotonic() >= deadline:
+        result = ModelFailure("timeout")
     if isinstance(result, Exception):
         intent, content = _safe_model_failure(result)
         offset = 1
@@ -886,6 +900,16 @@ def _model_action_completes(
         EngagementType.INFORM: {SyntheticIntent.SILENCE},
     }
     return intent in terminal_by_contract[profile.engagement_contract]
+
+
+def _emit_persona_inbound_attempts(
+    client: OfflineCaspianClient,
+    envelope: object,
+    record_attempt: Callable[[], None],
+) -> None:
+    """Record each offline retry immediately before the one gateway handler path."""
+    record_attempt()
+    client.emit_inbound(envelope)
 
 
 def _sha256(value: str) -> str:
@@ -1243,13 +1267,13 @@ def generate_scenario(
         def commit_model_batch() -> None:
             if not model_batch or decision_engine is None:
                 return
-            results = _evaluate_model_batch(
+            results, deadline = _evaluate_model_batch(
                 decision_engine,
                 model_batch,
                 max_decision_workers,
             )
             for candidate, result in zip(model_batch, results, strict=True):
-                action = _model_action(candidate, result)
+                action = _model_action(candidate, result, deadline=deadline)
                 visible_delivery, mandate_token = delivery_authority_by_trigger.pop(
                     candidate.trigger_id
                 )
@@ -1500,18 +1524,27 @@ def generate_scenario(
                 if channel is Channel.EMAIL
                 else telegram_envelope(**envelope_args)
             )
-            inbound_owner[message_id] = (persona_id, channel)
-            inbound_envelopes.append(
-                SyntheticInboundEnvelope(
-                    persona_id=persona_id,
-                    channel=channel,
-                    message_id=message_id,
-                    conversation_id=envelope_args["conversation_id"],
-                    connection_id=f"offline-{channel.value}-connection",
-                    sender_address=persona_by_id[persona_id].email,
-                )
+            attempt_record = SyntheticInboundEnvelope(
+                persona_id=persona_id,
+                channel=channel,
+                message_id=message_id,
+                conversation_id=envelope_args["conversation_id"],
+                connection_id=f"offline-{channel.value}-connection",
+                sender_address=persona_by_id[persona_id].email,
             )
-            client.emit_inbound(envelope)
+
+            def record_attempt(
+                attempt: SyntheticInboundEnvelope = attempt_record,
+            ) -> None:
+                inbound_owner[attempt.message_id] = (
+                    attempt.persona_id,
+                    attempt.channel,
+                )
+                inbound_envelopes.append(
+                    attempt
+                )
+
+            _emit_persona_inbound_attempts(client, envelope, record_attempt)
             collect_deliveries(clock[0])
 
     transcript = SyntheticTranscript.create(

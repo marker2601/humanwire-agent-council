@@ -747,6 +747,38 @@ def test_cooperative_late_result_is_cancelled_and_never_committed(
     )
 
 
+def test_completed_decision_expiring_before_final_acceptance_is_inert(
+    tmp_path, monkeypatch
+) -> None:
+    """Break caught: coordinator wake-up accepts a decision after its batch deadline."""
+    real_wait = synthetic_module.wait
+
+    def delayed_coordinator_wake(futures, *, timeout=None):
+        done, pending = real_wait(futures, timeout=timeout)
+        if done and not pending:
+            time.sleep(0.06)
+        return done, pending
+
+    monkeypatch.setattr(
+        synthetic_module,
+        "MODEL_DECISION_TIMEOUT_SECONDS",
+        0.03,
+        raising=False,
+    )
+    monkeypatch.setattr(synthetic_module, "wait", delayed_coordinator_wake)
+
+    result = generate_scenario(
+        one_person_generation_scenario(),
+        tmp_path / "run" / "transcript.json",
+        tmp_path / "run",
+        decision_engine=BarrierFreeDecisionEngine(),
+    )
+
+    assert result.transcript.actions[0].intent is SyntheticIntent.ERROR
+    assert result.transcript.actions[0].content == "synthetic_model_timeout"
+    assert result.inbound_envelopes == ()
+
+
 def test_zero_offset_uses_the_decision_context_virtual_time(tmp_path) -> None:
     """Break caught: a valid zero offset creates an action before its own context."""
 
@@ -856,6 +888,78 @@ def test_worker_count_preserves_repeated_trigger_order_and_transcript(tmp_path) 
     ] == sorted(
         synthetic_module.canonical_action_order(serial.transcript.scenario, action)
         for action in serial.transcript.actions
+    )
+
+
+class BarrierFreeDecisionEngine:
+    model_identifier = "fixture/immediate"
+
+    def decide(
+        self,
+        profile,
+        context,
+        *,
+        deadline=None,
+        cancellation=None,
+    ) -> PersonaDecision:
+        del deadline, cancellation
+        return scripted_decision_for(profile, context)
+
+
+def test_same_trigger_retry_is_visible_once_only_and_worker_invariant(
+    tmp_path, monkeypatch
+) -> None:
+    """Break caught: a same-message retry duplicates workflow authority or disappears."""
+
+    def emit_twice(client, envelope, record_attempt) -> None:
+        for _ in range(2):
+            record_attempt()
+            client.emit_inbound(envelope)
+
+    monkeypatch.setattr(
+        synthetic_module,
+        "_emit_persona_inbound_attempts",
+        emit_twice,
+    )
+    serial = generate_scenario(
+        one_person_generation_scenario(),
+        tmp_path / "serial" / "transcript.json",
+        tmp_path / "serial",
+        decision_engine=BarrierFreeDecisionEngine(),
+        max_decision_workers=1,
+    )
+    parallel = generate_scenario(
+        one_person_generation_scenario(),
+        tmp_path / "parallel" / "transcript.json",
+        tmp_path / "parallel",
+        decision_engine=BarrierFreeDecisionEngine(),
+        max_decision_workers=8,
+    )
+
+    assert [(item.action_id, item.trigger_id) for item in serial.transcript.actions] == [
+        ("beta-1", "outbound-1")
+    ]
+    assert [item.message_id for item in serial.inbound_envelopes] == [
+        "synthetic-beta-1",
+        "synthetic-beta-1",
+    ]
+    assert serial.gateway_handler_count == parallel.gateway_handler_count == 1
+    serial_trace = synthetic_module._semantic_trace(serial)
+    parallel_trace = synthetic_module._semantic_trace(parallel)
+    assert [item["action"] for item in serial_trace["inbound_attempts"]] == [
+        "beta-1",
+        "beta-1",
+    ]
+    assert [
+        event["type"]
+        for event in serial_trace["events"]
+        if event["type"] == "stakeholder.acknowledged"
+    ] == ["stakeholder.acknowledged"]
+    assert serial.transcript.model_dump_json() == parallel.transcript.model_dump_json()
+    assert serial.inbound_envelopes == parallel.inbound_envelopes
+    assert serial_trace["inbound_attempts"] == parallel_trace["inbound_attempts"]
+    assert synthetic_module.semantic_trace_hash(serial) == (
+        synthetic_module.semantic_trace_hash(parallel)
     )
 
 
