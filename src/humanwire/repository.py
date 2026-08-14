@@ -6,7 +6,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import exists, insert, literal, select, update
+from sqlalchemy import cast, exists, insert, literal, select, update
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -615,6 +616,12 @@ class RepositoryUnitOfWork:
     def __init__(self, session: Session) -> None:
         self._session = session
 
+    def _exact_json_snapshot(self, column: Any, expected: Any) -> Any:
+        """Compare JSON snapshots exactly on SQLite and semantically on PostgreSQL."""
+        if self._session.get_bind().dialect.name == "postgresql":
+            return cast(column, JSONB) == cast(expected, JSONB)
+        return column == expected
+
     def add_mandate(self, mandate: Mandate) -> None:
         self._session.add(_mandate_record(mandate))
         # Other aggregate records use a database foreign key but deliberately
@@ -699,7 +706,7 @@ class RepositoryUnitOfWork:
             MandateRecord.origin_message_id == expected.origin_message_id,
             MandateRecord.redacted_request == expected.redacted_request,
             MandateRecord.objective == expected.objective,
-            MandateRecord.plan == _json(expected.plan),
+            self._exact_json_snapshot(MandateRecord.plan, _json(expected.plan)),
             MandateRecord.state == expected.state.value,
             MandateRecord.reason == expected.reason,
             MandateRecord.next_action_at == expected.next_action_at,
@@ -758,7 +765,10 @@ class RepositoryUnitOfWork:
                 StakeholderAssignmentRecord.response_required
                 == expected.response_required,
                 StakeholderAssignmentRecord.state == expected.state.value,
-                StakeholderAssignmentRecord.route_ids == expected.route_ids,
+                self._exact_json_snapshot(
+                    StakeholderAssignmentRecord.route_ids,
+                    expected.route_ids,
+                ),
                 StakeholderAssignmentRecord.attempt_count == expected.attempt_count,
                 StakeholderAssignmentRecord.active_route_index
                 == expected.active_route_index,
@@ -818,7 +828,10 @@ class RepositoryUnitOfWork:
                 == expected.engagement_type.value,
                 StakeholderAssignmentRecord.response_required
                 == expected.response_required,
-                StakeholderAssignmentRecord.route_ids == expected.route_ids,
+                self._exact_json_snapshot(
+                    StakeholderAssignmentRecord.route_ids,
+                    expected.route_ids,
+                ),
                 StakeholderAssignmentRecord.state == expected.state.value,
                 StakeholderAssignmentRecord.attempt_count == expected.attempt_count,
                 StakeholderAssignmentRecord.active_route_index
@@ -1066,7 +1079,10 @@ class RepositoryUnitOfWork:
                 InterviewSessionRecord.mandate_id == str(expected.mandate_id),
                 InterviewSessionRecord.assignment_id == str(expected.assignment_id),
                 InterviewSessionRecord.stakeholder_person_id == assignment.person_id,
-                InterviewSessionRecord.questions == expected.questions,
+                self._exact_json_snapshot(
+                    InterviewSessionRecord.questions,
+                    expected.questions,
+                ),
                 InterviewSessionRecord.current_question_index
                 == expected.current_question_index,
                 InterviewSessionRecord.current_channel
@@ -1078,8 +1094,10 @@ class RepositoryUnitOfWork:
                 InterviewSessionRecord.current_route_id == expected.current_route_id,
                 InterviewSessionRecord.current_conversation_id
                 == expected.current_conversation_id,
-                InterviewSessionRecord.channel_history
-                == [channel.value for channel in expected.channel_history],
+                self._exact_json_snapshot(
+                    InterviewSessionRecord.channel_history,
+                    [channel.value for channel in expected.channel_history],
+                ),
                 InterviewSessionRecord.default_visibility
                 == expected.default_visibility.value,
                 InterviewSessionRecord.acknowledged_at == expected.acknowledged_at,
@@ -1139,7 +1157,10 @@ class RepositoryUnitOfWork:
                 == assignment.engagement_type.value,
                 StakeholderAssignmentRecord.response_required
                 == assignment.response_required,
-                StakeholderAssignmentRecord.route_ids == assignment.route_ids,
+                self._exact_json_snapshot(
+                    StakeholderAssignmentRecord.route_ids,
+                    assignment.route_ids,
+                ),
                 StakeholderAssignmentRecord.active_route_index
                 == assignment.active_route_index,
                 StakeholderAssignmentRecord.attempt_count == assignment.attempt_count,
@@ -1160,15 +1181,20 @@ class RepositoryUnitOfWork:
             InterviewSessionRecord.mandate_id == str(interview.mandate_id),
             InterviewSessionRecord.assignment_id == str(interview.assignment_id),
             InterviewSessionRecord.stakeholder_person_id == assignment.person_id,
-            InterviewSessionRecord.questions == interview.questions,
+            self._exact_json_snapshot(
+                InterviewSessionRecord.questions,
+                interview.questions,
+            ),
             InterviewSessionRecord.current_question_index
             == interview.current_question_index,
             InterviewSessionRecord.current_channel == interview.current_channel.value,
             InterviewSessionRecord.current_route_id == interview.current_route_id,
             InterviewSessionRecord.current_conversation_id
             == interview.current_conversation_id,
-            InterviewSessionRecord.channel_history
-            == [channel.value for channel in interview.channel_history],
+            self._exact_json_snapshot(
+                InterviewSessionRecord.channel_history,
+                [channel.value for channel in interview.channel_history],
+            ),
             InterviewSessionRecord.default_visibility
             == interview.default_visibility.value,
             InterviewSessionRecord.acknowledged_at == interview.acknowledged_at,
