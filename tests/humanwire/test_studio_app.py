@@ -105,6 +105,20 @@ def test_studio_home_is_idle_product_and_has_no_started_run(tmp_path) -> None:
     assert manager.list_runs() == ()
 
 
+def test_studio_page_renders_only_the_action_token_and_run_path_context(tmp_path) -> None:
+    client, manager = studio_client(tmp_path)
+    home = client.get("/")
+    created = client.post("/api/runs", headers=ACTION_HEADERS, content=request_body())
+    workspace = client.get(created.json()["workspace_url"])
+    manager.join("launch-001", timeout=20)
+
+    assert '<meta name="humanwire-action-token" content="test-action-token">' in home.text
+    assert home.text.count("test-action-token") == 1
+    assert workspace.text.count("test-action-token") == 1
+    assert 'data-studio-state="composer"' in workspace.text
+    assert 'data-studio-state="workspace"' in workspace.text
+
+
 @pytest.mark.parametrize(
     ("headers", "status"),
     [

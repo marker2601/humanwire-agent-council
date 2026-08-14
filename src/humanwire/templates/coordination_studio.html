@@ -8,12 +8,197 @@
     <link rel="stylesheet" href="/studio-static/coordination-studio.css">
   </head>
   <body class="coordination-studio-page">
-    <main>
-      <p class="coordination-studio-page__brand">HumanWire</p>
-      <h1>Start a coordination</h1>
-      <p>Prepare a decision, select the required stakeholders, and follow saved progress.</p>
-      <noscript>JavaScript is required to start a coordination.</noscript>
-    </main>
+    <header class="coordination-studio-page__masthead">
+      <a class="coordination-studio-page__brand" href="/" aria-label="HumanWire home">
+        <svg viewBox="0 0 32 32" aria-hidden="true">
+          <path d="M6 5v22M26 5v22M6 10l10 6 10-6M6 22l10-6 10 6"></path>
+        </svg>
+        <span>HumanWire</span>
+      </a>
+      <nav class="coordination-studio-page__nav" aria-label="HumanWire">
+        <a href="/" aria-current="page">New coordination</a>
+        <span>Decision Room</span>
+        <span>Reach</span>
+        <span>Data</span>
+      </nav>
+      <div class="coordination-studio-page__status-mark" aria-label="Private coordination studio">
+        <span aria-hidden="true"></span>
+        Private workspace
+      </div>
+    </header>
+
+    <section class="coordination-studio-page__composer" data-studio-state="composer">
+      <main class="coordination-studio-page__composer-main">
+        <header class="coordination-studio-page__page-heading">
+          <h1>Start a coordination</h1>
+          <p>Describe the outcome. HumanWire will plan the minimum stakeholder path.</p>
+        </header>
+
+        <form class="coordination-studio-page__form" data-composer-form novalidate>
+          <div class="coordination-studio-page__field">
+            <label for="coordination-objective">What needs to be decided?</label>
+            <textarea id="coordination-objective" name="objective" data-objective rows="3" required>Set up a decision meeting tomorrow to approve the launch plan.</textarea>
+          </div>
+
+          <fieldset class="coordination-studio-page__choice-group">
+            <legend>Who are you in this coordination?</legend>
+            <div class="coordination-studio-page__requester-cards">
+              <label><input type="radio" name="requester_role" value="manager" checked><span><strong>Strategy manager</strong><small>Alex Morgan</small></span></label>
+              <label><input type="radio" name="requester_role" value="executive"><span><strong>Executive</strong><small>Alex Morgan</small></span></label>
+              <label><input type="radio" name="requester_role" value="program_lead"><span><strong>Program lead</strong><small>Alex Morgan</small></span></label>
+              <label><input type="radio" name="requester_role" value="team_lead"><span><strong>Team lead</strong><small>Alex Morgan</small></span></label>
+            </div>
+          </fieldset>
+
+          <fieldset class="coordination-studio-page__stakeholder-fieldset">
+            <legend>Stakeholders <span>Seven selected</span></legend>
+            <div class="coordination-studio-page__stakeholder-list">
+              <label><input type="checkbox" name="participant_ids" value="inform" checked><span class="coordination-studio-page__avatar is-blue">MC</span><span><strong>Maya Chen</strong><small>Executive sponsor</small></span><em>Inform</em></label>
+              <label><input type="checkbox" name="participant_ids" value="ack" checked><span class="coordination-studio-page__avatar is-violet">NJ</span><span><strong>Nora Jensen</strong><small>Communications lead</small></span><em>Acknowledge</em></label>
+              <label><input type="checkbox" name="participant_ids" value="quick-a" checked><span class="coordination-studio-page__avatar is-teal">PS</span><span><strong>Priya Shah</strong><small>Product lead</small></span><em>Quick response</em></label>
+              <label><input type="checkbox" name="participant_ids" value="quick-b" checked><span class="coordination-studio-page__avatar is-blue">MR</span><span><strong>Marcus Reed</strong><small>Engineering lead</small></span><em>Quick response</em></label>
+              <label><input type="checkbox" name="participant_ids" value="structured" checked><span class="coordination-studio-page__avatar is-amber">AR</span><span><strong>Anika Rao</strong><small>Risk &amp; compliance lead</small></span><em>Structured interview</em></label>
+              <label><input type="checkbox" name="participant_ids" value="approval" checked><span class="coordination-studio-page__avatar is-green">SA</span><span><strong>Sofia Alvarez</strong><small>Approval owner</small></span><em>Review and approval</em></label>
+              <label><input type="checkbox" name="participant_ids" value="availability" checked><span class="coordination-studio-page__avatar is-violet">DB</span><span><strong>Daniel Brooks</strong><small>Operations lead</small></span><em>Availability</em></label>
+              <label><input type="checkbox" name="participant_ids" value="approval-change"><span class="coordination-studio-page__avatar is-teal">ET</span><span><strong>Elena Torres</strong><small>Business owner</small></span><em>Change authority</em></label>
+            </div>
+          </fieldset>
+
+          <div class="coordination-studio-page__form-row">
+            <fieldset class="coordination-studio-page__compact-fieldset">
+              <legend>Timing</legend>
+              <label><input type="radio" name="target_timing" value="tomorrow" checked><span>Tomorrow</span></label>
+              <label><input type="radio" name="target_timing" value="next_business_day"><span>Next business day</span></label>
+              <label><input type="radio" name="target_timing" value="custom"><span>Choose date</span></label>
+              <input type="date" aria-label="Coordination date" data-custom-date disabled>
+            </fieldset>
+            <label class="coordination-studio-page__switch-row"><input type="checkbox" data-include-conflict checked><span>Resolve disagreement before approval</span></label>
+            <fieldset class="coordination-studio-page__compact-fieldset">
+              <legend>Agent mode</legend>
+              <label><input type="radio" name="agent_mode" value="standard" checked><span>Standard agents</span></label>
+              <label><input type="radio" name="agent_mode" value="model_assisted"><span>Model-assisted</span></label>
+            </fieldset>
+          </div>
+
+          <fieldset class="coordination-studio-page__templates" data-current-template="launch-decision">
+            <legend>Templates</legend>
+            <div>
+              <button type="button" data-template-id="launch-decision" aria-pressed="true"><strong>Launch decision</strong><span>Coordinate a launch or major initiative.</span></button>
+              <button type="button" data-template-id="cross-team-conflict" aria-pressed="false"><strong>Resolve a cross-team conflict</strong><span>Surface issues and align on resolution.</span></button>
+              <button type="button" data-template-id="executive-decision-review" aria-pressed="false"><strong>Executive decision review</strong><span>Prepare the minimum evidence for review.</span></button>
+            </div>
+          </fieldset>
+
+          <div class="coordination-studio-page__submit-row">
+            <button class="coordination-studio-page__primary-action" type="button" data-start-coordination>
+              Start coordination
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"></path></svg>
+            </button>
+            <p data-form-status role="status" aria-live="polite"></p>
+          </div>
+        </form>
+      </main>
+
+      <aside class="coordination-studio-page__sequence" aria-labelledby="sequence-title">
+        <header><h2 id="sequence-title">Sequence preview</h2><p>HumanWire will orchestrate these stages.</p></header>
+        <ol>
+          <li data-sequence-stage><span>1</span><div><strong>Brief</strong><p>Interpret the objective and define the decision outcome.</p></div></li>
+          <li data-sequence-stage><span>2</span><div><strong>Outreach</strong><p>Engage the right people with the right context.</p></div></li>
+          <li data-sequence-stage><span>3</span><div><strong>Resolve</strong><p>Surface questions and resolve disagreement.</p></div></li>
+          <li data-sequence-stage><span>4</span><div><strong>Approve</strong><p>Collect review against the saved proposal.</p></div></li>
+          <li data-sequence-stage><span>5</span><div><strong>Schedule</strong><p>Confirm the exact meeting and package.</p></div></li>
+        </ol>
+      </aside>
+    </section>
+
+    <section class="coordination-studio-page__workspace" data-studio-state="workspace" hidden>
+      <header class="coordination-studio-page__workspace-heading">
+        <div>
+          <span>Objective</span>
+          <h1 data-workspace-objective>Coordination workspace</h1>
+          <p data-workspace-requester>Alex Morgan · Strategy manager</p>
+        </div>
+        <div class="coordination-studio-page__workspace-status">
+          <strong data-run-state>Running</strong>
+          <span data-connection-label>Workspace channels</span>
+        </div>
+      </header>
+
+      <ol class="coordination-studio-page__lifecycle" aria-label="Coordination lifecycle">
+        <li data-lifecycle-stage="brief"><span>1</span><div><strong>Brief</strong><small>Pending</small></div></li>
+        <li data-lifecycle-stage="outreach"><span>2</span><div><strong>Outreach</strong><small>Pending</small></div></li>
+        <li data-lifecycle-stage="resolve"><span>3</span><div><strong>Resolve</strong><small>Pending</small></div></li>
+        <li data-lifecycle-stage="approve"><span>4</span><div><strong>Approve</strong><small>Pending</small></div></li>
+        <li data-lifecycle-stage="schedule"><span>5</span><div><strong>Schedule</strong><small>Pending</small></div></li>
+      </ol>
+
+      <div class="coordination-studio-page__workspace-grid">
+        <main class="coordination-studio-page__work-surface">
+          <section class="coordination-studio-page__graph-panel" aria-labelledby="flow-title">
+            <header><div><span>Live coordination flow</span><h2 id="flow-title">HumanWire is coordinating the saved path</h2></div><strong data-current-stage>Brief</strong></header>
+            <svg data-flow-canvas viewBox="0 0 1000 620" role="img" aria-label="Saved coordination flow from request through stakeholders to the meeting package"></svg>
+            <div class="coordination-studio-page__persona-rail" aria-label="Stakeholders in this coordination">
+              <article data-persona-card="inform"><span class="coordination-studio-page__avatar is-blue">MC</span><strong>Maya Chen</strong><small>Executive sponsor</small></article>
+              <article data-persona-card="ack"><span class="coordination-studio-page__avatar is-violet">NJ</span><strong>Nora Jensen</strong><small>Communications lead</small></article>
+              <article data-persona-card="quick-a"><span class="coordination-studio-page__avatar is-teal">PS</span><strong>Priya Shah</strong><small>Product lead</small></article>
+              <article data-persona-card="quick-b"><span class="coordination-studio-page__avatar is-blue">MR</span><strong>Marcus Reed</strong><small>Engineering lead</small></article>
+              <article data-persona-card="structured"><span class="coordination-studio-page__avatar is-amber">AR</span><strong>Anika Rao</strong><small>Risk &amp; compliance lead</small></article>
+              <article data-persona-card="approval"><span class="coordination-studio-page__avatar is-green">SA</span><strong>Sofia Alvarez</strong><small>Approval owner</small></article>
+              <article data-persona-card="availability"><span class="coordination-studio-page__avatar is-violet">DB</span><strong>Daniel Brooks</strong><small>Operations lead</small></article>
+              <article data-persona-card="approval-change"><span class="coordination-studio-page__avatar is-teal">ET</span><strong>Elena Torres</strong><small>Business owner</small></article>
+            </div>
+          </section>
+
+          <section class="coordination-studio-page__flow-strip" aria-label="Selected saved transition">
+            <div><span>From</span><strong data-flow-from>Request</strong></div>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"></path></svg>
+            <div><span>To</span><strong data-flow-to>HumanWire</strong></div>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"></path></svg>
+            <div><span>Generated</span><strong data-flow-generated>Coordination brief</strong></div>
+          </section>
+
+          <div class="coordination-studio-page__mobile-tabs" role="tablist" aria-label="Workspace detail">
+            <button type="button" role="tab" aria-selected="true" aria-controls="conversation-panel" data-mobile-tab="conversation">Conversation</button>
+            <button type="button" role="tab" aria-selected="false" aria-controls="data-panel" data-mobile-tab="data">Data trail</button>
+          </div>
+
+          <section class="coordination-studio-page__data-panel" id="data-panel" aria-labelledby="data-title">
+            <header><h2 id="data-title">Data trail</h2><span>Saved results only</span></header>
+            <div data-data-list></div>
+          </section>
+
+          <section class="coordination-studio-page__outcome" aria-labelledby="outcome-title">
+            <span aria-hidden="true">✓</span>
+            <div><h2 id="outcome-title" data-outcome-headline>Coordination is ready to start</h2><p data-outcome-summary>HumanWire will save each confirmed step as work progresses.</p></div>
+          </section>
+        </main>
+
+        <aside class="coordination-studio-page__conversation" id="conversation-panel" aria-labelledby="conversation-title">
+          <header><h2 id="conversation-title">Conversation</h2><span>Saved messages</span></header>
+          <div data-conversation-list></div>
+        </aside>
+      </div>
+
+      <footer class="coordination-studio-page__replay-bar">
+        <div class="coordination-studio-page__replay-controls">
+          <button type="button" data-replay-previous aria-label="Previous saved event">Previous</button>
+          <button type="button" data-pause-visuals aria-pressed="false">Pause visuals</button>
+          <button type="button" data-replay-play aria-pressed="false" disabled>Play</button>
+          <button type="button" data-replay-next aria-label="Next saved event">Next</button>
+          <button type="button" data-follow-live aria-pressed="true">Follow live</button>
+        </div>
+        <strong data-event-progress>Event 0 of 0</strong>
+        <div class="coordination-studio-page__download-controls">
+          <button type="button" data-download-json disabled>Download JSON</button>
+          <button type="button" data-download-csv disabled>Download CSV</button>
+          <button type="button" data-new-coordination hidden>New coordination</button>
+        </div>
+      </footer>
+
+      <p class="coordination-studio-page__live-region" data-flow-live aria-live="polite" aria-atomic="true"></p>
+    </section>
+
+    <noscript class="coordination-studio-page__noscript">JavaScript is required to start and follow a coordination.</noscript>
     <script src="/studio-static/coordination-studio.js" defer></script>
   </body>
 </html>

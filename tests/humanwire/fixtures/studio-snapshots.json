@@ -1,0 +1,136 @@
+[
+  {
+    "schema_version": "humanwire.studio/v1",
+    "run_alias": "launch-001",
+    "objective": "Set up a decision meeting tomorrow to approve the launch plan.",
+    "requester_name": "Alex Morgan",
+    "requester_role_label": "Strategy manager",
+    "target_timing_label": "Tomorrow",
+    "run_state": "running",
+    "connection_label": "Workspace channels",
+    "lifecycle": {
+      "current": "outreach",
+      "stages": ["brief", "outreach", "resolve", "approve", "schedule"],
+      "completed": ["brief"]
+    },
+    "graph_nodes": [
+      {"node_id": "request", "label": "Request", "kind": "request", "persona_id": null, "role": null, "initials": null, "active": false},
+      {"node_id": "humanwire", "label": "HumanWire", "kind": "service", "persona_id": null, "role": null, "initials": null, "active": false},
+      {"node_id": "caspian-gateway", "label": "Caspian Gateway", "kind": "gateway", "persona_id": null, "role": null, "initials": null, "active": true},
+      {"node_id": "persona-quick-a", "label": "Priya Shah", "kind": "stakeholder", "persona_id": "quick-a", "role": "Product lead", "initials": "PS", "active": true},
+      {"node_id": "persona-structured", "label": "Anika Rao", "kind": "stakeholder", "persona_id": "structured", "role": "Risk & compliance lead", "initials": "AR", "active": false},
+      {"node_id": "interview", "label": "Targeted interview", "kind": "artifact", "persona_id": null, "role": null, "initials": null, "active": false}
+    ],
+    "graph_edges": [
+      {"source": "caspian-gateway", "destination": "persona-quick-a", "active": true},
+      {"source": "persona-structured", "destination": "interview", "active": false}
+    ],
+    "events": [
+      {
+        "timeline_ordinal": 1,
+        "persisted_ordinal": 1,
+        "created_at": "2026-08-14T15:15:00Z",
+        "stage": "outreach",
+        "effect": "persisted",
+        "active_transition": {
+          "source": "caspian-gateway",
+          "destination": "persona-quick-a",
+          "source_label": "Caspian Gateway",
+          "destination_label": "Priya Shah",
+          "generated_label": "Response requested"
+        },
+        "affected_persona_id": "quick-a",
+        "live_copy": "HumanWire requested Priya Shah's response."
+      }
+    ],
+    "conversations": [
+      {
+        "ordinal": 1,
+        "event_ordinal": 1,
+        "created_at": "2026-08-14T15:15:00Z",
+        "speaker": "Priya Shah",
+        "role": "Product lead",
+        "direction": "to_humanwire",
+        "channel": "Workspace",
+        "text": "Product requirements are aligned. No blockers from my side.",
+        "status": "received"
+      }
+    ],
+    "data_points": [
+      {"event_ordinal": 1, "label": "Response requested", "summary": "Priya Shah was asked for the product decision context.", "effect": "persisted"}
+    ],
+    "active_transition": {
+      "source": "caspian-gateway",
+      "destination": "persona-quick-a",
+      "source_label": "Caspian Gateway",
+      "destination_label": "Priya Shah",
+      "generated_label": "Response requested"
+    },
+    "current_event_ordinal": 1,
+    "total_event_count": 1,
+    "outcome": {"state": "coordinating", "headline": "Stakeholder outreach is underway", "summary": "HumanWire is collecting the minimum decision evidence.", "meeting_start": null, "meeting_end": null, "required_attendees": []},
+    "downloads_ready": false
+  },
+  {
+    "schema_version": "humanwire.studio/v1",
+    "run_alias": "launch-001",
+    "objective": "Set up a decision meeting tomorrow to approve the launch plan.",
+    "requester_name": "Alex Morgan",
+    "requester_role_label": "Strategy manager",
+    "target_timing_label": "Tomorrow",
+    "run_state": "complete",
+    "connection_label": "Workspace channels",
+    "lifecycle": {
+      "current": "resolve",
+      "stages": ["brief", "outreach", "resolve", "approve", "schedule"],
+      "completed": ["brief", "outreach"]
+    },
+    "graph_nodes": [
+      {"node_id": "request", "label": "Request", "kind": "request", "persona_id": null, "role": null, "initials": null, "active": false},
+      {"node_id": "humanwire", "label": "HumanWire", "kind": "service", "persona_id": null, "role": null, "initials": null, "active": false},
+      {"node_id": "caspian-gateway", "label": "Caspian Gateway", "kind": "gateway", "persona_id": null, "role": null, "initials": null, "active": false},
+      {"node_id": "persona-quick-a", "label": "Priya Shah", "kind": "stakeholder", "persona_id": "quick-a", "role": "Product lead", "initials": "PS", "active": false},
+      {"node_id": "persona-structured", "label": "Anika Rao", "kind": "stakeholder", "persona_id": "structured", "role": "Risk & compliance lead", "initials": "AR", "active": true},
+      {"node_id": "interview", "label": "Targeted interview", "kind": "artifact", "persona_id": null, "role": null, "initials": null, "active": true}
+    ],
+    "graph_edges": [
+      {"source": "caspian-gateway", "destination": "persona-quick-a", "active": false},
+      {"source": "persona-structured", "destination": "interview", "active": true}
+    ],
+    "events": [
+      {
+        "timeline_ordinal": 1,
+        "persisted_ordinal": 1,
+        "created_at": "2026-08-14T15:15:00Z",
+        "stage": "outreach",
+        "effect": "persisted",
+        "active_transition": {"source": "caspian-gateway", "destination": "persona-quick-a", "source_label": "Caspian Gateway", "destination_label": "Priya Shah", "generated_label": "Response requested"},
+        "affected_persona_id": "quick-a",
+        "live_copy": "HumanWire requested Priya Shah's response."
+      },
+      {
+        "timeline_ordinal": 2,
+        "persisted_ordinal": 2,
+        "created_at": "2026-08-14T15:17:00Z",
+        "stage": "resolve",
+        "effect": "persisted",
+        "active_transition": {"source": "persona-structured", "destination": "interview", "source_label": "Anika Rao", "destination_label": "Targeted interview", "generated_label": "Constraint recorded"},
+        "affected_persona_id": "structured",
+        "live_copy": "Anika Rao's constraint opened a targeted interview."
+      }
+    ],
+    "conversations": [
+      {"ordinal": 1, "event_ordinal": 1, "created_at": "2026-08-14T15:15:00Z", "speaker": "Priya Shah", "role": "Product lead", "direction": "to_humanwire", "channel": "Workspace", "text": "Product requirements are aligned. No blockers from my side.", "status": "received"},
+      {"ordinal": 2, "event_ordinal": 2, "created_at": "2026-08-14T15:17:00Z", "speaker": "Anika Rao", "role": "Risk & compliance lead", "direction": "to_humanwire", "channel": "Workspace", "text": "Rollback ownership must be explicit before approval.", "status": "received"}
+    ],
+    "data_points": [
+      {"event_ordinal": 1, "label": "Response requested", "summary": "Priya Shah was asked for the product decision context.", "effect": "persisted"},
+      {"event_ordinal": 2, "label": "Constraint recorded", "summary": "Rollback ownership requires confirmation before approval.", "effect": "persisted"}
+    ],
+    "active_transition": {"source": "persona-structured", "destination": "interview", "source_label": "Anika Rao", "destination_label": "Targeted interview", "generated_label": "Constraint recorded"},
+    "current_event_ordinal": 2,
+    "total_event_count": 2,
+    "outcome": {"state": "meeting_ready", "headline": "The decision meeting is ready", "summary": "Saved evidence supports the meeting package.", "meeting_start": "2026-08-15T15:00:00Z", "meeting_end": "2026-08-15T15:30:00Z", "required_attendees": ["Priya Shah", "Marcus Reed", "Anika Rao", "Sofia Alvarez"]},
+    "downloads_ready": true
+  }
+]
