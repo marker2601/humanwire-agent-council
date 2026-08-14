@@ -198,7 +198,9 @@ The installed `humanwire synthetic ...` command and `python scripts/synthetic_hu
 
 Atomic ownership protects competing well-behaved proof harness runs. It is not a security boundary against a malicious process running under the same operating-system account with direct filesystem control.
 
-Successful stdout contains only the six exact provenance labels, safe scenario/run identifiers, action/inbound/delivery counts, terminal state, and semantic trace SHA-256. It contains no routes, destinations, response content, operational UUIDs, or filesystem paths. The transcript excludes private fixture text, and `CapturedDelivery` objects are never serialized.
+The default proof runs two linked, deterministic stories. Its primary mandate covers all six engagement contracts, two independent quick-response personas, an email structured interview that advances through a saved alternate-channel step to Telegram confirmation, explicit approval, availability, two bounded proposal rounds, verified overlap, and a meeting-ready package. A separate required approval returns `CHANGE` and ends `PARTIAL` with no proposal or meeting.
+
+Successful stdout contains only the six exact provenance labels, safe scenario/run identifiers, action/inbound/delivery counts, `terminal_state=partial`, `terminal_states=meeting_ready,partial`, and semantic trace SHA-256. It contains no routes, destinations, response content, operational UUIDs, or filesystem paths. The transcript excludes private fixture text, and `CapturedDelivery` objects are never serialized.
 
 **Non-live disclaimer:** This deterministic synthetic proof uses simulated personas, injected fake-Caspian transport, deterministic local policy, and fresh local SQLite. It does not contact real people, call Caspian or Featherless, verify a live provider or model, or constitute real-human testing.
 

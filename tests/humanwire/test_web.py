@@ -145,6 +145,57 @@ def test_read_only_route_surface_and_html_placeholders(web_client, demo_app) -> 
         assert response.headers["content-type"].startswith("text/html")
 
 
+def test_public_demo_pages_truthfully_mark_live_provider_proof_pending(web_client) -> None:
+    """Break caught: public chrome claims a live-provider recording exists while proof is pending."""
+    for path in (
+        "/",
+        "/mandates/HW-2411",
+        "/mandates/HW-2411/reach",
+        "/mandates/HW-2411/data",
+    ):
+        response = web_client.get(path)
+
+        assert response.status_code == 200
+        visible_text = html_lib.unescape(re.sub(r"<[^>]+>", " ", response.text))
+        visible_text = " ".join(visible_text.split())
+        assert "live-provider proof pending" in visible_text
+        assert "live channel proof is shown" not in visible_text
+
+
+def test_reach_renders_all_exact_synthetic_provenance_labels(web_client) -> None:
+    """Break caught: a judge can replay Reach without seeing its synthetic proof class."""
+    response = web_client.get("/mandates/HW-2411/reach")
+
+    assert response.status_code == 200
+    visible_text = html_lib.unescape(re.sub(r"<[^>]+>", " ", response.text))
+    visible_text = " ".join(visible_text.split())
+    expected = (
+        "proof_class=synthetic_multi_persona",
+        "actor_type=simulated_persona",
+        "identity_source=synthetic_fixture",
+        "transport=fake_caspian",
+        "human_attested=false",
+        "live_provider_verified=false",
+    )
+    assert all(label in visible_text for label in expected)
+    assert 'aria-label="Synthetic proof provenance"' in response.text
+
+    styles = Path("src/humanwire/static/styles.css").read_text(encoding="utf-8")
+    provenance_rule = re.search(
+        r"\.proof-provenance\s*\{(?P<body>.*?)\}", styles, re.DOTALL
+    )
+    code_rule = re.search(
+        r"\.proof-provenance code\s*\{(?P<body>.*?)\}", styles, re.DOTALL
+    )
+    responsive_start = styles.rfind("@media (max-width: 759px)")
+    responsive_styles = styles[responsive_start : responsive_start + 500]
+    assert provenance_rule is not None and "font-size: 14px" in provenance_rule["body"]
+    assert code_rule is not None and "font-size: 14px" in code_rule["body"]
+    assert responsive_start >= 0
+    assert ".proof-provenance" in responsive_styles
+    assert "flex-direction: column" in responsive_styles
+
+
 def test_csv_route_and_data_table_are_get_only_with_stable_contract(
     web_client, demo_app
 ) -> None:

@@ -15,6 +15,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 
+from humanwire.alignment import NegotiationCoordinator
 from humanwire.caspian_gateway import CaspianGateway
 from humanwire.config import Settings
 from humanwire.database import create_session_factory
@@ -28,7 +29,7 @@ from humanwire.domain import (
     Person,
     PlannedStakeholder,
 )
-from humanwire.evidence import RuleBasedEvidenceExtractor
+from humanwire.evidence import EvidenceDraft, RuleBasedEvidenceExtractor
 from humanwire.offline_caspian import (
     CapturedDelivery,
     OfflineCaspianClient,
@@ -60,6 +61,8 @@ class SyntheticIntent(StrEnum):
     APPROVE = "approve"
     CHANGE = "change"
     AVAILABILITY = "availability"
+    ACCEPT_PROPOSAL = "accept_proposal"
+    CHANGE_PROPOSAL = "change_proposal"
     SILENCE = "silence"
     ERROR = "error"
 
@@ -121,6 +124,14 @@ def default_synthetic_scenario() -> SyntheticScenario:
         scenario_id="launch-v1",
         personas=[
             SyntheticPersona(
+                persona_id="synthetic-manager",
+                display_name="Synthetic Manager",
+                role="Simulation manager",
+                email="synthetic-manager@example.test",
+                channels=[Channel.EMAIL],
+                allowed_intents=[SyntheticIntent.AVAILABILITY],
+            ),
+            SyntheticPersona(
                 persona_id="inform",
                 display_name="Inform Persona",
                 role="Delivery owner",
@@ -134,18 +145,35 @@ def default_synthetic_scenario() -> SyntheticScenario:
                 role="Executive owner",
                 email="ack@example.test",
                 channels=[Channel.EMAIL],
-                allowed_intents=[SyntheticIntent.ACKNOWLEDGE],
+                allowed_intents=[
+                    SyntheticIntent.ACKNOWLEDGE,
+                    SyntheticIntent.ACCEPT_PROPOSAL,
+                ],
             ),
             SyntheticPersona(
-                persona_id="quick",
-                display_name="Quick Persona",
+                persona_id="quick-a",
+                display_name="Quick Persona A",
                 role="Program owner",
-                email="quick@example.test",
+                email="quick-a@example.test",
                 channels=[Channel.EMAIL],
                 allowed_intents=[
                     SyntheticIntent.ACKNOWLEDGE,
                     SyntheticIntent.ANSWER,
                     SyntheticIntent.CONFIRM_EVIDENCE,
+                    SyntheticIntent.ACCEPT_PROPOSAL,
+                ],
+            ),
+            SyntheticPersona(
+                persona_id="quick-b",
+                display_name="Quick Persona B",
+                role="Operations owner",
+                email="quick-b@example.test",
+                channels=[Channel.EMAIL],
+                allowed_intents=[
+                    SyntheticIntent.ACKNOWLEDGE,
+                    SyntheticIntent.ANSWER,
+                    SyntheticIntent.CONFIRM_EVIDENCE,
+                    SyntheticIntent.ACCEPT_PROPOSAL,
                 ],
             ),
             SyntheticPersona(
@@ -158,6 +186,9 @@ def default_synthetic_scenario() -> SyntheticScenario:
                     SyntheticIntent.ACKNOWLEDGE,
                     SyntheticIntent.INTERVIEW_RESPONSE,
                     SyntheticIntent.CONFIRM_EVIDENCE,
+                    SyntheticIntent.SILENCE,
+                    SyntheticIntent.CHANGE_PROPOSAL,
+                    SyntheticIntent.AVAILABILITY,
                 ],
                 private_facts=["PRIVATE-PERSONA-SENTINEL"],
             ),
@@ -167,7 +198,10 @@ def default_synthetic_scenario() -> SyntheticScenario:
                 role="Approval owner",
                 email="approval@example.test",
                 channels=[Channel.EMAIL],
-                allowed_intents=[SyntheticIntent.APPROVE, SyntheticIntent.CHANGE],
+                allowed_intents=[
+                    SyntheticIntent.APPROVE,
+                    SyntheticIntent.ACCEPT_PROPOSAL,
+                ],
             ),
             SyntheticPersona(
                 persona_id="availability",
@@ -175,7 +209,18 @@ def default_synthetic_scenario() -> SyntheticScenario:
                 role="Scheduling owner",
                 email="availability@example.test",
                 channels=[Channel.EMAIL],
-                allowed_intents=[SyntheticIntent.AVAILABILITY],
+                allowed_intents=[
+                    SyntheticIntent.AVAILABILITY,
+                    SyntheticIntent.ACCEPT_PROPOSAL,
+                ],
+            ),
+            SyntheticPersona(
+                persona_id="approval-change",
+                display_name="Change Persona",
+                role="Independent change authority",
+                email="approval-change@example.test",
+                channels=[Channel.EMAIL],
+                allowed_intents=[SyntheticIntent.CHANGE],
             ),
         ],
         provenance=SyntheticProvenance(
@@ -363,6 +408,7 @@ class SyntheticRunResult:
     captured_deliveries: tuple[CapturedDelivery, ...]
     model_client_configured: bool
     final_state: str
+    terminal_states: tuple[str, ...]
 
 
 class _DeterministicPersonaPolicy:
@@ -395,7 +441,8 @@ class _InformPolicy(_DeterministicPersonaPolicy):
 
 class _AcknowledgePolicy(_DeterministicPersonaPolicy):
     def _choose(self, context: _PersonaContext) -> tuple[SyntheticIntent, str]:
-        del context
+        if "humanwire draft proposal" in context.delivered_message.casefold():
+            return SyntheticIntent.ACCEPT_PROPOSAL, "Accepted."
         self.complete = True
         return SyntheticIntent.ACKNOWLEDGE, "Acknowledged."
 
@@ -403,6 +450,8 @@ class _AcknowledgePolicy(_DeterministicPersonaPolicy):
 class _QuickResponsePolicy(_DeterministicPersonaPolicy):
     def _choose(self, context: _PersonaContext) -> tuple[SyntheticIntent, str]:
         prompt = context.delivered_message.casefold()
+        if "humanwire draft proposal" in prompt:
+            return SyntheticIntent.ACCEPT_PROPOSAL, "Accepted."
         if "evidence confirmation" in prompt and "evidence confirmed" not in prompt:
             self.complete = True
             return SyntheticIntent.CONFIRM_EVIDENCE, "Confirmed."
@@ -414,6 +463,13 @@ class _QuickResponsePolicy(_DeterministicPersonaPolicy):
 class _StructuredInterviewPolicy(_DeterministicPersonaPolicy):
     def _choose(self, context: _PersonaContext) -> tuple[SyntheticIntent, str]:
         prompt = context.delivered_message.casefold()
+        if "humanwire availability request" in prompt:
+            return (
+                SyntheticIntent.AVAILABILITY,
+                "2026-08-13T15:00:00+00:00/2026-08-13T16:00:00+00:00",
+            )
+        if "humanwire draft proposal" in prompt:
+            return SyntheticIntent.CHANGE_PROPOSAL, "Keep human review on the agenda."
         if "evidence confirmation" in prompt and "evidence confirmed" not in prompt:
             self.complete = True
             return SyntheticIntent.CONFIRM_EVIDENCE, "Confirmed."
@@ -424,17 +480,30 @@ class _StructuredInterviewPolicy(_DeterministicPersonaPolicy):
             )
             if prior_answers == 0 and self.profile.private_facts:
                 digest = _sha256(self.profile.private_facts[0])
-                return SyntheticIntent.INTERVIEW_RESPONSE, f"PRIVATE: sha256:{digest}"
+                return (
+                    SyntheticIntent.INTERVIEW_RESPONSE,
+                    f"PRIVATE: must preserve sha256:{digest}",
+                )
+            if prior_answers == 1:
+                return (
+                    SyntheticIntent.INTERVIEW_RESPONSE,
+                    "The team must keep human review on the agenda.",
+                )
             return (
                 SyntheticIntent.INTERVIEW_RESPONSE,
                 "The team can support a reviewed launch.",
             )
+        if "prior registered route" in prompt and "reply ack" in prompt:
+            return SyntheticIntent.ACKNOWLEDGE, "Acknowledged."
+        if SyntheticIntent.SILENCE in self.profile.allowed_intents:
+            return SyntheticIntent.SILENCE, "synthetic_silence"
         return SyntheticIntent.ACKNOWLEDGE, "Acknowledged."
 
 
 class _ReviewApprovalPolicy(_DeterministicPersonaPolicy):
     def _choose(self, context: _PersonaContext) -> tuple[SyntheticIntent, str]:
-        del context
+        if "humanwire draft proposal" in context.delivered_message.casefold():
+            return SyntheticIntent.ACCEPT_PROPOSAL, "Accepted."
         self.complete = True
         if SyntheticIntent.APPROVE in self.profile.allowed_intents:
             return SyntheticIntent.APPROVE, "Approved."
@@ -443,7 +512,8 @@ class _ReviewApprovalPolicy(_DeterministicPersonaPolicy):
 
 class _AvailabilityPolicy(_DeterministicPersonaPolicy):
     def _choose(self, context: _PersonaContext) -> tuple[SyntheticIntent, str]:
-        del context
+        if "humanwire draft proposal" in context.delivered_message.casefold():
+            return SyntheticIntent.ACCEPT_PROPOSAL, "Accepted."
         self.complete = True
         return (
             SyntheticIntent.AVAILABILITY,
@@ -491,10 +561,15 @@ class _SyntheticPlanner:
         self.scenario = scenario
 
     def plan(self, text: str, initiator: Person) -> ResolvedPlan:
-        del text, initiator
+        del initiator
+        change_story = "required approval change" in text.casefold()
         stakeholders: list[PlannedStakeholder] = []
         people: list[Person] = []
         for persona in self.scenario.personas:
+            if persona.persona_id == "synthetic-manager":
+                continue
+            if change_story != (persona.persona_id == "approval-change"):
+                continue
             contract = _contract_for(persona)
             questions: list[str] = []
             if contract is EngagementType.QUICK_RESPONSE:
@@ -505,10 +580,15 @@ class _SyntheticPlanner:
                     "Which launch date is recorded?",
                     "What can the team support?",
                 ]
+            reason = (
+                "Approve the synthetic launch"
+                if contract is EngagementType.REVIEW_APPROVAL
+                else f"Provide the {contract.value} contribution"
+            )
             stakeholders.append(
                 PlannedStakeholder(
                     person_ref=persona.persona_id,
-                    reason=f"Provide the {contract.value} contribution",
+                    reason=reason,
                     direction=Direction.DOWNWARD,
                     required=contract is not EngagementType.INFORM,
                     engagement_type=contract,
@@ -519,7 +599,11 @@ class _SyntheticPlanner:
             people.append(self.people[persona.persona_id])
         return ResolvedPlan(
             plan=MandatePlan(
-                objective="Coordinate the deterministic synthetic launch",
+                objective=(
+                    "Record a required approval change without escalation"
+                    if change_story
+                    else "Coordinate the deterministic synthetic launch"
+                ),
                 required_decisions=["Approve the synthetic launch"],
                 stakeholders=stakeholders,
                 completion_conditions=["Every required synthetic contribution is recorded"],
@@ -527,6 +611,40 @@ class _SyntheticPlanner:
             people=people,
             planner="deterministic_synthetic",
         )
+
+
+class _SyntheticEvidenceExtractor(RuleBasedEvidenceExtractor):
+    """Bind one public synthetic constraint to the approved launch decision."""
+
+    def extract(self, *args, **kwargs) -> list[EvidenceDraft]:
+        drafts = super().extract(*args, **kwargs)
+        return [
+            draft.model_copy(
+                update={"related_decision": "Approve the synthetic launch"}
+            )
+            if draft.statement == "The team must keep human review on the agenda."
+            else draft
+            for draft in drafts
+        ]
+
+
+class _SyntheticNegotiationCoordinator(NegotiationCoordinator):
+    """Normalize issue order before deterministic proposal drafting."""
+
+    def prepare_proposal(self, mandate, report, round_number, now):
+        normalized = report.model_copy(
+            update={
+                "issues": sorted(
+                    report.issues,
+                    key=lambda issue: (
+                        issue.issue_type.value,
+                        issue.summary,
+                        tuple(issue.stakeholder_ids),
+                    ),
+                )
+            }
+        )
+        return super().prepare_proposal(mandate, normalized, round_number, now)
 
 
 @dataclass(frozen=True)
@@ -584,6 +702,8 @@ def _synthetic_directory(
     )
     people = {manager.person_id: manager}
     for persona in scenario.personas:
+        if persona.persona_id == manager.person_id:
+            continue
         routes = []
         for index, channel in enumerate(persona.channels):
             routes.append(
@@ -674,6 +794,10 @@ def _wire_command(
         return f"DECIDE {token} CHANGE {content}"
     if intent is SyntheticIntent.AVAILABILITY:
         return f"AVAILABLE {token} {content}"
+    if intent is SyntheticIntent.ACCEPT_PROPOSAL:
+        return f"ACCEPT {token}"
+    if intent is SyntheticIntent.CHANGE_PROPOSAL:
+        return f"CHANGE {token} {content}"
     raise ValueError("unsupported synthetic intent")
 
 
@@ -689,8 +813,6 @@ def _delivery_persona(
         return owner
     matches: list[tuple[str, Channel]] = []
     for persona_id, person in people.items():
-        if persona_id == "synthetic-manager":
-            continue
         for route in person.routes:
             if delivery.kind == "initiate" and route.recipient == delivery.destination:
                 matches.append((persona_id, Channel.EMAIL))
@@ -720,8 +842,8 @@ def _persona_context(
 
 
 def _validated_output_path(output_path: str | Path, run_root: str | Path) -> tuple[Path, Path]:
-    root = Path(run_root).resolve()
-    output = Path(output_path).resolve()
+    root = Path(run_root).absolute()
+    output = Path(output_path).absolute()
     try:
         output.relative_to(root)
     except ValueError as error:
@@ -789,12 +911,14 @@ def generate_scenario(
     directory, people = _synthetic_directory(scenario)
     session_factory = create_session_factory(settings.database_url)
     repository = SqlAlchemyHumanWireRepository(session_factory)
+    negotiation = _SyntheticNegotiationCoordinator(repository)
     workflow = HumanWireWorkflow(
         directory,
         repository,
         _SyntheticPlanner(people, scenario),
-        RuleBasedEvidenceExtractor(),
+        _SyntheticEvidenceExtractor(),
         settings,
+        negotiation_coordinator=negotiation,
     )
     client = OfflineCaspianClient()
     clock = [_FIXED_TIME]
@@ -843,8 +967,30 @@ def generate_scenario(
             if resolved is None:
                 continue
             persona_id, channel = resolved
+            if (
+                persona_id == "synthetic-manager"
+                and "HUMANWIRE AVAILABILITY REQUEST" not in delivery.text
+            ):
+                continue
             policy = policies[persona_id]
-            if getattr(policy, "complete", False):
+            is_proposal = "HUMANWIRE DRAFT PROPOSAL" in delivery.text
+            is_availability = "HUMANWIRE AVAILABILITY REQUEST" in delivery.text
+            can_answer_proposal = bool(
+                {
+                    SyntheticIntent.ACCEPT_PROPOSAL,
+                    SyntheticIntent.CHANGE_PROPOSAL,
+                }.intersection(persona_by_id[persona_id].allowed_intents)
+            )
+            can_answer_availability = (
+                SyntheticIntent.AVAILABILITY
+                in persona_by_id[persona_id].allowed_intents
+            )
+            if getattr(policy, "complete", False) and (
+                not (
+                    (is_proposal and can_answer_proposal)
+                    or (is_availability and can_answer_availability)
+                )
+            ):
                 continue
             persona = persona_by_id[persona_id]
             visible = _persona_visible_message(delivery.text, persona.private_facts)
@@ -925,7 +1071,55 @@ def generate_scenario(
             )
 
     collect_deliveries(clock[0])
-    while queued:
+    change_story_enabled = "approval-change" in persona_by_id
+    change_story_started = False
+    due_advances = 0
+    while True:
+        if not queued:
+            mandates = sorted(
+                repository.list_recent_mandates(1000),
+                key=lambda item: item.created_at,
+            )
+            if (
+                change_story_enabled
+                and not change_story_started
+                and mandates
+                and mandates[0].state.value == "meeting_ready"
+            ):
+                change_story_started = True
+                client.emit_inbound(
+                    email_envelope(
+                        message_id="synthetic-manager-change-mandate",
+                        conversation_id="synthetic-manager-change-conversation",
+                        sender_address="synthetic-manager@example.test",
+                        sender_name="Synthetic Manager",
+                        text=(
+                            "/mandate\nRecord the required approval change safely"
+                        ),
+                    )
+                )
+                gateway.dispatch_all(workflow.process_due(clock[0]))
+                collect_deliveries(clock[0])
+                continue
+
+            due_times = [
+                assignment.next_action_at
+                for mandate in mandates
+                if mandate.state.value == "interviewing"
+                for assignment in repository.list_assignments(mandate.mandate_id)
+                if assignment.next_action_at is not None
+                and assignment.next_action_at > clock[0]
+            ]
+            if due_times:
+                due_advances += 1
+                if due_advances > 32:
+                    raise ValueError("synthetic due-work progression exceeded its bound")
+                clock[0] = min(due_times)
+                gateway.dispatch_all(workflow.process_due(clock[0]))
+                collect_deliveries(clock[0])
+                continue
+            break
+
         _, persona_id, _, queued_action = heapq.heappop(queued)
         action = queued_action.action
         clock[0] = action.timestamp
@@ -988,8 +1182,12 @@ def generate_scenario(
         root,
         transcript.model_dump_json(indent=2) + "\n",
     )
+    all_mandates = sorted(
+        repository.list_recent_mandates(1000), key=lambda item: item.created_at
+    )
     latest = repository.list_recent_mandates(1)
     final_state = latest[0].state.value if latest else "missing"
+    terminal_states = tuple(item.state.value for item in all_mandates)
     session_factory.kw["bind"].dispose()
     return SyntheticRunResult(
         transcript=transcript,
@@ -999,6 +1197,7 @@ def generate_scenario(
         captured_deliveries=tuple(client.deliveries),
         model_client_configured=False,
         final_state=final_state,
+        terminal_states=terminal_states,
     )
 
 
@@ -1016,12 +1215,14 @@ def replay_transcript(
     directory, people = _synthetic_directory(scenario)
     session_factory = create_session_factory(settings.database_url)
     repository = SqlAlchemyHumanWireRepository(session_factory)
+    negotiation = _SyntheticNegotiationCoordinator(repository)
     workflow = HumanWireWorkflow(
         directory,
         repository,
         _SyntheticPlanner(people, scenario),
-        RuleBasedEvidenceExtractor(),
+        _SyntheticEvidenceExtractor(),
         settings,
+        negotiation_coordinator=negotiation,
     )
     client = OfflineCaspianClient()
     clock = [_FIXED_TIME]
@@ -1069,16 +1270,23 @@ def replay_transcript(
             if resolved is None:
                 continue
             persona_id, channel = resolved
+            if (
+                persona_id == "synthetic-manager"
+                and "HUMANWIRE AVAILABILITY REQUEST" not in delivery.text
+            ):
+                continue
             if pending_by_persona[persona_id] == 0:
                 continue
-            trigger_sequence += 1
-            trigger_id = f"outbound-{trigger_sequence}"
-            action = actions_by_trigger.pop(trigger_id, None)
+            candidate_id = f"outbound-{trigger_sequence + 1}"
+            action = actions_by_trigger.get(candidate_id)
             if action is None:
                 raise ValueError("replay produced an unrecorded outbound trigger")
             visible = _persona_visible_message(delivery.text, [])
-            if _sha256(visible) != transcript.outbound_digests[trigger_id]:
-                raise ValueError("replay outbound trigger digest mismatch")
+            if _sha256(visible) != transcript.outbound_digests[candidate_id]:
+                continue
+            trigger_sequence += 1
+            trigger_id = candidate_id
+            actions_by_trigger.pop(trigger_id)
             if action.persona_id != persona_id or action.channel is not channel:
                 raise ValueError("replay outbound identity mapping mismatch")
             token_match = _TOKEN_PATTERN.search(delivery.text)
@@ -1099,7 +1307,55 @@ def replay_transcript(
             )
 
     collect_frozen_deliveries()
-    while queued:
+    change_story_enabled = "approval-change" in persona_by_id
+    change_story_started = False
+    due_advances = 0
+    while True:
+        if not queued:
+            mandates = sorted(
+                repository.list_recent_mandates(1000),
+                key=lambda item: item.created_at,
+            )
+            if (
+                change_story_enabled
+                and not change_story_started
+                and mandates
+                and mandates[0].state.value == "meeting_ready"
+            ):
+                change_story_started = True
+                client.emit_inbound(
+                    email_envelope(
+                        message_id="synthetic-manager-change-mandate",
+                        conversation_id="synthetic-manager-change-conversation",
+                        sender_address="synthetic-manager@example.test",
+                        sender_name="Synthetic Manager",
+                        text=(
+                            "/mandate\nRecord the required approval change safely"
+                        ),
+                    )
+                )
+                gateway.dispatch_all(workflow.process_due(clock[0]))
+                collect_frozen_deliveries()
+                continue
+
+            due_times = [
+                assignment.next_action_at
+                for mandate in mandates
+                if mandate.state.value == "interviewing"
+                for assignment in repository.list_assignments(mandate.mandate_id)
+                if assignment.next_action_at is not None
+                and assignment.next_action_at > clock[0]
+            ]
+            if due_times:
+                due_advances += 1
+                if due_advances > 32:
+                    raise ValueError("synthetic due-work progression exceeded its bound")
+                clock[0] = min(due_times)
+                gateway.dispatch_all(workflow.process_due(clock[0]))
+                collect_frozen_deliveries()
+                continue
+            break
+
         _, persona_id, _, queued_action = heapq.heappop(queued)
         action = queued_action.action
         clock[0] = action.timestamp
@@ -1139,8 +1395,12 @@ def replay_transcript(
 
     if actions_by_trigger:
         raise ValueError("replay did not reproduce every frozen outbound trigger")
+    all_mandates = sorted(
+        repository.list_recent_mandates(1000), key=lambda item: item.created_at
+    )
     latest = repository.list_recent_mandates(1)
     final_state = latest[0].state.value if latest else "missing"
+    terminal_states = tuple(item.state.value for item in all_mandates)
     session_factory.kw["bind"].dispose()
     return SyntheticRunResult(
         transcript=transcript,
@@ -1150,6 +1410,7 @@ def replay_transcript(
         captured_deliveries=tuple(client.deliveries),
         model_client_configured=False,
         final_state=final_state,
+        terminal_states=terminal_states,
     )
 
 
@@ -1226,11 +1487,13 @@ def _semantic_trace(result: SyntheticRunResult) -> dict[str, object]:
     deliveries = []
     for delivery in result.captured_deliveries:
         if delivery.kind == "reply":
-            destination = (
-                "manager"
-                if delivery.destination == "synthetic-manager-mandate"
-                else action_alias_for_message(delivery.destination)
-            )
+            manager_destinations = {
+                "synthetic-manager-mandate": "manager/primary",
+                "synthetic-manager-change-mandate": "manager/change",
+            }
+            destination = manager_destinations.get(delivery.destination)
+            if destination is None:
+                destination = action_alias_for_message(delivery.destination)
         elif delivery.kind == "initiate":
             owners = email_owners.get(delivery.destination, [])
             if len(owners) != 1:
@@ -1621,7 +1884,22 @@ def _semantic_trace(result: SyntheticRunResult) -> dict[str, object]:
                 elif key == "meeting_id":
                     normalized[key] = meeting_alias[UUID(str(value))]
                 elif key == "delivery_id":
-                    normalized[key] = delivery_alias[str(value)]
+                    alias = delivery_alias.get(str(value))
+                    if alias is None:
+                        if event.assignment_id is None:
+                            raise ValueError("semantic delivery identity lacks assignment")
+                        assignment = next(
+                            item
+                            for item in assignments
+                            if item.assignment_id == event.assignment_id
+                        )
+                        route_index = int(event.metadata.get("route_index", 0))
+                        attempt = int(event.metadata.get("attempt_count", 0))
+                        alias = (
+                            f"{assignment_alias[event.assignment_id]}/attempt/{attempt}/"
+                            f"{route_alias_by_id[assignment.route_ids[route_index]]}"
+                        )
+                    normalized[key] = alias
                 elif key == "message_id":
                     normalized[key] = action_alias_for_message(str(value))
                 elif key == "route_fingerprint":
@@ -1734,6 +2012,7 @@ def _semantic_trace(result: SyntheticRunResult) -> dict[str, object]:
         "gateway_handler_count": result.gateway_handler_count,
         "model_client_configured": result.model_client_configured,
         "final_state": result.final_state,
+        "terminal_states": list(result.terminal_states),
     }
 
 

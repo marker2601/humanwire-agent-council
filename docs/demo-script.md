@@ -24,7 +24,9 @@ $replayRoot = Join-Path $PWD "work/synthetic-replay-01"
 python -m humanwire synthetic replay --transcript tests/fixtures/humanwire/synthetic_launch_v1.json --run-root $replayRoot
 ```
 
-Point out the exact visible provenance: `proof_class=synthetic_multi_persona`, `actor_type=simulated_persona`, `identity_source=synthetic_fixture`, `transport=fake_caspian`, `human_attested=false`, and `live_provider_verified=false`. Both commands print only safe identifiers, counts, terminal state, and trace hash. They never print routes, destinations, response content, UUIDs, or local paths.
+Point out the exact visible provenance: `proof_class=synthetic_multi_persona`, `actor_type=simulated_persona`, `identity_source=synthetic_fixture`, `transport=fake_caspian`, `human_attested=false`, and `live_provider_verified=false`. Both commands print only safe identifiers, counts, `terminal_state=partial`, `terminal_states=meeting_ready,partial`, and the same trace hash. They never print routes, destinations, response content, UUIDs, or local paths.
+
+Walk the semantic milestones rather than only the counts: the primary mandate includes all six contracts, two independent quick responses, saved email-to-Telegram structured continuation plus confirmation, approval, availability, proposal rounds one and two, and a verified meeting-ready package. The second mandate records a required approval `CHANGE`, ends `PARTIAL`, and creates neither a proposal nor a meeting.
 
 The claim fails closed if the root already exists or a competing output appears. HumanWire does not overwrite or recursively delete preexisting data and writes no artifact outside the claimed root. Atomic ownership coordinates well-behaved harness runs; it is not a security boundary against a malicious same-account process with direct filesystem control.
 

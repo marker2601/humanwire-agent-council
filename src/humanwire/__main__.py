@@ -94,6 +94,7 @@ def _print_synthetic_summary(result) -> None:
         ("inbound_attempt_count", str(len(result.inbound_envelopes))),
         ("delivery_count", str(len(result.captured_deliveries))),
         ("terminal_state", result.final_state),
+        ("terminal_states", ",".join(result.terminal_states)),
         ("trace_sha256", trace_hash),
     )
     for label, value in values:

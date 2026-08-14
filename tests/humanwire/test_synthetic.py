@@ -276,6 +276,117 @@ def test_generation_runs_six_distinct_deterministic_persona_policies(tmp_path) -
     assert intents["availability"] == [SyntheticIntent.AVAILABILITY]
 
 
+def test_default_scenario_executes_the_approved_primary_and_change_stories(tmp_path) -> None:
+    """Break caught: the frozen proof stops at counts instead of the approved outcomes."""
+    result = _generate(tmp_path, synthetic_module.default_synthetic_scenario())
+    trace = synthetic_module._semantic_trace(result)
+
+    contracts = {assignment["engagement_type"] for assignment in trace["assignments"]}
+    assert contracts == {
+        "inform",
+        "acknowledge",
+        "quick_response",
+        "structured_interview",
+        "review_approval",
+        "availability",
+    }
+    quick_people = {
+        assignment["person"]
+        for assignment in trace["assignments"]
+        if assignment["engagement_type"] == "quick_response"
+    }
+    assert quick_people == {"quick-a", "quick-b"}
+
+    mandates_by_state = {mandate["state"]: mandate for mandate in trace["mandates"]}
+    assert set(mandates_by_state) == {"meeting_ready", "partial"}
+    primary_token = mandates_by_state["meeting_ready"]["mandate"]
+    change_token = mandates_by_state["partial"]["mandate"]
+
+    primary_events = [
+        event for event in trace["events"] if event["mandate"] == primary_token
+    ]
+    primary_types = {event["type"] for event in primary_events}
+    assert {
+        "outreach.alternate_sent",
+        "interview.evidence_confirmed",
+        "engagement.decision_recorded",
+        "availability.recorded",
+        "mandate.meeting_required",
+        "meeting.package_created",
+        "mandate.meeting_ready",
+    } <= primary_types
+    assert [
+        proposal["round"]
+        for proposal in trace["proposals"]
+        if proposal["mandate"] == primary_token
+    ] == [1, 2]
+    primary_decisions = [
+        decision
+        for decision in trace["engagement_decisions"]
+        if decision["assignment"].startswith(f"{primary_token}/")
+    ]
+    assert [decision["response"] for decision in primary_decisions] == ["approve"]
+    meeting = next(
+        item for item in trace["meetings"] if item["mandate"] == primary_token
+    )
+    assert meeting["required_attendees"] == ["structured", "synthetic-manager"]
+    assert meeting["proposed_start"] == "2026-08-13T15:00:00Z"
+    assert meeting["proposed_end"] == "2026-08-13T15:30:00Z"
+    assert {
+        action["persona"]
+        for action in trace["actions"]
+        if action["intent"] == "availability"
+    } == {"availability", "structured", "synthetic-manager"}
+
+    structured_actions = [
+        action for action in trace["actions"] if action["persona"] == "structured"
+    ]
+    assert structured_actions[0]["channel"] == "email"
+    assert any(action["channel"] == "telegram" for action in structured_actions)
+    assert any(
+        action["channel"] == "telegram" and action["intent"] == "confirm_evidence"
+        for action in structured_actions
+    )
+    assert result.gateway_handler_count == 1
+    assert {
+        item["action"] for item in trace["inbound_attempts"]
+    } == {
+        action["action_id"]
+        for action in trace["actions"]
+        if action["intent"] != "silence"
+    }
+
+    change_decisions = [
+        decision
+        for decision in trace["engagement_decisions"]
+        if decision["assignment"].startswith(f"{change_token}/")
+    ]
+    assert [decision["response"] for decision in change_decisions] == ["change"]
+    assert not any(
+        proposal["mandate"] == change_token for proposal in trace["proposals"]
+    )
+    assert not any(meeting["mandate"] == change_token for meeting in trace["meetings"])
+
+
+def test_frozen_replay_preserves_both_terminal_outcomes_and_semantic_hash(tmp_path) -> None:
+    """Break caught: checked-in replay diverges from generation or drops one scenario."""
+    generated = generate_scenario(
+        synthetic_module.default_synthetic_scenario(),
+        tmp_path / "generated" / "transcript.json",
+        tmp_path / "generated",
+    )
+    frozen = synthetic_module.replay_transcript(
+        Path("tests/fixtures/humanwire/synthetic_launch_v1.json"),
+        tmp_path / "frozen",
+    )
+
+    assert generated.terminal_states == ("meeting_ready", "partial")
+    assert frozen.terminal_states == generated.terminal_states
+    assert synthetic_module.semantic_trace_hash(frozen) == (
+        synthetic_module.semantic_trace_hash(generated)
+    )
+
+
 def _policy_object_graph(policy) -> tuple[set[str], list[object]]:
     names: set[str] = set()
     values: list[object] = []
@@ -1091,6 +1202,7 @@ def test_synthetic_generate_and_replay_print_only_safe_proof_summary(
         "inbound_attempt_count",
         "delivery_count",
         "terminal_state",
+        "terminal_states",
         "trace_sha256",
     }
     for capture in (generated_capture, replay_capture):
@@ -1115,6 +1227,7 @@ def test_synthetic_generate_and_replay_print_only_safe_proof_summary(
             "partial",
             "scheduling",
         }
+        assert summary["terminal_states"] == "meeting_ready,partial"
         assert re.fullmatch(r"[0-9a-f]{64}", summary["trace_sha256"])
         forbidden = (
             private_text,
