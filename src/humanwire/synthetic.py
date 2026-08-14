@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import heapq
 import json
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -29,11 +31,20 @@ from humanwire.domain import (
     PlannedStakeholder,
 )
 from humanwire.evidence import EvidenceDraft, RuleBasedEvidenceExtractor
+from humanwire.model_client import ModelFailure
 from humanwire.offline_caspian import (
     CapturedDelivery,
     OfflineCaspianClient,
     email_envelope,
     telegram_envelope,
+)
+from humanwire.persona_runtime import (
+    PERSONA_PROMPT_VERSION,
+    PersonaDecisionEngine,
+    PersonaVisibility,
+    SyntheticGenerationMode,
+    SyntheticIntent,
+    SyntheticProvenance,
 )
 from humanwire.persona_runtime import (
     PersonaContext as _PersonaContext,
@@ -46,11 +57,6 @@ from humanwire.persona_runtime import (
 )
 from humanwire.persona_runtime import (
     PersonaTranscriptEntry as _PersonaTranscriptEntry,
-)
-from humanwire.persona_runtime import (
-    PersonaVisibility,
-    SyntheticIntent,
-    SyntheticProvenance,
 )
 from humanwire.planning import ResolvedPlan
 from humanwire.repository import SqlAlchemyHumanWireRepository
@@ -112,6 +118,16 @@ class SyntheticScenario(_StrictModel):
         if len(set(persona_ids)) != len(persona_ids):
             raise ValueError("persona IDs must be unique")
         return self
+
+
+class SyntheticRunSidecar(_StrictModel):
+    schema_version: Literal["humanwire.synthetic-run/v1"]
+    mode: Literal["model_assisted"]
+    model_identifier: str = Field(min_length=1, max_length=200)
+    prompt_version: Literal["humanwire.persona-decision/v1"]
+    identity_seed: int = Field(ge=0, le=2_147_483_647)
+    transcript_sha256: str = Field(pattern=_DIGEST_PATTERN)
+    provenance: SyntheticProvenance
 
 
 def _default_persona_contracts() -> list[SyntheticPersona]:
@@ -275,6 +291,23 @@ class SyntheticAction(_StrictModel):
         return self
 
 
+def canonical_action_order(
+    scenario: SyntheticScenario,
+    action: SyntheticAction,
+) -> tuple[datetime, int, str, int]:
+    """Order actions by saved virtual time and scenario identity, never scheduling."""
+    persona_rank = {
+        persona.persona_id: index for index, persona in enumerate(scenario.personas)
+    }
+    try:
+        rank = persona_rank[action.persona_id]
+    except KeyError as error:
+        raise ValueError(
+            f"action {action.action_id} references unknown persona {action.persona_id}"
+        ) from error
+    return (action.timestamp, rank, action.trigger_id, action.local_sequence)
+
+
 class SyntheticTranscript(_StrictModel):
     scenario: SyntheticScenario
     outbound_digests: dict[str, str] = Field(min_length=1, max_length=256)
@@ -307,7 +340,7 @@ class SyntheticTranscript(_StrictModel):
         if len(set(action_ids)) != len(action_ids):
             raise ValueError("action IDs must be unique")
 
-        previous_order: tuple[datetime, str, int] | None = None
+        previous_order: tuple[datetime, int, str, int] | None = None
         trigger_ids: list[str] = []
         for action in self.actions:
             persona = persona_by_id.get(action.persona_id)
@@ -323,7 +356,7 @@ class SyntheticTranscript(_StrictModel):
             ):
                 raise ValueError(f"persona {action.persona_id} is not allowed intent {action.intent.value}")
 
-            order = (action.timestamp, action.persona_id, action.local_sequence)
+            order = canonical_action_order(self.scenario, action)
             if previous_order is not None and order <= previous_order:
                 raise ValueError("actions must use strict deterministic order")
             previous_order = order
@@ -400,6 +433,9 @@ class SyntheticRunResult:
     model_client_configured: bool
     final_state: str
     terminal_states: tuple[str, ...]
+    mode: SyntheticGenerationMode
+    model_identifier: str | None
+    provenance_path: Path | None
 
 
 class _DeterministicPersonaPolicy:
@@ -555,6 +591,16 @@ def _contract_for(persona: SyntheticPersona) -> EngagementType:
     return EngagementType.ACKNOWLEDGE
 
 
+def _profile_for(persona: SyntheticPersona) -> _PolicyProfile:
+    contract = _contract_for(persona)
+    return _PolicyProfile(
+        role=persona.role,
+        private_facts=tuple(persona.private_facts),
+        allowed_intents=tuple(persona.allowed_intents),
+        engagement_contract=contract,
+    )
+
+
 def _build_policy(persona: SyntheticPersona) -> _DeterministicPersonaPolicy:
     contract = _contract_for(persona)
     strategies: dict[EngagementType, type[_DeterministicPersonaPolicy]] = {
@@ -565,13 +611,7 @@ def _build_policy(persona: SyntheticPersona) -> _DeterministicPersonaPolicy:
         EngagementType.REVIEW_APPROVAL: _ReviewApprovalPolicy,
         EngagementType.AVAILABILITY: _AvailabilityPolicy,
     }
-    profile = _PolicyProfile(
-        role=persona.role,
-        private_facts=tuple(persona.private_facts),
-        allowed_intents=tuple(persona.allowed_intents),
-        engagement_contract=contract,
-    )
-    return strategies[contract](profile)
+    return strategies[contract](_profile_for(persona))
 
 
 class _SyntheticPlanner:
@@ -671,6 +711,116 @@ class _QueuedAction:
     action: SyntheticAction
     raw_delivery: str
     mandate_token: str
+
+
+@dataclass(frozen=True)
+class _DecisionCandidate:
+    persona_id: str
+    profile: _PolicyProfile
+    context: _PersonaContext
+    channel: Channel
+    base_time: datetime
+    local_sequence: int
+    trigger_id: str
+    trigger_digest: str
+
+
+def _safe_decide(
+    engine: PersonaDecisionEngine,
+    profile: _PolicyProfile,
+    context: _PersonaContext,
+) -> _PersonaDecision | Exception:
+    try:
+        return _PersonaDecision.model_validate(engine.decide(profile, context))
+    except Exception as error:  # noqa: BLE001 - converted to a safe inert action
+        return error
+
+
+def _evaluate_model_batch(
+    engine: PersonaDecisionEngine,
+    candidates: list[_DecisionCandidate],
+    max_workers: int,
+) -> list[_PersonaDecision | Exception]:
+    workers = max(1, min(max_workers, len(candidates), 8))
+    if workers == 1:
+        return [
+            _safe_decide(engine, item.profile, item.context) for item in candidates
+        ]
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="humanwire-persona",
+    ) as pool:
+        futures = [
+            pool.submit(_safe_decide, engine, item.profile, item.context)
+            for item in candidates
+        ]
+        return [future.result() for future in futures]
+
+
+def _safe_model_failure(error: Exception) -> tuple[SyntheticIntent, str]:
+    if isinstance(error, ModelFailure) and error.reason in {
+        "timeout",
+        "network_error",
+        "invalid_response",
+        "invalid_json",
+        "invalid_schema",
+    }:
+        return SyntheticIntent.ERROR, f"synthetic_model_{error.reason}"
+    return SyntheticIntent.ERROR, "synthetic_model_invalid_output"
+
+
+def _model_action(
+    candidate: _DecisionCandidate,
+    result: _PersonaDecision | Exception,
+) -> SyntheticAction:
+    if isinstance(result, Exception):
+        intent, content = _safe_model_failure(result)
+        offset = 1
+        visibility = PersonaVisibility.SHAREABLE
+    elif result.intent not in candidate.profile.allowed_intents:
+        intent, content = _safe_model_failure(
+            ValueError("persona output violated its response contract")
+        )
+        offset = 1
+        visibility = PersonaVisibility.SHAREABLE
+    else:
+        intent = result.intent
+        content = result.content
+        offset = result.time_offset_seconds
+        visibility = result.visibility
+    return SyntheticAction(
+        schema_version=SUPPORTED_SCHEMA_VERSION,
+        action_id=f"{candidate.persona_id}-{candidate.local_sequence}",
+        persona_id=candidate.persona_id,
+        channel=candidate.channel,
+        timestamp=candidate.base_time + timedelta(seconds=offset),
+        local_sequence=candidate.local_sequence,
+        trigger_id=candidate.trigger_id,
+        trigger_digest=candidate.trigger_digest,
+        intent=intent,
+        content=content,
+        visibility=visibility,
+    )
+
+
+def _model_action_completes(
+    profile: _PolicyProfile,
+    intent: SyntheticIntent,
+) -> bool:
+    if intent in {SyntheticIntent.SILENCE, SyntheticIntent.ERROR}:
+        return True
+    terminal_by_contract = {
+        EngagementType.ACKNOWLEDGE: {SyntheticIntent.ACKNOWLEDGE},
+        EngagementType.QUICK_RESPONSE: {SyntheticIntent.CONFIRM_EVIDENCE},
+        EngagementType.STRUCTURED_INTERVIEW: {SyntheticIntent.CONFIRM_EVIDENCE},
+        EngagementType.REVIEW_APPROVAL: {
+            SyntheticIntent.APPROVE,
+            SyntheticIntent.CHANGE,
+        },
+        EngagementType.AVAILABILITY: {SyntheticIntent.AVAILABILITY},
+        EngagementType.INFORM: {SyntheticIntent.SILENCE},
+    }
+    return intent in terminal_by_contract[profile.engagement_contract]
 
 
 def _sha256(value: str) -> str:
@@ -924,17 +1074,35 @@ def _write_transcript_exclusively(output: Path, root: Path, content: str) -> Non
             raise FileExistsError("synthetic output parent must be an owned directory")
 
     final_output = _path_within_run_root(parent / relative_output.name, root)
-    with final_output.open("x", encoding="utf-8", newline="\n") as handle:
-        handle.write(content)
+    temporary_output = _path_within_run_root(
+        parent / f".{relative_output.name}.humanwire-tmp",
+        root,
+    )
+    try:
+        with temporary_output.open("x", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temporary_output, final_output)
+    finally:
+        temporary_output.unlink(missing_ok=True)
 
 
 def generate_scenario(
     scenario: SyntheticScenario,
     output_path: str | Path,
     run_root: str | Path,
+    *,
+    decision_engine: PersonaDecisionEngine | None = None,
+    max_decision_workers: int = 1,
 ) -> SyntheticRunResult:
-    """Generate one isolated deterministic run through the real gateway boundary."""
+    """Generate an isolated run through the one offline gateway boundary."""
     scenario = SyntheticScenario.model_validate(scenario)
+    model_identifier: str | None = None
+    if decision_engine is not None:
+        model_identifier = getattr(decision_engine, "model_identifier", None)
+        if not isinstance(model_identifier, str) or not 1 <= len(model_identifier) <= 200:
+            raise ValueError("model-assisted generation requires a bounded model identifier")
     output, root = _validated_output_path(output_path, run_root)
     root = _prepare_fresh_run_root(root)
     database_path = _reserve_database_path(root)
@@ -976,7 +1144,16 @@ def generate_scenario(
     gateway.dispatch_all(released)
 
     persona_by_id = {persona.persona_id: persona for persona in scenario.personas}
-    policies = {persona.persona_id: _build_policy(persona) for persona in scenario.personas}
+    policies = (
+        {persona.persona_id: _build_policy(persona) for persona in scenario.personas}
+        if decision_engine is None
+        else {}
+    )
+    profiles = (
+        {persona.persona_id: _profile_for(persona) for persona in scenario.personas}
+        if decision_engine is not None
+        else {}
+    )
     histories: dict[str, list[_PersonaTranscriptEntry]] = {
         persona.persona_id: [] for persona in scenario.personas
     }
@@ -987,12 +1164,42 @@ def generate_scenario(
     inbound_envelopes: list[SyntheticInboundEnvelope] = []
     outbound_digests: dict[str, str] = {}
     actions: list[SyntheticAction] = []
-    queued: list[tuple[datetime, str, int, _QueuedAction]] = []
+    queued: list[tuple[datetime, int, str, int, _QueuedAction]] = []
+    delivery_authority_by_trigger: dict[str, tuple[str, str]] = {}
+    model_completed_personas: set[str] = set()
     delivery_cursor = 0
     trigger_sequence = 0
 
     def collect_deliveries(now: datetime) -> None:
         nonlocal delivery_cursor, trigger_sequence
+        model_batch: list[_DecisionCandidate] = []
+        batched_personas: set[str] = set()
+
+        def commit_model_batch() -> None:
+            if not model_batch or decision_engine is None:
+                return
+            results = _evaluate_model_batch(
+                decision_engine,
+                model_batch,
+                max_decision_workers,
+            )
+            for candidate, result in zip(model_batch, results, strict=True):
+                action = _model_action(candidate, result)
+                visible_delivery, mandate_token = delivery_authority_by_trigger.pop(
+                    candidate.trigger_id
+                )
+                heapq.heappush(
+                    queued,
+                    (
+                        *canonical_action_order(scenario, action),
+                        _QueuedAction(
+                            action,
+                            visible_delivery,
+                            mandate_token,
+                        ),
+                    ),
+                )
+
         while delivery_cursor < len(client.deliveries):
             delivery = client.deliveries[delivery_cursor]
             delivery_cursor += 1
@@ -1005,7 +1212,6 @@ def generate_scenario(
                 and "HUMANWIRE AVAILABILITY REQUEST" not in delivery.text
             ):
                 continue
-            policy = policies[persona_id]
             is_proposal = "HUMANWIRE DRAFT PROPOSAL" in delivery.text
             is_availability = "HUMANWIRE AVAILABILITY REQUEST" in delivery.text
             can_answer_proposal = bool(
@@ -1018,7 +1224,13 @@ def generate_scenario(
                 SyntheticIntent.AVAILABILITY
                 in persona_by_id[persona_id].allowed_intents
             )
-            if getattr(policy, "complete", False) and (
+            policy = policies.get(persona_id)
+            persona_complete = (
+                getattr(policy, "complete", False)
+                if policy is not None
+                else persona_id in model_completed_personas
+            )
+            if persona_complete and (
                 not (
                     (is_proposal and can_answer_proposal)
                     or (is_availability and can_answer_availability)
@@ -1044,6 +1256,30 @@ def generate_scenario(
                 histories[persona_id],
                 now + timedelta(seconds=1),
             )
+            outbound_digests[trigger_id] = trigger_digest
+            if decision_engine is not None:
+                delivery_authority_by_trigger[trigger_id] = (visible, mandate_token)
+                if persona_id in batched_personas:
+                    commit_model_batch()
+                    model_batch.clear()
+                    batched_personas.clear()
+                model_batch.append(
+                    _DecisionCandidate(
+                        persona_id=persona_id,
+                        profile=profiles[persona_id],
+                        context=context,
+                        channel=channel,
+                        base_time=now,
+                        local_sequence=local_sequence,
+                        trigger_id=trigger_id,
+                        trigger_digest=trigger_digest,
+                    )
+                )
+                batched_personas.add(persona_id)
+                continue
+
+            if policy is None:
+                raise AssertionError("deterministic persona policy is missing")
             try:
                 raw_output = policy.respond(context)
                 decision = _PersonaDecision.model_validate(raw_output)
@@ -1095,16 +1331,14 @@ def generate_scenario(
                     content="synthetic_invalid_output",
                     visibility=PersonaVisibility.SHAREABLE,
                 )
-            outbound_digests[trigger_id] = trigger_digest
             heapq.heappush(
                 queued,
                 (
-                    action.timestamp,
-                    action.persona_id,
-                    action.local_sequence,
-                    _QueuedAction(action, delivery.text, mandate_token),
+                    *canonical_action_order(scenario, action),
+                    _QueuedAction(action, visible, mandate_token),
                 ),
             )
+        commit_model_batch()
 
     collect_deliveries(clock[0])
     change_story_enabled = "approval-change" in persona_by_id
@@ -1156,10 +1390,16 @@ def generate_scenario(
                 continue
             break
 
-        _, persona_id, _, queued_action = heapq.heappop(queued)
+        _, _, _, _, queued_action = heapq.heappop(queued)
         action = queued_action.action
+        persona_id = action.persona_id
         clock[0] = action.timestamp
         actions.append(action)
+        if decision_engine is not None and _model_action_completes(
+            profiles[persona_id],
+            action.intent,
+        ):
+            model_completed_personas.add(persona_id)
         visible = _persona_visible_message(
             queued_action.raw_delivery,
             persona_by_id[persona_id].private_facts,
@@ -1219,6 +1459,28 @@ def generate_scenario(
         root,
         transcript.model_dump_json(indent=2) + "\n",
     )
+    mode = (
+        SyntheticGenerationMode.MODEL_ASSISTED
+        if decision_engine is not None
+        else SyntheticGenerationMode.DETERMINISTIC
+    )
+    provenance_path: Path | None = None
+    if decision_engine is not None:
+        sidecar = SyntheticRunSidecar(
+            schema_version="humanwire.synthetic-run/v1",
+            mode="model_assisted",
+            model_identifier=model_identifier,
+            prompt_version=PERSONA_PROMPT_VERSION,
+            identity_seed=scenario.identity_seed,
+            transcript_sha256=transcript.digest,
+            provenance=scenario.provenance,
+        )
+        provenance_path = root / "provenance.json"
+        _write_transcript_exclusively(
+            provenance_path,
+            root,
+            sidecar.model_dump_json(indent=2) + "\n",
+        )
     all_mandates = sorted(
         repository.list_recent_mandates(1000), key=lambda item: item.created_at
     )
@@ -1232,9 +1494,12 @@ def generate_scenario(
         gateway_handler_count=client.on_message_registration_count,
         inbound_envelopes=tuple(inbound_envelopes),
         captured_deliveries=tuple(client.deliveries),
-        model_client_configured=False,
+        model_client_configured=decision_engine is not None,
         final_state=final_state,
         terminal_states=terminal_states,
+        mode=mode,
+        model_identifier=model_identifier,
+        provenance_path=provenance_path,
     )
 
 
@@ -1295,7 +1560,7 @@ def replay_transcript(
     inbound_owner: dict[str, tuple[str, Channel]] = {}
     mandate_tokens: dict[str, str] = {}
     inbound_envelopes: list[SyntheticInboundEnvelope] = []
-    queued: list[tuple[datetime, str, int, _QueuedAction]] = []
+    queued: list[tuple[datetime, int, str, int, _QueuedAction]] = []
     delivery_cursor = 0
     trigger_sequence = 0
 
@@ -1337,9 +1602,7 @@ def replay_transcript(
             heapq.heappush(
                 queued,
                 (
-                    action.timestamp,
-                    action.persona_id,
-                    action.local_sequence,
+                    *canonical_action_order(scenario, action),
                     _QueuedAction(action, delivery.text, mandate_token),
                 ),
             )
@@ -1394,8 +1657,9 @@ def replay_transcript(
                 continue
             break
 
-        _, persona_id, _, queued_action = heapq.heappop(queued)
+        _, _, _, _, queued_action = heapq.heappop(queued)
         action = queued_action.action
+        persona_id = action.persona_id
         clock[0] = action.timestamp
         command = _wire_command(
             action.intent,
@@ -1450,6 +1714,9 @@ def replay_transcript(
         model_client_configured=False,
         final_state=final_state,
         terminal_states=terminal_states,
+        mode=SyntheticGenerationMode.FROZEN_REPLAY,
+        model_identifier=None,
+        provenance_path=None,
     )
 
 

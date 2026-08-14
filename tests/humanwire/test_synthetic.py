@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -18,7 +19,8 @@ from pydantic import ValidationError
 
 import humanwire.synthetic as synthetic_module
 from humanwire.domain import Channel, EngagementType
-from humanwire.persona_runtime import PersonaVisibility
+from humanwire.model_client import ModelFailure
+from humanwire.persona_runtime import PersonaDecision, PersonaVisibility
 from humanwire.synthetic import (
     SUPPORTED_SCHEMA_VERSION,
     SyntheticAction,
@@ -293,6 +295,334 @@ def _generate(tmp_path, scenario: SyntheticScenario | None = None):
     run_root = tmp_path / "run"
     output_path = run_root / "transcript.json"
     return generate_scenario(scenario or make_generation_scenario(), output_path, run_root)
+
+
+def concurrent_generation_scenario() -> SyntheticScenario:
+    return make_scenario(
+        personas=[
+            SyntheticPersona(
+                persona_id="synthetic-manager",
+                display_name="Manager Persona",
+                role="Simulation manager",
+                email="manager@example.test",
+                channels=[Channel.EMAIL],
+                allowed_intents=[SyntheticIntent.AVAILABILITY],
+            ),
+            SyntheticPersona(
+                persona_id="beta",
+                display_name="Beta Persona",
+                role="Beta owner",
+                email="beta@example.test",
+                channels=[Channel.EMAIL],
+                allowed_intents=[SyntheticIntent.ACKNOWLEDGE],
+            ),
+            SyntheticPersona(
+                persona_id="alpha",
+                display_name="Alpha Persona",
+                role="Alpha owner",
+                email="alpha@example.test",
+                channels=[Channel.EMAIL],
+                allowed_intents=[SyntheticIntent.ACKNOWLEDGE],
+            ),
+        ]
+    )
+
+
+def one_person_generation_scenario() -> SyntheticScenario:
+    scenario = concurrent_generation_scenario()
+    return scenario.model_copy(
+        update={
+            "personas": [
+                persona
+                for persona in scenario.personas
+                if persona.persona_id != "alpha"
+            ]
+        }
+    )
+
+
+def scripted_decision_for(profile, context) -> PersonaDecision:
+    del profile, context
+    return PersonaDecision(
+        time_offset_seconds=1,
+        intent=SyntheticIntent.ACKNOWLEDGE,
+        content="Acknowledged.",
+    )
+
+
+class BarrierDecisionEngine:
+    model_identifier = "fixture/barrier"
+
+    def __init__(self) -> None:
+        self.barrier = threading.Barrier(2)
+        self.active = 0
+        self.maximum_active = 0
+        self.lock = threading.Lock()
+
+    def decide(self, profile, context) -> PersonaDecision:
+        with self.lock:
+            self.active += 1
+            self.maximum_active = max(self.maximum_active, self.active)
+        self.barrier.wait(timeout=2)
+        if profile.role == "Beta owner":
+            time.sleep(0.02)
+        with self.lock:
+            self.active -= 1
+        return scripted_decision_for(profile, context)
+
+
+def test_model_decisions_may_overlap_but_commit_in_canonical_order(tmp_path) -> None:
+    """Break caught: worker completion timing determines public action order."""
+    engine = BarrierDecisionEngine()
+    first = generate_scenario(
+        concurrent_generation_scenario(),
+        tmp_path / "a" / "transcript.json",
+        tmp_path / "a",
+        decision_engine=engine,
+        max_decision_workers=2,
+    )
+    second = generate_scenario(
+        concurrent_generation_scenario(),
+        tmp_path / "b" / "transcript.json",
+        tmp_path / "b",
+        decision_engine=BarrierDecisionEngine(),
+        max_decision_workers=2,
+    )
+
+    assert engine.maximum_active == 2
+    assert first.transcript.model_dump_json() == second.transcript.model_dump_json()
+    keys = [
+        synthetic_module.canonical_action_order(first.transcript.scenario, action)
+        for action in first.transcript.actions
+    ]
+    assert keys == sorted(keys)
+    assert [action.persona_id for action in first.transcript.actions] == ["beta", "alpha"]
+
+
+def test_model_decision_worker_bound_is_clamped_to_eight(tmp_path) -> None:
+    """Break caught: an operator-supplied worker count creates unbounded model calls."""
+
+    class MeasuringEngine:
+        model_identifier = "fixture/measuring"
+
+        def __init__(self) -> None:
+            self.lock = threading.Lock()
+            self.release = threading.Event()
+            self.active = 0
+            self.maximum_active = 0
+
+        def decide(self, profile, context) -> PersonaDecision:
+            with self.lock:
+                self.active += 1
+                self.maximum_active = max(self.maximum_active, self.active)
+                if self.active == 8:
+                    self.release.set()
+            self.release.wait(timeout=2)
+            with self.lock:
+                self.active -= 1
+            return scripted_decision_for(profile, context)
+
+    scenario = concurrent_generation_scenario()
+    contracts = list(scenario.personas)
+    for index in range(3, 10):
+        contracts.append(
+            SyntheticPersona(
+                persona_id=f"worker-{index}",
+                display_name=f"Worker {index}",
+                role=f"Worker owner {index}",
+                email=f"worker-{index}@example.test",
+                channels=[Channel.EMAIL],
+                allowed_intents=[SyntheticIntent.ACKNOWLEDGE],
+            )
+        )
+    engine = MeasuringEngine()
+
+    generate_scenario(
+        scenario.model_copy(update={"personas": contracts}),
+        tmp_path / "run" / "transcript.json",
+        tmp_path / "run",
+        decision_engine=engine,
+        max_decision_workers=100,
+    )
+
+    assert engine.maximum_active == 8
+
+
+def test_one_persona_has_only_one_model_decision_in_flight(tmp_path) -> None:
+    """Break caught: duplicate deliveries concurrently mutate one persona's local state."""
+
+    class TrackingEngine:
+        model_identifier = "fixture/tracking"
+
+        def __init__(self) -> None:
+            self.active_by_role: dict[str, int] = {}
+            self.maximum_by_role: dict[str, int] = {}
+            self.call_count = 0
+            self.lock = threading.Lock()
+
+        def decide(self, profile, context) -> PersonaDecision:
+            with self.lock:
+                active = self.active_by_role.get(profile.role, 0) + 1
+                self.active_by_role[profile.role] = active
+                self.maximum_by_role[profile.role] = max(
+                    self.maximum_by_role.get(profile.role, 0), active
+                )
+                self.call_count += 1
+            time.sleep(0.01)
+            with self.lock:
+                self.active_by_role[profile.role] -= 1
+            prompt = context.delivered_message.casefold()
+            if prompt.startswith("question "):
+                return PersonaDecision(
+                    time_offset_seconds=1,
+                    intent=SyntheticIntent.ANSWER,
+                    content="Launch date is 2026-09-01.",
+                )
+            if "evidence confirmation" in prompt:
+                return PersonaDecision(
+                    time_offset_seconds=1,
+                    intent=SyntheticIntent.CONFIRM_EVIDENCE,
+                    content="Confirmed.",
+                )
+            return PersonaDecision(
+                time_offset_seconds=1,
+                intent=SyntheticIntent.ACKNOWLEDGE,
+                content="Acknowledged.",
+            )
+
+    engine = TrackingEngine()
+    scenario = make_generation_scenario()
+    generate_scenario(
+        scenario.model_copy(
+            update={
+                "personas": [
+                    persona
+                    for persona in scenario.personas
+                    if persona.persona_id in {"synthetic-manager", "quick"}
+                ]
+            }
+        ),
+        tmp_path / "run" / "transcript.json",
+        tmp_path / "run",
+        decision_engine=engine,
+        max_decision_workers=8,
+    )
+
+    assert engine.call_count == 3
+    assert engine.maximum_by_role == {"Program owner": 1}
+
+
+class FailingDecisionEngine:
+    model_identifier = "fixture/failing"
+
+    def __init__(self, failure: Exception) -> None:
+        self.failure = failure
+
+    def decide(self, profile, context) -> PersonaDecision:
+        del profile, context
+        raise self.failure
+
+
+def test_model_failure_records_error_without_gateway_authority(tmp_path) -> None:
+    """Break caught: model exception details or partial output reach the gateway."""
+    result = generate_scenario(
+        one_person_generation_scenario(),
+        tmp_path / "run" / "transcript.json",
+        tmp_path / "run",
+        decision_engine=FailingDecisionEngine(ModelFailure("timeout")),
+    )
+
+    action = result.transcript.actions[0]
+    assert action.intent is SyntheticIntent.ERROR
+    assert action.content == "synthetic_model_timeout"
+    assert result.inbound_envelopes == ()
+
+
+def test_model_decision_disallowed_intent_is_inert(tmp_path) -> None:
+    """Break caught: an injected engine bypasses the persona intent contract."""
+
+    class DisallowedDecisionEngine:
+        model_identifier = "fixture/disallowed"
+
+        def decide(self, profile, context) -> PersonaDecision:
+            del profile, context
+            return PersonaDecision(
+                time_offset_seconds=1,
+                intent=SyntheticIntent.CHANGE,
+                content="Forged change.",
+            )
+
+    result = generate_scenario(
+        one_person_generation_scenario(),
+        tmp_path / "run" / "transcript.json",
+        tmp_path / "run",
+        decision_engine=DisallowedDecisionEngine(),
+    )
+
+    assert result.transcript.actions[0].intent is SyntheticIntent.ERROR
+    assert result.transcript.actions[0].content == "synthetic_model_invalid_output"
+    assert result.inbound_envelopes == ()
+
+
+def test_model_decision_writes_only_strict_private_provenance_sidecar(tmp_path) -> None:
+    """Break caught: prompts, decisions, routing, or diagnostics enter public provenance."""
+    result = generate_scenario(
+        one_person_generation_scenario(),
+        tmp_path / "run" / "transcript.json",
+        tmp_path / "run",
+        decision_engine=FailingDecisionEngine(ModelFailure("timeout")),
+    )
+
+    assert result.mode.value == "model_assisted"
+    assert result.model_identifier == "fixture/failing"
+    assert result.provenance_path == tmp_path / "run" / "provenance.json"
+    payload = json.loads(result.provenance_path.read_text(encoding="utf-8"))
+    assert set(payload) == {
+        "schema_version",
+        "mode",
+        "model_identifier",
+        "prompt_version",
+        "identity_seed",
+        "transcript_sha256",
+        "provenance",
+    }
+    assert payload["transcript_sha256"] == result.transcript.digest
+    serialized = result.provenance_path.read_text(encoding="utf-8")
+    assert "synthetic_model_timeout" not in serialized
+    assert "Acknowledged." not in serialized
+    assert "sender_address" not in serialized
+    assert "conversation_id" not in serialized
+    assert "PRIVATE-PERSONA-SENTINEL" not in serialized
+
+
+def test_model_sidecar_write_failure_does_not_rewrite_transcript(
+    tmp_path, monkeypatch
+) -> None:
+    """Break caught: sidecar failure retries effects or overwrites public transcript."""
+    original_write = synthetic_module._write_transcript_exclusively
+
+    def fail_sidecar(path, root, content):
+        if path.name == "provenance.json":
+            raise OSError("PRIVATE-DIAGNOSTIC-SENTINEL")
+        return original_write(path, root, content)
+
+    monkeypatch.setattr(
+        synthetic_module,
+        "_write_transcript_exclusively",
+        fail_sidecar,
+    )
+    transcript_path = tmp_path / "run" / "transcript.json"
+
+    with pytest.raises(OSError, match="PRIVATE-DIAGNOSTIC-SENTINEL"):
+        generate_scenario(
+            one_person_generation_scenario(),
+            transcript_path,
+            tmp_path / "run",
+            decision_engine=FailingDecisionEngine(ModelFailure("timeout")),
+        )
+
+    assert load_transcript(transcript_path).actions[0].content == "synthetic_model_timeout"
+    assert not (tmp_path / "run" / "provenance.json").exists()
 
 
 def test_generation_runs_six_distinct_deterministic_persona_policies(tmp_path) -> None:
@@ -643,12 +973,16 @@ def test_two_fresh_generations_write_identical_safe_transcripts(tmp_path) -> Non
     safe_bytes = first_output.read_bytes()
     assert b"PRIVATE-PERSONA-SENTINEL" not in safe_bytes
     assert hashlib.sha256(b"PRIVATE-PERSONA-SENTINEL").hexdigest().encode() in safe_bytes
+    assert first.mode.value == "deterministic"
+    assert first.model_identifier is None
+    assert first.provenance_path is None
+    assert not (tmp_path / "run-a" / "provenance.json").exists()
 
 
-def test_generation_orders_actions_by_timestamp_persona_and_local_sequence(tmp_path) -> None:
+def test_generation_orders_actions_by_saved_scenario_rank_and_trigger(tmp_path) -> None:
     result = _generate(tmp_path)
     keys = [
-        (action.timestamp, action.persona_id, action.local_sequence)
+        synthetic_module.canonical_action_order(result.transcript.scenario, action)
         for action in result.transcript.actions
     ]
 
@@ -772,6 +1106,12 @@ def test_replay_never_builds_or_calls_persona_policies(tmp_path, monkeypatch) ->
         raise AssertionError("replay invoked persona generation")
 
     monkeypatch.setattr(synthetic_module, "_build_policy", policy_use_is_a_failure)
+    monkeypatch.setattr(synthetic_module, "_profile_for", policy_use_is_a_failure)
+    monkeypatch.setattr(
+        synthetic_module,
+        "_evaluate_model_batch",
+        policy_use_is_a_failure,
+    )
 
     replayed = synthetic_module.replay_transcript(
         generated_path,
@@ -780,6 +1120,9 @@ def test_replay_never_builds_or_calls_persona_policies(tmp_path, monkeypatch) ->
 
     assert replayed.gateway_handler_count == 1
     assert replayed.inbound_envelopes
+    assert replayed.mode.value == "frozen_replay"
+    assert replayed.model_identifier is None
+    assert replayed.provenance_path is None
 
 
 def test_frozen_replay_hash_is_equal_after_a_fresh_replay_restart(tmp_path) -> None:

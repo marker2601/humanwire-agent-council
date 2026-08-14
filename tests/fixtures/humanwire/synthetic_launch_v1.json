@@ -186,45 +186,6 @@
   "actions": [
     {
       "schema_version": "humanwire.synthetic/v1",
-      "action_id": "ack-1",
-      "persona_id": "ack",
-      "channel": "email",
-      "timestamp": "2026-08-13T12:00:01Z",
-      "local_sequence": 1,
-      "trigger_id": "outbound-2",
-      "trigger_digest": "457e339d3a84e5317f7ac221c5b9ffc31230aa2cac81b12823024cc8a9e478f5",
-      "intent": "acknowledge",
-      "content": "Acknowledged.",
-      "visibility": "shareable"
-    },
-    {
-      "schema_version": "humanwire.synthetic/v1",
-      "action_id": "approval-1",
-      "persona_id": "approval",
-      "channel": "email",
-      "timestamp": "2026-08-13T12:00:01Z",
-      "local_sequence": 1,
-      "trigger_id": "outbound-6",
-      "trigger_digest": "d31c0f7413b2c0d19e632fba5fd2055da80b21dd1aac55a2c40bef16abd917a2",
-      "intent": "approve",
-      "content": "Approved.",
-      "visibility": "shareable"
-    },
-    {
-      "schema_version": "humanwire.synthetic/v1",
-      "action_id": "availability-1",
-      "persona_id": "availability",
-      "channel": "email",
-      "timestamp": "2026-08-13T12:00:01Z",
-      "local_sequence": 1,
-      "trigger_id": "outbound-7",
-      "trigger_digest": "c6ca2ee7151329ee7c43dda92585152d665e8bf2621f77c4f234fa11af1dac56",
-      "intent": "availability",
-      "content": "2026-08-13T15:00:00+00:00/2026-08-13T16:00:00+00:00",
-      "visibility": "shareable"
-    },
-    {
-      "schema_version": "humanwire.synthetic/v1",
       "action_id": "inform-1",
       "persona_id": "inform",
       "channel": "email",
@@ -234,6 +195,19 @@
       "trigger_digest": "b5440ef8ae4e14a72b377766e1090b364e02a90f94f28ee1270b5882acc36f40",
       "intent": "silence",
       "content": "synthetic_silence",
+      "visibility": "shareable"
+    },
+    {
+      "schema_version": "humanwire.synthetic/v1",
+      "action_id": "ack-1",
+      "persona_id": "ack",
+      "channel": "email",
+      "timestamp": "2026-08-13T12:00:01Z",
+      "local_sequence": 1,
+      "trigger_id": "outbound-2",
+      "trigger_digest": "457e339d3a84e5317f7ac221c5b9ffc31230aa2cac81b12823024cc8a9e478f5",
+      "intent": "acknowledge",
+      "content": "Acknowledged.",
       "visibility": "shareable"
     },
     {
@@ -273,6 +247,32 @@
       "trigger_digest": "321bf174b0d450c3cef7eb2d47b4ca3d1a738d6ff77f9a86a5c8804576ed3748",
       "intent": "silence",
       "content": "synthetic_silence",
+      "visibility": "shareable"
+    },
+    {
+      "schema_version": "humanwire.synthetic/v1",
+      "action_id": "approval-1",
+      "persona_id": "approval",
+      "channel": "email",
+      "timestamp": "2026-08-13T12:00:01Z",
+      "local_sequence": 1,
+      "trigger_id": "outbound-6",
+      "trigger_digest": "d31c0f7413b2c0d19e632fba5fd2055da80b21dd1aac55a2c40bef16abd917a2",
+      "intent": "approve",
+      "content": "Approved.",
+      "visibility": "shareable"
+    },
+    {
+      "schema_version": "humanwire.synthetic/v1",
+      "action_id": "availability-1",
+      "persona_id": "availability",
+      "channel": "email",
+      "timestamp": "2026-08-13T12:00:01Z",
+      "local_sequence": 1,
+      "trigger_id": "outbound-7",
+      "trigger_digest": "c6ca2ee7151329ee7c43dda92585152d665e8bf2621f77c4f234fa11af1dac56",
+      "intent": "availability",
+      "content": "2026-08-13T15:00:00+00:00/2026-08-13T16:00:00+00:00",
       "visibility": "shareable"
     },
     {
@@ -420,32 +420,6 @@
     },
     {
       "schema_version": "humanwire.synthetic/v1",
-      "action_id": "approval-2",
-      "persona_id": "approval",
-      "channel": "email",
-      "timestamp": "2026-08-13T12:00:26Z",
-      "local_sequence": 2,
-      "trigger_id": "outbound-22",
-      "trigger_digest": "204fdc31d1c58a0c1f0a1dc5cc7b5c11b488cde8edeb948214dc353088b41cde",
-      "intent": "accept_proposal",
-      "content": "Accepted.",
-      "visibility": "shareable"
-    },
-    {
-      "schema_version": "humanwire.synthetic/v1",
-      "action_id": "availability-2",
-      "persona_id": "availability",
-      "channel": "email",
-      "timestamp": "2026-08-13T12:00:26Z",
-      "local_sequence": 2,
-      "trigger_id": "outbound-23",
-      "trigger_digest": "204fdc31d1c58a0c1f0a1dc5cc7b5c11b488cde8edeb948214dc353088b41cde",
-      "intent": "accept_proposal",
-      "content": "Accepted.",
-      "visibility": "shareable"
-    },
-    {
-      "schema_version": "humanwire.synthetic/v1",
       "action_id": "quick-a-4",
       "persona_id": "quick-a",
       "channel": "email",
@@ -485,38 +459,38 @@
     },
     {
       "schema_version": "humanwire.synthetic/v1",
+      "action_id": "approval-2",
+      "persona_id": "approval",
+      "channel": "email",
+      "timestamp": "2026-08-13T12:00:26Z",
+      "local_sequence": 2,
+      "trigger_id": "outbound-22",
+      "trigger_digest": "204fdc31d1c58a0c1f0a1dc5cc7b5c11b488cde8edeb948214dc353088b41cde",
+      "intent": "accept_proposal",
+      "content": "Accepted.",
+      "visibility": "shareable"
+    },
+    {
+      "schema_version": "humanwire.synthetic/v1",
+      "action_id": "availability-2",
+      "persona_id": "availability",
+      "channel": "email",
+      "timestamp": "2026-08-13T12:00:26Z",
+      "local_sequence": 2,
+      "trigger_id": "outbound-23",
+      "trigger_digest": "204fdc31d1c58a0c1f0a1dc5cc7b5c11b488cde8edeb948214dc353088b41cde",
+      "intent": "accept_proposal",
+      "content": "Accepted.",
+      "visibility": "shareable"
+    },
+    {
+      "schema_version": "humanwire.synthetic/v1",
       "action_id": "ack-3",
       "persona_id": "ack",
       "channel": "email",
       "timestamp": "2026-08-13T12:00:27Z",
       "local_sequence": 3,
       "trigger_id": "outbound-24",
-      "trigger_digest": "a32aab8699b64665cba858b401d1c1a59c2d418a99328d4bfa9074555432b007",
-      "intent": "accept_proposal",
-      "content": "Accepted.",
-      "visibility": "shareable"
-    },
-    {
-      "schema_version": "humanwire.synthetic/v1",
-      "action_id": "approval-3",
-      "persona_id": "approval",
-      "channel": "email",
-      "timestamp": "2026-08-13T12:00:27Z",
-      "local_sequence": 3,
-      "trigger_id": "outbound-28",
-      "trigger_digest": "a32aab8699b64665cba858b401d1c1a59c2d418a99328d4bfa9074555432b007",
-      "intent": "accept_proposal",
-      "content": "Accepted.",
-      "visibility": "shareable"
-    },
-    {
-      "schema_version": "humanwire.synthetic/v1",
-      "action_id": "availability-3",
-      "persona_id": "availability",
-      "channel": "email",
-      "timestamp": "2026-08-13T12:00:27Z",
-      "local_sequence": 3,
-      "trigger_id": "outbound-29",
       "trigger_digest": "a32aab8699b64665cba858b401d1c1a59c2d418a99328d4bfa9074555432b007",
       "intent": "accept_proposal",
       "content": "Accepted.",
@@ -563,15 +537,28 @@
     },
     {
       "schema_version": "humanwire.synthetic/v1",
-      "action_id": "structured-10",
-      "persona_id": "structured",
+      "action_id": "approval-3",
+      "persona_id": "approval",
       "channel": "email",
-      "timestamp": "2026-08-13T12:00:28Z",
-      "local_sequence": 10,
-      "trigger_id": "outbound-30",
-      "trigger_digest": "c5243e689b7a36c03b43df4fb67cd70297cf07f19587b0dc7dc644534b9d1843",
-      "intent": "availability",
-      "content": "2026-08-13T15:00:00+00:00/2026-08-13T16:00:00+00:00",
+      "timestamp": "2026-08-13T12:00:27Z",
+      "local_sequence": 3,
+      "trigger_id": "outbound-28",
+      "trigger_digest": "a32aab8699b64665cba858b401d1c1a59c2d418a99328d4bfa9074555432b007",
+      "intent": "accept_proposal",
+      "content": "Accepted.",
+      "visibility": "shareable"
+    },
+    {
+      "schema_version": "humanwire.synthetic/v1",
+      "action_id": "availability-3",
+      "persona_id": "availability",
+      "channel": "email",
+      "timestamp": "2026-08-13T12:00:27Z",
+      "local_sequence": 3,
+      "trigger_id": "outbound-29",
+      "trigger_digest": "a32aab8699b64665cba858b401d1c1a59c2d418a99328d4bfa9074555432b007",
+      "intent": "accept_proposal",
+      "content": "Accepted.",
       "visibility": "shareable"
     },
     {
@@ -582,6 +569,19 @@
       "timestamp": "2026-08-13T12:00:28Z",
       "local_sequence": 1,
       "trigger_id": "outbound-31",
+      "trigger_digest": "c5243e689b7a36c03b43df4fb67cd70297cf07f19587b0dc7dc644534b9d1843",
+      "intent": "availability",
+      "content": "2026-08-13T15:00:00+00:00/2026-08-13T16:00:00+00:00",
+      "visibility": "shareable"
+    },
+    {
+      "schema_version": "humanwire.synthetic/v1",
+      "action_id": "structured-10",
+      "persona_id": "structured",
+      "channel": "email",
+      "timestamp": "2026-08-13T12:00:28Z",
+      "local_sequence": 10,
+      "trigger_id": "outbound-30",
       "trigger_digest": "c5243e689b7a36c03b43df4fb67cd70297cf07f19587b0dc7dc644534b9d1843",
       "intent": "availability",
       "content": "2026-08-13T15:00:00+00:00/2026-08-13T16:00:00+00:00",
@@ -601,5 +601,5 @@
       "visibility": "shareable"
     }
   ],
-  "digest": "dda4b453e9b3729842bfd2ff7c6876a20c9fad7bf52329db3e85a2ada22c031e"
+  "digest": "96ae18838ae4185d21a711ec401ab29ce8dc3abc2e253270eea6baf86fda8851"
 }

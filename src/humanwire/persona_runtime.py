@@ -35,6 +35,12 @@ class SyntheticIntent(StrEnum):
     ERROR = "error"
 
 
+class SyntheticGenerationMode(StrEnum):
+    DETERMINISTIC = "deterministic"
+    MODEL_ASSISTED = "model_assisted"
+    FROZEN_REPLAY = "frozen_replay"
+
+
 class SyntheticProvenance(StrictPersonaModel):
     proof_class: Literal["synthetic_multi_persona"]
     actor_type: Literal["simulated_persona"]
@@ -79,6 +85,8 @@ class PersonaDecision(StrictPersonaModel):
 
 
 class PersonaDecisionEngine(Protocol):
+    model_identifier: str
+
     def decide(self, profile: PersonaProfile, context: PersonaContext) -> PersonaDecision:
         raise NotImplementedError
 

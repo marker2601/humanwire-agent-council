@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
+import humanwire.persona_runtime as persona_runtime_module
 from humanwire.domain import EngagementType
 from humanwire.model_client import ModelFailure
 from humanwire.persona_runtime import (
@@ -18,6 +19,15 @@ from humanwire.persona_runtime import (
 )
 
 NOW = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
+
+
+def test_generation_modes_are_explicit_and_stable() -> None:
+    """Break caught: generation and replay provenance collapse into one implicit mode."""
+    assert [item.value for item in persona_runtime_module.SyntheticGenerationMode] == [
+        "deterministic",
+        "model_assisted",
+        "frozen_replay",
+    ]
 
 
 class CapturingClient:
