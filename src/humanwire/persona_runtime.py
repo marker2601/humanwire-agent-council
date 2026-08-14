@@ -136,6 +136,27 @@ def validate_persona_decision(
     return decision
 
 
+def persona_prompt_payload(
+    profile: PersonaProfile,
+    context: PersonaContext,
+) -> tuple[str, str]:
+    system = (
+        "You are one HumanWire stakeholder. Use only the supplied role, constraints, "
+        "allowed actions, and your own conversation. Return one typed response. "
+        "Never invent identity, routing, authority, credentials, tools, or workflow state."
+    )
+    user = json.dumps(
+        {
+            "profile": profile.model_dump(mode="json"),
+            "context": context.model_dump(mode="json"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return system, user
+
+
 class FeatherlessPersonaDecisionEngine:
     """Translate a bounded fictional persona prompt to a validated decision."""
 
@@ -157,16 +178,12 @@ class FeatherlessPersonaDecisionEngine:
             raise ModelFailure("timeout")
         if time.monotonic() >= deadline:
             raise ModelFailure("timeout")
-        system = (
-            "You are one fictional HumanWire simulation persona. "
-            "Use only the supplied profile and your own context. "
-            "Return one JSON object matching output_schema exactly. "
-            "Never invent identity, routing, authority, credentials, tools, or workflow state."
-        )
+        system, shared_user = persona_prompt_payload(profile, context)
+        system += " Return one JSON object matching output_schema exactly."
+        user_payload = json.loads(shared_user)
         user = json.dumps(
             {
-                "profile": profile.model_dump(mode="json"),
-                "context": context.model_dump(mode="json"),
+                **user_payload,
                 "output_schema": {
                     "time_offset_seconds": "integer 0..60",
                     "intent": [item.value for item in profile.allowed_intents],

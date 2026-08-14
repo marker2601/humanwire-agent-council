@@ -18,6 +18,7 @@ from humanwire.persona_runtime import (
     PersonaDecision,
     PersonaProfile,
     SyntheticIntent,
+    persona_prompt_payload,
 )
 
 NOW = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
@@ -117,6 +118,35 @@ def test_model_engine_receives_only_the_approved_persona_context() -> None:
     assert 0 < client.calls[0][2] <= 5
     assert set(vars(engine)) == {"_client", "model_identifier"}
     assert engine._client is client
+
+
+def test_direct_adapter_extends_the_shared_persona_prompt() -> None:
+    """Break caught: the direct and typed adapters drift to different persona context."""
+    client = CapturingClient(
+        {
+            "time_offset_seconds": 2,
+            "intent": "acknowledge",
+            "content": "ACK",
+            "visibility": "shareable",
+        }
+    )
+    profile = _profile()
+    context = _context()
+    shared_system, shared_user = persona_prompt_payload(profile, context)
+
+    _decide(FeatherlessPersonaDecisionEngine(client, "fixture/model"), profile, context)
+
+    direct_system, direct_user, _ = client.calls[0]
+    assert direct_system.startswith(shared_system)
+    assert json.loads(direct_user) == {
+        **json.loads(shared_user),
+        "output_schema": {
+            "time_offset_seconds": "integer 0..60",
+            "intent": ["acknowledge"],
+            "content": "non-empty string, maximum 600 characters",
+            "visibility": ["shareable", "anonymous", "private"],
+        },
+    }
 
 
 @pytest.mark.parametrize(
