@@ -204,6 +204,28 @@ Successful stdout contains only the six exact provenance labels, safe scenario/r
 
 **Non-live disclaimer:** This deterministic synthetic proof uses simulated personas, injected fake-Caspian transport, deterministic local policy, and fresh local SQLite. It does not contact real people, call Caspian or Featherless, verify a live provider or model, or constitute real-human testing.
 
+### Watch the local synthetic agent runtime
+
+Every watch uses an explicit run root that must not exist. The deterministic viewer is reproducible offline simulation/replay proof; the Featherless mode is private exploratory model-assisted behavior and is not live-provider or human proof. Both remain local-only at `http://127.0.0.1:8766`. The public Vercel demo cannot start a simulation.
+
+```powershell
+# Deterministic, no external model/provider call
+.\.venv\Scripts\python.exe -m humanwire synthetic watch `
+  --agent-mode deterministic `
+  --seed 8842 `
+  --run-root work\synthetic-watch-8842 `
+  --output work\synthetic-watch-8842\transcript.json
+
+# Explicit private exploratory Featherless mode; reads only configured Featherless settings
+.\.venv\Scripts\python.exe -m humanwire synthetic watch `
+  --agent-mode featherless `
+  --seed 8842 `
+  --run-root work\synthetic-model-8842 `
+  --output work\synthetic-model-8842\transcript.json
+```
+
+Wait for completion before downloading JSON or CSV evidence. Stop the viewer only after downloads; stopping it does not mutate persisted workflow state. Validate privacy and replay into another fresh root before treating any output as frozen. Model-assisted output must never replace the committed deterministic fixture. See the [synthetic agent runtime operator guide](docs/synthetic-agent-runtime.md) for the freeze, replay, download, privacy, and claim rules.
+
 ## Analytics and Power BI contract
 
 The Data page, JSON endpoint, and CSV endpoint share one canonical redacted 16-field projection. Non-demo `/api/v1/*` requests require `Authorization: Bearer <read-only-token>`; credentials never belong in query strings, shared URLs, screenshots, or committed Power BI source text.

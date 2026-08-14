@@ -32,17 +32,25 @@ The claim fails closed if the root already exists or a competing output appears.
 
 **Non-live disclaimer:** This deterministic synthetic proof uses simulated personas, injected fake-Caspian transport, deterministic local policy, and fresh local SQLite. It does not contact real people, call Caspian or Featherless, verify a live provider or model, or constitute real-human testing.
 
-## 3. Open the fictional public app
+## 3. Watch the local persisted run
+
+For a local operator walkthrough, start the deterministic command in the [synthetic agent runtime guide](synthetic-agent-runtime.md) with a run root that does not exist, then open `http://127.0.0.1:8766`. Follow Live advances only through persisted events. Pause it and use Previous and Next to show that one persona or origin highlight and `From -> To -> Generated` describe the selected event.
+
+After the viewer reports Complete, download JSON and CSV as attachments and confirm that the JSON evidence records `meeting_ready,partial`. Then stop the viewer and replay the validated transcript into a second fresh root. Stopping the viewer does not mutate persisted workflow state. The public Vercel demo cannot start a simulation.
+
+The deterministic watch is local synthetic proof, not live-provider or human proof. Featherless mode is a separate, explicit private exploratory check and must pass validation, privacy, and replay before its output may be frozen; it does not replace the deterministic fixture.
+
+## 4. Open the fictional public app
 
 Run the deterministic demo server and open `/`. Select `HW-2411` to show the active mixed plan. Explain why not everyone is interviewed: HumanWire chooses the smallest contract needed. An information recipient gets delivery only, an acknowledgement recipient only authenticates receipt, quick respondents answer one question each, and only the structured contributor enters a multi-question session.
 
-## 4. Walk the product surfaces
+## 5. Walk the product surfaces
 
 In Decision Room, point out the mandate state, typed stakeholder ladders, safe evidence summary, and pending approval. Open Reach to show exact outreach progression and the email-to-Telegram continuation. Open Data to show the canonical event table, filters, and CSV export; JSON and parsed CSV use the same field order and values.
 
 Use `HW-2412` for an approved aligned result. Use `HW-2413` to demonstrate a prepared meeting view and local ICS download. Downloading the ICS does not create or update a calendar event.
 
-## 5. Explain the safety story
+## 6. Explain the safety story
 
 The connected proof uses a primary approved mandate for bounded proposal rounds and verified meeting readiness. A separate required approval receives `CHANGE` and stops at partial/blocking. HumanWire never forces that blocker into a meeting. Raw private rationale, contact routes, provider bodies, and credentials are absent from the UI, APIs, CSV, ICS, events, logs, and smoke output.
 

@@ -47,6 +47,20 @@ ENVIRONMENT_KEYS = {
     "PUBLIC_DEMO",
 }
 
+DETERMINISTIC_WATCH_COMMAND = """# Deterministic, no external model/provider call
+.\\.venv\\Scripts\\python.exe -m humanwire synthetic watch `
+  --agent-mode deterministic `
+  --seed 8842 `
+  --run-root work\\synthetic-watch-8842 `
+  --output work\\synthetic-watch-8842\\transcript.json"""
+
+FEATHERLESS_WATCH_COMMAND = """# Explicit private exploratory Featherless mode; reads only configured Featherless settings
+.\\.venv\\Scripts\\python.exe -m humanwire synthetic watch `
+  --agent-mode featherless `
+  --seed 8842 `
+  --run-root work\\synthetic-model-8842 `
+  --output work\\synthetic-model-8842\\transcript.json"""
+
 
 def test_vercel_entrypoint_serves_the_isolated_humanwire_demo() -> None:
     sys.modules.pop("index", None)
@@ -144,3 +158,33 @@ def test_cutover_removes_every_obsolete_product_surface() -> None:
     assert "secondsignal" not in public_text.casefold()
     assert "SecondSignal" not in public_text
     assert re.search(r"\bSS-[A-Z0-9]", public_text) is None
+
+
+def test_agent_runtime_docs_preserve_exact_proof_boundary() -> None:
+    text = (ROOT / "docs/synthetic-agent-runtime.md").read_text(encoding="utf-8")
+    for label in (
+        "proof_class=synthetic_multi_persona",
+        "actor_type=simulated_persona",
+        "identity_source=synthetic_fixture",
+        "transport=fake_caspian",
+        "human_attested=false",
+        "live_provider_verified=false",
+    ):
+        assert label in text
+    assert "127.0.0.1" in text
+    assert "not live Caspian, email, Telegram, Featherless, or human proof" in text
+    assert "The public Vercel demo cannot start a simulation" in text
+
+
+def test_agent_runtime_readme_preserves_exact_watch_commands() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert DETERMINISTIC_WATCH_COMMAND in readme
+    assert FEATHERLESS_WATCH_COMMAND in readme
+
+
+def test_agent_runtime_claim_ledger_keeps_viewer_local_and_synthetic() -> None:
+    claims = (ROOT / "submission/verified-claims.md").read_text(encoding="utf-8")
+
+    assert "local synthetic proof" in claims
+    assert "not live-provider proof" in claims
