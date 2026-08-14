@@ -269,6 +269,58 @@ def test_incomplete_store_has_no_transcript_evidence_binding() -> None:
     assert store.final_evidence_binding() is None
 
 
+@pytest.mark.parametrize(
+    "run_state",
+    (
+        SyntheticRunState.STARTING,
+        SyntheticRunState.RUNNING,
+        SyntheticRunState.FAILED,
+    ),
+)
+def test_store_constructor_rejects_a_transcript_binding_in_every_noncomplete_state(
+    run_state: SyntheticRunState,
+) -> None:
+    """Break caught: constructor retention bypasses transcript-binding finality."""
+    snapshot = initial_progress(default_synthetic_scenario(seed=33)).model_copy(
+        update={"run_state": run_state}
+    )
+    snapshot._transcript_sha256 = "a" * 64
+
+    with pytest.raises(
+        ValueError,
+        match="^synthetic transcript binding requires completed finality$",
+    ):
+        SyntheticProgressStore(snapshot)
+
+
+def test_store_constructor_requires_full_finality_for_a_transcript_binding() -> None:
+    """Break caught: a complete label without a final trace authorizes bound evidence."""
+    initial = initial_progress(default_synthetic_scenario(seed=34))
+    incomplete_finality = initial.model_copy(
+        update={"run_state": SyntheticRunState.COMPLETE}
+    )
+    incomplete_finality._transcript_sha256 = "b" * 64
+
+    with pytest.raises(
+        ValueError,
+        match="^synthetic transcript binding requires completed finality$",
+    ):
+        SyntheticProgressStore(incomplete_finality)
+
+    complete = initial.model_copy(
+        update={
+            "run_state": SyntheticRunState.COMPLETE,
+            "final_trace_sha256": "c" * 64,
+        }
+    )
+    complete._transcript_sha256 = "d" * 64
+
+    binding = SyntheticProgressStore(complete).final_evidence_binding()
+    assert binding is not None
+    assert binding[0].trace_sha256 == "c" * 64
+    assert binding[1] == "d" * 64
+
+
 def test_replay_store_binds_the_validated_source_transcript_digest(tmp_path) -> None:
     """Break caught: replay completion binds a digest other than its validated input."""
     scenario = default_synthetic_scenario(seed=32)

@@ -424,6 +424,11 @@ class SyntheticProgressStore:
             r"[0-9a-f]{64}", transcript_sha256
         ):
             raise ValueError("synthetic transcript binding must be a SHA-256 digest")
+        if transcript_sha256 is not None and (
+            snapshot.run_state is not SyntheticRunState.COMPLETE
+            or snapshot.final_trace_sha256 is None
+        ):
+            raise ValueError("synthetic transcript binding requires completed finality")
         validated = SyntheticProgressSnapshot.model_validate(snapshot.model_dump())
         validated._identity_seed = snapshot._identity_seed
         validated._transcript_sha256 = transcript_sha256
