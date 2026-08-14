@@ -134,6 +134,48 @@ def test_generate_scenario_defaults_preserve_frozen_proof_contract(tmp_path) -> 
     assert result.terminal_states == ("meeting_ready", "partial")
 
 
+def test_none_presentation_callback_preserves_exact_generation_bytes(tmp_path) -> None:
+    """Break caught: an unused product callback changes the frozen proof transcript."""
+    scenario = default_synthetic_scenario(seed=0)
+    baseline_path = tmp_path / "baseline" / "transcript.json"
+    explicit_path = tmp_path / "explicit" / "transcript.json"
+
+    baseline = generate_scenario(scenario, baseline_path, tmp_path / "baseline")
+    explicit = generate_scenario(
+        scenario,
+        explicit_path,
+        tmp_path / "explicit",
+        presentation_observer=None,
+    )
+
+    assert baseline_path.read_bytes() == explicit_path.read_bytes()
+    assert synthetic_module.semantic_trace_hash(baseline) == (
+        synthetic_module.semantic_trace_hash(explicit)
+    )
+
+
+@pytest.mark.parametrize(
+    "visibility",
+    [PersonaVisibility.PRIVATE, PersonaVisibility.ANONYMOUS],
+)
+def test_nonshareable_decision_is_not_sent_to_presentation_observer(visibility) -> None:
+    """Break caught: private or anonymous content is attributed in the product timeline."""
+
+    class RejectingPresentationObserver:
+        called = False
+
+        def record_decision(self, **kwargs) -> None:
+            del kwargs
+            self.called = True
+
+    observer = RejectingPresentationObserver()
+    action = make_action(content="Private response content", visibility=visibility)
+
+    synthetic_module._record_decision_presentation(observer, action)
+
+    assert observer.called is False
+
+
 def test_schema_rejects_unsupported_version() -> None:
     with pytest.raises(ValidationError, match="schema_version"):
         make_scenario(schema_version="v999")

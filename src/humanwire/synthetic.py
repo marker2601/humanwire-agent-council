@@ -69,6 +69,10 @@ from humanwire.persona_runtime import (
 from humanwire.planning import ResolvedPlan
 from humanwire.repository import SqlAlchemyHumanWireRepository
 from humanwire.studio_models import CoordinationRequest, RequesterRole, product_catalog
+from humanwire.studio_projection import (
+    StudioPresentationObserver,
+    project_delivery_presentation,
+)
 from humanwire.synthetic_identities import (
     IDENTITY_GENERATOR_VERSION,
     seeded_identity_map,
@@ -1167,6 +1171,62 @@ def _record_inert_progress(
             pass
 
 
+def _mark_presentation_unavailable(observer: StudioPresentationObserver) -> None:
+    marker = getattr(observer, "mark_unavailable", None)
+    if not callable(marker):
+        return
+    try:
+        marker()
+    except Exception:  # noqa: BLE001, S110 - presentation remains non-authoritative
+        pass
+
+
+def _record_outbound_presentation(
+    observer: StudioPresentationObserver | None,
+    *,
+    created_at: datetime,
+    persona_id: str,
+    channel: Channel,
+    delivery_text: str,
+) -> None:
+    """Publish only fixed product copy selected from a known HumanWire heading."""
+    if observer is None:
+        return
+    projected = project_delivery_presentation(delivery_text)
+    if projected is None:
+        return
+    message_kind, safe_text = projected
+    try:
+        observer.record_outbound(
+            created_at=created_at,
+            persona_id=persona_id,
+            channel=channel,
+            message_kind=message_kind,
+            safe_text=safe_text,
+        )
+    except Exception:  # noqa: BLE001 - presentation cannot affect generation authority
+        _mark_presentation_unavailable(observer)
+
+
+def _record_decision_presentation(
+    observer: StudioPresentationObserver | None,
+    action: SyntheticAction,
+) -> None:
+    """Publish accepted bounded decision content before orchestrator wire translation."""
+    if observer is None or action.visibility is not PersonaVisibility.SHAREABLE:
+        return
+    try:
+        observer.record_decision(
+            created_at=action.timestamp,
+            persona_id=action.persona_id,
+            channel=action.channel,
+            intent=action.intent,
+            safe_content=action.content,
+        )
+    except Exception:  # noqa: BLE001 - presentation cannot affect generation authority
+        _mark_presentation_unavailable(observer)
+
+
 def _persisted_event_count(repository: SqlAlchemyHumanWireRepository) -> int:
     return sum(
         len(repository.list_events(mandate.mandate_id))
@@ -1466,6 +1526,7 @@ def generate_scenario(
     decision_engine: PersonaDecisionEngineFactory | None = None,
     max_decision_workers: int = 1,
     progress_observer: SyntheticProgressObserver | None = None,
+    presentation_observer: StudioPresentationObserver | None = None,
     mandate_request: str | None = None,
     include_change_story: bool | None = None,
 ) -> SyntheticRunResult:
@@ -1655,6 +1716,13 @@ def generate_scenario(
             mandate_token = mandate_tokens.get(persona_id)
             if mandate_token is None:
                 raise ValueError("persona delivery arrived before its mandate token")
+            _record_outbound_presentation(
+                presentation_observer,
+                created_at=now,
+                persona_id=persona_id,
+                channel=channel,
+                delivery_text=delivery.text,
+            )
             trigger_sequence += 1
             trigger_id = f"outbound-{trigger_sequence}"
             trigger_digest = _sha256(visible)
@@ -1833,6 +1901,7 @@ def generate_scenario(
         persona_id = action.persona_id
         clock[0] = action.timestamp
         actions.append(action)
+        _record_decision_presentation(presentation_observer, action)
         if decision_engine is not None and _model_action_completes(
             profiles[persona_id],
             action.intent,
