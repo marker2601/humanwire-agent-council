@@ -15,7 +15,8 @@ import time
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from datetime import time as datetime_time
 from pathlib import Path
 from typing import Literal, Self
 from uuid import UUID
@@ -522,12 +523,30 @@ class SyntheticRunResult:
     provenance_path: Path | None
 
 
+class _ScheduledPolicyProfile(_PolicyProfile):
+    availability_date: date
+
+
 class _DeterministicPersonaPolicy:
     """Shared mechanics for a policy isolated to a sanitized frozen profile."""
 
     def __init__(self, profile: _PolicyProfile) -> None:
         self.profile = profile
         self.complete = False
+
+    def availability_window(self) -> str:
+        availability_date = getattr(
+            self.profile,
+            "availability_date",
+            _FIXED_TIME.date(),
+        )
+        start = datetime.combine(
+            availability_date,
+            datetime_time(hour=15),
+            tzinfo=UTC,
+        )
+        end = start + timedelta(hours=1)
+        return f"{start.isoformat()}/{end.isoformat()}"
 
     def respond(self, context: _PersonaContext) -> _PersonaDecision:
         intent, content, visibility = self._choose(context)
@@ -592,10 +611,16 @@ class _StructuredInterviewPolicy(_DeterministicPersonaPolicy):
         if "humanwire availability request" in prompt:
             return (
                 SyntheticIntent.AVAILABILITY,
-                "2026-08-13T15:00:00+00:00/2026-08-13T16:00:00+00:00",
+                self.availability_window(),
                 PersonaVisibility.SHAREABLE,
             )
         if "humanwire draft proposal" in prompt:
+            if self.profile.role == "Risk & compliance lead":
+                return (
+                    SyntheticIntent.CHANGE_PROPOSAL,
+                    "Assign Engineering as the rollback checkpoint owner before approval.",
+                    PersonaVisibility.SHAREABLE,
+                )
             return (
                 SyntheticIntent.CHANGE_PROPOSAL,
                 "Keep human review on the agenda.",
@@ -617,6 +642,12 @@ class _StructuredInterviewPolicy(_DeterministicPersonaPolicy):
                     PersonaVisibility.PRIVATE,
                 )
             if prior_answers == 1:
+                if self.profile.role == "Risk & compliance lead":
+                    return (
+                        SyntheticIntent.INTERVIEW_RESPONSE,
+                        "Engineering must own the rollback checkpoint before approval.",
+                        PersonaVisibility.SHAREABLE,
+                    )
                 return (
                     SyntheticIntent.INTERVIEW_RESPONSE,
                     "The team must keep human review on the agenda.",
@@ -655,7 +686,7 @@ class _AvailabilityPolicy(_DeterministicPersonaPolicy):
         self.complete = True
         return (
             SyntheticIntent.AVAILABILITY,
-            "2026-08-13T15:00:00+00:00/2026-08-13T16:00:00+00:00",
+            self.availability_window(),
             PersonaVisibility.SHAREABLE,
         )
 
@@ -675,17 +706,30 @@ def _contract_for(persona: SyntheticPersona) -> EngagementType:
     return EngagementType.ACKNOWLEDGE
 
 
-def _profile_for(persona: SyntheticPersona) -> _PolicyProfile:
+def _profile_for(
+    persona: SyntheticPersona,
+    availability_date: date | None = None,
+) -> _PolicyProfile:
     contract = _contract_for(persona)
-    return _PolicyProfile(
+    profile_type = (
+        _PolicyProfile if availability_date is None else _ScheduledPolicyProfile
+    )
+    profile_fields: dict[str, object] = {}
+    if availability_date is not None:
+        profile_fields["availability_date"] = availability_date
+    return profile_type(
         role=persona.role,
         private_facts=tuple(persona.private_facts),
         allowed_intents=tuple(persona.allowed_intents),
         engagement_contract=contract,
+        **profile_fields,
     )
 
 
-def _build_policy(persona: SyntheticPersona) -> _DeterministicPersonaPolicy:
+def _build_policy(
+    persona: SyntheticPersona,
+    availability_date: date | None = None,
+) -> _DeterministicPersonaPolicy:
     contract = _contract_for(persona)
     strategies: dict[EngagementType, type[_DeterministicPersonaPolicy]] = {
         EngagementType.INFORM: _InformPolicy,
@@ -695,7 +739,7 @@ def _build_policy(persona: SyntheticPersona) -> _DeterministicPersonaPolicy:
         EngagementType.REVIEW_APPROVAL: _ReviewApprovalPolicy,
         EngagementType.AVAILABILITY: _AvailabilityPolicy,
     }
-    return strategies[contract](_profile_for(persona))
+    return strategies[contract](_profile_for(persona, availability_date))
 
 
 class _SyntheticPlanner:
@@ -761,11 +805,15 @@ class _SyntheticEvidenceExtractor(RuleBasedEvidenceExtractor):
 
     def extract(self, *args, **kwargs) -> list[EvidenceDraft]:
         drafts = super().extract(*args, **kwargs)
+        product_constraints = {
+            "The team must keep human review on the agenda.",
+            "Engineering must own the rollback checkpoint before approval.",
+        }
         return [
             draft.model_copy(
                 update={"related_decision": "Approve the synthetic launch"}
             )
-            if draft.statement == "The team must keep human review on the agenda."
+            if draft.statement in product_constraints
             else draft
             for draft in drafts
         ]
@@ -1529,6 +1577,7 @@ def generate_scenario(
     presentation_observer: StudioPresentationObserver | None = None,
     mandate_request: str | None = None,
     include_change_story: bool | None = None,
+    availability_date: date | None = None,
 ) -> SyntheticRunResult:
     """Generate an isolated run through the one offline gateway boundary."""
     scenario = SyntheticScenario.model_validate(scenario)
@@ -1606,11 +1655,17 @@ def generate_scenario(
     )
 
     persona_by_id = {persona.persona_id: persona for persona in scenario.personas}
-    policies = (
-        {persona.persona_id: _build_policy(persona) for persona in scenario.personas}
-        if decision_engine is None
-        else {}
-    )
+    if decision_engine is None:
+        policies = {
+            persona.persona_id: (
+                _build_policy(persona)
+                if availability_date is None
+                else _build_policy(persona, availability_date)
+            )
+            for persona in scenario.personas
+        }
+    else:
+        policies = {}
     profiles = (
         {persona.persona_id: _profile_for(persona) for persona in scenario.personas}
         if decision_engine is not None

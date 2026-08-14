@@ -4,6 +4,20 @@
 
 HumanWire turns one authenticated manager mandate into a bounded, cross-channel coordination plan. It informs people who only need context, asks for acknowledgement where receipt matters, collects quick or structured input where evidence is required, routes explicit approval to the right authority, and prepares a meeting only when asynchronous coordination cannot resolve a verified conflict.
 
+## Start the local coordination studio
+
+The primary local product opens on **Start a coordination**. It lets you submit the launch-decision request, watch the saved Request -> HumanWire -> Caspian Gateway path progress through conflict resolution, approval, availability, and a meeting package, then replay or download the immutable result.
+
+```powershell
+python -m humanwire studio --workspace-root .worktrees/humanwire-runs --port 8766
+```
+
+Open `http://127.0.0.1:8766/`. The command creates the workspace parent when needed, but every coordination still owns a new exclusive child run root; opening the page alone does not start a run.
+
+**Standard agent reasoning** is the credential-free default. **AI-assisted reasoning** uses the bounded PydanticAI stakeholder adapter only when `FEATHERLESS_API_KEY` is configured. In both modes, HumanWire's workflow and repository retain authority, and non-silent responses cross one CaspianGateway handler. The local status **Workspace channels** means the coordination used the local channel boundary; it does not claim external provider delivery.
+
+Verification of external Caspian, email, and Telegram delivery remains a separate private operator checklist. A live model run is likewise pending until separately retained evidence exists. The `humanwire synthetic` CLI remains available as internal deterministic evidence, but it is not the primary product screen.
+
 ## Live demo
 
 The public deployment target is [secondsignal.vercel.app](https://secondsignal.vercel.app). The app is a deterministic, read-only HumanWire fixture: it loads no local organization directory, provider credentials, model credentials, or private responses. Local and browser gates must pass before that continuity URL is updated.

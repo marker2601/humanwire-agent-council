@@ -1174,6 +1174,7 @@ class StudioProgressObserver:
         current_stage = StudioLifecycleStage.BRIEF
         negotiation_started = False
         approval_started = False
+        proposal_count = 0
         events: list[StudioTimelineEvent] = []
         for timeline_ordinal, event in enumerate(self._timeline, 1):
             if event.effect == "persisted":
@@ -1200,6 +1201,10 @@ class StudioProgressObserver:
                     people[persona_id].display_name if persona_id in people else None,
                 )
                 label = _DATA_LABELS.get(raw_type, replay.data_point)
+                if raw_type == "proposal.created":
+                    proposal_count += 1
+                    if proposal_count > 1:
+                        label = "Proposal revised"
                 if label == "No public data point":
                     label = "Coordination record updated"
                 transition = _transition_for(

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from enum import StrEnum
 from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 _SAFE_ID = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+_COORDINATION_REFERENCE_DATE = date(2026, 8, 13)
 
 
 class _StudioModel(BaseModel):
@@ -176,3 +177,16 @@ _PRODUCT_CATALOG = StudioCatalog(stakeholders=_STAKEHOLDERS, templates=_TEMPLATE
 def product_catalog() -> StudioCatalog:
     """Return the fixed professional catalog shown by the studio product."""
     return _PRODUCT_CATALOG
+
+
+def coordination_target_date(request: CoordinationRequest) -> date:
+    """Resolve product timing against the studio's deterministic reference date."""
+    request = CoordinationRequest.model_validate(request)
+    if request.target_timing is TargetTiming.CUSTOM:
+        assert request.custom_date is not None
+        return request.custom_date
+    candidate = _COORDINATION_REFERENCE_DATE + timedelta(days=1)
+    if request.target_timing is TargetTiming.NEXT_BUSINESS_DAY:
+        while candidate.weekday() >= 5:
+            candidate += timedelta(days=1)
+    return candidate

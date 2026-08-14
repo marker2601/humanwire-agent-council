@@ -13,7 +13,11 @@ from pathlib import Path
 from humanwire.config import Settings
 from humanwire.persona_runtime import PersonaDecisionEngineFactory
 from humanwire.pydantic_persona import PydanticAIPersonaDecisionEngineFactory
-from humanwire.studio_models import CoordinationRequest, StudioAgentMode
+from humanwire.studio_models import (
+    CoordinationRequest,
+    StudioAgentMode,
+    coordination_target_date,
+)
 from humanwire.studio_projection import (
     StudioProgressObserver,
     StudioProgressStore,
@@ -183,6 +187,7 @@ class StudioRunManager:
             )
             store, observer = create_studio_progress(request, scenario)
             decision_engine = self._decision_engine_for(request)
+            self._workspace_root.mkdir(parents=True, exist_ok=True)
             record = StudioRunRecord(
                 run_alias=alias,
                 request=request,
@@ -306,6 +311,7 @@ class StudioRunManager:
                 presentation_observer=observer,
                 mandate_request=record.request.objective,
                 include_change_story=False,
+                availability_date=coordination_target_date(record.request),
             )
         except Exception:  # noqa: BLE001 - private worker failures stay inside this boundary
             record.store.publish_failed()

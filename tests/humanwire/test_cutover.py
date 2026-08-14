@@ -62,6 +62,12 @@ FEATHERLESS_WATCH_COMMAND = """# Explicit private exploratory Featherless mode; 
   --output work\\synthetic-model-8842\\transcript.json"""
 
 
+STUDIO_COMMAND = (
+    "python -m humanwire studio --workspace-root "
+    ".worktrees/humanwire-runs --port 8766"
+)
+
+
 def test_vercel_entrypoint_serves_the_isolated_humanwire_demo() -> None:
     sys.modules.pop("index", None)
     app = importlib.import_module("index").app
@@ -190,6 +196,25 @@ def test_agent_runtime_readme_preserves_exact_watch_commands() -> None:
 
     assert DETERMINISTIC_WATCH_COMMAND in readme
     assert FEATHERLESS_WATCH_COMMAND in readme
+
+
+def test_coordination_studio_is_the_primary_truthful_local_product() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    demo = (ROOT / "submission/demo.md").read_text(encoding="utf-8")
+    claims = (ROOT / "submission/verified-claims.md").read_text(encoding="utf-8")
+    checklist = (ROOT / "submission/checklist.md").read_text(encoding="utf-8")
+    combined = f"{readme}\n{demo}\n{claims}\n{checklist}"
+
+    assert STUDIO_COMMAND in readme
+    assert "Start a coordination" in readme
+    assert "Standard agent reasoning" in combined
+    assert "PydanticAI" in combined
+    assert "FEATHERLESS_API_KEY" in combined
+    assert "Workspace channels" in combined
+    assert "one CaspianGateway handler" in combined
+    assert "external Caspian, email, and Telegram" in combined
+    assert "internal deterministic evidence" in combined
+    assert "PENDING" in checklist
 
 
 def test_agent_runtime_claim_ledger_classifies_local_viewer_only() -> None:

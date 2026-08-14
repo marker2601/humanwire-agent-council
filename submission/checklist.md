@@ -67,6 +67,18 @@ Official event rules, eligibility, registration state, reuse terms, and deadline
 
 ## Public demo and browser QA
 
+### Local coordination studio
+
+- [x] The primary local command opens an idle **Start a coordination** composer and creates no run before submission.
+- [x] Standard agent reasoning completes the request-to-meeting workflow without reading ambient model/provider settings.
+- [x] The saved standard run includes rollback conflict, targeted interview, evidence confirmation, proposal revision, approval, availability, and a meeting package through one CaspianGateway handler.
+- [x] Refresh, manual presentation replay, JSON/CSV parity, and second-run isolation are covered by local acceptance.
+- [x] In-app Browser acceptance passed at 1280x720, 600x900, and 390x844 with synchronized replay, responsive tabs, attachment downloads, visible keyboard focus, 44px controls, 14px text, no page overflow, and a clean console.
+- [x] Reduced-motion behavior remains covered by the automated contract; the in-app Browser reported no active reduced-motion preference to exercise manually.
+- [ ] PENDING: retain a separate live PydanticAI/Featherless run before claiming live model use.
+- [ ] PENDING: retain external Caspian, email, and Telegram evidence before claiming external delivery. **Workspace channels** alone is not that evidence.
+- [x] Keep the older synthetic CLI classified as internal deterministic evidence, not the primary product screen.
+
 - [ ] Update [secondsignal.vercel.app](https://secondsignal.vercel.app) only after local and live gates pass.
 - [ ] `/`, `/mandates/HW-2411`, `/mandates/HW-2411/reach`, `/mandates/HW-2411/data`, and `/health/live` return 200.
 - [ ] Dashboard, Decision Room, Reach, Data, JSON, CSV, and ICS visibly identify HumanWire.
