@@ -26,6 +26,28 @@ class _OnceFlag(argparse.Action):
         setattr(namespace, self.dest, True)
 
 
+class _OnceValue(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        seen_name = f"_humanwire_seen_{self.dest}"
+        if getattr(namespace, seen_name, False):
+            parser.error(f"{option_string} may be supplied only once")
+        setattr(namespace, seen_name, True)
+        setattr(namespace, self.dest, values)
+
+
+def _bounded_integer(label: str, minimum: int, maximum: int):
+    def parse(value: str) -> int:
+        try:
+            parsed = int(value)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(f"{label} must be an integer") from error
+        if not minimum <= parsed <= maximum:
+            raise argparse.ArgumentTypeError(f"{label} must be between {minimum} and {maximum}")
+        return parsed
+
+    return parse
+
+
 def _safe_database_url(database_url: str) -> str:
     return make_url(database_url).render_as_string(hide_password=True)
 
@@ -111,12 +133,26 @@ def run_synthetic(args: argparse.Namespace) -> int:
     try:
         if args.synthetic_command == "generate":
             result = generate_scenario(
-                default_synthetic_scenario(),
+                default_synthetic_scenario(seed=args.seed),
                 Path(args.output),
                 Path(args.run_root),
             )
         elif args.synthetic_command == "replay":
             result = replay_transcript(Path(args.transcript), Path(args.run_root))
+        elif args.synthetic_command == "watch":
+            from humanwire.synthetic_watch import SyntheticWatchOptions, run_synthetic_watch
+
+            return run_synthetic_watch(
+                SyntheticWatchOptions(
+                    output=Path(args.output),
+                    run_root=Path(args.run_root),
+                    seed=args.seed,
+                    agent_mode=args.agent_mode,
+                    port=args.port,
+                    step_delay_ms=args.step_delay_ms,
+                    max_decision_workers=args.max_decision_workers,
+                )
+            )
         else:
             raise AssertionError(f"Unhandled synthetic command: {args.synthetic_command}")
     except ValidationError:
@@ -156,9 +192,41 @@ def build_parser() -> argparse.ArgumentParser:
     generate = synthetic_modes.add_parser("generate")
     generate.add_argument("--output", required=True)
     generate.add_argument("--run-root", required=True)
+    generate.add_argument("--seed", type=int, default=0)
     replay = synthetic_modes.add_parser("replay")
     replay.add_argument("--transcript", required=True)
     replay.add_argument("--run-root", required=True)
+    watch = synthetic_modes.add_parser(
+        "watch",
+        help="run a loopback-only synthetic simulation viewer",
+    )
+    watch.add_argument("--output", required=True, action=_OnceValue)
+    watch.add_argument("--run-root", required=True, action=_OnceValue)
+    watch.add_argument("--seed", type=int, default=0, action=_OnceValue)
+    watch.add_argument(
+        "--agent-mode",
+        choices=("deterministic", "featherless"),
+        default="deterministic",
+        action=_OnceValue,
+    )
+    watch.add_argument(
+        "--port",
+        type=_bounded_integer("port", 1024, 65535),
+        default=8766,
+        action=_OnceValue,
+    )
+    watch.add_argument(
+        "--step-delay-ms",
+        type=_bounded_integer("step delay", 0, 3000),
+        default=350,
+        action=_OnceValue,
+    )
+    watch.add_argument(
+        "--max-decision-workers",
+        type=_bounded_integer("max decision workers", 1, 8),
+        default=4,
+        action=_OnceValue,
+    )
     sandbox = subcommands.add_parser(
         "sandbox",
         help="run read-only private sandbox readiness tooling",

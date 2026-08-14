@@ -13,6 +13,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -1624,6 +1625,444 @@ def test_generate_requires_explicit_output_and_run_root(capsys) -> None:
     assert captured.out == ""
     assert "--output" in captured.err
     assert "--run-root" in captured.err
+
+
+def test_watch_cli_binds_only_loopback_and_starts_generation_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: watch exposes a configurable/public bind or skips generation."""
+    from humanwire.__main__ import main
+
+    calls: dict[str, object] = {}
+
+    def fake_uvicorn_run(app, *, host, port, **kwargs):
+        calls.update(app=app, host=host, port=port, kwargs=kwargs)
+
+    monkeypatch.setattr("humanwire.synthetic_watch.uvicorn.run", fake_uvicorn_run)
+    run_root = tmp_path / "run"
+
+    assert main(
+        [
+            "synthetic",
+            "watch",
+            "--output",
+            str(run_root / "transcript.json"),
+            "--run-root",
+            str(run_root),
+            "--seed",
+            "8842",
+            "--agent-mode",
+            "deterministic",
+            "--port",
+            "8766",
+            "--step-delay-ms",
+            "0",
+            "--max-decision-workers",
+            "1",
+        ]
+    ) == 0
+    assert calls["host"] == "127.0.0.1"
+    assert calls["port"] == 8766
+    assert load_transcript(run_root / "transcript.json").scenario.identity_seed == 8842
+
+
+def test_deterministic_watch_ignores_ambient_featherless_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: deterministic watch reads model settings or builds a client."""
+    from humanwire.__main__ import main
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("deterministic watch configured a model")
+
+    monkeypatch.setenv("FEATHERLESS_API_KEY", "DO-NOT-READ")
+    monkeypatch.setattr("humanwire.synthetic_watch.Settings", forbidden)
+    monkeypatch.setattr("humanwire.synthetic_watch.FeatherlessJsonClient", forbidden)
+    monkeypatch.setattr("humanwire.synthetic_watch.uvicorn.run", lambda *_a, **_k: None)
+    run_root = tmp_path / "deterministic-run"
+
+    assert main(
+        [
+            "synthetic",
+            "watch",
+            "--output",
+            str(run_root / "transcript.json"),
+            "--run-root",
+            str(run_root),
+            "--agent-mode",
+            "deterministic",
+            "--step-delay-ms",
+            "0",
+        ]
+    ) == 0
+    assert load_transcript(run_root / "transcript.json").scenario.identity_seed == 0
+
+
+def test_featherless_watch_without_key_fails_safely(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Break caught: missing credentials start work or disclose configuration details."""
+    from humanwire.__main__ import main
+
+    monkeypatch.setattr(
+        "humanwire.synthetic_watch.Settings",
+        lambda: SimpleNamespace(featherless_api_key=None),
+    )
+    monkeypatch.setattr(
+        "humanwire.synthetic_watch.uvicorn.run",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("viewer started")),
+    )
+    run_root = tmp_path / "missing-key-run"
+
+    assert main(
+        [
+            "synthetic",
+            "watch",
+            "--output",
+            str(run_root / "transcript.json"),
+            "--run-root",
+            str(run_root),
+            "--agent-mode",
+            "featherless",
+            "--step-delay-ms",
+            "0",
+        ]
+    ) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "synthetic_status=failed\nfailure_reason=model_credentials_missing\n"
+    )
+    assert not run_root.exists()
+
+
+@pytest.mark.parametrize(
+    ("flag", "first", "second"),
+    [
+        ("--output", "first.json", "second.json"),
+        ("--run-root", "first", "second"),
+        ("--seed", "1", "2"),
+        ("--agent-mode", "deterministic", "featherless"),
+        ("--port", "8766", "8767"),
+        ("--step-delay-ms", "0", "1"),
+        ("--max-decision-workers", "1", "2"),
+    ],
+)
+def test_watch_cli_rejects_duplicate_options(
+    flag: str, first: str, second: str, capsys
+) -> None:
+    """Break caught: repeated security-relevant watch options silently override."""
+    from humanwire.__main__ import build_parser
+
+    required: list[str] = []
+    if flag != "--output":
+        required.extend(("--output", "transcript.json"))
+    if flag != "--run-root":
+        required.extend(("--run-root", "run"))
+
+    with pytest.raises(SystemExit) as caught:
+        build_parser().parse_args(
+            ["synthetic", "watch", *required, flag, first, flag, second]
+        )
+
+    assert caught.value.code == 2
+    assert "may be supplied only once" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--port", "1023"),
+        ("--port", "65536"),
+        ("--step-delay-ms", "-1"),
+        ("--step-delay-ms", "3001"),
+        ("--max-decision-workers", "0"),
+        ("--max-decision-workers", "9"),
+        ("--agent-mode", "ambient"),
+    ],
+)
+def test_watch_cli_rejects_invalid_options_before_starting_work(
+    flag: str, value: str, tmp_path: Path, capsys
+) -> None:
+    """Break caught: invalid watch bounds reach threads, files, or network setup."""
+    from humanwire.__main__ import main
+
+    run_root = tmp_path / "invalid-run"
+    with pytest.raises(SystemExit) as caught:
+        main(
+            [
+                "synthetic",
+                "watch",
+                "--output",
+                str(run_root / "transcript.json"),
+                "--run-root",
+                str(run_root),
+                flag,
+                value,
+            ]
+        )
+
+    assert caught.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert flag in captured.err
+    assert not run_root.exists()
+
+
+def test_watch_cli_has_no_host_option(tmp_path: Path, capsys) -> None:
+    """Break caught: watch accepts caller-controlled binding hosts."""
+    from humanwire.__main__ import main
+
+    run_root = tmp_path / "host-run"
+    with pytest.raises(SystemExit) as caught:
+        main(
+            [
+                "synthetic",
+                "watch",
+                "--output",
+                str(run_root / "transcript.json"),
+                "--run-root",
+                str(run_root),
+                "--host",
+                "0.0.0.0",
+            ]
+        )
+
+    assert caught.value.code == 2
+    assert "unrecognized arguments: --host" in capsys.readouterr().err
+    assert not run_root.exists()
+
+
+def test_generate_cli_seed_selects_identity_fixture(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Break caught: generate parses but ignores its explicit identity seed."""
+    from humanwire.__main__ import main
+
+    run_root = tmp_path / "seeded-run"
+    assert main(
+        [
+            "synthetic",
+            "generate",
+            "--output",
+            str(run_root / "transcript.json"),
+            "--run-root",
+            str(run_root),
+            "--seed",
+            "8842",
+        ]
+    ) == 0
+
+    assert capsys.readouterr().err == ""
+    assert load_transcript(run_root / "transcript.json").scenario.identity_seed == 8842
+
+
+def test_watch_creates_viewer_before_non_daemon_worker_and_joins_on_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: viewer close abandons a daemon worker or races app/store creation."""
+    from humanwire.synthetic_watch import SyntheticWatchOptions, run_synthetic_watch
+
+    calls: list[str] = []
+    generation_started = threading.Event()
+    release_generation = threading.Event()
+    generation_finished = threading.Event()
+    captured: dict[str, object] = {}
+
+    def fake_create_app(store, transcript_path):
+        calls.append("viewer_created")
+        captured.update(store=store, transcript_path=transcript_path)
+        return "viewer-app"
+
+    def fake_generate(scenario, output_path, run_root, **kwargs):
+        calls.append("generation_started")
+        captured.update(
+            scenario=scenario,
+            output_path=output_path,
+            run_root=run_root,
+            generation_thread=threading.current_thread(),
+            generation_kwargs=kwargs,
+        )
+        generation_started.set()
+        assert release_generation.wait(timeout=5)
+        generation_finished.set()
+
+    def fake_uvicorn(app, *, host, port, **kwargs):
+        assert generation_started.wait(timeout=5)
+        calls.append("viewer_started")
+        captured.update(app=app, host=host, port=port, uvicorn_kwargs=kwargs)
+        release_generation.set()
+
+    monkeypatch.setattr("humanwire.synthetic_watch.create_synthetic_viewer_app", fake_create_app)
+    monkeypatch.setattr("humanwire.synthetic_watch.generate_scenario", fake_generate)
+    monkeypatch.setattr("humanwire.synthetic_watch.uvicorn.run", fake_uvicorn)
+    run_root = tmp_path / "lifecycle-run"
+
+    assert run_synthetic_watch(
+        SyntheticWatchOptions(
+            output=run_root / "transcript.json",
+            run_root=run_root,
+            seed=73,
+            agent_mode="deterministic",
+            port=9123,
+            step_delay_ms=0,
+            max_decision_workers=3,
+        )
+    ) == 0
+
+    assert calls[0] == "viewer_created"
+    assert generation_finished.is_set()
+    assert captured["app"] == "viewer-app"
+    assert captured["host"] == "127.0.0.1"
+    assert captured["port"] == 9123
+    assert captured["generation_thread"].name == "humanwire-synthetic-generation"
+    assert captured["generation_thread"].daemon is False
+    assert captured["scenario"].identity_seed == 73
+    assert captured["generation_kwargs"]["decision_engine"] is None
+    assert captured["generation_kwargs"]["max_decision_workers"] == 3
+
+
+def test_watch_worker_failure_publishes_only_fixed_safe_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Break caught: worker exceptions leak text or leave progress falsely running."""
+    from humanwire.synthetic_watch import SyntheticWatchOptions, run_synthetic_watch
+
+    captured: dict[str, object] = {}
+    failed = threading.Event()
+
+    def fake_create_app(store, transcript_path):
+        captured.update(store=store, transcript_path=transcript_path)
+        return "viewer-app"
+
+    def fail_generation(*_args, **_kwargs):
+        failed.set()
+        raise RuntimeError("PRIVATE-PROVIDER-BODY")
+
+    def fake_uvicorn(*_args, **_kwargs):
+        assert failed.wait(timeout=5)
+
+    monkeypatch.setattr("humanwire.synthetic_watch.create_synthetic_viewer_app", fake_create_app)
+    monkeypatch.setattr("humanwire.synthetic_watch.generate_scenario", fail_generation)
+    monkeypatch.setattr("humanwire.synthetic_watch.uvicorn.run", fake_uvicorn)
+    run_root = tmp_path / "failed-run"
+
+    assert run_synthetic_watch(
+        SyntheticWatchOptions(
+            output=run_root / "transcript.json",
+            run_root=run_root,
+            step_delay_ms=0,
+        )
+    ) == 0
+    capture = capsys.readouterr()
+    snapshot = captured["store"].snapshot()
+
+    assert capture.out == "viewer_url=http://127.0.0.1:8766\n"
+    assert capture.err == ""
+    assert "PRIVATE-PROVIDER-BODY" not in capture.out + capture.err
+    assert snapshot.run_state.value == "failed"
+    assert snapshot.runtime_status.value == "terminal_failure"
+    assert snapshot.final_trace_sha256 is None
+
+
+def test_featherless_watch_uses_central_client_without_exposing_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Break caught: explicit model mode bypasses the central adapter or publishes its key."""
+    from pydantic import SecretStr
+
+    from humanwire.model_client import FeatherlessJsonClient
+    from humanwire.persona_runtime import FeatherlessPersonaDecisionEngine
+    from humanwire.synthetic_watch import SyntheticWatchOptions, run_synthetic_watch
+
+    key = "PRIVATE-FEATHERLESS-WATCH-KEY"
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "humanwire.synthetic_watch.Settings",
+        lambda: SimpleNamespace(
+            featherless_api_key=SecretStr(key),
+            featherless_model="fixture/model-v1",
+            featherless_base_url="https://models.example.test/v1",
+        ),
+    )
+    monkeypatch.setattr(
+        "humanwire.synthetic_watch.create_synthetic_viewer_app",
+        lambda store, path: captured.update(store=store, path=path) or "viewer-app",
+    )
+
+    def fake_generate(*_args, **kwargs):
+        captured["engine"] = kwargs["decision_engine"]
+
+    monkeypatch.setattr("humanwire.synthetic_watch.generate_scenario", fake_generate)
+    monkeypatch.setattr("humanwire.synthetic_watch.uvicorn.run", lambda *_a, **_k: None)
+    run_root = tmp_path / "model-run"
+
+    assert run_synthetic_watch(
+        SyntheticWatchOptions(
+            output=run_root / "transcript.json",
+            run_root=run_root,
+            agent_mode="featherless",
+            step_delay_ms=0,
+        )
+    ) == 0
+    capture = capsys.readouterr()
+    engine = captured["engine"]
+
+    assert isinstance(engine, FeatherlessPersonaDecisionEngine)
+    assert isinstance(engine._client, FeatherlessJsonClient)
+    assert engine.model_identifier == "fixture/model-v1"
+    assert key not in capture.out + capture.err
+    assert key not in captured["store"].snapshot().model_dump_json()
+
+
+def test_watch_pacing_occurs_after_publication_without_changing_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: presentation pacing precedes publication or changes evidence semantics."""
+    from humanwire.synthetic_watch import SyntheticWatchOptions, run_synthetic_watch
+
+    captured: dict[str, object] = {}
+    observed_counts: list[int] = []
+
+    def fake_create_app(store, path):
+        captured.update(store=store, path=path)
+        return "viewer-app"
+
+    def observe_sleep(seconds: float) -> None:
+        assert seconds == 0.001
+        observed_counts.append(captured["store"].snapshot().saved_event_count)
+
+    monkeypatch.setattr("humanwire.synthetic_watch.create_synthetic_viewer_app", fake_create_app)
+    monkeypatch.setattr("humanwire.synthetic_watch.uvicorn.run", lambda *_a, **_k: None)
+    monkeypatch.setattr("humanwire.synthetic_watch.time.sleep", observe_sleep)
+    paced_root = tmp_path / "paced-run"
+
+    assert run_synthetic_watch(
+        SyntheticWatchOptions(
+            output=paced_root / "transcript.json",
+            run_root=paced_root,
+            seed=91,
+            step_delay_ms=1,
+        )
+    ) == 0
+    paced = load_transcript(paced_root / "transcript.json")
+    plain_root = tmp_path / "plain-run"
+    plain = generate_scenario(
+        synthetic_module.default_synthetic_scenario(seed=91),
+        plain_root / "transcript.json",
+        plain_root,
+    )
+
+    assert observed_counts
+    assert observed_counts == sorted(set(observed_counts))
+    assert paced.model_dump_json() == plain.transcript.model_dump_json()
 
 
 def test_generation_rejects_output_outside_run_root_before_writing(tmp_path) -> None:
