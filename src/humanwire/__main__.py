@@ -158,6 +158,11 @@ def build_parser() -> argparse.ArgumentParser:
     replay = synthetic_modes.add_parser("replay")
     replay.add_argument("--transcript", required=True)
     replay.add_argument("--run-root", required=True)
+    sandbox = subcommands.add_parser(
+        "sandbox",
+        help="run read-only private sandbox readiness tooling",
+    )
+    sandbox.add_argument("sandbox_command", choices=("check", "checklist"))
     return parser
 
 
@@ -176,6 +181,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_smoke(smoke_args)
     if args.command == "synthetic":
         return run_synthetic(args)
+    if args.command == "sandbox":
+        from humanwire.sandbox import main as sandbox_main
+
+        return sandbox_main([args.sandbox_command])
     settings = Settings()
     if args.command == "init-db":
         init_database(settings)

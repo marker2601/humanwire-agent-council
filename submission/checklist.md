@@ -43,7 +43,13 @@ Official event rules, eligibility, registration state, reuse terms, and deadline
 
 ## Required live proof
 
-- [ ] Start `humanwire listen` with the operator's configured Caspian, Telegram, and optional Featherless credentials.
+- [ ] Create a distinct private deployment, managed PostgreSQL database, Caspian project, directory, analytics token, email connection, Telegram bot, and consenting operator-owned test identities.
+- [ ] Keep `FEATHERLESS_API_KEY` optional; deterministic policy and fallbacks retain authority.
+- [ ] Set `DATABASE_URL` to the private PostgreSQL target, `ORGANIZATION_PATH` to the private directory, `ENGAGEMENT_REQUIRE_GO=true`, and `PUBLIC_DEMO=false` in ignored or deployment secrets.
+- [ ] Run `alembic upgrade head` as the only private-sandbox schema startup path; do not use `humanwire init-db` or `create_all`.
+- [ ] Independently verify the database current revision, set `HUMANWIRE_ALEMBIC_REVISION` to the exact repository head, and run `humanwire sandbox check` without treating its static result as connectivity proof.
+- [ ] Review `humanwire sandbox checklist`; keep every item pending until external proof exists.
+- [ ] Start exactly one `humanwire listen` owner for the private provider stream/database with the operator's configured Caspian, Telegram, and optional Featherless credentials.
 - [ ] Send the manager mandate from its exact registered route and conversation.
 - [ ] Show the safe preview and one constrained optional override before release.
 - [ ] Show one `INFORM` delivery with no response request.
@@ -55,7 +61,9 @@ Official event rules, eligibility, registration state, reuse terms, and deadline
 - [ ] Show the bounded proposal or verified meeting-ready path.
 - [ ] Confirm Decision Room, Reach, and Data match the provider events without exposing private content.
 - [ ] Repeat the complete flow three times without database edits or code changes.
-- [ ] Retain only safe tokens, timestamps, and screenshots; never record keys, routes, addresses, private answers, or provider bodies.
+- [ ] Retain only safe token aliases, timestamps, aggregate counts, trace hashes, redacted screenshots, and outcomes; never record keys, database URLs/hosts/users/passwords, routes, identities, destinations, private answers, or provider bodies.
+- [ ] Document backup, retention, reset, single-listener ownership, and evidence-destruction boundaries before the run.
+- [ ] Set `live_provider_verified=true` only after all three flows and the retention/evidence review pass.
 
 ## Public demo and browser QA
 
@@ -74,6 +82,7 @@ Official event rules, eligibility, registration state, reuse terms, and deadline
 .\.venv\Scripts\python.exe -m ruff check src tests scripts
 .\.venv\Scripts\python.exe scripts\smoke_humanwire.py
 .\.venv\Scripts\python.exe -m humanwire smoke
+.\.venv\Scripts\python.exe -m humanwire sandbox checklist
 .\.venv\Scripts\python.exe -m pip check
 git diff --check
 git status --short

@@ -151,6 +151,37 @@ The opt-in live mode only prints a manual checklist and has no provider, model, 
 
 Actual Caspian and Telegram proof is a separate operator gate. It must cover one inform, acknowledgement, quick response, email structured interview continued on Telegram, authenticated evidence confirmation, explicit approval response, delivery failover, and three consecutive complete flows without database edits.
 
+## Private PostgreSQL sandbox readiness
+
+The private sandbox is a separate operator-owned deployment, PostgreSQL database, Caspian project, directory, analytics token, email connection, Telegram bot, and set of consenting test identities. Do not reuse the public demo project, its synthetic directory, or its SQLite database.
+
+Copy `.env.example` to an ignored private environment and set these required variables there:
+
+```text
+CASPIAN_API_KEY
+TELEGRAM_BOT_TOKEN
+CASPIAN_EMAIL_USERNAME
+DATABASE_URL
+ORGANIZATION_PATH
+ENGAGEMENT_REQUIRE_GO
+PUBLIC_DEMO
+HUMANWIRE_ALEMBIC_REVISION
+```
+
+`DATABASE_URL` must use `postgresql://` or `postgresql+psycopg://`, `ORGANIZATION_PATH` must identify a distinct private directory containing both email and Telegram routes, `ENGAGEMENT_REQUIRE_GO` must be `true`, and `PUBLIC_DEMO` must be `false`. `FEATHERLESS_API_KEY` is optional; deterministic fallbacks remain authoritative when it is absent.
+
+Schema creation is migration-only for this sandbox. The operator must run Alembic against the intended private target, verify the current revision through authorized database operations, and only then set `HUMANWIRE_ALEMBIC_REVISION` to the exact repository head:
+
+```powershell
+.\.venv\Scripts\python.exe -m alembic upgrade head
+.\.venv\Scripts\python.exe -m humanwire sandbox check
+.\.venv\Scripts\python.exe -m humanwire sandbox checklist
+```
+
+Do not use `humanwire init-db` for private sandbox startup. `sandbox check` is a static, read-only preflight: it does not load `.env`, connect to PostgreSQL or providers, query the installed revision, run migrations, call a model, or write repository state. It prints only `PASS`, `FAIL`, or `PENDING` with safe requirement variable names and aggregate directory/migration counts. A matching `HUMANWIRE_ALEMBIC_REVISION` is an operator attestation, not connectivity proof; absent attestation is `PENDING`, and a stale value is `FAIL`.
+
+`sandbox checklist` remains `PENDING` until one listener owns the provider stream/database and three complete flows use only consenting operator-owned identities. The flows must cover `INFORM`, authenticated acknowledgement, `QUICK_RESPONSE` plus exact confirmation, an email structured interview continued on Telegram plus confirmation, explicit approval, alternate-channel progression, bounded proposal/scheduling, and matching read-only projections. Retain only safe token aliases, timestamps, aggregate counts, trace hashes, redacted screenshots, and outcomes. Never retain credentials, URLs, hosts, usernames, passwords, routes, identities, destinations, provider bodies, or private answers. Set `live_provider_verified=true` only after all three flows and the retention/evidence review pass.
+
 ## Reproducible synthetic persona proof
 
 Run generation and frozen replay through the installed module with explicit single-owner run-root paths that do not yet exist. HumanWire atomically creates each root, so concurrent cooperative harness runs have exactly one owner. The generated transcript must stay inside its claimed run root:
