@@ -201,9 +201,12 @@ class StudioRunManager:
             record.worker = worker
             self._records[alias] = record
             self._active_alias = alias
+            failed_before_start = False
             try:
                 worker.start()
             except Exception:  # noqa: BLE001 - thread runtime details stay private
+                failed_before_start = worker.ident is None and not worker.is_alive()
+            if failed_before_start:
                 self._records.pop(alias, None)
                 if self._active_alias == alias:
                     self._active_alias = None
@@ -250,27 +253,38 @@ class StudioRunManager:
     ) -> PersonaDecisionEngineFactory | None:
         if request.agent_mode is StudioAgentMode.STANDARD:
             return None
+        factory: PersonaDecisionEngineFactory | None = None
+        failure_reason: str | None = None
         try:
             if self._model_factory_builder is not None:
                 factory = self._model_factory_builder()
-                if factory is None:
-                    raise ModelModeUnavailable("model_runtime_unavailable")
-                return factory
-            settings = Settings()
-            if settings.featherless_api_key is None:
-                raise ModelModeUnavailable("model_credentials_missing")
-            api_key = settings.featherless_api_key.get_secret_value()
-            if not api_key.strip():
-                raise ModelModeUnavailable("model_credentials_missing")
-            return PydanticAIPersonaDecisionEngineFactory(
-                api_key=api_key,
-                model_identifier=settings.featherless_model,
-                base_url=settings.featherless_base_url,
+            else:
+                settings = Settings()
+                if settings.featherless_api_key is None:
+                    failure_reason = "model_credentials_missing"
+                else:
+                    api_key = settings.featherless_api_key.get_secret_value()
+                    if not api_key.strip():
+                        failure_reason = "model_credentials_missing"
+                    else:
+                        factory = PydanticAIPersonaDecisionEngineFactory(
+                            api_key=api_key,
+                            model_identifier=settings.featherless_model,
+                            base_url=settings.featherless_base_url,
+                        )
+        except ModelModeUnavailable as error:
+            failure_reason = (
+                error.reason
+                if error.reason in _MODEL_UNAVAILABLE_REASONS
+                else "model_runtime_unavailable"
             )
-        except ModelModeUnavailable:
-            raise
         except Exception:  # noqa: BLE001 - provider/configuration details stay private
-            raise ModelModeUnavailable("model_runtime_unavailable") from None
+            failure_reason = "model_runtime_unavailable"
+        if factory is None:
+            raise ModelModeUnavailable(
+                failure_reason or "model_runtime_unavailable"
+            ) from None
+        return factory
 
     def _run_one(
         self,

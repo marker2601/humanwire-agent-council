@@ -16,6 +16,23 @@ from humanwire.studio_run import (
 from tests.humanwire.studio_fixtures import conflict_request, launch_request
 
 
+def exception_graph_text(error: BaseException) -> str:
+    pending = [error]
+    seen = set()
+    rendered = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        rendered.extend((repr(current), str(current), repr(current.args)))
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+    return "\n".join(rendered)
+
+
 def manager_with_blocking_runner(tmp_path, release, aliases, *, started=None):
     alias_iter = iter(aliases)
 
@@ -116,10 +133,56 @@ def test_worker_start_failure_releases_atomic_ownership_without_private_text(
     with pytest.raises(RuntimeError, match="coordination worker could not start") as error:
         manager.create_run(launch_request())
 
-    assert "PRIVATE-THREAD" not in str(error.value)
+    assert "PRIVATE-THREAD" not in exception_graph_text(error.value)
     assert manager.active_alias is None
     assert manager.list_runs() == ()
     assert not any(tmp_path.iterdir())
+
+
+def test_worker_that_starts_then_raises_retains_ownership_until_it_finishes(
+    tmp_path, monkeypatch
+) -> None:
+    release = threading.Event()
+    runner_started = threading.Event()
+    captured = {}
+
+    def runner(scenario, output_path, run_root, **kwargs):
+        captured["thread"] = threading.current_thread()
+        Path(run_root).mkdir()
+        runner_started.set()
+        assert release.wait(2)
+
+    real_start = threading.Thread.start
+
+    def start_then_raise(worker):
+        real_start(worker)
+        captured["started_worker"] = worker
+        raise RuntimeError("PRIVATE-PARTIAL-START-RUNTIME")
+
+    monkeypatch.setattr(threading.Thread, "start", start_then_raise)
+    manager = StudioRunManager(
+        workspace_root=tmp_path,
+        runner=runner,
+        alias_factory=iter(["launch-001", "conflict-002"]).__next__,
+    )
+
+    created = manager.create_run(launch_request())
+
+    assert created.run_alias == "launch-001"
+    assert runner_started.wait(2)
+    worker = captured["started_worker"]
+    assert worker is captured["thread"]
+    assert worker.ident is not None
+    assert worker.is_alive()
+    assert manager.active_alias == "launch-001"
+    assert manager.list_runs() == ("launch-001",)
+    with pytest.raises(ActiveRunError) as error:
+        manager.create_run(conflict_request())
+    assert error.value.run_alias == "launch-001"
+
+    release.set()
+    manager.join("launch-001", timeout=2)
+    assert manager.active_alias is None
 
 
 def test_worker_is_non_daemon_and_receives_exact_run_contract(tmp_path) -> None:
@@ -247,9 +310,34 @@ def test_model_builder_failure_is_translated_without_private_exception_or_root(
         manager.create_run(launch_request(agent_mode="model_assisted"))
 
     assert error.value.reason == "model_runtime_unavailable"
-    assert "PRIVATE-MODEL" not in str(error.value)
+    assert "PRIVATE-MODEL" not in exception_graph_text(error.value)
     assert not any(tmp_path.iterdir())
     assert manager.list_runs() == ()
+
+
+def test_caller_model_error_is_rebuilt_without_its_private_exception_graph(
+    tmp_path,
+) -> None:
+    def fail_builder():
+        try:
+            raise RuntimeError("PRIVATE-CALLER-MODEL-CAUSE")
+        except RuntimeError as private_error:
+            raise ModelModeUnavailable("PRIVATE-CALLER-REASON") from private_error
+
+    manager = StudioRunManager(
+        workspace_root=tmp_path,
+        alias_factory=iter(["model-001"]).__next__,
+        model_factory_builder=fail_builder,
+    )
+
+    with pytest.raises(ModelModeUnavailable) as error:
+        manager.create_run(launch_request(agent_mode="model_assisted"))
+
+    assert error.value.reason == "model_runtime_unavailable"
+    assert "PRIVATE-CALLER" not in exception_graph_text(error.value)
+    assert error.value.__context__ is None
+    assert error.value.__cause__ is None
+    assert not any(tmp_path.iterdir())
 
 
 @pytest.mark.parametrize("key", [None, SecretStr(""), SecretStr("   ")])
