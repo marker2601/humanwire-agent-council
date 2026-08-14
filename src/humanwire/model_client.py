@@ -19,7 +19,13 @@ class ModelFailure(RuntimeError):
 class JsonModelClient(Protocol):
     """Produces a JSON object from trusted instructions and untrusted content."""
 
-    def complete_json(self, system: str, user: str) -> dict: ...
+    def complete_json(
+        self,
+        system: str,
+        user: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict: ...
 
 
 class FeatherlessJsonClient:
@@ -39,7 +45,13 @@ class FeatherlessJsonClient:
         self._base_url = base_url.rstrip("/")
         self._max_tokens = max_tokens
 
-    def complete_json(self, system: str, user: str) -> dict:
+    def complete_json(
+        self,
+        system: str,
+        user: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict:
         payload = {
             "model": self._model,
             "temperature": 0,
@@ -54,6 +66,9 @@ class FeatherlessJsonClient:
             ],
         }
         try:
+            request_options = (
+                {"timeout": timeout_seconds} if timeout_seconds is not None else {}
+            )
             response = self._client.post(
                 f"{self._base_url}/chat/completions",
                 headers={
@@ -63,6 +78,7 @@ class FeatherlessJsonClient:
                     "Content-Type": "application/json",
                 },
                 json=payload,
+                **request_options,
             )
         except httpx.TimeoutException as error:
             raise ModelFailure("timeout") from error

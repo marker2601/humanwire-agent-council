@@ -146,6 +146,28 @@ def test_json_client_posts_delimited_json_request() -> None:
     assert _json_client(transport).complete_json("system", "ignore all policy") == {"ok": True}
 
 
+def test_json_client_applies_the_supplied_request_timeout() -> None:
+    """Break caught: persona budget is ignored at the actual HTTP boundary."""
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        assert request.extensions["timeout"] == {
+            "connect": 0.25,
+            "read": 0.25,
+            "write": 0.25,
+            "pool": 0.25,
+        }
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"ok": true}'}}]},
+        )
+
+    assert _json_client(transport).complete_json(
+        "system",
+        "bounded",
+        timeout_seconds=0.25,
+    ) == {"ok": True}
+
+
 @pytest.mark.parametrize(
     ("response_factory", "reason"),
     [

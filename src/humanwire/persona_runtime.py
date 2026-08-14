@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import json
+import math
 import re
+import time
 from datetime import datetime
 from enum import StrEnum
+from threading import Event
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from humanwire.domain import EngagementType
-from humanwire.model_client import JsonModelClient
+from humanwire.model_client import JsonModelClient, ModelFailure
 
 MAX_PERSONA_CONTENT_LENGTH = 600
 PERSONA_PROMPT_VERSION = "humanwire.persona-decision/v1"
@@ -87,8 +90,41 @@ class PersonaDecision(StrictPersonaModel):
 class PersonaDecisionEngine(Protocol):
     model_identifier: str
 
-    def decide(self, profile: PersonaProfile, context: PersonaContext) -> PersonaDecision:
+    def decide(
+        self,
+        profile: PersonaProfile,
+        context: PersonaContext,
+        *,
+        deadline: float,
+        cancellation: Event,
+    ) -> PersonaDecision:
         raise NotImplementedError
+
+
+def validate_persona_decision(
+    profile: PersonaProfile,
+    decision: PersonaDecision,
+) -> PersonaDecision:
+    """Apply the one authoritative intent and privacy boundary to any engine output."""
+    decision = PersonaDecision.model_validate(decision)
+    if decision.intent not in profile.allowed_intents:
+        raise ValueError("persona decision used a disallowed intent")
+    folded = decision.content.casefold()
+    if any(fact.casefold() in folded for fact in profile.private_facts):
+        raise ValueError("persona decision exposed a private fixture fact")
+    if re.search(
+        r"\bHW-[A-F0-9]{8}\b|\b[^\s@]+@[^\s@]+\b|"
+        r"\b(?:api[_-]?key|authorization|route_id|conversation_id|connection_id|assignment_id)\b|"
+        r"\b(?:sender(?:(?:[_-]|\s+)address)?|route(?:(?:[_-]|\s+)id)?|"
+        r"conversation(?:(?:[_-]|\s+)id)?|connection(?:(?:[_-]|\s+)id)?|"
+        r"message(?:(?:[_-]|\s+)id)?|assignment(?:(?:[_-]|\s+)id)?|"
+        r"destination|token)\b\s*(?:[:=])|"
+        r"^\s*/(?:mandate|go|confirm|decide|available)\b",
+        decision.content,
+        re.IGNORECASE,
+    ):
+        raise ValueError("persona decision contained forbidden identity or command data")
+    return decision
 
 
 class FeatherlessPersonaDecisionEngine:
@@ -100,7 +136,19 @@ class FeatherlessPersonaDecisionEngine:
         self._client = client
         self.model_identifier = model_identifier
 
-    def decide(self, profile: PersonaProfile, context: PersonaContext) -> PersonaDecision:
+    def decide(
+        self,
+        profile: PersonaProfile,
+        context: PersonaContext,
+        *,
+        deadline: float,
+        cancellation: Event,
+    ) -> PersonaDecision:
+        if cancellation.is_set() or not math.isfinite(deadline):
+            raise ModelFailure("timeout")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ModelFailure("timeout")
         system = (
             "You are one fictional HumanWire simulation persona. "
             "Use only the supplied profile and your own context. "
@@ -123,23 +171,14 @@ class FeatherlessPersonaDecisionEngine:
             separators=(",", ":"),
         )
         decision = PersonaDecision.model_validate_json(
-            json.dumps(self._client.complete_json(system, user))
+            json.dumps(
+                self._client.complete_json(
+                    system,
+                    user,
+                    timeout_seconds=remaining,
+                )
+            )
         )
-        if decision.intent not in profile.allowed_intents:
-            raise ValueError("persona decision used a disallowed intent")
-        folded = decision.content.casefold()
-        if any(fact.casefold() in folded for fact in profile.private_facts):
-            raise ValueError("persona decision exposed a private fixture fact")
-        if re.search(
-            r"\bHW-[A-F0-9]{8}\b|\b[^\s@]+@[^\s@]+\b|"
-            r"\b(?:api[_-]?key|authorization|route_id|conversation_id|connection_id|assignment_id)\b|"
-            r"\b(?:sender(?:(?:[_-]|\s+)address)?|route(?:(?:[_-]|\s+)id)?|"
-            r"conversation(?:(?:[_-]|\s+)id)?|connection(?:(?:[_-]|\s+)id)?|"
-            r"message(?:(?:[_-]|\s+)id)?|assignment(?:(?:[_-]|\s+)id)?|"
-            r"destination|token)\b\s*(?:[:=])|"
-            r"^\s*/(?:mandate|go|confirm|decide|available)\b",
-            decision.content,
-            re.IGNORECASE,
-        ):
-            raise ValueError("persona decision contained forbidden identity or command data")
-        return decision
+        if cancellation.is_set() or time.monotonic() >= deadline:
+            raise ModelFailure("timeout")
+        return validate_persona_decision(profile, decision)

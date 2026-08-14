@@ -359,7 +359,15 @@ class BarrierDecisionEngine:
         self.maximum_active = 0
         self.lock = threading.Lock()
 
-    def decide(self, profile, context) -> PersonaDecision:
+    def decide(
+        self,
+        profile,
+        context,
+        *,
+        deadline=None,
+        cancellation=None,
+    ) -> PersonaDecision:
+        del deadline, cancellation
         with self.lock:
             self.active += 1
             self.maximum_active = max(self.maximum_active, self.active)
@@ -411,7 +419,15 @@ def test_model_decision_worker_bound_is_clamped_to_eight(tmp_path) -> None:
             self.active = 0
             self.maximum_active = 0
 
-        def decide(self, profile, context) -> PersonaDecision:
+        def decide(
+            self,
+            profile,
+            context,
+            *,
+            deadline=None,
+            cancellation=None,
+        ) -> PersonaDecision:
+            del deadline, cancellation
             with self.lock:
                 self.active += 1
                 self.maximum_active = max(self.maximum_active, self.active)
@@ -460,7 +476,15 @@ def test_one_persona_has_only_one_model_decision_in_flight(tmp_path) -> None:
             self.call_count = 0
             self.lock = threading.Lock()
 
-        def decide(self, profile, context) -> PersonaDecision:
+        def decide(
+            self,
+            profile,
+            context,
+            *,
+            deadline=None,
+            cancellation=None,
+        ) -> PersonaDecision:
+            del deadline, cancellation
             with self.lock:
                 active = self.active_by_role.get(profile.role, 0) + 1
                 self.active_by_role[profile.role] = active
@@ -518,8 +542,15 @@ class FailingDecisionEngine:
     def __init__(self, failure: Exception) -> None:
         self.failure = failure
 
-    def decide(self, profile, context) -> PersonaDecision:
-        del profile, context
+    def decide(
+        self,
+        profile,
+        context,
+        *,
+        deadline=None,
+        cancellation=None,
+    ) -> PersonaDecision:
+        del profile, context, deadline, cancellation
         raise self.failure
 
 
@@ -544,8 +575,15 @@ def test_model_decision_disallowed_intent_is_inert(tmp_path) -> None:
     class DisallowedDecisionEngine:
         model_identifier = "fixture/disallowed"
 
-        def decide(self, profile, context) -> PersonaDecision:
-            del profile, context
+        def decide(
+            self,
+            profile,
+            context,
+            *,
+            deadline=None,
+            cancellation=None,
+        ) -> PersonaDecision:
+            del profile, context, deadline, cancellation
             return PersonaDecision(
                 time_offset_seconds=1,
                 intent=SyntheticIntent.CHANGE,
@@ -562,6 +600,263 @@ def test_model_decision_disallowed_intent_is_inert(tmp_path) -> None:
     assert result.transcript.actions[0].intent is SyntheticIntent.ERROR
     assert result.transcript.actions[0].content == "synthetic_model_invalid_output"
     assert result.inbound_envelopes == ()
+
+
+@pytest.mark.parametrize(
+    "unsafe_content",
+    ["PRIVATE-PERSONA-SENTINEL", "sender_address=forged"],
+)
+def test_generic_engine_private_or_identity_content_is_inert(
+    tmp_path, unsafe_content
+) -> None:
+    """Break caught: central generation trusts privacy checks unique to one adapter."""
+
+    class UnsafeContentEngine:
+        model_identifier = "fixture/unsafe-content"
+
+        def decide(
+            self,
+            profile,
+            context,
+            *,
+            deadline=None,
+            cancellation=None,
+        ) -> PersonaDecision:
+            del profile, context, deadline, cancellation
+            return PersonaDecision(
+                time_offset_seconds=1,
+                intent=SyntheticIntent.ACKNOWLEDGE,
+                content=unsafe_content,
+            )
+
+    scenario = one_person_generation_scenario()
+    personas = list(scenario.personas)
+    personas[1] = personas[1].model_copy(
+        update={"private_facts": ["PRIVATE-PERSONA-SENTINEL"]}
+    )
+    result = generate_scenario(
+        scenario.model_copy(update={"personas": personas}),
+        tmp_path / "run" / "transcript.json",
+        tmp_path / "run",
+        decision_engine=UnsafeContentEngine(),
+    )
+
+    assert result.transcript.actions[0].intent is SyntheticIntent.ERROR
+    assert result.transcript.actions[0].content == "synthetic_model_invalid_output"
+    assert unsafe_content not in result.transcript.model_dump_json()
+    assert unsafe_content not in (tmp_path / "run" / "transcript.json").read_text()
+    assert result.inbound_envelopes == ()
+
+
+def test_engine_without_cooperative_deadline_contract_is_never_called(tmp_path) -> None:
+    """Break caught: generation silently invokes an unbounded legacy engine shape."""
+
+    class LegacyBlockingShapeEngine:
+        model_identifier = "fixture/legacy-shape"
+
+        def __init__(self) -> None:
+            self.called = False
+
+        def decide(self, profile, context) -> PersonaDecision:
+            del profile, context
+            self.called = True
+            return PersonaDecision(
+                time_offset_seconds=1,
+                intent=SyntheticIntent.ACKNOWLEDGE,
+                content="Acknowledged.",
+            )
+
+    engine = LegacyBlockingShapeEngine()
+    result = generate_scenario(
+        one_person_generation_scenario(),
+        tmp_path / "run" / "transcript.json",
+        tmp_path / "run",
+        decision_engine=engine,
+    )
+
+    assert engine.called is False
+    assert result.transcript.actions[0].intent is SyntheticIntent.ERROR
+    assert result.transcript.actions[0].content == "synthetic_model_invalid_output"
+    assert result.inbound_envelopes == ()
+
+
+def test_cooperative_late_result_is_cancelled_and_never_committed(
+    tmp_path, monkeypatch
+) -> None:
+    """Break caught: a late valid decision is accepted or leaves model work running."""
+
+    class CooperativeLateEngine:
+        model_identifier = "fixture/cooperative-late"
+
+        def __init__(self) -> None:
+            self.finished = threading.Event()
+
+        def decide(
+            self,
+            profile,
+            context,
+            *,
+            deadline=None,
+            cancellation=None,
+        ) -> PersonaDecision:
+            del profile, context, deadline
+            if cancellation is None:
+                time.sleep(0.35)
+            else:
+                cancellation.wait(timeout=1)
+            self.finished.set()
+            return PersonaDecision(
+                time_offset_seconds=1,
+                intent=SyntheticIntent.ACKNOWLEDGE,
+                content="Late acknowledgement must be discarded.",
+            )
+
+    monkeypatch.setattr(
+        synthetic_module,
+        "MODEL_DECISION_TIMEOUT_SECONDS",
+        0.05,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        synthetic_module,
+        "MODEL_DECISION_CANCELLATION_GRACE_SECONDS",
+        0.2,
+        raising=False,
+    )
+    engine = CooperativeLateEngine()
+    started = time.monotonic()
+    result = generate_scenario(
+        one_person_generation_scenario(),
+        tmp_path / "run" / "transcript.json",
+        tmp_path / "run",
+        decision_engine=engine,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.40
+    assert engine.finished.is_set()
+    assert result.transcript.actions[0].intent is SyntheticIntent.ERROR
+    assert result.transcript.actions[0].content == "synthetic_model_timeout"
+    transcript_bytes = (tmp_path / "run" / "transcript.json").read_bytes()
+    sidecar_bytes = (tmp_path / "run" / "provenance.json").read_bytes()
+    time.sleep(0.05)
+    assert (tmp_path / "run" / "transcript.json").read_bytes() == transcript_bytes
+    assert (tmp_path / "run" / "provenance.json").read_bytes() == sidecar_bytes
+    assert not any(
+        thread.name.startswith("humanwire-persona") for thread in threading.enumerate()
+    )
+
+
+def test_zero_offset_uses_the_decision_context_virtual_time(tmp_path) -> None:
+    """Break caught: a valid zero offset creates an action before its own context."""
+
+    class ZeroOffsetEngine:
+        model_identifier = "fixture/zero-offset"
+
+        def __init__(self) -> None:
+            self.virtual_time = None
+
+        def decide(
+            self,
+            profile,
+            context,
+            *,
+            deadline=None,
+            cancellation=None,
+        ) -> PersonaDecision:
+            del profile, deadline, cancellation
+            self.virtual_time = context.virtual_time
+            return PersonaDecision(
+                time_offset_seconds=0,
+                intent=SyntheticIntent.ACKNOWLEDGE,
+                content="Acknowledged at context time.",
+            )
+
+    engine = ZeroOffsetEngine()
+    result = generate_scenario(
+        one_person_generation_scenario(),
+        tmp_path / "run" / "transcript.json",
+        tmp_path / "run",
+        decision_engine=engine,
+    )
+
+    assert result.transcript.actions[0].timestamp == engine.virtual_time
+    assert result.inbound_envelopes
+
+
+def test_worker_count_preserves_repeated_trigger_order_and_transcript(tmp_path) -> None:
+    """Break caught: parallelism changes saved trigger order for a repeated persona."""
+
+    class WorkflowScriptEngine:
+        model_identifier = "fixture/worker-invariance"
+
+        def decide(
+            self,
+            profile,
+            context,
+            *,
+            deadline=None,
+            cancellation=None,
+        ) -> PersonaDecision:
+            del profile, deadline, cancellation
+            prompt = context.delivered_message.casefold()
+            if prompt.startswith("question "):
+                intent = SyntheticIntent.ANSWER
+                content = "Launch date is 2026-09-01."
+            elif "evidence confirmation" in prompt:
+                intent = SyntheticIntent.CONFIRM_EVIDENCE
+                content = "Confirmed."
+            else:
+                intent = SyntheticIntent.ACKNOWLEDGE
+                content = "Acknowledged."
+            return PersonaDecision(
+                time_offset_seconds=1,
+                intent=intent,
+                content=content,
+            )
+
+    scenario = make_generation_scenario()
+    scenario = scenario.model_copy(
+        update={
+            "personas": [
+                persona
+                for persona in scenario.personas
+                if persona.persona_id in {"synthetic-manager", "ack", "quick"}
+            ]
+        }
+    )
+    serial = generate_scenario(
+        scenario,
+        tmp_path / "serial" / "transcript.json",
+        tmp_path / "serial",
+        decision_engine=WorkflowScriptEngine(),
+        max_decision_workers=1,
+    )
+    parallel = generate_scenario(
+        scenario,
+        tmp_path / "parallel" / "transcript.json",
+        tmp_path / "parallel",
+        decision_engine=WorkflowScriptEngine(),
+        max_decision_workers=8,
+    )
+
+    assert serial.transcript.model_dump_json() == parallel.transcript.model_dump_json()
+    quick_actions = [
+        action for action in serial.transcript.actions if action.persona_id == "quick"
+    ]
+    assert [action.trigger_id for action in quick_actions] == [
+        "outbound-2",
+        "outbound-3",
+        "outbound-4",
+    ]
+    assert [action.local_sequence for action in quick_actions] == [1, 2, 3]
+    assert [
+        synthetic_module.canonical_action_order(serial.transcript.scenario, action)
+        for action in serial.transcript.actions
+    ] == sorted(
+        synthetic_module.canonical_action_order(serial.transcript.scenario, action)
+        for action in serial.transcript.actions
+    )
 
 
 def test_model_decision_writes_only_strict_private_provenance_sidecar(tmp_path) -> None:

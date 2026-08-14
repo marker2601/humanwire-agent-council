@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+import time
 from datetime import UTC, datetime
 
 import pytest
@@ -33,10 +35,16 @@ def test_generation_modes_are_explicit_and_stable() -> None:
 class CapturingClient:
     def __init__(self, payload: dict[str, object]) -> None:
         self.payload = payload
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple[str, str, float | None]] = []
 
-    def complete_json(self, system: str, user: str) -> dict:
-        self.calls.append((system, user))
+    def complete_json(
+        self,
+        system: str,
+        user: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict:
+        self.calls.append((system, user, timeout_seconds))
         return self.payload
 
 
@@ -58,6 +66,19 @@ def _context() -> PersonaContext:
     )
 
 
+def _decide(
+    engine: FeatherlessPersonaDecisionEngine,
+    profile: PersonaProfile | None = None,
+    context: PersonaContext | None = None,
+) -> PersonaDecision:
+    return engine.decide(
+        profile or _profile(),
+        context or _context(),
+        deadline=time.monotonic() + 5,
+        cancellation=threading.Event(),
+    )
+
+
 def test_model_engine_receives_only_the_approved_persona_context() -> None:
     """Break caught: the adapter leaks routing or workflow authority into its prompt."""
     client = CapturingClient(
@@ -70,7 +91,7 @@ def test_model_engine_receives_only_the_approved_persona_context() -> None:
     )
     engine = FeatherlessPersonaDecisionEngine(client, "fixture/model")
 
-    decision = engine.decide(_profile(), _context())
+    decision = _decide(engine)
 
     payload = json.loads(client.calls[0][1])
     assert set(payload) == {"profile", "context", "output_schema"}
@@ -92,6 +113,8 @@ def test_model_engine_receives_only_the_approved_persona_context() -> None:
         re.IGNORECASE,
     )
     assert decision.intent is SyntheticIntent.ACKNOWLEDGE
+    assert client.calls[0][2] is not None
+    assert 0 < client.calls[0][2] <= 5
     assert set(vars(engine)) == {"_client", "model_identifier"}
     assert engine._client is client
 
@@ -167,7 +190,8 @@ def test_model_engine_rejects_forbidden_content_before_any_gateway_inbound(
     )
 
     with pytest.raises(ValueError, match="forbidden identity or command data|private fixture fact"):
-        FeatherlessPersonaDecisionEngine(client, "fixture/model").decide(
+        _decide(
+            FeatherlessPersonaDecisionEngine(client, "fixture/model"),
             _profile(private_facts=("fictional constraint",)),
             _context(),
         )
@@ -189,9 +213,7 @@ def test_model_engine_allows_normal_business_route_and_token_words() -> None:
         }
     )
 
-    decision = FeatherlessPersonaDecisionEngine(client, "fixture/model").decide(
-        _profile(), _context()
-    )
+    decision = _decide(FeatherlessPersonaDecisionEngine(client, "fixture/model"))
 
     assert decision.content == (
         "Route the reviewed launch plan through the normal approval process "
@@ -211,22 +233,49 @@ def test_model_engine_rejects_a_disallowed_intent() -> None:
     )
 
     with pytest.raises(ValueError, match="disallowed intent"):
-        FeatherlessPersonaDecisionEngine(client, "fixture/model").decide(_profile(), _context())
+        _decide(FeatherlessPersonaDecisionEngine(client, "fixture/model"))
 
 
 def test_model_failure_reason_propagates_without_private_context() -> None:
     """Break caught: model transport failures are replaced with unsafe diagnostic text."""
 
     class FailingClient:
-        def complete_json(self, system: str, user: str) -> dict:
+        def complete_json(
+            self,
+            system: str,
+            user: str,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> dict:
+            del system, user, timeout_seconds
             raise ModelFailure("timeout")
 
     with pytest.raises(ModelFailure, match="timeout") as error:
-        FeatherlessPersonaDecisionEngine(FailingClient(), "fixture/model").decide(
-            _profile(), _context()
-        )
+        _decide(FeatherlessPersonaDecisionEngine(FailingClient(), "fixture/model"))
 
     assert error.value.reason == "timeout"
+
+
+def test_model_engine_rejects_expired_deadline_before_calling_client() -> None:
+    """Break caught: the primary adapter begins HTTP work with no remaining budget."""
+    client = CapturingClient(
+        {
+            "time_offset_seconds": 1,
+            "intent": "acknowledge",
+            "content": "ACK",
+            "visibility": "shareable",
+        }
+    )
+
+    with pytest.raises(ModelFailure, match="timeout"):
+        FeatherlessPersonaDecisionEngine(client, "fixture/model").decide(
+            _profile(),
+            _context(),
+            deadline=time.monotonic() - 1,
+            cancellation=threading.Event(),
+        )
+
+    assert client.calls == []
 
 
 def test_persona_decision_is_frozen_and_strict() -> None:

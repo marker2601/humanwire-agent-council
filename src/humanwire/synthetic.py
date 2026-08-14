@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import heapq
+import inspect
 import json
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -45,6 +48,7 @@ from humanwire.persona_runtime import (
     SyntheticGenerationMode,
     SyntheticIntent,
     SyntheticProvenance,
+    validate_persona_decision,
 )
 from humanwire.persona_runtime import (
     PersonaContext as _PersonaContext,
@@ -73,6 +77,8 @@ _DIGEST_PATTERN = r"^[0-9a-f]{64}$"
 _TOKEN_PATTERN = re.compile(r"\bHW-[A-F0-9]{8}\b")
 _EMAIL_PATTERN = re.compile(r"\b[^\s@]+@[^\s@]+\b")
 _FIXED_TIME = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
+MODEL_DECISION_TIMEOUT_SECONDS = 15.0
+MODEL_DECISION_CANCELLATION_GRACE_SECONDS = 1.0
 
 
 class _StrictModel(BaseModel):
@@ -729,11 +735,39 @@ def _safe_decide(
     engine: PersonaDecisionEngine,
     profile: _PolicyProfile,
     context: _PersonaContext,
+    deadline: float,
+    cancellation: threading.Event,
 ) -> _PersonaDecision | Exception:
     try:
-        return _PersonaDecision.model_validate(engine.decide(profile, context))
+        decision = _PersonaDecision.model_validate(
+            engine.decide(
+                profile,
+                context,
+                deadline=deadline,
+                cancellation=cancellation,
+            )
+        )
+        if cancellation.is_set() or time.monotonic() >= deadline:
+            raise ModelFailure("timeout")
+        return validate_persona_decision(profile, decision)
     except Exception as error:  # noqa: BLE001 - converted to a safe inert action
         return error
+
+
+def _supports_cooperative_deadline(
+    engine: PersonaDecisionEngine,
+    candidate: _DecisionCandidate,
+) -> bool:
+    try:
+        inspect.signature(engine.decide).bind(
+            candidate.profile,
+            candidate.context,
+            deadline=0.0,
+            cancellation=threading.Event(),
+        )
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _evaluate_model_batch(
@@ -741,20 +775,51 @@ def _evaluate_model_batch(
     candidates: list[_DecisionCandidate],
     max_workers: int,
 ) -> list[_PersonaDecision | Exception]:
-    workers = max(1, min(max_workers, len(candidates), 8))
-    if workers == 1:
+    if not candidates:
+        return []
+    if not _supports_cooperative_deadline(engine, candidates[0]):
         return [
-            _safe_decide(engine, item.profile, item.context) for item in candidates
+            ValueError("persona engine lacks cooperative deadline support")
+            for _ in candidates
         ]
-    with ThreadPoolExecutor(
+    workers = max(1, min(max_workers, len(candidates), 8))
+    deadline = time.monotonic() + MODEL_DECISION_TIMEOUT_SECONDS
+    cancellation = threading.Event()
+    pool = ThreadPoolExecutor(
         max_workers=workers,
         thread_name_prefix="humanwire-persona",
-    ) as pool:
+    )
+    try:
         futures = [
-            pool.submit(_safe_decide, engine, item.profile, item.context)
+            pool.submit(
+                _safe_decide,
+                engine,
+                item.profile,
+                item.context,
+                deadline,
+                cancellation,
+            )
             for item in candidates
         ]
-        return [future.result() for future in futures]
+        _, pending = wait(
+            futures,
+            timeout=max(0.0, deadline - time.monotonic()),
+        )
+        timed_out = set(pending)
+        if timed_out:
+            cancellation.set()
+            _, not_cleaned = wait(
+                timed_out,
+                timeout=MODEL_DECISION_CANCELLATION_GRACE_SECONDS,
+            )
+            if not_cleaned:
+                raise RuntimeError("persona engine violated cooperative cancellation")
+        return [
+            ModelFailure("timeout") if future in timed_out else future.result()
+            for future in futures
+        ]
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 def _safe_model_failure(error: Exception) -> tuple[SyntheticIntent, str]:
@@ -1269,7 +1334,7 @@ def generate_scenario(
                         profile=profiles[persona_id],
                         context=context,
                         channel=channel,
-                        base_time=now,
+                        base_time=context.virtual_time,
                         local_sequence=local_sequence,
                         trigger_id=trigger_id,
                         trigger_digest=trigger_digest,
