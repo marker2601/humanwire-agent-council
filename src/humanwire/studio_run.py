@@ -28,9 +28,6 @@ from humanwire.synthetic import (
 from humanwire.synthetic_progress import SyntheticEvidenceBundle
 
 _SAFE_RUN_ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-_MODEL_UNAVAILABLE_REASONS = frozenset(
-    {"model_credentials_missing", "model_runtime_unavailable"}
-)
 
 
 class ActiveRunError(RuntimeError):
@@ -53,10 +50,12 @@ class ModelModeUnavailable(RuntimeError):
     """A model readiness failure carrying only an allowlisted reason."""
 
     def __init__(self, reason: str) -> None:
-        if reason not in _MODEL_UNAVAILABLE_REASONS:
-            reason = "model_runtime_unavailable"
-        self.reason = reason
-        super().__init__(reason)
+        if reason == "model_credentials_missing":
+            canonical_reason = "model_credentials_missing"
+        else:
+            canonical_reason = "model_runtime_unavailable"
+        self.reason = canonical_reason
+        super().__init__(canonical_reason)
 
 
 @dataclass
@@ -273,11 +272,12 @@ class StudioRunManager:
                             base_url=settings.featherless_base_url,
                         )
         except ModelModeUnavailable as error:
-            failure_reason = (
-                error.reason
-                if error.reason in _MODEL_UNAVAILABLE_REASONS
-                else "model_runtime_unavailable"
-            )
+            if error.reason == "model_credentials_missing":
+                failure_reason = "model_credentials_missing"
+            elif error.reason == "model_runtime_unavailable":
+                failure_reason = "model_runtime_unavailable"
+            else:
+                failure_reason = "model_runtime_unavailable"
         except Exception:  # noqa: BLE001 - provider/configuration details stay private
             failure_reason = "model_runtime_unavailable"
         if factory is None:

@@ -340,6 +340,40 @@ def test_caller_model_error_is_rebuilt_without_its_private_exception_graph(
     assert not any(tmp_path.iterdir())
 
 
+def test_allowlist_equal_model_reason_is_canonicalized_to_a_builtin_string(
+    tmp_path,
+) -> None:
+    class PrivateReason(str):
+        def __new__(cls):
+            return super().__new__(cls, "model_credentials_missing")
+
+        def __repr__(self) -> str:
+            return "PRIVATE-REASON-OBJECT"
+
+    def fail_builder():
+        failure = ModelModeUnavailable("model_runtime_unavailable")
+        failure.reason = PrivateReason()
+        failure.args = (PrivateReason(),)
+        raise failure
+
+    manager = StudioRunManager(
+        workspace_root=tmp_path,
+        alias_factory=iter(["model-001"]).__next__,
+        model_factory_builder=fail_builder,
+    )
+
+    with pytest.raises(ModelModeUnavailable) as error:
+        manager.create_run(launch_request(agent_mode="model_assisted"))
+
+    assert error.value.reason == "model_credentials_missing"
+    assert type(error.value.reason) is str
+    assert type(error.value.args[0]) is str
+    assert "PRIVATE-REASON" not in exception_graph_text(error.value)
+    assert error.value.__context__ is None
+    assert error.value.__cause__ is None
+    assert not any(tmp_path.iterdir())
+
+
 @pytest.mark.parametrize("key", [None, SecretStr(""), SecretStr("   ")])
 def test_default_model_builder_rejects_missing_or_blank_key(
     tmp_path, monkeypatch, key
