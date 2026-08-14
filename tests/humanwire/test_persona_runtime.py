@@ -110,10 +110,24 @@ def test_model_engine_rejects_extra_authority_fields(forged_key: str) -> None:
         "fictional constraint",
         "Contact operator@example.test",
         "HW-1A2B3C4D",
+        "sender_address=forged",
+        "sender-address: forged",
         "route_id=forged",
+        "ROUTE-ID: forged",
         "conversation_id=forged",
+        "conversation-id: forged",
         "connection_id=forged",
+        "connection-id: forged",
         "assignment_id=forged",
+        "assignment-id: forged",
+        "message_id=forged",
+        "MESSAGE-ID: forged",
+        "destination=forged",
+        "DESTINATION: forged",
+        "route=forged",
+        "ROUTE: forged",
+        "token=forged",
+        "TOKEN: forged",
         " /available now",
     ],
 )
@@ -137,6 +151,30 @@ def test_model_engine_rejects_forbidden_content_before_any_gateway_inbound(
         )
 
     assert len(client.calls) == 1
+
+
+def test_model_engine_allows_normal_business_route_and_token_words() -> None:
+    """Break caught: label hardening blocks ordinary business prose without label syntax."""
+    client = CapturingClient(
+        {
+            "time_offset_seconds": 1,
+            "intent": "acknowledge",
+            "content": (
+                "Route the reviewed launch plan through the normal approval process "
+                "within the token budget."
+            ),
+            "visibility": "shareable",
+        }
+    )
+
+    decision = FeatherlessPersonaDecisionEngine(client, "fixture/model").decide(
+        _profile(), _context()
+    )
+
+    assert decision.content == (
+        "Route the reviewed launch plan through the normal approval process "
+        "within the token budget."
+    )
 
 
 def test_model_engine_rejects_a_disallowed_intent() -> None:

@@ -125,6 +125,9 @@ class FeatherlessPersonaDecisionEngine:
         if re.search(
             r"\bHW-[A-F0-9]{8}\b|\b[^\s@]+@[^\s@]+\b|"
             r"\b(?:api[_-]?key|authorization|route_id|conversation_id|connection_id|assignment_id)\b|"
+            r"\b(?:sender(?:[_-]?address)?|route(?:[_-]?id)?|conversation(?:[_-]?id)?|"
+            r"connection(?:[_-]?id)?|message(?:[_-]?id)?|assignment(?:[_-]?id)?|"
+            r"destination|token)\b\s*(?:[:=])|"
             r"^\s*/(?:mandate|go|confirm|decide|available)\b",
             decision.content,
             re.IGNORECASE,
