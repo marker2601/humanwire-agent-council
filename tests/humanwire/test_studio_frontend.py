@@ -1,12 +1,20 @@
+import html
+import json
 import re
+import shutil
 import subprocess
 import textwrap
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from humanwire.studio_app import create_coordination_studio_app
+from humanwire.studio_projection import create_studio_progress
 from humanwire.studio_run import StudioRunManager
+from humanwire.synthetic import build_coordination_scenario, generate_scenario
+
+from .studio_fixtures import launch_request
 
 ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = ROOT / "src/humanwire/templates/coordination_studio.html"
@@ -14,6 +22,17 @@ CSS = ROOT / "src/humanwire/studio_static/coordination-studio.css"
 SCRIPT = ROOT / "src/humanwire/studio_static/coordination-studio.js"
 FIXTURES = ROOT / "tests/humanwire/fixtures/studio-snapshots.json"
 HOSTILE_HARNESS = ROOT / "tests/humanwire/studio_frontend_hostile_harness.js"
+
+
+def chromium_executable() -> Path | None:
+    candidates = (
+        shutil.which("chrome"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    )
+    return next((Path(item) for item in candidates if item and Path(item).is_file()), None)
 
 
 def css_block(source: str, marker: str, *, start: int = 0) -> str:
@@ -170,6 +189,176 @@ def test_hostile_async_reset_catalog_graph_and_mobile_contract() -> None:
             check=False,
         )
         assert result.returncode == 0, f"{mode}: {result.stderr}"
+
+
+def test_real_completed_graph_rendered_content_has_five_pixel_clearance(
+    tmp_path,
+) -> None:
+    """Break caught: real SVG text escapes its card and collides with another node."""
+    chromium = chromium_executable()
+    if chromium is None:
+        pytest.skip("Chromium is unavailable; rendered SVG bounds require a browser engine")
+
+    request = launch_request()
+    scenario = build_coordination_scenario(request, seed=7, scenario_id="render-001")
+    store, observer = create_studio_progress(request, scenario)
+    run_root = tmp_path / "completed-run"
+    generate_scenario(
+        scenario,
+        run_root / "transcript.json",
+        run_root,
+        mandate_request=request.objective,
+        include_change_story=False,
+        progress_observer=observer,
+        presentation_observer=observer,
+    )
+    snapshot = store.snapshot()
+    assert len(snapshot.events) == 62
+    assert len(snapshot.graph_nodes) == 17
+    assert len(snapshot.graph_edges) == 57
+
+    client = studio_client(tmp_path / "studio")
+    page = client.get("/").text
+    catalog = client.get("/api/catalog").json()
+    page = page.replace(
+        '<link rel="stylesheet" href="/studio-static/coordination-studio.css">',
+        f"<style>{CSS.read_text(encoding='utf-8')}</style>",
+    )
+    fixture = {
+        "catalog": catalog,
+        "snapshot": snapshot.model_dump(mode="json"),
+    }
+    fixture_json = json.dumps(fixture).replace("</", "<\\/")
+    prelude = textwrap.dedent(
+        f"""
+        <script>
+          const browserFixture = {fixture_json};
+          history.replaceState = () => {{}};
+          window.fetch = async (url) => {{
+            let body;
+            let status = 200;
+            if (url === "/api/catalog") body = browserFixture.catalog;
+            else if (url === "/api/runs") {{
+              status = 201;
+              body = {{ run_alias: "render-001", workspace_url: "/runs/render-001" }};
+            }} else if (url === "/api/runs/render-001") body = browserFixture.snapshot;
+            else throw new Error(`Unexpected browser fixture URL: ${{url}}`);
+            return new Response(JSON.stringify(body), {{
+              status,
+              headers: {{ "Content-Type": "application/json", ETag: '"event-62"' }},
+            }});
+          }};
+        </script>
+        """
+    )
+    measurement = textwrap.dedent(
+        """
+        <script>
+          window.addEventListener("load", () => {
+            setTimeout(() => document.querySelector("[data-start-coordination]").click(), 25);
+            setTimeout(() => {
+              const groups = Array.from(document.querySelectorAll("[data-flow-node]"));
+              const boxes = groups.map((group) => {
+                const bounds = group.getBoundingClientRect();
+                const card = group.querySelector("rect").getBoundingClientRect();
+                const textBounds = Array.from(group.querySelectorAll("text"), (item) => {
+                  const box = item.getBoundingClientRect();
+                  return { left: box.left, top: box.top, right: box.right, bottom: box.bottom };
+                });
+                return {
+                  id: group.getAttribute("data-flow-node"),
+                  label: group.querySelectorAll("text")[1].textContent,
+                  left: bounds.left,
+                  top: bounds.top,
+                  right: bounds.right,
+                  bottom: bounds.bottom,
+                  card: { left: card.left, top: card.top, right: card.right, bottom: card.bottom },
+                  textBounds,
+                };
+              });
+              const collisions = [];
+              for (let left = 0; left < boxes.length; left += 1) {
+                for (let right = left + 1; right < boxes.length; right += 1) {
+                  const a = boxes[left];
+                  const b = boxes[right];
+                  const horizontalGap = Math.max(b.left - a.right, a.left - b.right);
+                  const verticalGap = Math.max(b.top - a.bottom, a.top - b.bottom);
+                  if (horizontalGap < 5 && verticalGap < 5) {
+                    collisions.push({
+                      pair: `${a.label} <-> ${b.label}`,
+                      horizontalGap,
+                      verticalGap,
+                    });
+                  }
+                }
+              }
+              const escapedText = boxes.flatMap((box) =>
+                box.textBounds
+                  .filter((text) => (
+                    text.left < box.card.left - 0.5
+                    || text.right > box.card.right + 0.5
+                    || text.top < box.card.top - 0.5
+                    || text.bottom > box.card.bottom + 0.5
+                  ))
+                  .map(() => box.label)
+              );
+              const result = document.createElement("pre");
+              result.id = "graph-bounds-result";
+              result.textContent = JSON.stringify({
+                nodeCount: boxes.length,
+                edgeCount: document.querySelectorAll("[data-flow-edge]").length,
+                collisions,
+                escapedText: Array.from(new Set(escapedText)),
+              });
+              document.body.append(result);
+            }, 800);
+          });
+        </script>
+        """
+    )
+    controller = SCRIPT.read_text(encoding="utf-8").replace("</", "<\\/")
+    page = page.replace(
+        '<script src="/studio-static/coordination-studio.js" defer></script>',
+        f"{prelude}<script>{controller}</script>{measurement}",
+    )
+    harness = tmp_path / "rendered-graph.html"
+    harness.write_text(page, encoding="utf-8")
+    profile = tmp_path / "chromium-profile"
+    result = subprocess.run(
+        [
+            str(chromium),
+            "--headless=new",
+            "--disable-gpu",
+            "--no-sandbox",
+            "--hide-scrollbars",
+            "--force-device-scale-factor=1",
+            "--window-size=1680,950",
+            "--virtual-time-budget=2200",
+            f"--user-data-dir={profile}",
+            "--dump-dom",
+            harness.as_uri(),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    matched = re.search(
+        r'<pre id="graph-bounds-result">(.*?)</pre>',
+        result.stdout,
+        re.DOTALL,
+    )
+    assert matched is not None, result.stdout[-2000:]
+    measured = json.loads(html.unescape(matched.group(1)))
+    assert measured["nodeCount"] == 17
+    assert measured["edgeCount"] == 57
+    assert {
+        "escapedText": measured["escapedText"],
+        "collisions": measured["collisions"],
+    } == {"escapedText": [], "collisions": []}
 
 
 def test_controller_source_has_no_unsafe_dom_or_token_persistence() -> None:

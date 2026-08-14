@@ -344,6 +344,22 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
+  function graphNodeWidth(node, useMobile) {
+    if (useMobile) {
+      return 190;
+    }
+    if (node.kind === "stakeholder") {
+      return 180;
+    }
+    if (node.kind === "artifact") {
+      return 160;
+    }
+    if (node.kind === "gateway") {
+      return 150;
+    }
+    return 130;
+  }
+
   function graphPositions(nodes, useMobile) {
     const positions = {};
     if (useMobile) {
@@ -366,25 +382,25 @@ document.addEventListener("DOMContentLoaded", () => {
       };
     }
     const people = nodes.filter((item) => item.kind === "stakeholder");
-    const pitch = 47;
-    const height = Math.max(360, people.length * pitch + 16);
-    const centerY = (height - 39) / 2;
+    const pitch = 54;
+    const height = Math.max(394, people.length * pitch + 16);
+    const centerY = (height - 44) / 2;
     positions.request = { x: 10, y: centerY };
-    positions.humanwire = { x: 180, y: centerY };
-    positions["caspian-gateway"] = { x: 350, y: centerY };
+    positions.humanwire = { x: 155, y: centerY };
+    positions["caspian-gateway"] = { x: 300, y: centerY };
     people.forEach((item, index) => {
-      positions[item.node_id] = { x: 530, y: 8 + index * pitch };
+      positions[item.node_id] = { x: 465, y: 8 + index * pitch };
     });
-    const artifactPitch = 47;
-    const artifactStart = Math.max(8, (height - 4 * 39 - 3 * 8) / 2);
+    const artifactPitch = 54;
+    const artifactStart = Math.max(8, (height - 4 * 44 - 3 * 10) / 2);
     const artifactPositions = {
-      conflict: { x: 700, y: artifactStart },
-      interview: { x: 700, y: artifactStart + artifactPitch },
-      evidence: { x: 700, y: artifactStart + artifactPitch * 2 },
-      proposal: { x: 700, y: artifactStart + artifactPitch * 3 },
-      approval: { x: 855, y: centerY - 82 },
-      availability: { x: 855, y: centerY },
-      meeting: { x: 855, y: centerY + 82 },
+      conflict: { x: 660, y: artifactStart },
+      interview: { x: 660, y: artifactStart + artifactPitch },
+      evidence: { x: 660, y: artifactStart + artifactPitch * 2 },
+      proposal: { x: 660, y: artifactStart + artifactPitch * 3 },
+      approval: { x: 835, y: centerY - 86 },
+      availability: { x: 835, y: centerY },
+      meeting: { x: 835, y: centerY + 86 },
     };
     Object.assign(positions, artifactPositions);
     return { height, positions };
@@ -405,8 +421,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
     const isMobile = mobileLayout.matches;
     const width = isMobile ? 420 : 1000;
-    const nodeWidth = isMobile ? 190 : 140;
-    const nodeHeight = isMobile ? 54 : 39;
+    const nodeHeight = isMobile ? 54 : 44;
     const layout = graphPositions(snapshot.graph_nodes, isMobile);
     const height = layout.height;
     const positions = layout.positions;
@@ -417,13 +432,23 @@ document.addEventListener("DOMContentLoaded", () => {
     const description = svgElement("desc", {});
     description.textContent = "The highlighted path is the selected saved transition. Labels remain available in the From, To, and Generated summary.";
     canvas.append(title, description);
+    const nodesById = new Map(snapshot.graph_nodes.map((node) => [node.node_id, node]));
 
     snapshot.graph_edges.forEach((edge, index) => {
       const source = positions[edge.source];
       const destination = positions[edge.destination];
-      if (source === undefined || destination === undefined) {
+      const sourceNode = nodesById.get(edge.source);
+      const destinationNode = nodesById.get(edge.destination);
+      if (
+        source === undefined
+        || destination === undefined
+        || sourceNode === undefined
+        || destinationNode === undefined
+      ) {
         return;
       }
+      const sourceWidth = graphNodeWidth(sourceNode, isMobile);
+      const destinationWidth = graphNodeWidth(destinationNode, isMobile);
       const path = svgElement("path", {
         class: "studio-flow-edge",
         "data-flow-edge": "",
@@ -431,13 +456,13 @@ document.addEventListener("DOMContentLoaded", () => {
         "data-destination": edge.destination,
         "data-lane": String(index),
       });
-      const startX = source.x + nodeWidth;
+      const startX = source.x + sourceWidth;
       const startY = source.y + nodeHeight / 2;
       const endX = destination.x;
       const endY = destination.y + nodeHeight / 2;
       if (isMobile) {
-        const verticalStartX = source.x + nodeWidth / 2;
-        const verticalEndX = destination.x + nodeWidth / 2;
+        const verticalStartX = source.x + sourceWidth / 2;
+        const verticalEndX = destination.x + destinationWidth / 2;
         const middleY = (startY + endY) / 2 + ((index % 5) - 2) * 4;
         path.setAttribute(
           "d",
@@ -455,6 +480,7 @@ document.addEventListener("DOMContentLoaded", () => {
       if (position === undefined) {
         return;
       }
+      const nodeWidth = graphNodeWidth(node, isMobile);
       const group = svgElement("g", {
         class: "studio-flow-node",
         transform: `translate(${position.x} ${position.y})`,
