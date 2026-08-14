@@ -507,6 +507,7 @@ def test_persisted_ordinals_follow_global_saved_event_order() -> None:
         (1, "Mandate received"),
         (2, "Mandate created"),
     ]
+    assert [event.channel for event in snapshot.events] == ["Internal", "Internal"]
 
 
 def test_store_returns_immutable_independent_snapshots() -> None:
@@ -562,8 +563,8 @@ def test_invalid_person_bindings_remain_saved_but_neutral() -> None:
             created_at=created_at + timedelta(seconds=case_index),
             assignment_id=event_assignment_id,
             person_id=person_id,
-            channel=None,
-            direction=None,
+            channel=SimpleNamespace(value="email"),
+            direction=SimpleNamespace(value="downward"),
         )
         repository = SimpleNamespace(
             list_recent_mandates=lambda _limit, mandate=mandate: [mandate],
@@ -586,3 +587,7 @@ def test_invalid_person_bindings_remain_saved_but_neutral() -> None:
         assert projected[0].highlight_target == "none"
         assert projected[0].persona_label is None
         assert projected[0].data_point == "No public data point"
+        assert projected[0].channel is None
+        assert projected[0].direction is None
+        assert "Email" not in projected[0].description
+        assert "Downward" not in projected[0].description

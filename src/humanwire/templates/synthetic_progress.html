@@ -59,16 +59,52 @@
         <div class="synthetic-section-heading">
           <div>
             <p class="eyebrow">Persisted replay</p>
-            <h2 id="synthetic-replay-heading">Saved event flow</h2>
+            <h2 id="synthetic-replay-heading">Live coordination map</h2>
+            <p class="synthetic-section-copy">Watch each saved event move through HumanWire and become a visible data point.</p>
           </div>
           <button type="button" data-follow-live aria-pressed="true">Follow live</button>
         </div>
         <ol class="replay-events" data-replay-list hidden aria-hidden="true"></ol>
-        <dl class="replay-flow-strip" data-replay-flow>
-          <div><dt>From</dt><dd data-replay-source>No persisted event yet</dd></div>
-          <div><dt>To</dt><dd data-replay-destination>HumanWire</dd></div>
-          <div><dt>Generated</dt><dd data-replay-data-point>Waiting</dd></div>
-        </dl>
+        <div class="replay-map-shell">
+          <div class="replay-map-heading">
+            <div>
+              <span class="replay-map-kicker">Coordination journey</span>
+              <strong data-replay-stage>Waiting for a saved event</strong>
+            </div>
+            <span class="replay-story-pill" data-replay-story>Primary story</span>
+          </div>
+          <ol class="replay-journey" data-flow-journey aria-label="Coordination stages"></ol>
+          <figure class="replay-system-map" aria-label="Event route visualization">
+            <figcaption class="sr-only">The selected saved event moves from its source through a safe channel to its destination, where HumanWire saves a public data point.</figcaption>
+            <div class="replay-route" data-replay-route data-direction="internal">
+              <article class="replay-route-node replay-route-source">
+                <span class="replay-node-icon" aria-hidden="true">01</span>
+                <span class="replay-node-label">Source</span>
+                <strong data-replay-source>No persisted event yet</strong>
+              </article>
+              <div class="replay-connector" aria-hidden="true"><span class="replay-route-token"></span></div>
+              <article class="replay-route-node replay-route-channel">
+                <span class="replay-node-icon" aria-hidden="true">02</span>
+                <span class="replay-node-label">Channel</span>
+                <strong data-replay-channel>Not recorded</strong>
+                <small data-replay-direction>Route metadata unavailable</small>
+              </article>
+              <div class="replay-connector" aria-hidden="true"><span class="replay-route-token"></span></div>
+              <article class="replay-route-node replay-route-destination">
+                <span class="replay-node-icon" aria-hidden="true">03</span>
+                <span class="replay-node-label">Destination</span>
+                <strong data-replay-destination>HumanWire</strong>
+              </article>
+              <div class="replay-connector" aria-hidden="true"><span class="replay-route-token"></span></div>
+              <article class="replay-route-node replay-route-data">
+                <span class="replay-node-icon" aria-hidden="true">04</span>
+                <span class="replay-node-label">Saved data</span>
+                <strong data-replay-data-point>Waiting</strong>
+                <small>Persisted evidence</small>
+              </article>
+            </div>
+          </figure>
+        </div>
         <div class="replay-detail">
           <p data-replay-description>Waiting for the first saved event.</p>
           <time data-replay-time></time>

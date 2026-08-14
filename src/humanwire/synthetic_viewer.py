@@ -37,6 +37,8 @@ _CSV_FIELDS = (
     "stage",
     "source",
     "destination",
+    "channel",
+    "direction",
     "data_point",
     "proof_class",
     "actor_type",
@@ -110,6 +112,8 @@ def _events_csv(bundle: SyntheticEvidenceBundle) -> str:
             "stage": event.stage,
             "source": event.source,
             "destination": event.destination,
+            "channel": event.channel,
+            "direction": event.direction,
             "data_point": event.data_point,
             **provenance,
         }

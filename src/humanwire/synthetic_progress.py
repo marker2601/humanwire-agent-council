@@ -94,6 +94,8 @@ class SyntheticProgressEvent(_StrictProgressModel):
     stage: str = Field(min_length=1, max_length=80)
     source: str = Field(min_length=1, max_length=120)
     destination: str = Field(min_length=1, max_length=120)
+    channel: Literal["Email", "Telegram", "Internal"] | None = None
+    direction: Literal["Upward", "Downward", "Lateral", "External"] | None = None
     data_point: str = Field(min_length=1, max_length=120)
     description: str = Field(min_length=1, max_length=200)
     highlight_target: str = Field(pattern=r"^(origin|none|persona-[1-9][0-9]*)$")
@@ -280,10 +282,13 @@ def _story_for_index(index: int) -> Literal["primary", "change"]:
     return "primary" if index == 0 else "change"
 
 
-def _event_description(stage: str, data_point: str, event: object) -> str:
+def _event_description(
+    stage: str,
+    data_point: str,
+    channel: str | None,
+    direction: str | None,
+) -> str:
     parts = [f"{stage}: {data_point}"]
-    channel = _safe_channel(getattr(event, "channel", None))
-    direction = _safe_direction(getattr(event, "direction", None))
     if channel:
         parts.append(channel)
     if direction:
@@ -683,6 +688,18 @@ class RepositoryProgressObserver:
                     highlight_target = "none"
                     persona_label = None
                     contract = None
+                projected_channel = (
+                    _safe_channel(getattr(event, "channel", None))
+                    if can_explain
+                    else None
+                )
+                if projected_channel is None and has_exact_mandate_binding:
+                    projected_channel = "Internal"
+                projected_direction = (
+                    _safe_direction(getattr(event, "direction", None))
+                    if can_explain
+                    else None
+                )
                 projected = SyntheticProgressEvent(
                     timeline_ordinal=1,
                     persisted_ordinal=None,
@@ -692,8 +709,15 @@ class RepositoryProgressObserver:
                     stage=labels.stage,
                     source=labels.source,
                     destination=labels.destination,
+                    channel=projected_channel,
+                    direction=projected_direction,
                     data_point=labels.data_point,
-                    description=_event_description(labels.stage, labels.data_point, event),
+                    description=_event_description(
+                        labels.stage,
+                        labels.data_point,
+                        projected_channel,
+                        projected_direction,
+                    ),
                     highlight_target=highlight_target,
                     persona_label=persona_label,
                     contract=contract,

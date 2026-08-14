@@ -3,6 +3,18 @@
 
   const POLL_INTERVAL_MS = 1000;
   const PLAY_INTERVAL_MS = 1600;
+  const FLOW_STAGES = [
+    "Mandate",
+    "Plan",
+    "Outreach",
+    "Response",
+    "Evidence",
+    "Decision",
+    "Proposal",
+    "Scheduling",
+    "Outcome",
+    "Saved event",
+  ];
 
   function label(value) {
     if (!value) return "Waiting";
@@ -28,9 +40,15 @@
     const play = document.querySelector("[data-replay-play]");
     const next = document.querySelector("[data-replay-next]");
     const replayProgress = document.querySelector("[data-replay-progress]");
+    const replayRoute = document.querySelector("[data-replay-route]");
+    const flowJourney = document.querySelector("[data-flow-journey]");
     const replaySource = document.querySelector("[data-replay-source]");
+    const replayChannel = document.querySelector("[data-replay-channel]");
+    const replayDirection = document.querySelector("[data-replay-direction]");
     const replayDestination = document.querySelector("[data-replay-destination]");
     const replayDataPoint = document.querySelector("[data-replay-data-point]");
+    const replayStage = document.querySelector("[data-replay-stage]");
+    const replayStory = document.querySelector("[data-replay-story]");
     const replayDescription = document.querySelector("[data-replay-description]");
     const replayTime = document.querySelector("[data-replay-time]");
     const replayLive = document.querySelector("[data-replay-live]");
@@ -44,6 +62,51 @@
     let pollTimer = null;
     let playTimer = null;
     let polling = false;
+    let routePulseTimer = null;
+    let lastRenderedEventKey = null;
+
+    replayRoute.classList.add(reducedMotion ? "is-static" : "is-animated");
+
+    function renderJourney(stage, story, index) {
+      const seen = new Set(
+        events
+          .slice(0, index + 1)
+          .filter((event) => event.story === story)
+          .map((event) => event.stage),
+      );
+      const stages = FLOW_STAGES.map((name, stageIndex) => {
+        const item = document.createElement("li");
+        item.setAttribute("data-flow-stage", name);
+        item.classList.toggle("is-visited", seen.has(name));
+        item.classList.toggle("is-current", name === stage);
+        const marker = document.createElement("span");
+        marker.textContent = String(stageIndex + 1).padStart(2, "0");
+        marker.setAttribute("aria-hidden", "true");
+        const stageLabel = document.createElement("strong");
+        stageLabel.textContent = name;
+        if (name === stage) stageLabel.setAttribute("aria-current", "step");
+        item.append(marker, stageLabel);
+        return item;
+      });
+      flowJourney.replaceChildren(...stages);
+    }
+
+    function clearRoutePulse() {
+      if (routePulseTimer !== null) {
+        window.clearTimeout(routePulseTimer);
+        routePulseTimer = null;
+      }
+      replayRoute.classList.remove("is-traversing");
+    }
+
+    function pulseRoute(event) {
+      clearRoutePulse();
+      replayRoute.setAttribute("data-event-ordinal", String(event.timeline_ordinal));
+      routePulseTimer = window.setTimeout(() => {
+        replayRoute.classList.add("is-traversing");
+        routePulseTimer = null;
+      }, 0);
+    }
 
     function setDownloadsEnabled(enabled) {
       [jsonDownload, csvDownload].forEach((download) => {
@@ -66,6 +129,8 @@
       play.setAttribute("aria-pressed", "false");
       play.setAttribute("aria-label", "Play saved events");
       play.textContent = "Play";
+      replayRoute.classList.remove("is-playing");
+      clearRoutePulse();
     }
 
     function setFollowing(nextFollowing) {
@@ -76,9 +141,17 @@
     function selectEvent(index, { manual = false, announce = true } = {}) {
       if (events.length === 0) {
         selectedIndex = -1;
+        lastRenderedEventKey = null;
         replaySource.textContent = "No persisted event yet";
+        replayChannel.textContent = "Not recorded";
+        replayDirection.textContent = "Route metadata unavailable";
         replayDestination.textContent = "HumanWire";
         replayDataPoint.textContent = "Waiting";
+        replayStage.textContent = "Waiting for a saved event";
+        replayStory.textContent = "Primary story";
+        replayRoute.dataset.direction = "unavailable";
+        replayRoute.classList.remove("is-active", "is-traversing", "is-playing");
+        renderJourney("", "primary", -1);
         replayDescription.textContent = "Waiting for the first saved event.";
         replayTime.textContent = "";
         replayProgress.textContent = "Event 0 of 0";
@@ -91,9 +164,27 @@
       selectedIndex = Math.max(0, Math.min(index, events.length - 1));
       if (manual) setFollowing(false);
       const event = events[selectedIndex];
+      const eventKey = `${event.timeline_ordinal}:${event.persisted_ordinal ?? ""}`;
+      const channelLabel = event.channel || "Not recorded";
+      const directionLabel = event.direction
+        ? `${event.direction} route`
+        : event.channel === "Internal"
+          ? "HumanWire system route"
+          : "Direction not recorded";
       replaySource.textContent = event.source;
+      replayChannel.textContent = channelLabel;
+      replayDirection.textContent = directionLabel;
       replayDestination.textContent = event.destination;
       replayDataPoint.textContent = event.data_point;
+      replayStage.textContent = event.stage;
+      replayStory.textContent = `${label(event.story)} story`;
+      replayRoute.dataset.direction = (
+        event.direction || (event.channel === "Internal" ? "internal" : "unavailable")
+      ).toLowerCase();
+      replayRoute.classList.add("is-active");
+      renderJourney(event.stage, event.story, selectedIndex);
+      if (!reducedMotion && eventKey !== lastRenderedEventKey) pulseRoute(event);
+      lastRenderedEventKey = eventKey;
       replayDescription.textContent = event.description;
       const generated = new Date(event.created_at);
       replayTime.textContent = Number.isNaN(generated.valueOf())
@@ -108,7 +199,7 @@
         );
       });
       if (announce) {
-        replayLive.textContent = `Event ${selectedIndex + 1} of ${events.length}: From ${event.source}; To ${event.destination}; Generated ${event.data_point}. ${event.description}`;
+        replayLive.textContent = `Event ${selectedIndex + 1} of ${events.length}: ${event.source} via ${channelLabel} to ${event.destination}; saved ${event.data_point} at ${event.stage} stage. ${event.description}`;
       }
     }
 
@@ -220,7 +311,7 @@
         stopPlayback();
         return;
       }
-      if (reducedMotion || document.visibilityState !== "visible" || events.length < 2) {
+      if (document.visibilityState !== "visible" || events.length < 2) {
         stopPlayback();
         return;
       }
@@ -229,6 +320,7 @@
       play.setAttribute("aria-pressed", "true");
       play.setAttribute("aria-label", "Pause saved events");
       play.textContent = "Pause";
+      replayRoute.classList.add("is-playing");
       playTimer = window.setInterval(advanceSavedEvent, PLAY_INTERVAL_MS);
     });
     [jsonDownload, csvDownload].forEach((download) => {
