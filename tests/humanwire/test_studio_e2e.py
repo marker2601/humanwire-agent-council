@@ -1,5 +1,6 @@
 import csv
 import io
+from datetime import date
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -52,6 +53,7 @@ def test_launch_request_visibly_resolves_conflict_and_creates_meeting(tmp_path) 
         step_delay_ms=0,
         max_decision_workers=4,
         alias_factory=iter(["launch-001"]).__next__,
+        reference_date_factory=lambda: date(2026, 8, 13),
     )
     app = create_coordination_studio_app(manager, action_token="acceptance-token")
     with TestClient(app, base_url="http://127.0.0.1") as client:
@@ -82,16 +84,110 @@ def test_launch_request_visibly_resolves_conflict_and_creates_meeting(tmp_path) 
         "Interview answer recorded",
         "Evidence confirmed",
         "Proposal revised",
-        "Approval recorded",
+        "Approval complete",
         "Availability recorded",
         "Meeting package created",
     ):
         assert required in event_labels
+    conflict_ordinal = event_labels.index("Conflict identified") + 1
+    rollback_ordinal = next(
+        item["event_ordinal"]
+        for item in snapshot["conversations"]
+        if item["speaker"] == "Anika Rao"
+        and "rollback" in item["text"].casefold()
+    )
+    evidence_ordinal = event_labels.index("Confirmed evidence assembled") + 1
+    proposal_ordinal = event_labels.index("Decision proposal prepared") + 1
+    revision_ordinal = event_labels.index("Proposal revised") + 1
+    approval_ordinal = event_labels.index("Approval complete") + 1
+    scheduling_ordinal = event_labels.index("Scheduling started") + 1
+    meeting_ordinal = event_labels.index("Meeting package created") + 1
+    assert (
+        conflict_ordinal
+        < rollback_ordinal
+        < evidence_ordinal
+        < proposal_ordinal
+        < revision_ordinal
+        < approval_ordinal
+        < scheduling_ordinal
+        < meeting_ordinal
+    )
+    assert not any(
+        item["label"] in {"Approval recorded", "Availability recorded"}
+        and item["event_ordinal"] < proposal_ordinal
+        for item in snapshot["data_points"]
+    )
+    assert not any(
+        item["speaker"] == "Sofia Alvarez"
+        and item["event_ordinal"] < proposal_ordinal
+        and item["text"] in {"Approved.", "Accepted."}
+        for item in snapshot["conversations"]
+    )
+    assert not any(
+        item["speaker"] == "Daniel Brooks"
+        and item["event_ordinal"] < approval_ordinal
+        and "availability" in item["text"].casefold()
+        for item in snapshot["conversations"]
+    )
     assert any(
         item["speaker"] == "Anika Rao"
         and "rollback" in item["text"].casefold()
         for item in snapshot["conversations"]
     )
+
+
+def test_conflict_control_false_skips_conflict_and_interview_branch(tmp_path) -> None:
+    manager = StudioRunManager(
+        workspace_root=tmp_path,
+        seed=7,
+        step_delay_ms=0,
+        max_decision_workers=4,
+        alias_factory=iter(["launch-no-conflict"]).__next__,
+        reference_date_factory=lambda: date(2026, 8, 13),
+    )
+    app = create_coordination_studio_app(manager, action_token="acceptance-token")
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        response = client.post(
+            "/api/runs",
+            headers=_ACTION_HEADERS,
+            content=launch_request(include_conflict=False).model_dump_json(),
+        )
+        assert response.status_code == 201
+        manager.join("launch-no-conflict", timeout=20)
+        snapshot = client.get("/api/runs/launch-no-conflict").json()
+
+    labels = [item["label"] for item in snapshot["data_points"]]
+    assert snapshot["run_state"] == "complete"
+    assert snapshot["outcome"]["headline"] == "Meeting package ready"
+    assert snapshot["lifecycle"]["current"] == "schedule"
+    assert snapshot["events"][-1]["stage"] == "schedule"
+    assert "Conflict identified" not in labels
+    assert "Targeted interview" not in {
+        item["active_transition"]["destination_label"] for item in snapshot["events"]
+    }
+    assert any(
+        item["role"] == "Risk & compliance lead"
+        and item["direction"] == "to_humanwire"
+        and item["text"] == "Acknowledged."
+        for item in snapshot["conversations"]
+    )
+    assert not any(
+        "rollback" in item["text"].casefold() for item in snapshot["conversations"]
+    )
+    assert not any(
+        item["role"] == "Risk & compliance lead"
+        and (item["status"] == "rejected" or item["text"] == "Response could not be accepted.")
+        for item in snapshot["conversations"]
+    )
+    approval_ordinal = next(
+        item["event_ordinal"] for item in snapshot["data_points"]
+        if item["label"] == "Approval complete"
+    )
+    meeting_ordinal = next(
+        item["event_ordinal"] for item in snapshot["data_points"]
+        if item["label"] == "Meeting package created"
+    )
+    assert approval_ordinal < meeting_ordinal
 
 
 def test_refresh_manual_replay_downloads_and_second_run_preserve_saved_state(

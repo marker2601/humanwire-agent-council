@@ -13,7 +13,7 @@ Open `http://127.0.0.1:8766/`. Confirm that the composer is idle and no coordina
 1. Select **Start coordination**.
 2. Follow the saved path from Request to HumanWire, Caspian Gateway, and the selected stakeholders.
 3. Show Anika Rao's rollback conflict, the targeted interview, confirmed evidence, and the revised proposal.
-4. Show Sofia Alvarez's approval, the required availability, and the Aug. 14 meeting package.
+4. Show Sofia Alvarez's approval, the required availability, and the meeting package on the requested local-date schedule.
 5. Pause visuals, use Previous and Next, resume Follow live, and use Play/Pause after completion. These controls select saved presentation events; they do not rerun agents or mutate the workflow.
 6. Download JSON and CSV. Both are attachments, retain the workspace URL, and contain one row for every persisted or inert timeline event.
 7. Choose **New coordination** and start a second isolated run. The first transcript, database, and downloads remain unchanged.

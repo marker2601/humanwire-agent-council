@@ -29,6 +29,8 @@ function matches(node, selector) {
   return true;
 }
 
+let hostileScrollFailure = false;
+
 class Element {
   constructor(tag = "div") {
     this.tagName = tag.toUpperCase();
@@ -42,6 +44,7 @@ class Element {
     this.checked = false;
     this.disabled = false;
     this.hidden = false;
+    this.scrollCalls = [];
   }
   setAttribute(name, value) {
     this.attributes[name] = String(value);
@@ -57,11 +60,15 @@ class Element {
   addEventListener(type, callback) { (this.listeners[type] ||= []).push(callback); }
   dispatch(type) { (this.listeners[type] || []).forEach((callback) => callback({ preventDefault() {} })); }
   click() { if (!this.disabled) this.dispatch("click"); }
+  scrollIntoView(options) { if (hostileScrollFailure) throw new Error("unsupported scroll options"); this.scrollCalls.push(options); }
   querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
   querySelectorAll(selector) {
     const found = [];
     const visit = (node) => { if (matches(node, selector)) found.push(node); node.children.forEach(visit); };
     this.children.forEach(visit);
+    if (mode === "terminal-transition" && selector === ".is-selected-event") {
+      return Object.assign({ length: found.length }, found);
+    }
     return found;
   }
 }
@@ -230,12 +237,30 @@ function assertGraphGeometry() {
   fetchQueue.push(response(catalog)); require(scriptPath); (documentListeners.DOMContentLoaded || []).forEach((callback) => callback()); await Promise.resolve(); await Promise.resolve();
   expect("catalog Elena label", () => assert.equal(participants.at(-1).parentNode.querySelector("em").textContent, "Review and approval"));
   expect("initial selected count", () => assert.equal(text("[data-stakeholder-count]"), "Seven selected"));
+  const structured = participants.find((item) => item.value === "structured");
+  conflict.checked = false; conflict.dispatch("change");
+  expect("no-conflict engagement truth", () => assert.equal(structured.parentNode.querySelector("em").textContent, "Acknowledgement · risk check"));
+  conflict.checked = true; conflict.dispatch("change");
+  expect("conflict engagement restored", () => assert.equal(structured.parentNode.querySelector("em").textContent, "Structured interview"));
   conflictButton.click(); expect("template selected count", () => assert.equal(text("[data-stakeholder-count]"), "Four selected"));
+  expect("template engagement restored", () => assert.equal(structured.parentNode.querySelector("em").textContent, "Structured interview"));
   const approval = participants.find((item) => item.value === "approval"); approval.checked = false; approval.dispatch("change"); expect("manual selected count", () => assert.equal(text("[data-stakeholder-count]"), "Three selected")); launchButton.click();
 
   fetchQueue.push(response({ run_alias: "launch-001", workspace_url: "/runs/launch-001" }, 201)); await click("[data-start-coordination]"); await Promise.resolve();
   const four = snapshotWithEvents(4); await poll(four, 200, '"event-4"');
   assert.equal(text("[data-event-progress]"), "Event 1 of 4"); assert.equal(pendingTimeouts(), 1);
+  if (mode === "terminal-transition") {
+    const completedWhileQueued = snapshotWithEvents(10, "complete", true);
+    completedWhileQueued.events.at(-1).stage = "schedule";
+    hostileScrollFailure = true;
+    await poll(completedWhileQueued, 200, '"event-10-complete"');
+    assert.equal(text("[data-event-progress]"), "Event 10 of 10");
+    assert.equal(text("[data-current-stage]"), "Schedule");
+    assert.equal(nodes["[data-replay-previous]"].disabled, false);
+    assert.equal(nodes["[data-replay-next]"].disabled, true);
+    assert.equal(failures.length, 0, failures.join("\n"));
+    return;
+  }
   expect("17-node graph geometry", assertGraphGeometry);
   await click("[data-pause-visuals]"); expect("Pause cancels render timeout", () => assert.equal(pendingTimeouts(), 0));
   timeouts.clear(); expect("Pause gates queued advance", () => assert.equal(text("[data-event-progress]"), "Event 1 of 4"));
@@ -261,7 +286,15 @@ function assertGraphGeometry() {
   assert.equal(nodes["[data-download-json]"].disabled, false); assert.equal(nodes["[data-new-coordination]"].hidden, false);
   await click("[data-replay-previous]"); await click("[data-replay-play]"); await runInterval(900); expect("Play advances", () => assert.equal(text("[data-event-progress]"), "Event 10 of 10")); await runInterval(900); assert.equal([...intervals.values()].some((timer) => timer.delay === 900), false);
   await click("[data-replay-previous]"); await click("[data-replay-play]"); document.hidden = true; (documentListeners.visibilitychange || []).forEach((callback) => callback()); assert.equal([...intervals.values()].some((timer) => timer.delay === 900), false); assert.equal([...document.querySelectorAll("[data-flow-edge]")].some((edge) => edge.classList.contains("is-travelling")), false);
-  dataTab.click(); assert.equal(nodes['[data-studio-state="workspace"]'].getAttribute("data-mobile-panel"), "data"); conversationTab.click(); assert.equal(nodes['[data-studio-state="workspace"]'].getAttribute("data-mobile-panel"), "conversation");
+  document.hidden = false;
+  const selectedDataRow = dataRows().find((row) => row.classList.contains("is-selected-event"));
+  const dataScrollCount = selectedDataRow.scrollCalls.length;
+  dataTab.click(); assert.equal(nodes['[data-studio-state="workspace"]'].getAttribute("data-mobile-panel"), "data");
+  assert.ok(selectedDataRow.scrollCalls.length > dataScrollCount);
+  const selectedConversationRow = conversationRows().find((row) => row.classList.contains("is-selected-event"));
+  const conversationScrollCount = selectedConversationRow.scrollCalls.length;
+  conversationTab.click(); assert.equal(nodes['[data-studio-state="workspace"]'].getAttribute("data-mobile-panel"), "conversation");
+  assert.ok(selectedConversationRow.scrollCalls.length > conversationScrollCount);
 
   await click("[data-new-coordination]");
   expect("reset returns composer", () => { assert.equal(nodes['[data-studio-state="composer"]'].hidden, false); assert.equal(nodes['[data-studio-state="workspace"]'].hidden, true); });

@@ -1170,6 +1170,11 @@ class StudioProgressObserver:
             self._timeline.append(_TimelineSource(effect="inert", created_at=item.created_at))
         self._inert_seen = len(inert_events)
         overrides = self._assign_records(raw)
+        inbound_records = {
+            item.event_ordinal: item
+            for item in self._records
+            if item.direction == "to_humanwire" and item.event_ordinal is not None
+        }
         people = self._identities
         current_stage = StudioLifecycleStage.BRIEF
         negotiation_started = False
@@ -1182,12 +1187,20 @@ class StudioProgressObserver:
                 raw_event = raw[event.persisted_ordinal - 1]
                 raw_type = raw_event.event_type
                 persona_id = overrides.get(timeline_ordinal, raw_event.persona_id)
+                inbound_record = inbound_records.get(timeline_ordinal)
+                quick_response = (
+                    raw_type == "interview.answer_recorded"
+                    and inbound_record is not None
+                    and inbound_record.intent is SyntheticIntent.ANSWER
+                )
                 phase = _event_phase(
                     raw_type,
                     persona_id,
                     negotiation_started=negotiation_started,
                     approval_started=approval_started,
                 )
+                if quick_response:
+                    phase = "Outreach"
                 if phase == "Negotiation":
                     negotiation_started = True
                 elif phase == "Approval":
@@ -1201,6 +1214,8 @@ class StudioProgressObserver:
                     people[persona_id].display_name if persona_id in people else None,
                 )
                 label = _DATA_LABELS.get(raw_type, replay.data_point)
+                if quick_response:
+                    label = "Response recorded"
                 if raw_type == "proposal.created":
                     proposal_count += 1
                     if proposal_count > 1:
@@ -1213,6 +1228,14 @@ class StudioProgressObserver:
                     persona_id,
                     people[persona_id].display_name if persona_id in people else None,
                 )
+                if quick_response and persona_id in people:
+                    transition = StudioTransition(
+                        source=_node_id_for_persona(persona_id),
+                        destination="humanwire",
+                        source_label=people[persona_id].display_name,
+                        destination_label="HumanWire",
+                        generated_label=label,
+                    )
                 effect: Literal["persisted", "inert"] = "persisted"
                 persisted_ordinal = event.persisted_ordinal
                 live_copy = f"{label}."

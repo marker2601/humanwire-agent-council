@@ -1,5 +1,6 @@
 import json
 import threading
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -187,6 +188,11 @@ def test_worker_that_starts_then_raises_retains_ownership_until_it_finishes(
 
 def test_worker_is_non_daemon_and_receives_exact_run_contract(tmp_path) -> None:
     captured = {}
+    sampled_dates = []
+
+    def reference_date_factory():
+        sampled_dates.append(date(2026, 8, 13))
+        return sampled_dates[-1]
 
     def runner(scenario, output_path, run_root, **kwargs):
         captured.update(
@@ -205,6 +211,7 @@ def test_worker_is_non_daemon_and_receives_exact_run_contract(tmp_path) -> None:
         max_decision_workers=3,
         runner=runner,
         alias_factory=iter(["launch-001"]).__next__,
+        reference_date_factory=reference_date_factory,
     )
     created = manager.create_run(launch_request())
     manager.join(created.run_alias, timeout=2)
@@ -222,6 +229,10 @@ def test_worker_is_non_daemon_and_receives_exact_run_contract(tmp_path) -> None:
     ]
     assert captured["kwargs"]["mandate_request"] == launch_request().objective
     assert captured["kwargs"]["include_change_story"] is False
+    assert captured["kwargs"]["availability_date"] == date(2026, 8, 14)
+    assert captured["kwargs"]["defer_authority_until_ready"] is True
+    assert captured["kwargs"]["include_conflict"] is True
+    assert sampled_dates == [date(2026, 8, 13)]
 
 
 def test_model_assisted_request_requires_explicit_model_factory(

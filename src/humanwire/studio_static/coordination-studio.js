@@ -91,6 +91,23 @@ document.addEventListener("DOMContentLoaded", () => {
     updateStakeholderCount();
   }
 
+  function updateConflictEngagementLabel() {
+    const conflict = one("[data-include-conflict]");
+    const structured = Array.from(
+      document.querySelectorAll('[name="participant_ids"]'),
+    ).find((input) => input.value === "structured");
+    const engagement = structured?.parentNode?.querySelector("em");
+    const catalogPerson = state.catalog?.stakeholders?.find(
+      (person) => person.persona_id === "structured",
+    );
+    if (conflict === null || engagement == null || catalogPerson === undefined) {
+      return;
+    }
+    engagement.textContent = conflict.checked
+      ? catalogPerson.engagement_label
+      : "Acknowledgement · risk check";
+  }
+
   function applyTemplate(template) {
     if (template === undefined || template === null) {
       return;
@@ -110,6 +127,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (conflict !== null) {
       conflict.checked = template.include_conflict;
     }
+    updateConflictEngagementLabel();
     if (templateRoot !== null) {
       templateRoot.setAttribute("data-current-template", template.template_id);
     }
@@ -280,7 +298,6 @@ document.addEventListener("DOMContentLoaded", () => {
     setText("[data-outcome-headline]", snapshot.outcome.headline);
     setText("[data-outcome-summary]", snapshot.outcome.summary);
     renderGraph(snapshot);
-    renderLifecycle(snapshot.lifecycle, snapshot.lifecycle.current);
     updateDownloads(snapshot.downloads_ready);
 
     const unseen = snapshot.events.filter(
@@ -292,7 +309,16 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     });
 
-    if (state.selectedOrdinal > 0) {
+    const terminal = snapshot.run_state === "complete" || snapshot.run_state === "failed";
+    const terminalFollowLive = terminal
+      && state.followLive
+      && !state.visualsPaused
+      && !document.hidden
+      && state.events.length > 0;
+    if (terminalFollowLive) {
+      cancelRenderQueue();
+      renderEvent(state.events.length);
+    } else if (state.selectedOrdinal > 0) {
       renderEvent(Math.min(state.selectedOrdinal, state.events.length));
     }
 
@@ -300,7 +326,7 @@ document.addEventListener("DOMContentLoaded", () => {
       setText("[data-event-progress]", "Event 0 of 0");
       setText("[data-current-stage]", titleCase(snapshot.lifecycle.current));
       renderVisibleRows(0);
-    } else if (state.followLive && !state.visualsPaused && !document.hidden) {
+    } else if (!terminalFollowLive && state.followLive && !state.visualsPaused && !document.hidden) {
       state.renderQueue.push(...unseen);
       drainRenderQueue();
     } else if (state.selectedOrdinal === 0) {
@@ -545,23 +571,44 @@ document.addEventListener("DOMContentLoaded", () => {
     setText("[data-flow-live]", event.live_copy);
     setText("[data-current-stage]", titleCase(event.stage));
     setText("[data-event-progress]", `Event ${ordinal} of ${state.events.length}`);
-    renderLifecycle(state.snapshot.lifecycle, event.stage);
+    renderLifecycle(state.snapshot.lifecycle, event.stage, ordinal);
     renderVisibleRows(ordinal);
+    const terminal = state.snapshot.run_state === "complete" || state.snapshot.run_state === "failed";
+    setText(
+      "[data-outcome-label]",
+      terminal && ordinal < state.events.length ? "Final outcome" : "",
+    );
     updateControls();
   }
 
-  function renderLifecycle(lifecycle, selectedStage) {
-    const completed = new Set(lifecycle.completed || []);
+  function renderLifecycle(lifecycle, selectedStage, selectedOrdinal) {
+    const completed = new Set(
+      state.events
+        .slice(0, Math.max(0, selectedOrdinal - 1))
+        .map((event) => event.stage),
+    );
+    completed.delete(selectedStage);
+    const completedSelection = state.snapshot !== null
+      && state.snapshot.run_state === "complete"
+      && selectedOrdinal === state.events.length;
+    const failedSelection = state.snapshot !== null
+      && state.snapshot.run_state === "failed"
+      && selectedOrdinal === state.events.length;
+    if (completedSelection) {
+      completed.add(selectedStage);
+    }
     document.querySelectorAll("[data-lifecycle-stage]").forEach((item) => {
       const stage = item.getAttribute("data-lifecycle-stage");
       item.classList.toggle("is-complete", completed.has(stage));
-      item.classList.toggle("is-current", stage === selectedStage);
+      item.classList.toggle("is-current", stage === selectedStage && !completedSelection);
       const status = item.querySelector("small");
       if (status !== null) {
         status.textContent = completed.has(stage)
           ? "Completed"
-          : stage === selectedStage
-            ? "In progress"
+          : stage === selectedStage && failedSelection
+            ? "Failed"
+            : stage === selectedStage && !completedSelection
+              ? "In progress"
             : "Pending";
       }
     });
@@ -570,6 +617,17 @@ document.addEventListener("DOMContentLoaded", () => {
   function timeLabel(value) {
     const text = String(value || "");
     return text.length >= 16 ? `${text.slice(11, 16)} UTC` : "Saved";
+  }
+
+  function scrollSelectedRow(row) {
+    if (row === null || row === undefined || typeof row.scrollIntoView !== "function") {
+      return;
+    }
+    try {
+      row.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "auto" });
+    } catch (_error) {
+      // Replay selection must remain usable when a browser rejects scroll options.
+    }
   }
 
   function renderVisibleRows(ordinal) {
@@ -586,6 +644,11 @@ document.addEventListener("DOMContentLoaded", () => {
           const row = document.createElement("article");
           row.setAttribute("class", "studio-conversation-row");
           row.setAttribute("data-conversation-row", String(item.ordinal));
+          row.setAttribute("data-event-ordinal", String(item.event_ordinal));
+          if (item.event_ordinal === ordinal) {
+            row.classList.add("is-selected-event");
+            row.setAttribute("aria-current", "true");
+          }
           if (item.status === "rejected" || item.status === "no_response") {
             row.classList.add("is-attention");
           }
@@ -602,6 +665,8 @@ document.addEventListener("DOMContentLoaded", () => {
           row.append(header, role, message);
           conversationList.append(row);
         });
+      const selected = conversationList.querySelectorAll(".is-selected-event");
+      scrollSelectedRow(selected.length > 0 ? selected[selected.length - 1] : null);
     }
     if (dataList !== null) {
       dataList.replaceChildren();
@@ -611,6 +676,10 @@ document.addEventListener("DOMContentLoaded", () => {
           const row = document.createElement("article");
           row.setAttribute("class", "studio-data-row");
           row.setAttribute("data-data-row", String(item.event_ordinal));
+          if (item.event_ordinal === ordinal) {
+            row.classList.add("is-selected-event");
+            row.setAttribute("aria-current", "true");
+          }
           const ordinalLabel = document.createElement("span");
           ordinalLabel.textContent = String(item.event_ordinal);
           const label = document.createElement("strong");
@@ -622,6 +691,7 @@ document.addEventListener("DOMContentLoaded", () => {
           row.append(ordinalLabel, label, summary, effect);
           dataList.append(row);
         });
+      scrollSelectedRow(dataList.querySelector(".is-selected-event"));
     }
   }
 
@@ -782,6 +852,7 @@ document.addEventListener("DOMContentLoaded", () => {
       "[data-flow-live]",
       "[data-outcome-headline]",
       "[data-outcome-summary]",
+      "[data-outcome-label]",
     ].forEach((selector) => setText(selector, ""));
     setText("[data-event-progress]", "Event 0 of 0");
     updateDownloads(false);
@@ -803,6 +874,10 @@ document.addEventListener("DOMContentLoaded", () => {
         tab.getAttribute("data-mobile-tab") === selected ? "true" : "false",
       );
     });
+    const visibleList = one(
+      selected === "data" ? "[data-data-list]" : "[data-conversation-list]",
+    );
+    scrollSelectedRow(visibleList?.querySelector(".is-selected-event"));
   }
 
   one("[data-start-coordination]").addEventListener("click", (event) => {
@@ -827,6 +902,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.querySelectorAll('[name="participant_ids"]').forEach((input) => {
     input.addEventListener("change", updateStakeholderCount);
   });
+  one("[data-include-conflict]").addEventListener("change", updateConflictEngagementLabel);
   one("[data-pause-visuals]").addEventListener("click", () => {
     state.visualsPaused = !state.visualsPaused;
     if (state.visualsPaused) {

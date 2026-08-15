@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 _SAFE_ID = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
-_COORDINATION_REFERENCE_DATE = date(2026, 8, 13)
+
+
+def local_reference_date() -> date:
+    """Return the host's current local calendar date from an aware clock."""
+    return datetime.now(UTC).astimezone().date()
 
 
 class _StudioModel(BaseModel):
@@ -179,13 +183,18 @@ def product_catalog() -> StudioCatalog:
     return _PRODUCT_CATALOG
 
 
-def coordination_target_date(request: CoordinationRequest) -> date:
-    """Resolve product timing against the studio's deterministic reference date."""
+def coordination_target_date(
+    request: CoordinationRequest,
+    *,
+    reference_date: date | None = None,
+) -> date:
+    """Resolve product timing against an injected or current local date."""
     request = CoordinationRequest.model_validate(request)
+    reference = local_reference_date() if reference_date is None else reference_date
     if request.target_timing is TargetTiming.CUSTOM:
         assert request.custom_date is not None
         return request.custom_date
-    candidate = _COORDINATION_REFERENCE_DATE + timedelta(days=1)
+    candidate = reference + timedelta(days=1)
     if request.target_timing is TargetTiming.NEXT_BUSINESS_DAY:
         while candidate.weekday() >= 5:
             candidate += timedelta(days=1)

@@ -23,7 +23,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 
-from humanwire.alignment import NegotiationCoordinator
+from humanwire.alignment import NegotiationCoordinator, NegotiationOutcome
 from humanwire.caspian_gateway import CaspianGateway
 from humanwire.config import Settings
 from humanwire.database import create_session_factory
@@ -38,6 +38,7 @@ from humanwire.domain import (
     PlannedStakeholder,
 )
 from humanwire.evidence import EvidenceDraft, RuleBasedEvidenceExtractor
+from humanwire.meetings import MeetingCoordinator
 from humanwire.model_client import ModelFailure
 from humanwire.offline_caspian import (
     CapturedDelivery,
@@ -339,11 +340,19 @@ def build_coordination_scenario(
             )
             continue
         stakeholder = stakeholder_by_id[persona.persona_id]
+        allowed_intents = list(persona.allowed_intents)
+        if (
+            persona.persona_id == "structured"
+            and request.include_conflict is False
+            and SyntheticIntent.ACCEPT_PROPOSAL not in allowed_intents
+        ):
+            allowed_intents.append(SyntheticIntent.ACCEPT_PROPOSAL)
         personas.append(
             persona.model_copy(
                 update={
                     "display_name": stakeholder.display_name,
                     "role": stakeholder.role,
+                    "allowed_intents": allowed_intents,
                 }
             )
         )
@@ -584,6 +593,18 @@ class _AcknowledgePolicy(_DeterministicPersonaPolicy):
         return SyntheticIntent.ACKNOWLEDGE, "Acknowledged.", PersonaVisibility.SHAREABLE
 
 
+class _BenignRiskPolicy(_DeterministicPersonaPolicy):
+    """Acknowledge the risk check and remain available for proposal review."""
+
+    def _choose(
+        self, context: _PersonaContext
+    ) -> tuple[SyntheticIntent, str, PersonaVisibility]:
+        if "humanwire draft proposal" in context.delivered_message.casefold():
+            self.complete = True
+            return SyntheticIntent.ACCEPT_PROPOSAL, "Accepted.", PersonaVisibility.SHAREABLE
+        return SyntheticIntent.ACKNOWLEDGE, "Acknowledged.", PersonaVisibility.SHAREABLE
+
+
 class _QuickResponsePolicy(_DeterministicPersonaPolicy):
     def _choose(
         self, context: _PersonaContext
@@ -726,6 +747,19 @@ def _profile_for(
     )
 
 
+def _no_conflict_profile(persona: SyntheticPersona) -> _PolicyProfile:
+    """Return the sanitized, benign contract used by the product conflict toggle."""
+    return _PolicyProfile(
+        role=persona.role,
+        private_facts=(),
+        allowed_intents=(
+            SyntheticIntent.ACKNOWLEDGE,
+            SyntheticIntent.ACCEPT_PROPOSAL,
+        ),
+        engagement_contract=EngagementType.ACKNOWLEDGE,
+    )
+
+
 def _build_policy(
     persona: SyntheticPersona,
     availability_date: date | None = None,
@@ -743,9 +777,18 @@ def _build_policy(
 
 
 class _SyntheticPlanner:
-    def __init__(self, people: dict[str, Person], scenario: SyntheticScenario) -> None:
+    def __init__(
+        self,
+        people: dict[str, Person],
+        scenario: SyntheticScenario,
+        *,
+        defer_authority_until_ready: bool = False,
+        include_conflict: bool | None = None,
+    ) -> None:
         self.people = people
         self.scenario = scenario
+        self.defer_authority_until_ready = defer_authority_until_ready
+        self.include_conflict = include_conflict
 
     def plan(self, text: str, initiator: Person) -> ResolvedPlan:
         del initiator
@@ -758,6 +801,13 @@ class _SyntheticPlanner:
             if change_story != (persona.persona_id == "approval-change"):
                 continue
             contract = _contract_for(persona)
+            if self.defer_authority_until_ready and contract in {
+                EngagementType.REVIEW_APPROVAL,
+                EngagementType.AVAILABILITY,
+            }:
+                continue
+            if self.include_conflict is False and contract is EngagementType.STRUCTURED_INTERVIEW:
+                contract = EngagementType.ACKNOWLEDGE
             questions: list[str] = []
             if contract is EngagementType.QUICK_RESPONSE:
                 questions = ["Which launch date is recorded?"]
@@ -822,6 +872,17 @@ class _SyntheticEvidenceExtractor(RuleBasedEvidenceExtractor):
 class _SyntheticNegotiationCoordinator(NegotiationCoordinator):
     """Normalize issue order before deterministic proposal drafting."""
 
+    def __init__(
+        self,
+        repository,
+        approval_persona_ids: tuple[str, ...] = (),
+        *,
+        schedule_after_approval: bool = False,
+    ) -> None:
+        super().__init__(repository)
+        self.approval_persona_ids = approval_persona_ids
+        self.schedule_after_approval = schedule_after_approval
+
     def prepare_proposal(self, mandate, report, round_number, now):
         normalized = report.model_copy(
             update={
@@ -835,7 +896,41 @@ class _SyntheticNegotiationCoordinator(NegotiationCoordinator):
                 )
             }
         )
-        return super().prepare_proposal(mandate, normalized, round_number, now)
+        proposal = super().prepare_proposal(mandate, normalized, round_number, now)
+        return proposal.model_copy(
+            update={
+                "required_respondent_ids": list(
+                    dict.fromkeys(
+                        [
+                            *proposal.required_respondent_ids,
+                            *self.approval_persona_ids,
+                        ]
+                    )
+                )
+            }
+        )
+
+    def evaluate_round(self, proposal):
+        outcome = super().evaluate_round(proposal)
+        if self.schedule_after_approval and outcome is NegotiationOutcome.ALIGNED:
+            return NegotiationOutcome.MEETING_REQUIRED
+        return outcome
+
+
+class _SyntheticMeetingCoordinator(MeetingCoordinator):
+    def __init__(
+        self,
+        initiator_id: str,
+        availability_persona_ids: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(initiator_id)
+        self.availability_persona_ids = availability_persona_ids
+
+    def required_attendees(self, report, assignments, decision_owner_id):
+        attendees = super().required_attendees(report, assignments, decision_owner_id)
+        attendees.update(self.availability_persona_ids)
+        self._required_attendee_ids = attendees
+        return attendees
 
 
 @dataclass(frozen=True)
@@ -1578,6 +1673,8 @@ def generate_scenario(
     mandate_request: str | None = None,
     include_change_story: bool | None = None,
     availability_date: date | None = None,
+    defer_authority_until_ready: bool = False,
+    include_conflict: bool | None = None,
 ) -> SyntheticRunResult:
     """Generate an isolated run through the one offline gateway boundary."""
     scenario = SyntheticScenario.model_validate(scenario)
@@ -1599,14 +1696,38 @@ def generate_scenario(
     directory, people = _synthetic_directory(scenario)
     session_factory = create_session_factory(settings.database_url)
     repository = SqlAlchemyHumanWireRepository(session_factory)
-    negotiation = _SyntheticNegotiationCoordinator(repository)
+    approval_persona_ids = tuple(
+        persona.persona_id
+        for persona in scenario.personas
+        if _contract_for(persona) is EngagementType.REVIEW_APPROVAL
+    )
+    availability_persona_ids = tuple(
+        persona.persona_id
+        for persona in scenario.personas
+        if _contract_for(persona) is EngagementType.AVAILABILITY
+        and persona.persona_id != "synthetic-manager"
+    )
+    negotiation = _SyntheticNegotiationCoordinator(
+        repository,
+        approval_persona_ids if defer_authority_until_ready else (),
+        schedule_after_approval=defer_authority_until_ready,
+    )
     workflow = HumanWireWorkflow(
         directory,
         repository,
-        _SyntheticPlanner(people, scenario),
+        _SyntheticPlanner(
+            people,
+            scenario,
+            defer_authority_until_ready=defer_authority_until_ready,
+            include_conflict=include_conflict,
+        ),
         _SyntheticEvidenceExtractor(),
         settings,
         negotiation_coordinator=negotiation,
+        meeting_coordinator_factory=lambda initiator_id: _SyntheticMeetingCoordinator(
+            initiator_id,
+            availability_persona_ids if defer_authority_until_ready else (),
+        ),
     )
     client = OfflineCaspianClient()
     clock = [_FIXED_TIME]
@@ -1658,16 +1779,29 @@ def generate_scenario(
     if decision_engine is None:
         policies = {
             persona.persona_id: (
-                _build_policy(persona)
-                if availability_date is None
-                else _build_policy(persona, availability_date)
+                _BenignRiskPolicy(_no_conflict_profile(persona))
+                if include_conflict is False
+                and _contract_for(persona) is EngagementType.STRUCTURED_INTERVIEW
+                else (
+                    _build_policy(persona)
+                    if availability_date is None
+                    else _build_policy(persona, availability_date)
+                )
             )
             for persona in scenario.personas
         }
     else:
         policies = {}
     profiles = (
-        {persona.persona_id: _profile_for(persona) for persona in scenario.personas}
+        {
+            persona.persona_id: (
+                _no_conflict_profile(persona)
+                if include_conflict is False
+                and _contract_for(persona) is EngagementType.STRUCTURED_INTERVIEW
+                else _profile_for(persona, availability_date)
+            )
+            for persona in scenario.personas
+        }
         if decision_engine is not None
         else {}
     )

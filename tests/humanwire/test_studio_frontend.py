@@ -151,6 +151,11 @@ def test_studio_css_is_scoped_responsive_and_accessible() -> None:
     assert "prefers-reduced-motion: reduce" in css
     assert ":focus-visible" in css and "outline: 2px" in css
     assert "min-height: 44px" in css and "min-width: 44px" in css
+    selected_rows = css_block(
+        css,
+        ".coordination-studio-page .studio-conversation-row.is-selected-event,\n",
+    )
+    assert "scroll-margin-block-end: 96px" in selected_rows
     for size in re.findall(r"font-size:\s*([0-9.]+)px", css):
         assert float(size) >= 14
 
@@ -169,10 +174,15 @@ def test_all_effective_targets_and_mobile_completion_actions_remain_usable() -> 
     phone = css_block(css, "@media (max-width: 479px)")
     tablet_downloads = css_block(tablet, ".coordination-studio-page__download-controls")
     tablet_replay = css_block(tablet, ".coordination-studio-page__replay-bar")
+    tablet_selected_rows = css_block(
+        tablet,
+        ".coordination-studio-page .studio-conversation-row.is-selected-event,\n",
+    )
     assert "display: none" not in tablet_downloads
     assert re.search(r"display:\s*(?:flex|grid)", tablet_downloads)
     assert "flex-wrap: wrap" in tablet_downloads or "grid-template" in tablet_downloads
     assert "display: none" not in tablet_replay
+    assert "scroll-margin-block-end: 224px" in tablet_selected_rows
     assert not re.search(
         r"\[data-pause-visuals\][^{]*\{[^}]*display:\s*none",
         phone,
@@ -181,7 +191,7 @@ def test_all_effective_targets_and_mobile_completion_actions_remain_usable() -> 
 
 
 def test_hostile_async_reset_catalog_graph_and_mobile_contract() -> None:
-    for mode in ("normal", "reduced", "mobile"):
+    for mode in ("normal", "reduced", "mobile", "terminal-transition"):
         result = subprocess.run(
             ["node", str(HOSTILE_HARNESS), str(SCRIPT), str(FIXTURES), mode],
             cwd=ROOT,
@@ -444,6 +454,7 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
             this.checked = false;
             this.disabled = false;
             this.hidden = false;
+            this.scrollCalls = [];
           }
           setAttribute(name, value) {
             this.attributes[name] = String(value);
@@ -458,6 +469,7 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
           remove() { if (this.parentNode) this.parentNode.children = this.parentNode.children.filter((item) => item !== this); }
           addEventListener(type, callback) { (this.listeners[type] ||= []).push(callback); }
           click() { if (!this.disabled) (this.listeners.click || []).forEach((callback) => callback({ preventDefault() {} })); }
+          scrollIntoView(options) { this.scrollCalls.push(options); }
           querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
           querySelectorAll(selector) {
             const found = [];
@@ -498,12 +510,15 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
         register("[data-flow-live]"); register("[data-flow-canvas]", "svg");
         register("[data-conversation-list]"); register("[data-data-list]");
         register("[data-outcome-headline]"); register("[data-outcome-summary]");
+        register("[data-outcome-label]");
         register("[data-pause-visuals]", "button"); register("[data-follow-live]", "button");
         register("[data-replay-previous]", "button"); register("[data-replay-next]", "button");
         register("[data-replay-play]", "button"); register("[data-download-json]", "button");
         register("[data-download-csv]", "button"); register("[data-new-coordination]", "button");
+        const lifecycleItems = {};
         ["brief", "outreach", "resolve", "approve", "schedule"].forEach((stage) => {
-          all.push(new Element("li")); all.at(-1).setAttribute("data-lifecycle-stage", stage);
+          const item = new Element("li"); item.setAttribute("data-lifecycle-stage", stage);
+          item.append(new Element("small")); lifecycleItems[stage] = item; all.push(item);
         });
         ["quick-a", "structured"].forEach((id) => {
           all.push(new Element("article")); all.at(-1).setAttribute("data-persona-card", id);
@@ -543,7 +558,7 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
         global.clearInterval = () => {};
         global.setTimeout = (callback) => { callback(); return 1; };
         global.clearTimeout = () => {};
-        global.location = { pathname: "/" };
+        global.location = { pathname: ["refresh", "failed"].includes(mode) ? "/runs/launch-001" : "/" };
         global.history = { replaceState(_state, _title, url) { location.pathname = url; } };
         global.window = global;
         global.matchMedia = () => ({ matches: mode === "reduced", addEventListener() {} });
@@ -559,9 +574,17 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
         function conversationRows() { return nodes["[data-conversation-list]"].querySelectorAll("[data-conversation-row]"); }
         function dataRows() { return nodes["[data-data-list]"].querySelectorAll("[data-data-row]"); }
         function flowStrip() { return { from: text("[data-flow-from]"), to: text("[data-flow-to]"), generated: text("[data-flow-generated]") }; }
+        function lifecycleStatus(stage) { return lifecycleItems[stage].querySelector("small").textContent; }
         async function pollWith(snapshot) { fetchQueue.push(jsonResponse(snapshot, 200, '"event-' + snapshot.current_event_ordinal + '"')); await intervals[0].callback(); await Promise.resolve(); }
 
         (async () => {
+          const terminalSnapshot = structuredClone(fixtureSnapshots[1]);
+          terminalSnapshot.lifecycle = {
+            current: "schedule",
+            stages: ["brief", "outreach", "resolve", "approve", "schedule"],
+            completed: ["brief", "outreach", "resolve", "approve", "schedule"],
+          };
+          terminalSnapshot.events.at(-1).stage = "schedule";
           fetchQueue.push(jsonResponse({
             stakeholders: [
               { persona_id: "quick-a", display_name: "Priya Shah", role: "Product lead", engagement_label: "Quick response" },
@@ -582,6 +605,30 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
           await Promise.resolve(); await Promise.resolve();
           assert.equal(fetchCalls[0].url, "/api/catalog");
 
+          if (["refresh", "failed"].includes(mode)) {
+            const hydratedSnapshot = structuredClone(terminalSnapshot);
+            if (mode === "failed") {
+              hydratedSnapshot.run_state = "failed";
+              hydratedSnapshot.events.at(-1).stage = "resolve";
+              hydratedSnapshot.lifecycle.current = "resolve";
+              hydratedSnapshot.lifecycle.completed = ["brief", "outreach"];
+            }
+            fetchQueue.push(jsonResponse(hydratedSnapshot, 200, '"event-2"'));
+            await intervals[0].callback(); await Promise.resolve();
+            assert.equal(text("[data-event-progress]"), "Event 2 of 2");
+            if (mode === "failed") {
+              assert.equal(text("[data-current-stage]"), "Resolve");
+              assert.equal(lifecycleStatus("resolve"), "Failed");
+              assert.equal(lifecycleItems.resolve.classList.contains("is-complete"), false);
+              assert.equal(lifecycleItems.resolve.classList.contains("is-current"), true);
+            } else {
+              assert.equal(text("[data-current-stage]"), "Schedule");
+              assert.equal(lifecycleStatus("schedule"), "Completed");
+              assert.equal(lifecycleItems.schedule.classList.contains("is-complete"), true);
+            }
+            return;
+          }
+
           fetchQueue.push(jsonResponse({ run_alias: "launch-001", workspace_url: "/runs/launch-001" }, 201));
           await click("[data-start-coordination]");
           await Promise.resolve(); await Promise.resolve();
@@ -599,7 +646,7 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
           assert.equal(conversationRows().length, 1);
           assert.equal(dataRows().length, 1);
 
-          await pollWith(fixtureSnapshots[1]);
+          await pollWith(terminalSnapshot);
           assert.equal(text("[data-event-progress]"), "Event 2 of 2");
           assert.deepEqual(flowStrip(), {
             from: fixtureSnapshots[1].active_transition.source_label,
@@ -610,6 +657,17 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
           assert.equal(activePersonas().length, 1);
           assert.equal(conversationRows().length, 2);
           assert.equal(dataRows().length, 2);
+          assert.equal(conversationRows()[0].classList.contains("is-selected-event"), false);
+          assert.equal(conversationRows()[1].classList.contains("is-selected-event"), true);
+          assert.equal(conversationRows()[1].getAttribute("aria-current"), "true");
+          assert.equal(conversationRows()[1].getAttribute("data-event-ordinal"), "2");
+          assert.equal(dataRows()[0].classList.contains("is-selected-event"), false);
+          assert.equal(dataRows()[1].classList.contains("is-selected-event"), true);
+          assert.equal(dataRows()[1].getAttribute("aria-current"), "true");
+          assert.deepEqual(conversationRows()[1].scrollCalls, [{ block: "nearest", inline: "nearest", behavior: "auto" }]);
+          assert.deepEqual(dataRows()[1].scrollCalls, [{ block: "nearest", inline: "nearest", behavior: "auto" }]);
+          assert.equal(lifecycleStatus("schedule"), "Completed");
+          assert.equal(lifecycleItems.schedule.classList.contains("is-current"), false);
           assert.equal(nodes["[data-download-json]"].disabled, false);
           assert.equal(nodes["[data-download-csv]"].disabled, false);
           const activeEdge = activeEdges()[0];
@@ -618,6 +676,14 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
           await click("[data-replay-previous]");
           assert.equal(text("[data-event-progress]"), "Event 1 of 2");
           assert.equal(conversationRows().length, 1);
+          assert.equal(conversationRows()[0].getAttribute("aria-current"), "true");
+          assert.equal(dataRows()[0].getAttribute("aria-current"), "true");
+          assert.equal(text("[data-outcome-label]"), "Final outcome");
+          assert.equal(lifecycleStatus("outreach"), "In progress");
+          assert.equal(lifecycleStatus("resolve"), "Pending");
+          assert.equal(lifecycleStatus("approve"), "Pending");
+          assert.equal(lifecycleStatus("schedule"), "Pending");
+          assert.equal(lifecycleItems.schedule.classList.contains("is-complete"), false);
           await click("[data-replay-next]");
           assert.equal(text("[data-event-progress]"), "Event 2 of 2");
           await click("[data-download-json]");
@@ -626,7 +692,7 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
         })().catch((error) => { process.stderr.write(error.stack + "\n"); process.exitCode = 1; });
         """
     )
-    for mode in ("normal", "reduced"):
+    for mode in ("normal", "reduced", "refresh", "failed"):
         result = subprocess.run(
             ["node", "-e", harness, str(SCRIPT), str(FIXTURES), mode],
             cwd=ROOT,

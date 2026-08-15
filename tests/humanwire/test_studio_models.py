@@ -1,3 +1,5 @@
+from datetime import date
+
 import pytest
 from pydantic import ValidationError
 
@@ -8,6 +10,7 @@ from humanwire.studio_models import (
     RequesterRole,
     StudioAgentMode,
     TargetTiming,
+    coordination_target_date,
     product_catalog,
 )
 from humanwire.synthetic import build_coordination_scenario
@@ -41,6 +44,17 @@ def test_product_catalog_uses_approved_names_templates_and_copy() -> None:
     assert launch.requester_role is RequesterRole.MANAGER
     assert launch.target_timing is TargetTiming.TOMORROW
     assert launch.include_conflict is True
+
+
+def test_coordination_dates_use_the_injected_local_reference_date() -> None:
+    assert coordination_target_date(
+        launch_request(target_timing="tomorrow"),
+        reference_date=date(2026, 8, 14),
+    ) == date(2026, 8, 15)
+    assert coordination_target_date(
+        launch_request(target_timing="next_business_day"),
+        reference_date=date(2026, 8, 14),
+    ) == date(2026, 8, 17)
 
 
 def test_approval_change_catalog_label_matches_its_existing_contract() -> None:

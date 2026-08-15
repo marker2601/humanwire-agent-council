@@ -8,6 +8,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 from humanwire.config import Settings
@@ -17,6 +18,7 @@ from humanwire.studio_models import (
     CoordinationRequest,
     StudioAgentMode,
     coordination_target_date,
+    local_reference_date,
 )
 from humanwire.studio_projection import (
     StudioProgressObserver,
@@ -70,6 +72,7 @@ class StudioRunRecord:
     transcript_path: Path
     store: StudioProgressStore
     observer: StudioProgressObserver
+    availability_date: date
     worker: threading.Thread | None = None
 
 
@@ -144,6 +147,7 @@ class StudioRunManager:
         model_factory_builder: Callable[[], PersonaDecisionEngineFactory] | None = None,
         alias_factory: Callable[[], str] = safe_run_alias,
         runner: Callable[..., SyntheticRunResult] = generate_scenario,
+        reference_date_factory: Callable[[], date] = local_reference_date,
     ) -> None:
         self._workspace_root = Path(workspace_root).resolve()
         if not 0 <= seed <= 2_147_483_647:
@@ -158,6 +162,7 @@ class StudioRunManager:
         self._model_factory_builder = model_factory_builder
         self._alias_factory = alias_factory
         self._runner = runner
+        self._reference_date_factory = reference_date_factory
         self._lock = threading.RLock()
         self._records: dict[str, StudioRunRecord] = {}
         self._active_alias: str | None = None
@@ -187,6 +192,13 @@ class StudioRunManager:
             )
             store, observer = create_studio_progress(request, scenario)
             decision_engine = self._decision_engine_for(request)
+            reference_date = self._reference_date_factory()
+            if not isinstance(reference_date, date):
+                raise TypeError("reference date factory must return a date")
+            availability_date = coordination_target_date(
+                request,
+                reference_date=reference_date,
+            )
             self._workspace_root.mkdir(parents=True, exist_ok=True)
             record = StudioRunRecord(
                 run_alias=alias,
@@ -195,6 +207,7 @@ class StudioRunManager:
                 transcript_path=run_root / "transcript.json",
                 store=store,
                 observer=observer,
+                availability_date=availability_date,
             )
             worker = threading.Thread(
                 target=self._run_one,
@@ -311,7 +324,9 @@ class StudioRunManager:
                 presentation_observer=observer,
                 mandate_request=record.request.objective,
                 include_change_story=False,
-                availability_date=coordination_target_date(record.request),
+                availability_date=record.availability_date,
+                defer_authority_until_ready=True,
+                include_conflict=record.request.include_conflict,
             )
         except Exception:  # noqa: BLE001 - private worker failures stay inside this boundary
             record.store.publish_failed()
