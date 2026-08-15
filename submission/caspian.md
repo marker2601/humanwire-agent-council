@@ -82,9 +82,9 @@ Copy-Item .env.example .env
 .\.venv\Scripts\python.exe -m humanwire smoke
 ```
 
-The offline smoke uses a temporary file-backed SQLite database, deterministic fake channel/model adapters, and the real gateway, workflow, repository, and web boundaries. It makes no network call and prints eleven safe `PASS` lines. The deterministic public replay is also synthetic and read-only.
+The offline smoke uses a temporary file-backed SQLite database, deterministic fake channel/model adapters, and the real gateway, workflow, repository, and web boundaries. It makes no network call and prints eleven safe `PASS` lines. The legacy frozen replay is separate local synthetic/read-only evidence, not the public interactive product.
 
-Visible provenance for the public replay and offline simulation must remain:
+Visible provenance for the legacy frozen replay and offline simulation must remain:
 
 ```text
 proof_class=synthetic_multi_persona
@@ -99,30 +99,30 @@ The opt-in `humanwire smoke --live --confirm-live` command prints a manual check
 
 ## Screenshot shot list
 
-Capture only the synthetic, read-only fixture after final QA; never capture routes, addresses, tokens, private answers, provider bodies, credentials, conversation/message IDs, or database content.
+Capture the interactive Standard-agent public product only after final QA; never capture routes, addresses, tokens, private answers, provider bodies, credentials, conversation/message IDs, or database content.
 
-1. Desktop Decision Room: mandate state with safe destination-free preview/release story.
-2. Desktop Reach: selected persisted event, flow strip, and synthetic provenance labels.
-3. Desktop Data: filtered redacted JSON/CSV controls and safe event table.
-4. Desktop meeting-ready state: verified-overlap outcome and ICS download.
-5. Mobile (390 px) Decision Room: readable, unclipped synthetic/read-only labeling.
+1. Desktop composer: launch-decision request, selected stakeholders, and visible Standard-agent boundary.
+2. Desktop Decision Room: selected saved event, graph, and From → To → Generated strip.
+3. Desktop Reach/Data: synchronized conversation and saved result at the same event.
+4. Desktop meeting-ready state: verified outcome plus final JSON/CSV downloads.
+5. Mobile (390 px) Decision Room: readable controls and the visible **Standard agents · no external messages** boundary.
 6. Mobile (390 px) Reach or Data: replay/export controls and safe content visible.
 
 ## 75–90 second video beats
 
 1. **0–8s — Problem:** broadcasting makes silence look like progress; HumanWire asks for the minimum necessary contribution.
-2. **8–18s — Preview:** authenticated manager mandate, destination-free preview, permitted override or `GO` release.
-3. **18–31s — One handler/two channels:** email and Telegram enter one Caspian `on_message` handler; show an email structured interview continuing on Telegram.
-4. **31–43s — Truthful evidence:** distinguish delivery, acknowledgement, asserted answer, and exact `CONFIRM <token>` evidence confirmation.
-5. **43–55s — Decisions and bounded resolution:** explicit authority approval commands, a required `CHANGE` as a partial blocker, and the two-round cap.
-6. **55–66s — Meeting proof:** exact attendee availability produces a meeting package and downloadable local ICS only after verified overlap.
-7. **66–78s — Durable operations:** persisted outbox, callback/replay fencing, failure ladder, and restart recovery; provider delivery remains at least once.
-8. **78–90s — Safe proof and limits:** Decision Room/Reach/Data exports, synthetic provenance labels, and explicit statement that live-provider proof is pending.
+2. **8–18s — Start:** submit the launch request and show the bounded live graph begin from Request through HumanWire and the Caspian Gateway boundary.
+3. **18–31s — Minimum path:** show named Standard agents receiving different engagement contracts rather than a broadcast.
+4. **31–43s — Truthful evidence:** follow the conflict, targeted interview, and confirmed-evidence milestones in synchronized Reach/Data panes.
+5. **43–55s — Decisions and bounded resolution:** show the revised proposal and explicit saved approval after evidence.
+6. **55–66s — Meeting proof:** show saved availability and the meeting-ready package only after approval.
+7. **66–78s — Inspect and replay:** use Decision Room, Reach, Data, Previous/Next, and final JSON/CSV downloads.
+8. **78–90s — Safe boundary:** show **Standard agents · no external messages** and state that live-provider proof remains pending.
 
 ## Submission links and official-form items
 
 - Public repository URL: **[entrant-provided after publication and signed-out verification]**
-- Public demo URL: **[entrant-provided after signed-out synthetic/read-only verification; current continuity target: https://secondsignal.vercel.app]**
+- Public product URL: **[entrant-provided after signed-out interactive-run, replay, download, and Standard-agent-boundary verification; current continuity target: https://secondsignal.vercel.app]**
 - Public video URL: **[entrant-provided after upload and signed-out playback verification]**
 - Caspian registration evidence: **[entrant-provided privacy-safe confirmation]**
 - Caspian eligibility, team, reuse/originality, deadline, judging, and required form/media evidence: **[official organizer evidence pending]**
@@ -132,6 +132,6 @@ No official event facts, eligibility, deadline, judging criterion, organizer app
 
 ## Limitations and readiness
 
-SQLite is HumanWire’s local transactional and offline-proof boundary; a production deployment needs a managed relational database with equivalent constraints, migrations, operations, backups, retention, and a separately verified cutover. Telegram outreach requires an existing bot conversation. Provider delivery is at least once. The public demo is deterministic, synthetic, read-only, and isolated; it does not prove a live Caspian/provider run or real-human testing. HumanWire creates a local read-only ICS artifact and does not write calendars. It claims neither Power BI certification, real-time analytics, production security certification, nor organizer endorsement.
+SQLite is HumanWire’s local transactional and offline-proof boundary; a production deployment needs a managed relational database with equivalent constraints, migrations, operations, backups, retention, and a separately verified cutover. Telegram outreach requires an existing bot conversation. Provider delivery is at least once. The public product is an interactive, credential-free Standard-agent workflow that sends no external messages; it does not prove a live Caspian/provider run or real-human testing. HumanWire creates a local read-only ICS artifact and does not write calendars. It claims neither Power BI certification, real-time analytics, production security certification, nor organizer endorsement.
 
 The local submission packet is ready to be paired with the required safe screenshots, recorded video, signed-out links, official organizer evidence, and separately retained private live-provider proof. Until those external or private items exist, they remain explicitly pending rather than inferred from the synthetic replay or fake transport.

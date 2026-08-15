@@ -5,6 +5,8 @@ document.addEventListener("DOMContentLoaded", () => {
   const composer = document.querySelector('[data-studio-state="composer"]');
   const workspace = document.querySelector('[data-studio-state="workspace"]');
   const actionToken = document.querySelector('meta[name="humanwire-action-token"]');
+  const deliveryMode = document.querySelector('meta[name="humanwire-delivery-mode"]')
+    ?.getAttribute("content") || "poll";
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
   const mobileLayout = window.matchMedia("(max-width: 759px)");
   const state = {
@@ -22,6 +24,8 @@ document.addEventListener("DOMContentLoaded", () => {
     renderTimer: null,
     renderQueue: [],
     rendering: false,
+    activeView: "new",
+    inlineExports: null,
   };
 
   if (composer === null || workspace === null || actionToken === null) {
@@ -45,9 +49,75 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
+  function setNavigationCurrent(selected) {
+    document.querySelectorAll("[data-studio-nav]").forEach((item) => {
+      if (item.getAttribute("data-studio-nav") === selected) {
+        item.setAttribute("aria-current", "page");
+      } else {
+        item.removeAttribute("aria-current");
+      }
+    });
+  }
+
+  function setWorkspaceNavigation(enabled) {
+    document.querySelectorAll("[data-studio-nav]").forEach((item) => {
+      if (item.getAttribute("data-studio-nav") === "new") {
+        return;
+      }
+      item.disabled = !enabled;
+      item.setAttribute("aria-disabled", enabled ? "false" : "true");
+      if (enabled) {
+        item.removeAttribute("title");
+      } else {
+        item.setAttribute("title", "Available after coordination starts");
+      }
+    });
+  }
+
   function setStudioState(selected) {
     composer.hidden = selected !== "composer";
     workspace.hidden = selected !== "workspace";
+    const inWorkspace = selected === "workspace";
+    setWorkspaceNavigation(inWorkspace);
+    if (inWorkspace) {
+      if (!new Set(["decision", "reach", "data"]).has(state.activeView)) {
+        state.activeView = "decision";
+      }
+    } else {
+      state.activeView = "new";
+    }
+    setNavigationCurrent(state.activeView);
+  }
+
+  function openWorkspaceView(selected) {
+    if (state.runAlias === null || !new Set(["decision", "reach", "data"]).has(selected)) {
+      return;
+    }
+    state.activeView = selected;
+    setNavigationCurrent(selected);
+    if (selected === "reach") {
+      showMobileTab("conversation");
+    } else if (selected === "data") {
+      showMobileTab("data");
+    }
+    const target = one(`[data-studio-panel="${selected}"]`);
+    if (target === null) {
+      return;
+    }
+    try {
+      if (typeof target.focus === "function") {
+        target.focus({ preventScroll: true });
+      }
+      if (typeof target.scrollIntoView === "function") {
+        target.scrollIntoView({
+          block: "start",
+          inline: "nearest",
+          behavior: reducedMotion.matches ? "auto" : "smooth",
+        });
+      }
+    } catch (_error) {
+      // Navigation remains selected even if a browser lacks focus/scroll options.
+    }
   }
 
   function selectedValue(name, fallback) {
@@ -205,16 +275,36 @@ document.addEventListener("DOMContentLoaded", () => {
       const response = await fetch("/api/runs", {
         method: "POST",
         headers: {
-          Accept: "application/json",
+          Accept: deliveryMode === "stream" ? "application/x-ndjson" : "application/json",
           "Content-Type": "application/json",
           "X-HumanWire-Action": actionToken.getAttribute("content") || "",
         },
         body: JSON.stringify(requestPayload()),
       });
-      const result = await response.json();
-      if (response.status === 409 && result.error === "active_run" && result.run_alias) {
-        enterWorkspace(result.run_alias, `/runs/${result.run_alias}`);
+      const contentType = response.headers.get("Content-Type") || "";
+      if (response.ok && contentType.startsWith("application/x-ndjson")) {
+        const runAlias = response.headers.get("X-HumanWire-Run-Alias");
+        if (runAlias === null || response.body === null) {
+          throw new Error("stream_unavailable");
+        }
+        enterStreamingWorkspace(runAlias);
+        await consumeRunStream(response);
         return;
+      }
+      const result = await response.json();
+      if (response.status === 409 && result.error === "active_run") {
+        if (deliveryMode === "stream") {
+          setText(
+            "[data-form-status]",
+            "Another coordination is already running. Try again in a moment.",
+          );
+          start.disabled = false;
+          return;
+        }
+        if (result.run_alias) {
+          enterWorkspace(result.run_alias, `/runs/${result.run_alias}`);
+          return;
+        }
       }
       if (!response.ok || !result.run_alias || !result.workspace_url) {
         if (result.error === "model_unavailable") {
@@ -227,13 +317,93 @@ document.addEventListener("DOMContentLoaded", () => {
       }
       enterWorkspace(result.run_alias, result.workspace_url);
     } catch (_error) {
-      setText("[data-form-status]", "The coordination could not start. Try again.");
-      start.disabled = false;
+      if (deliveryMode === "stream" && state.runAlias !== null) {
+        setText(
+          "[data-flow-live]",
+          "Updates ended early. The last saved coordination state remains visible.",
+        );
+        const newButton = one("[data-new-coordination]");
+        if (newButton !== null) {
+          newButton.hidden = false;
+        }
+      } else {
+        setText("[data-form-status]", "The coordination could not start. Try again.");
+        start.disabled = false;
+      }
+    }
+  }
+
+  function enterStreamingWorkspace(runAlias) {
+    state.runAlias = runAlias;
+    state.activeView = "decision";
+    state.inlineExports = null;
+    setStudioState("workspace");
+    history.replaceState({ runAlias }, "", "/");
+    stopPolling();
+  }
+
+  function acceptStreamEnvelope(envelope) {
+    if (envelope === null || typeof envelope !== "object") {
+      return false;
+    }
+    if (envelope.type === "snapshot" && envelope.snapshot !== null) {
+      if (envelope.evidence && typeof envelope.events_csv === "string") {
+        state.inlineExports = {
+          evidence: envelope.evidence,
+          eventsCsv: envelope.events_csv,
+        };
+      }
+      receiveSnapshot(envelope.snapshot);
+      return envelope.snapshot.run_state === "complete"
+        || envelope.snapshot.run_state === "failed";
+    } else if (envelope.type === "error") {
+      setText(
+        "[data-flow-live]",
+        "Updates ended early. The last saved coordination state remains visible.",
+      );
+    }
+    return false;
+  }
+
+  async function consumeRunStream(response) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let pending = "";
+    let terminalReceived = false;
+    while (true) {
+      const chunk = await reader.read();
+      pending += decoder.decode(chunk.value || new Uint8Array(), { stream: !chunk.done });
+      const lines = pending.split("\n");
+      pending = lines.pop() || "";
+      lines.forEach((line) => {
+        if (!line.trim()) {
+          return;
+        }
+        try {
+          terminalReceived = acceptStreamEnvelope(JSON.parse(line)) || terminalReceived;
+        } catch (_error) {
+          setText("[data-flow-live]", "An update could not be displayed. Continuing safely.");
+        }
+      });
+      if (chunk.done) {
+        break;
+      }
+    }
+    if (pending.trim()) {
+      try {
+        terminalReceived = acceptStreamEnvelope(JSON.parse(pending)) || terminalReceived;
+      } catch (_error) {
+        setText("[data-flow-live]", "An update could not be displayed. The saved state remains visible.");
+      }
+    }
+    if (!terminalReceived) {
+      throw new Error("stream_ended_early");
     }
   }
 
   function enterWorkspace(runAlias, workspaceUrl) {
     state.runAlias = runAlias;
+    state.activeView = "decision";
     setStudioState("workspace");
     history.replaceState({ runAlias }, "", workspaceUrl);
     startPolling();
@@ -786,12 +956,30 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
     const anchor = document.createElement("a");
-    anchor.setAttribute("href", `/api/runs/${state.runAlias}/${suffix}`);
+    let objectUrl = null;
+    if (deliveryMode === "stream") {
+      if (state.inlineExports === null) {
+        return;
+      }
+      const content = suffix === "evidence.json"
+        ? `${JSON.stringify(state.inlineExports.evidence, null, 2)}\n`
+        : state.inlineExports.eventsCsv;
+      const mediaType = suffix === "evidence.json"
+        ? "application/json;charset=utf-8"
+        : "text/csv;charset=utf-8";
+      objectUrl = URL.createObjectURL(new Blob([content], { type: mediaType }));
+      anchor.setAttribute("href", objectUrl);
+    } else {
+      anchor.setAttribute("href", `/api/runs/${state.runAlias}/${suffix}`);
+    }
     anchor.setAttribute("download", filename);
     anchor.hidden = true;
     document.body.append(anchor);
     anchor.click();
     anchor.remove();
+    if (objectUrl !== null) {
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    }
   }
 
   function newCoordination() {
@@ -805,6 +993,8 @@ document.addEventListener("DOMContentLoaded", () => {
     state.etag = null;
     state.followLive = true;
     state.visualsPaused = false;
+    state.activeView = "new";
+    state.inlineExports = null;
     clearPresentation();
     setStudioState("composer");
     history.replaceState({}, "", "/");
@@ -937,6 +1127,12 @@ document.addEventListener("DOMContentLoaded", () => {
     downloadAttachment("events.csv", `${state.runAlias}-events.csv`);
   });
   one("[data-new-coordination]").addEventListener("click", newCoordination);
+  document.querySelectorAll("[data-studio-nav]").forEach((item) => {
+    if (item.getAttribute("data-studio-nav") === "new") {
+      return;
+    }
+    item.addEventListener("click", () => openWorkspaceView(item.getAttribute("data-studio-nav")));
+  });
   document.querySelectorAll("[data-mobile-tab]").forEach((tab) => {
     tab.addEventListener("click", () => showMobileTab(tab.getAttribute("data-mobile-tab")));
   });
@@ -960,11 +1156,14 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  const route = location.pathname.match(/^\/runs\/([A-Za-z0-9][A-Za-z0-9._-]{0,63})$/);
+  const route = deliveryMode === "poll"
+    ? location.pathname.match(/^\/runs\/([A-Za-z0-9][A-Za-z0-9._-]{0,63})$/)
+    : null;
   loadCatalog();
   showMobileTab("conversation");
   if (route !== null) {
     state.runAlias = route[1];
+    state.activeView = "decision";
     setStudioState("workspace");
     startPolling();
   } else {

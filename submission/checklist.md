@@ -65,7 +65,7 @@ Official event rules, eligibility, registration state, reuse terms, and deadline
 - [ ] Document backup, retention, reset, single-listener ownership, and evidence-destruction boundaries before the run.
 - [ ] Set `live_provider_verified=true` only after all three flows and the retention/evidence review pass.
 
-## Public demo and browser QA
+## Public product and browser QA
 
 ### Local coordination studio
 
@@ -80,11 +80,12 @@ Official event rules, eligibility, registration state, reuse terms, and deadline
 - [x] Keep the older synthetic CLI classified as internal deterministic evidence, not the primary product screen.
 
 - [ ] Update [secondsignal.vercel.app](https://secondsignal.vercel.app) only after local and live gates pass.
-- [ ] `/`, `/mandates/HW-2411`, `/mandates/HW-2411/reach`, `/mandates/HW-2411/data`, and `/health/live` return 200.
-- [ ] Dashboard, Decision Room, Reach, Data, JSON, CSV, and ICS visibly identify HumanWire.
+- [ ] `/`, `/api/catalog`, the exact guarded POST `/api/runs`, and the public studio assets work from a signed-out production session; unknown/private routes fail closed.
+- [ ] A submitted request renders progressive saved updates through the bounded same-origin event stream and reaches the meeting-ready outcome.
+- [ ] Decision Room, Reach, and Data navigation work during and after the run; JSON and CSV downloads use the final validated stream evidence without a second server request.
 - [ ] Test desktop, 600-pixel, and 390-pixel widths for clipping, overlap, readable controls, and navigation.
 - [ ] Confirm there are no relevant browser console errors or framework overlays.
-- [ ] Confirm the demo is labeled synthetic/read-only and loads no ambient configuration.
+- [ ] Confirm the public product visibly says **Standard agents · no external messages**, offers no model mode, and loads no ambient provider/model configuration.
 
 ## Final local gate
 

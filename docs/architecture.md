@@ -21,12 +21,11 @@ Initial outreach is committed with a durable outbox row containing stable aggreg
 
 This is an at-least-once boundary. HumanWire makes duplicate callbacks and inbound replays inert, but it does not claim that an external provider sends exactly once. Email-to-Telegram continuation keeps one persisted interview session, question index, route order, and conversation correlation.
 
-## Read-only product surfaces
+## Product projections
 
-- Decision Room shows mandate truth, adaptive ladders, evidence counts, and meeting readiness.
-- Reach shows safe stakeholder outreach state and exact event history.
-- Data and its CSV export share one canonical 16-field analytics projection and filter contract.
-- The meeting ICS route requires current, verified meeting proof.
+- The public interactive studio renders Decision Room, Reach, and Data from one bounded stream of safe saved progress; its final JSON and CSV downloads come from the validated final evidence in that stream.
+- The legacy/local Decision Room, Reach, and Data surfaces rebuild read-only mandate views; their CSV and JSON exports share one canonical 16-field analytics projection and filter contract.
+- The local meeting ICS route requires current, verified meeting proof.
 
 Public projections are rebuilt from persisted records and remove contact routes, provider metadata, raw private evidence, raw change text, and credentials. Unknown mandates return a bodyless 404. Internal analytics APIs require the configured bearer token outside demo mode; the token is never returned.
 
@@ -34,4 +33,4 @@ Public projections are rebuilt from persisted records and remove contact routes,
 
 SQLite is the local transactional boundary used by the deterministic demo and offline proof. Repository transactions, compare-and-save fences, unique identities, the release outbox, events, decisions, proposals, availability, and meeting packages survive workflow restart.
 
-A production migration needs a managed relational database with equivalent constraints and transaction isolation, a single migration owner, independently supervised due-action workers, provider retry/lease monitoring, encrypted backups, retention policy, and secret injection outside the database and logs. The public demo remains isolated and in-memory. Production cutover and real provider verification are separate operator gates.
+A production migration needs a managed relational database with equivalent constraints and transaction isolation, a single migration owner, independently supervised due-action workers, provider retry/lease monitoring, encrypted backups, retention policy, and secret injection outside the database and logs. The public interactive product uses isolated ephemeral file-backed run roots under the serverless temporary directory; it is not a persistent multi-tenant database. Production cutover and real provider verification are separate operator gates.

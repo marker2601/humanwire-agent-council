@@ -36,19 +36,19 @@ The claim fails closed if the root already exists or a competing output appears.
 
 For a local operator walkthrough, start the deterministic command in the [synthetic agent runtime guide](synthetic-agent-runtime.md) with a run root that does not exist, then open `http://127.0.0.1:8766`. Follow Live advances only through persisted events. Pause it and use Previous and Next to show that one persona or origin highlight and `From -> To -> Generated` describe the selected event.
 
-After the viewer reports Complete, download JSON and CSV as attachments and confirm that the JSON evidence records `meeting_ready,partial`. Then stop the viewer and replay the validated transcript into a second fresh root. Stopping the viewer does not mutate persisted workflow state. The public Vercel demo cannot start a simulation.
+After the viewer reports Complete, download JSON and CSV as attachments and confirm that the JSON evidence records `meeting_ready,partial`. Then stop the viewer and replay the validated transcript into a second fresh root. Stopping the viewer does not mutate persisted workflow state. The public Vercel product cannot start this local synthetic-watch viewer.
 
 The deterministic watch is local synthetic proof, not live-provider or human proof. Featherless mode is a separate, explicit private exploratory check and must pass validation, privacy, and replay before its output may be frozen; it does not replace the deterministic fixture.
 
-## 4. Open the fictional public app
+## 4. Open the public interactive product
 
-Run the deterministic demo server and open `/`. Select `HW-2411` to show the active mixed plan. Explain why not everyone is interviewed: HumanWire chooses the smallest contract needed. An information recipient gets delivery only, an acknowledgement recipient only authenticates receipt, quick respondents answer one question each, and only the structured contributor enters a multi-question session.
+Open the deployed product and confirm that it starts on **Start a coordination** with the visible **Standard agents · no external messages** boundary. Submit the launch-decision template. The page must move into the workspace and progressively render the saved Request → HumanWire → Caspian Gateway path without contacting external people or providers.
 
 ## 5. Walk the product surfaces
 
-In Decision Room, point out the mandate state, typed stakeholder ladders, safe evidence summary, and pending approval. Open Reach to show exact outreach progression and the email-to-Telegram continuation. Open Data to show the canonical event table, filters, and CSV export; JSON and parsed CSV use the same field order and values.
+In Decision Room, follow the graph through outreach, conflict, targeted interview, evidence confirmation, revised proposal, approval, availability, and the meeting package. Open Reach to inspect the saved conversation at the selected event, then open Data to inspect the synchronized saved result. Use Previous, Next, Play, Pause visuals, and Follow live to show that the graph, conversation, data row, and From → To → Generated strip all describe the same selected event.
 
-Use `HW-2412` for an approved aligned result. Use `HW-2413` to demonstrate a prepared meeting view and local ICS download. Downloading the ICS does not create or update a calendar event.
+After completion, download JSON and CSV from the validated final evidence already carried by the event stream, then choose **New coordination** and confirm that the prior presentation is cleared before another run starts. The public product does not expose the legacy ICS or private operational APIs.
 
 ## 6. Explain the safety story
 

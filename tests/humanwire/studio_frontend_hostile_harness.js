@@ -45,6 +45,7 @@ class Element {
     this.disabled = false;
     this.hidden = false;
     this.scrollCalls = [];
+    this.focusCalls = [];
   }
   setAttribute(name, value) {
     this.attributes[name] = String(value);
@@ -61,6 +62,7 @@ class Element {
   dispatch(type) { (this.listeners[type] || []).forEach((callback) => callback({ preventDefault() {} })); }
   click() { if (!this.disabled) this.dispatch("click"); }
   scrollIntoView(options) { if (hostileScrollFailure) throw new Error("unsupported scroll options"); this.scrollCalls.push(options); }
+  focus(options) { this.focusCalls.push(options); }
   querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
   querySelectorAll(selector) {
     const found = [];
@@ -100,6 +102,13 @@ function register(selector, tag = "div", attributes = {}) {
 
 register('[data-studio-state="composer"]', "section");
 register('[data-studio-state="workspace"]', "section").hidden = true;
+const newNav = register('[data-studio-nav="new"]', "a", { "data-studio-nav": "new", "aria-current": "page" });
+const decisionNav = register('[data-studio-nav="decision"]', "button", { "data-studio-nav": "decision", "aria-disabled": "true", disabled: "" });
+const reachNav = register('[data-studio-nav="reach"]', "button", { "data-studio-nav": "reach", "aria-disabled": "true", disabled: "" });
+const dataNav = register('[data-studio-nav="data"]', "button", { "data-studio-nav": "data", "aria-disabled": "true", disabled: "" });
+const decisionPanel = register('[data-studio-panel="decision"]', "section", { "data-studio-panel": "decision" });
+const reachPanel = register('[data-studio-panel="reach"]', "aside", { "data-studio-panel": "reach" });
+const dataPanel = register('[data-studio-panel="data"]', "section", { "data-studio-panel": "data" });
 register("[data-composer-form]", "form"); register("[data-start-coordination]", "button");
 register("[data-form-status]"); register("[data-stakeholder-count]").textContent = "Seven selected";
 register("[data-objective]", "textarea").value = catalog.templates[0].objective;
@@ -235,6 +244,15 @@ function assertGraphGeometry() {
   const failures = [];
   const expect = (label, assertion) => { try { assertion(); } catch (error) { failures.push(`${label}: ${error.message}`); } };
   fetchQueue.push(response(catalog)); require(scriptPath); (documentListeners.DOMContentLoaded || []).forEach((callback) => callback()); await Promise.resolve(); await Promise.resolve();
+  expect("workspace nav starts truthfully disabled", () => {
+    assert.equal(newNav.getAttribute("aria-current"), "page");
+    for (const nav of [decisionNav, reachNav, dataNav]) {
+      assert.equal(nav.disabled, true);
+      assert.equal(nav.getAttribute("aria-disabled"), "true");
+    }
+  });
+  decisionNav.click();
+  expect("disabled nav cannot imply a hidden destination", () => assert.equal(decisionPanel.scrollCalls.length, 0));
   expect("catalog Elena label", () => assert.equal(participants.at(-1).parentNode.querySelector("em").textContent, "Review and approval"));
   expect("initial selected count", () => assert.equal(text("[data-stakeholder-count]"), "Seven selected"));
   const structured = participants.find((item) => item.value === "structured");
@@ -247,8 +265,37 @@ function assertGraphGeometry() {
   const approval = participants.find((item) => item.value === "approval"); approval.checked = false; approval.dispatch("change"); expect("manual selected count", () => assert.equal(text("[data-stakeholder-count]"), "Three selected")); launchButton.click();
 
   fetchQueue.push(response({ run_alias: "launch-001", workspace_url: "/runs/launch-001" }, 201)); await click("[data-start-coordination]"); await Promise.resolve();
+  expect("workspace nav enables when a run exists", () => {
+    assert.equal(newNav.getAttribute("aria-current"), null);
+    assert.equal(decisionNav.getAttribute("aria-current"), "page");
+    for (const nav of [decisionNav, reachNav, dataNav]) {
+      assert.equal(nav.disabled, false);
+      assert.equal(nav.getAttribute("aria-disabled"), "false");
+    }
+  });
   const four = snapshotWithEvents(4); await poll(four, 200, '"event-4"');
   assert.equal(text("[data-event-progress]"), "Event 1 of 4"); assert.equal(pendingTimeouts(), 1);
+  const navOrdinal = text("[data-event-progress]");
+  await click('[data-studio-nav="reach"]');
+  expect("Reach opens the conversation workspace without changing replay", () => {
+    assert.equal(reachNav.getAttribute("aria-current"), "page");
+    assert.equal(nodes['[data-studio-state="workspace"]'].getAttribute("data-mobile-panel"), "conversation");
+    assert.equal(reachPanel.scrollCalls.length, 1);
+    assert.equal(text("[data-event-progress]"), navOrdinal);
+  });
+  await click('[data-studio-nav="data"]');
+  expect("Data opens the saved data workspace without changing replay", () => {
+    assert.equal(dataNav.getAttribute("aria-current"), "page");
+    assert.equal(nodes['[data-studio-state="workspace"]'].getAttribute("data-mobile-panel"), "data");
+    assert.equal(dataPanel.scrollCalls.length, 1);
+    assert.equal(text("[data-event-progress]"), navOrdinal);
+  });
+  await click('[data-studio-nav="decision"]');
+  expect("Decision Room returns to the graph without changing replay", () => {
+    assert.equal(decisionNav.getAttribute("aria-current"), "page");
+    assert.equal(decisionPanel.scrollCalls.length, 1);
+    assert.equal(text("[data-event-progress]"), navOrdinal);
+  });
   if (mode === "terminal-transition") {
     const completedWhileQueued = snapshotWithEvents(10, "complete", true);
     completedWhileQueued.events.at(-1).stage = "schedule";
@@ -305,6 +352,14 @@ function assertGraphGeometry() {
   expect("reset clears downloads", () => { assert.equal(nodes["[data-download-json]"].disabled, true); assert.equal(nodes["[data-download-csv]"].disabled, true); assert.equal(nodes["[data-new-coordination]"].hidden, true); });
   expect("reset clears timers", () => { assert.equal(timeouts.size, 0); assert.equal(intervals.size, 0); });
   expect("reset clears lifecycle", () => document.querySelectorAll("[data-lifecycle-stage]").forEach((item) => { assert.equal(item.classList.contains("is-current"), false); assert.equal(item.classList.contains("is-complete"), false); assert.equal(item.querySelector("small").textContent, "Pending"); }));
+  expect("reset restores truthful navigation", () => {
+    assert.equal(newNav.getAttribute("aria-current"), "page");
+    for (const nav of [decisionNav, reachNav, dataNav]) {
+      assert.equal(nav.disabled, true);
+      assert.equal(nav.getAttribute("aria-disabled"), "true");
+      assert.equal(nav.getAttribute("aria-current"), null);
+    }
+  });
   assert.equal(location.pathname, "/");
   if (failures.length) throw new Error(failures.join("\n"));
 })().catch((error) => { process.stderr.write(`${error.stack}\n`); process.exitCode = 1; });

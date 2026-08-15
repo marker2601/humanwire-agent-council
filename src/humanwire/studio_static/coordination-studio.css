@@ -165,16 +165,32 @@
 }
 
 .coordination-studio-page__nav a,
-.coordination-studio-page__nav span {
+.coordination-studio-page__nav button {
   display: flex;
   align-items: center;
+  min-width: 44px;
+  min-height: 52px;
   padding: 0 22px;
+  border: 0;
+  border-bottom: 3px solid transparent;
+  background: transparent;
   color: var(--muted);
+  font-family: inherit;
   font-size: 15px;
   text-decoration: none;
 }
 
-.coordination-studio-page__nav a[aria-current="page"] {
+.coordination-studio-page__nav button:not(:disabled) {
+  cursor: pointer;
+}
+
+.coordination-studio-page__nav button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.coordination-studio-page__nav a[aria-current="page"],
+.coordination-studio-page__nav button[aria-current="page"] {
   border-bottom: 3px solid var(--cyan);
   color: var(--ice);
 }
@@ -188,11 +204,31 @@
   font-size: 14px;
 }
 
-.coordination-studio-page__status-mark span {
+.coordination-studio-page__status-mark > span {
+  flex: 0 0 auto;
   width: 9px;
   height: 9px;
   border-radius: 50%;
   background: var(--green);
+}
+
+.coordination-studio-page__status-mark > div {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  line-height: 1.2;
+}
+
+.coordination-studio-page__status-mark strong {
+  color: var(--ice);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.coordination-studio-page__status-mark small {
+  color: var(--muted);
+  font-size: 14px;
+  white-space: nowrap;
 }
 
 .coordination-studio-page__composer {
@@ -1166,7 +1202,7 @@
   }
 
   .coordination-studio-page__nav a,
-  .coordination-studio-page__nav span {
+  .coordination-studio-page__nav button {
     padding: 0 12px;
   }
 }
@@ -1186,14 +1222,12 @@
   }
 
   .coordination-studio-page__status-mark {
-    width: 44px;
-    padding: 0;
-    overflow: hidden;
-    text-indent: -999px;
+    width: auto;
+    padding: 0 16px 0 8px;
   }
 
-  .coordination-studio-page__status-mark span {
-    margin: 0 auto;
+  .coordination-studio-page__status-mark > span {
+    margin: 0;
   }
 
   .coordination-studio-page__composer {
@@ -1377,9 +1411,31 @@
 }
 
 @media (max-width: 479px) {
+  .coordination-studio-page__masthead {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
   .coordination-studio-page__brand {
     padding: 0 15px;
     font-size: 18px;
+  }
+
+  .coordination-studio-page__brand > span,
+  .coordination-studio-page__status-mark strong {
+    display: none;
+  }
+
+  .coordination-studio-page__status-mark {
+    min-width: 0;
+    padding: 0 12px 0 4px;
+  }
+
+  .coordination-studio-page__status-mark > div {
+    min-width: 0;
+  }
+
+  .coordination-studio-page__status-mark small {
+    white-space: normal;
   }
 
   .coordination-studio-page__composer,

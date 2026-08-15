@@ -1,6 +1,6 @@
 # HumanWire synthetic agent runtime
 
-This guide is for the local, operator-owned synthetic viewer. It watches a fresh SQLite-backed simulation while persisted events arrive, then exposes the completed run as validated JSON and CSV evidence. The viewer binds only to the literal loopback address at `http://127.0.0.1:8766`; it is GET-only and is not a deployed control plane. The public Vercel demo cannot start a simulation.
+This guide is for the local, operator-owned synthetic viewer. It watches a fresh SQLite-backed simulation while persisted events arrive, then exposes the completed run as validated JSON and CSV evidence. The viewer binds only to the literal loopback address at `http://127.0.0.1:8766`; it is GET-only and is not a deployed control plane. The public Vercel product cannot start this local synthetic-watch viewer.
 
 ## Proof boundary
 

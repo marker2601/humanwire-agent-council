@@ -121,6 +121,29 @@ def test_composer_and_workspace_expose_the_complete_accessible_product_shell(
     assert re.search(r"<button[^>]+data-download-csv[^>]+disabled", html)
 
 
+def test_primary_navigation_is_truthful_before_a_run_and_targets_real_workspace_panels(
+    tmp_path,
+) -> None:
+    """Break caught: navigation labels look interactive but are inert spans."""
+    html = studio_client(tmp_path).get("/").text
+    assert re.search(
+        r'<a[^>]+data-studio-nav="new"[^>]+aria-current="page"[^>]*>'
+        r"New coordination</a>",
+        html,
+    )
+    for target, label in (
+        ("decision", "Decision Room"),
+        ("reach", "Reach"),
+        ("data", "Data"),
+    ):
+        assert re.search(
+            rf'<button[^>]+data-studio-nav="{target}"[^>]+disabled[^>]+'
+            rf'aria-disabled="true"[^>]*>{label}</button>',
+            html,
+        )
+        assert f'data-studio-panel="{target}"' in html
+
+
 def test_action_token_is_rendered_only_in_the_meta_boundary(tmp_path) -> None:
     response = studio_client(tmp_path).get("/")
     visible_text = re.sub(r"<[^>]+>", " ", response.text)
@@ -188,6 +211,17 @@ def test_all_effective_targets_and_mobile_completion_actions_remain_usable() -> 
         phone,
         re.DOTALL,
     )
+    assert re.search(
+        r"\.coordination-studio-page__brand\s*>\s*span\s*,\s*"
+        r"\.coordination-studio-page__status-mark\s+strong\s*\{[^}]*"
+        r"display:\s*none",
+        phone,
+        re.DOTALL,
+    )
+    phone_status = css_block(phone, ".coordination-studio-page__status-mark {")
+    phone_status_copy = css_block(phone, ".coordination-studio-page__status-mark small {")
+    assert "min-width: 0" in phone_status
+    assert "white-space: normal" in phone_status_copy
 
 
 def test_hostile_async_reset_catalog_graph_and_mobile_contract() -> None:
@@ -408,6 +442,16 @@ def test_controller_source_has_no_unsafe_dom_or_token_persistence() -> None:
     assert "setAttribute" in source
 
 
+def test_exports_use_stateless_stream_blobs_and_local_attachment_routes() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+
+    assert '`/api/runs/${state.runAlias}/${suffix}`' in source
+    assert "new Blob" in source
+    assert "URL.createObjectURL" in source
+    assert "URL.revokeObjectURL" in source
+    assert "data:${mediaType}" not in source
+
+
 def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> None:
     harness = textwrap.dedent(
         r"""
@@ -417,6 +461,8 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
         const fixturePath = process.argv[2];
         const mode = process.argv[3];
         const fixtureSnapshots = JSON.parse(fs.readFileSync(fixturePath, "utf8"));
+        const downloadClicks = [];
+        const revokedUrls = [];
 
         class ClassList {
           constructor() { this.values = new Set(); }
@@ -468,7 +514,12 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
           replaceChildren(...nodes) { this.children = []; this.append(...nodes); }
           remove() { if (this.parentNode) this.parentNode.children = this.parentNode.children.filter((item) => item !== this); }
           addEventListener(type, callback) { (this.listeners[type] ||= []).push(callback); }
-          click() { if (!this.disabled) (this.listeners.click || []).forEach((callback) => callback({ preventDefault() {} })); }
+          click() {
+            if (this.tagName === "A") {
+              downloadClicks.push({ href: this.getAttribute("href"), filename: this.getAttribute("download") });
+            }
+            if (!this.disabled) (this.listeners.click || []).forEach((callback) => callback({ preventDefault() {} }));
+          }
           scrollIntoView(options) { this.scrollCalls.push(options); }
           querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
           querySelectorAll(selector) {
@@ -524,6 +575,8 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
           all.push(new Element("article")); all.at(-1).setAttribute("data-persona-card", id);
         });
         const meta = register('meta[name="humanwire-action-token"]', "meta"); meta.setAttribute("content", "test-token");
+        const deliveryMeta = register('meta[name="humanwire-delivery-mode"]', "meta");
+        deliveryMeta.setAttribute("content", mode.startsWith("stream-") ? "stream" : "poll");
 
         const domListeners = {};
         global.document = {
@@ -561,6 +614,10 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
         global.location = { pathname: ["refresh", "failed"].includes(mode) ? "/runs/launch-001" : "/" };
         global.history = { replaceState(_state, _title, url) { location.pathname = url; } };
         global.window = global;
+        global.URL = {
+          createObjectURL(blob) { assert.ok(blob instanceof Blob); return `blob:humanwire-${downloadClicks.length + 1}`; },
+          revokeObjectURL(url) { revokedUrls.push(url); },
+        };
         global.matchMedia = () => ({ matches: mode === "reduced", addEventListener() {} });
         global.addEventListener = () => {};
 
@@ -604,6 +661,94 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
           (domListeners.DOMContentLoaded || []).forEach((callback) => callback());
           await Promise.resolve(); await Promise.resolve();
           assert.equal(fetchCalls[0].url, "/api/catalog");
+
+          if (["stream-eof", "stream-rejected"].includes(mode)) {
+            const reader = mode === "stream-rejected"
+              ? { async read() { throw new Error("PRIVATE-STREAM-DETAIL"); } }
+              : { async read() { return { done: true, value: undefined }; } };
+            fetchQueue.push({
+              ok: true,
+              status: 201,
+              headers: {
+                get(name) {
+                  const normalized = String(name).toLowerCase();
+                  if (normalized === "content-type") return "application/x-ndjson";
+                  if (normalized === "x-humanwire-run-alias") return "stream-run";
+                  return null;
+                },
+              },
+              body: { getReader() { return reader; } },
+            });
+            await click("[data-start-coordination]");
+            for (let index = 0; index < 8; index += 1) await Promise.resolve();
+            assert.equal(nodes['[data-studio-state="composer"]'].hidden, true);
+            assert.equal(nodes['[data-studio-state="workspace"]'].hidden, false);
+            assert.match(text("[data-flow-live]"), /updates ended early/i);
+            assert.doesNotMatch(text("[data-flow-live]"), /PRIVATE-STREAM-DETAIL/);
+            return;
+          }
+
+          if (mode === "stream-conflict") {
+            fetchQueue.push(jsonResponse({ error: "active_run" }, 409));
+            await click("[data-start-coordination]");
+            await Promise.resolve(); await Promise.resolve();
+            assert.equal(location.pathname, "/");
+            assert.equal(nodes['[data-studio-state="composer"]'].hidden, false);
+            assert.equal(nodes['[data-studio-state="workspace"]'].hidden, true);
+            assert.match(text("[data-form-status]"), /already running/i);
+            assert.equal(nodes["[data-start-coordination]"].disabled, false);
+            return;
+          }
+
+          if (mode === "stream-complete") {
+            const completed = structuredClone(terminalSnapshot);
+            completed.run_state = "complete";
+            completed.downloads_ready = true;
+            const envelope = JSON.stringify({
+              type: "snapshot",
+              snapshot: completed,
+              evidence: { schema_version: "humanwire.studio-evidence/v1", run_alias: "stream-run" },
+              events_csv: "timeline_ordinal,persisted_ordinal,effect\r\n1,1,persisted\r\n",
+            }) + "\n";
+            let delivered = false;
+            fetchQueue.push({
+              ok: true,
+              status: 201,
+              headers: {
+                get(name) {
+                  const normalized = String(name).toLowerCase();
+                  if (normalized === "content-type") return "application/x-ndjson";
+                  if (normalized === "x-humanwire-run-alias") return "stream-run";
+                  return null;
+                },
+              },
+              body: {
+                getReader() {
+                  return {
+                    async read() {
+                      if (delivered) return { done: true, value: undefined };
+                      delivered = true;
+                      return { done: false, value: new TextEncoder().encode(envelope) };
+                    },
+                  };
+                },
+              },
+            });
+            await click("[data-start-coordination]");
+            for (let index = 0; index < 10; index += 1) await Promise.resolve();
+            assert.equal(nodes["[data-download-json]"].disabled, false);
+            assert.equal(nodes["[data-download-csv]"].disabled, false);
+            await click("[data-download-json]");
+            await click("[data-download-csv]");
+            assert.deepEqual(downloadClicks, [
+              { href: "blob:humanwire-1", filename: "stream-run-evidence.json" },
+              { href: "blob:humanwire-2", filename: "stream-run-events.csv" },
+            ]);
+            assert.deepEqual(revokedUrls, ["blob:humanwire-1", "blob:humanwire-2"]);
+            assert.equal(fetchCalls.length, 2);
+            assert.equal(location.pathname, "/");
+            return;
+          }
 
           if (["refresh", "failed"].includes(mode)) {
             const hydratedSnapshot = structuredClone(terminalSnapshot);
@@ -692,7 +837,16 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
         })().catch((error) => { process.stderr.write(error.stack + "\n"); process.exitCode = 1; });
         """
     )
-    for mode in ("normal", "reduced", "refresh", "failed"):
+    for mode in (
+        "normal",
+        "reduced",
+        "refresh",
+        "failed",
+        "stream-conflict",
+        "stream-complete",
+        "stream-eof",
+        "stream-rejected",
+    ):
         result = subprocess.run(
             ["node", "-e", harness, str(SCRIPT), str(FIXTURES), mode],
             cwd=ROOT,

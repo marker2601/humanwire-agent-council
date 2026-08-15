@@ -35,17 +35,17 @@ Once every required contribution is ready, deterministic policy evaluates alignm
 
 ## Product surfaces: persisted truth made inspectable
 
-HumanWire’s Decision Room, Reach, and Data surfaces rebuild safe, read-only views from persisted truth. Reach is a GET-only replay of a frozen scenario: selecting an event explains its causal chain as:
+HumanWire’s public Decision Room, Reach, and Data surfaces render safe presentation views from one bounded stream of saved coordination progress. Selecting an event explains its causal chain as:
 
 ```text
 From [source]  ->  To [destination]  ->  Generated [safe data point]
 ```
 
-The replay uses allowlisted labels for the mandate, plan, outreach, response, evidence, decision, proposal, scheduling, and outcome stages. It does not contact people, run a model, create a mandate, mutate persisted state, or create telemetry. Decision Room shows the coordination state and safe contribution progress; Data presents the canonical redacted outreach-event projection.
+The interactive product uses allowlisted labels for request, outreach, response, evidence, decision, proposal, scheduling, and outcome stages. It starts an isolated Standard-agent run but does not contact external people or providers. Decision Room shows the live saved path; Reach and Data remain synchronized to the selected saved event.
 
-The inline JSON API, downloadable JSON attachment, and CSV download use the same filtered 16-field redacted projection as the Data table. JSON and CSV preserve the exact active filter query; the ICS is a local read-only artifact. Public projections exclude private evidence, raw `CHANGE` rationale, contact routes, provider bodies, message identifiers, credentials, operational UUIDs, and availability windows. In non-demo deployments, `/api/v1/*` is read-only and separately protected by a read token; the public fixture contains no API credential.
+The public JSON and CSV downloads are created from the same validated final evidence delivered by the event stream. The separate legacy/local analytics API, JSON attachment, CSV, and ICS keep their 16-field filter contract. Public projections exclude private evidence, raw `CHANGE` rationale, contact routes, provider bodies, message identifiers, credentials, operational UUIDs, and availability windows.
 
-The deterministic public replay and the offline simulation visibly retain this provenance:
+The legacy frozen replay and offline simulation visibly retain this provenance:
 
 ```text
 proof_class=synthetic_multi_persona
@@ -96,30 +96,30 @@ This is deterministic offline and synthetic proof. A controlled private live-pro
 
 ## Screenshot shot list
 
-Capture only the synthetic, read-only fixture after final QA. Never capture addresses, routes, tokens, private answers, provider bodies, conversation/message IDs, credentials, or database content.
+Capture the interactive Standard-agent public product only after final QA. Never capture addresses, routes, tokens, private answers, provider bodies, conversation/message IDs, credentials, or database content.
 
-1. Desktop Decision Room: destination-free preview/release and six-contract mix.
-2. Desktop Reach: a selected persisted event with the From → To → Generated strip and synthetic provenance labels.
-3. Desktop Data: a filtered redacted event table with JSON-attachment and CSV-download controls.
-4. Desktop meeting-ready state: verified-overlap outcome and local ICS download.
-5. Mobile (390 px) Decision Room: readable synthetic/read-only labeling and contract progress.
+1. Desktop composer: launch-decision request, selected stakeholders, and visible Standard-agent boundary.
+2. Desktop Decision Room: selected saved event, graph, and From → To → Generated strip.
+3. Desktop Reach/Data: synchronized conversation and saved result at the same event.
+4. Desktop meeting-ready state: verified outcome plus final JSON/CSV downloads.
+5. Mobile (390 px) Decision Room: readable controls, contract progress, and the visible **Standard agents · no external messages** boundary.
 6. Mobile (390 px) Reach or Data: visible replay or export controls with safe content.
 
 ## 75–90 second video beats
 
 1. **0–8s — Problem:** explain why broadcast, delivery, and silence are not a trustworthy coordination record.
-2. **8–20s — One persistent mandate:** show preview/release and the six minimum-necessary contracts.
-3. **20–32s — Cross-channel continuity:** show one normalized handler and a structured interview continuing from email to Telegram.
-4. **32–44s — Human proof:** distinguish asserted input from exact `CONFIRM <token>` on the persisted route and conversation.
-5. **44–55s — Truthful decisions:** show exact approval commands and a required `CHANGE` staying partial, outside the meeting path.
-6. **55–66s — Bounded resolution:** show the two-round cap, then exact attendee availability and verified meeting overlap.
-7. **66–78s — Inspectable product:** show Decision Room, From → To → Generated replay, redacted Data, JSON/CSV, and local ICS.
-8. **78–90s — Proof boundary:** show synthetic provenance labels and state that fake-Caspian/offline proof is implemented and tested while private live-provider proof is pending.
+2. **8–20s — Start one coordination:** submit the launch request and show the bounded graph begin.
+3. **20–32s — Minimum path:** show named stakeholders receiving different contracts through one channel-neutral gateway boundary.
+4. **32–44s — Evidence:** follow conflict, targeted interview, and confirmed evidence in synchronized panes.
+5. **44–55s — Truthful decision:** show the revised proposal and saved approval only after evidence.
+6. **55–66s — Meeting path:** show availability and verified meeting readiness only after approval.
+7. **66–78s — Inspectable product:** use Decision Room, Reach, Data, replay, and final JSON/CSV downloads.
+8. **78–90s — Proof boundary:** show **Standard agents · no external messages** and state that private live-provider proof remains pending.
 
 ## Submission links and official-form items
 
 - Public repository URL: **[entrant-provided after publication and signed-out verification]**
-- Public demo URL: **[entrant-provided after signed-out synthetic/read-only verification; current continuity target: https://secondsignal.vercel.app]**
+- Public product URL: **[entrant-provided after signed-out interactive-run, replay, download, and Standard-agent-boundary verification; current continuity target: https://secondsignal.vercel.app]**
 - Public video URL: **[entrant-provided after upload and signed-out playback verification]**
 - Build Beyond registration evidence: **[entrant-provided privacy-safe confirmation]**
 - Build Beyond eligibility, team, reuse/originality, deadline, judging, and required form/media evidence: **[official organizer evidence pending]**
@@ -131,4 +131,4 @@ Organizer eligibility is external pending. This packet does not assert official 
 
 SQLite is HumanWire’s local transactional and offline-proof boundary; production requires a managed relational database with equivalent constraints, migrations, operations, backups, retention, and separately verified cutover. Provider delivery is at least once. Telegram outreach requires an existing bot conversation. HumanWire does not claim production-security certification, Power BI certification, realtime analytics, organizer endorsement, a hosted production database, or an external calendar write.
 
-The public demo is deterministic, synthetic, GET-only, read-only, and isolated from ambient configuration. Fake-Caspian and fake-model proof are not live-provider, live-model, or real-human proof. This local packet is ready to pair with safe screenshots, a 75–90 second recording, signed-out repository/demo/video links, Build Beyond organizer evidence, and privately retained live-provider proof when those items exist.
+The public product is an interactive, credential-free Standard-agent workflow with one guarded creation request and a bounded same-origin event stream. It sends no external messages and remains isolated from ambient provider/model configuration. Separate fake-Caspian and fake-model proof are not live-provider, live-model, or real-human proof. This local packet is ready to pair with safe screenshots, a 75–90 second recording, signed-out repository/product/video links, Build Beyond organizer evidence, and privately retained live-provider proof when those items exist.

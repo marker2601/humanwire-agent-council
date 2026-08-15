@@ -68,23 +68,22 @@ STUDIO_COMMAND = (
 )
 
 
-def test_vercel_entrypoint_serves_the_isolated_humanwire_demo() -> None:
+def test_vercel_entrypoint_serves_the_public_coordination_product() -> None:
     sys.modules.pop("index", None)
     app = importlib.import_module("index").app
-    client = TestClient(app)
+    client = TestClient(app, base_url="https://secondsignal.vercel.app")
 
     home = client.get("/")
 
     assert home.status_code == 200
     assert "HumanWire" in home.text
     assert "SecondSignal" not in home.text
-    assert client.get("/mandates/HW-2411").status_code == 200
-    assert client.get("/mandates/HW-2411/reach").status_code == 200
-    assert client.get("/mandates/HW-2411/data").status_code == 200
-    assert client.get("/health/live").json() == {"status": "live"}
-    assert client.get("/health/ready").json() == {"status": "ready", "mode": "demo"}
-    assert client.get("/api/runs").status_code == 404
-    assert client.get("/studio-static/coordination-studio.js").status_code == 404
+    assert "Start a coordination" in home.text
+    assert '<meta name="humanwire-delivery-mode" content="stream">' in home.text
+    assert client.get("/studio-static/coordination-studio.js").status_code == 200
+    assert client.get("/mandates/HW-2411").status_code == 404
+    assert client.get("/health/live").status_code == 404
+    assert client.get("/api/runs").status_code == 405
 
 
 def test_installed_distribution_exposes_only_the_humanwire_product() -> None:
@@ -188,7 +187,8 @@ def test_agent_runtime_docs_preserve_exact_proof_boundary() -> None:
         assert label in text
     assert "127.0.0.1" in text
     assert "not live Caspian, email, Telegram, Featherless, or human proof" in text
-    assert "The public Vercel demo cannot start a simulation" in text
+    assert "The public Vercel product cannot start this local synthetic-watch viewer" in text
+    assert "cannot start a simulation" not in text
 
 
 def test_agent_runtime_readme_preserves_exact_watch_commands() -> None:
@@ -215,6 +215,20 @@ def test_coordination_studio_is_the_primary_truthful_local_product() -> None:
     assert "external Caspian, email, and Telegram" in combined
     assert "internal deterministic evidence" in combined
     assert "PENDING" in checklist
+
+
+def test_public_claims_match_the_interactive_standard_agent_product() -> None:
+    claims = (ROOT / "submission/verified-claims.md").read_text(encoding="utf-8")
+    checklist = (ROOT / "submission/checklist.md").read_text(encoding="utf-8")
+
+    assert "bounded same-origin event stream" in claims
+    assert "credential-free Standard agents" in claims
+    assert "no external messages" in claims
+    assert "The public demo is deterministic, synthetic, read-only" not in claims
+    assert "POST `/api/runs`" in checklist
+    assert "JSON and CSV downloads" in checklist
+    assert "/mandates/HW-2411" not in checklist
+    assert "synthetic/read-only" not in checklist
 
 
 def test_agent_runtime_claim_ledger_classifies_local_viewer_only() -> None:

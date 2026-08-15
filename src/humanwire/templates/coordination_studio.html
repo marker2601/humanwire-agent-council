@@ -4,6 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="humanwire-action-token" content="{{ action_token | e }}">
+    <meta name="humanwire-delivery-mode" content="{{ delivery_mode | default('poll') | e }}">
     <title>HumanWire coordination studio</title>
     <link rel="stylesheet" href="/studio-static/coordination-studio.css">
   </head>
@@ -16,14 +17,17 @@
         <span>HumanWire</span>
       </a>
       <nav class="coordination-studio-page__nav" aria-label="HumanWire">
-        <a href="/" aria-current="page">New coordination</a>
-        <span>Decision Room</span>
-        <span>Reach</span>
-        <span>Data</span>
+        <a href="/" data-studio-nav="new" aria-current="page">New coordination</a>
+        <button type="button" data-studio-nav="decision" disabled aria-disabled="true" title="Available after coordination starts">Decision Room</button>
+        <button type="button" data-studio-nav="reach" disabled aria-disabled="true" title="Available after coordination starts">Reach</button>
+        <button type="button" data-studio-nav="data" disabled aria-disabled="true" title="Available after coordination starts">Data</button>
       </nav>
-      <div class="coordination-studio-page__status-mark" aria-label="Private coordination studio">
+      <div class="coordination-studio-page__status-mark" aria-label="{% if delivery_mode | default('poll') == 'stream' %}Interactive coordination studio{% else %}Private coordination studio{% endif %}">
         <span aria-hidden="true"></span>
-        Private workspace
+        <div>
+          <strong>{% if delivery_mode | default('poll') == 'stream' %}Interactive workspace{% else %}Private workspace{% endif %}</strong>
+          {% if delivery_mode | default('poll') == 'stream' %}<small>Standard agents · no external messages</small>{% endif %}
+        </div>
       </div>
     </header>
 
@@ -73,11 +77,13 @@
               <input type="date" aria-label="Coordination date" data-custom-date disabled>
             </fieldset>
             <label class="coordination-studio-page__switch-row"><input type="checkbox" data-include-conflict checked><span>Resolve disagreement before approval</span></label>
-            <fieldset class="coordination-studio-page__compact-fieldset">
-              <legend>Agent mode</legend>
-              <label><input type="radio" name="agent_mode" value="standard" checked><span>Standard agents</span></label>
-              <label><input type="radio" name="agent_mode" value="model_assisted"><span>Model-assisted</span></label>
-            </fieldset>
+            {% if delivery_mode | default('poll') != 'stream' %}
+              <fieldset class="coordination-studio-page__compact-fieldset">
+                <legend>Agent mode</legend>
+                <label><input type="radio" name="agent_mode" value="standard" checked><span>Standard agents</span></label>
+                <label><input type="radio" name="agent_mode" value="model_assisted"><span>Model-assisted</span></label>
+              </fieldset>
+            {% endif %}
           </div>
 
           <fieldset class="coordination-studio-page__templates" data-current-template="launch-decision">
@@ -134,7 +140,7 @@
 
       <div class="coordination-studio-page__workspace-grid">
         <main class="coordination-studio-page__work-surface">
-          <section class="coordination-studio-page__graph-panel" aria-labelledby="flow-title">
+          <section class="coordination-studio-page__graph-panel" data-studio-panel="decision" tabindex="-1" aria-labelledby="flow-title">
             <header><div><span>Live coordination flow</span><h2 id="flow-title">HumanWire is coordinating the saved path</h2></div><strong data-current-stage>Brief</strong></header>
             <svg data-flow-canvas viewBox="0 0 1000 620" role="img" aria-label="Saved coordination flow from request through stakeholders to the meeting package"></svg>
             <div class="coordination-studio-page__persona-rail" aria-label="Stakeholders in this coordination">
@@ -162,7 +168,7 @@
             <button type="button" role="tab" aria-selected="false" aria-controls="data-panel" data-mobile-tab="data">Data trail</button>
           </div>
 
-          <section class="coordination-studio-page__data-panel" id="data-panel" aria-labelledby="data-title">
+          <section class="coordination-studio-page__data-panel" id="data-panel" data-studio-panel="data" tabindex="-1" aria-labelledby="data-title">
             <header><h2 id="data-title">Data trail</h2><span>Saved results only</span></header>
             <div data-data-list></div>
           </section>
@@ -173,7 +179,7 @@
           </section>
         </main>
 
-        <aside class="coordination-studio-page__conversation" id="conversation-panel" aria-labelledby="conversation-title">
+        <aside class="coordination-studio-page__conversation" id="conversation-panel" data-studio-panel="reach" tabindex="-1" aria-labelledby="conversation-title">
           <header><h2 id="conversation-title">Conversation</h2><span>Saved messages</span></header>
           <div data-conversation-list></div>
         </aside>

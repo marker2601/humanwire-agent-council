@@ -18,9 +18,11 @@ Open `http://127.0.0.1:8766/`. The command creates the workspace parent when nee
 
 Verification of external Caspian, email, and Telegram delivery remains a separate private operator checklist. A live model run is likewise pending until separately retained evidence exists. The `humanwire synthetic` CLI remains available as internal deterministic evidence, but it is not the primary product screen.
 
-## Live demo
+## Live product
 
-The public deployment target is [secondsignal.vercel.app](https://secondsignal.vercel.app). The app is a deterministic, read-only HumanWire fixture: it loads no local organization directory, provider credentials, model credentials, or private responses. Local and browser gates must pass before that continuity URL is updated.
+The public product is deployed at [secondsignal.vercel.app](https://secondsignal.vercel.app). A submitted coordination opens one bounded same-origin event stream and renders the real workflow as it progresses from the request through outreach, conflict resolution, approval, availability, and a meeting-ready package. The public build uses credential-free Standard agents and loads no private organization directory, provider credentials, model credentials, contact destinations, or private responses.
+
+The private local studio uses the same product UI with polling and isolated file-backed run roots. External Caspian/email/Telegram delivery and live Featherless evidence remain separate operator-configured modes; the public URL does not claim those external connections.
 
 ## The coordination problem
 
@@ -74,7 +76,7 @@ flowchart LR
 - Provider delivery is at least once. Stable outbox identity and leases make callbacks and recovery safe, but an external recipient may still see a duplicate after a provider accepted a send and its callback was lost.
 - Required silence, failure, rejection, `CHANGE`, missing evidence, and pending confirmation never become alignment.
 - Public projections exclude raw private evidence, change rationale, contact routes, provider bodies, message identifiers, credentials, and operational UUIDs.
-- The web app is GET-only; unknown resources use a bodyless 404 and internal APIs require a separate read token outside demo mode.
+- The legacy analytics surface is GET-only. The coordination studio accepts one guarded same-origin creation request; unknown resources fail closed and private operational APIs remain unavailable from the public product.
 
 See [architecture](docs/architecture.md) and the [threat model](docs/threat-model.md) for the complete boundary.
 
@@ -167,7 +169,7 @@ Actual Caspian and Telegram proof is a separate operator gate. It must cover one
 
 ## Private PostgreSQL sandbox readiness
 
-The private sandbox is a separate operator-owned deployment, PostgreSQL database, Caspian project, directory, analytics token, email connection, Telegram bot, and set of consenting test identities. Do not reuse the public demo project, its synthetic directory, or its SQLite database.
+The private sandbox is a separate operator-owned deployment, PostgreSQL database, Caspian project, directory, analytics token, email connection, Telegram bot, and set of consenting test identities. Do not reuse the public product project, its Standard-agent directory, or its ephemeral SQLite run roots.
 
 Copy `.env.example` to an ignored private environment and set these required variables there:
 
@@ -220,7 +222,7 @@ Successful stdout contains only the six exact provenance labels, safe scenario/r
 
 ### Watch the local synthetic agent runtime
 
-Every watch uses an explicit run root that must not exist. The deterministic viewer is reproducible offline simulation/replay proof; the Featherless mode is private exploratory model-assisted behavior and is not live-provider or human proof. Both remain local-only at `http://127.0.0.1:8766`. The public Vercel demo cannot start a simulation.
+Every watch uses an explicit run root that must not exist. The deterministic viewer is reproducible offline simulation/replay proof; the Featherless mode is private exploratory model-assisted behavior and is not live-provider or human proof. Both remain local-only at `http://127.0.0.1:8766`. The public Vercel product cannot start this local synthetic-watch viewer.
 
 ```powershell
 # Deterministic, no external model/provider call
@@ -253,7 +255,7 @@ Power BI can use an authenticated Web request where managed header credentials a
 - Provider delivery is at least once, not exactly once.
 - Telegram outreach requires a previously established bot conversation.
 - Featherless improves suggestions but never owns authority; deterministic fallback is intentionally conservative.
-- The public demo is synthetic and read-only. Offline fake-provider proof is not evidence of a live provider run.
+- The public product is an interactive, credential-free Standard-agent workflow and sends no external messages. Separate offline fake-provider proof is not evidence of a live provider run.
 - The ICS artifact uses `METHOD:PUBLISH`. HumanWire does not create, update, cancel, or verify an external calendar event.
 - HumanWire does not claim organizer endorsement, Power BI certification, production security certification, or realtime analytics.
 

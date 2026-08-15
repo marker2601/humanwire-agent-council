@@ -86,7 +86,7 @@ The implemented offline proof uses a temporary file-backed SQLite database, dete
 
 Featherless integration is therefore implemented and tested with deterministic fake-model/fallback evidence. It is not live-recorded Featherless proof. A controlled private live-provider/model recording remains pending until an operator-owned configuration and its checklist are completed without exposing private content.
 
-The deterministic public replay and offline simulation must visibly retain:
+The legacy frozen replay and offline simulation must visibly retain:
 
 ```text
 proof_class=synthetic_multi_persona
@@ -99,30 +99,30 @@ live_provider_verified=false
 
 ## Screenshot shot list
 
-Capture only the synthetic, read-only fixture after final QA. Never capture addresses, routes, tokens, private answers, provider bodies, conversation/message IDs, credentials, or database content.
+Capture the interactive Standard-agent public product only after final QA. Never capture addresses, routes, tokens, private answers, provider bodies, conversation/message IDs, credentials, or database content.
 
-1. Desktop Decision Room: destination-free preview/release and contract mix.
-2. Desktop Reach: selected persisted event, flow strip, and synthetic provenance labels.
-3. Desktop Data: filtered redacted event table with JSON/CSV controls.
-4. Desktop meeting-ready state: verified-overlap outcome and local ICS download.
-5. Mobile (390 px) Decision Room: readable synthetic/read-only labeling.
+1. Desktop composer: launch-decision request, selected stakeholders, and visible Standard-agent boundary.
+2. Desktop Decision Room: selected saved event, graph, and From → To → Generated strip.
+3. Desktop Reach/Data: synchronized conversation and saved result at the same event.
+4. Desktop meeting-ready state: verified outcome plus final JSON/CSV downloads.
+5. Mobile (390 px) Decision Room: readable controls and the visible **Standard agents · no external messages** boundary.
 6. Mobile (390 px) Reach or Data: visible replay/export controls and safe content.
 
 ## 75–90 second video beats
 
 1. **0–8s — Problem:** AI coordination should not turn silence or model text into authority.
-2. **8–18s — Minimum necessary engagement:** show the six contracts and why HumanWire does not interview everyone.
-3. **18–30s — Advisory Featherless:** show the four constrained jobs and strict schema/deterministic fallback boundary.
-4. **30–42s — Human confirmation:** distinguish asserted evidence from exact `CONFIRM <token>` on the persisted route and conversation.
-5. **42–54s — Authority and truthful blockers:** show exact approval commands and a required `CHANGE` staying partial.
-6. **54–65s — Bounded resolution:** show the two-round cap, then verified availability and the local ICS outcome.
-7. **65–77s — Durable, private-by-design system:** one handler/two channels, recovery/replay fences, redacted read-only views and exports.
-8. **77–90s — Proof boundary:** display synthetic provenance labels; state that deterministic fake-model/fake-provider proof is implemented and tested, while private live Featherless/provider recording is pending.
+2. **8–18s — Minimum necessary engagement:** submit the launch request and show the different stakeholder contracts.
+3. **18–30s — Standard agents:** show credential-free agent responses while the real workflow retains authority.
+4. **30–42s — Evidence:** follow conflict, targeted interview, and confirmed evidence in synchronized Reach/Data panes.
+5. **42–54s — Authority:** show the revised proposal and saved approval only after the evidence gate.
+6. **54–65s — Meeting path:** show availability and the meeting-ready outcome only after approval.
+7. **65–77s — Inspectable system:** replay the graph and download final JSON/CSV evidence.
+8. **77–90s — Proof boundary:** show **Standard agents · no external messages**; state that private live Featherless/provider recording remains pending.
 
 ## Submission links and official-form items
 
 - Public repository URL: **[entrant-provided after publication and signed-out verification]**
-- Public demo URL: **[entrant-provided after signed-out synthetic/read-only verification; current continuity target: https://secondsignal.vercel.app]**
+- Public product URL: **[entrant-provided after signed-out interactive-run, replay, download, and Standard-agent-boundary verification; current continuity target: https://secondsignal.vercel.app]**
 - Public video URL: **[entrant-provided after upload and signed-out playback verification]**
 - ML Empowerment registration evidence: **[entrant-provided privacy-safe confirmation]**
 - ML Empowerment eligibility, team, reuse/originality, deadline, judging, and required form/media evidence: **[official organizer evidence pending]**
@@ -132,6 +132,6 @@ Organizer eligibility is external pending. This packet does not assert official 
 
 ## Limitations and readiness
 
-SQLite is HumanWire’s local transactional and offline-proof boundary; production requires a managed relational database with equivalent constraints, migrations, operations, backups, retention, and separately verified cutover. Telegram outreach requires an existing bot conversation. Provider delivery is at least once. The public demo is deterministic, synthetic, read-only, and isolated; fake-Caspian and fake-model proof are not live-provider, live-Featherless, or real-human proof. HumanWire does not claim production-security certification, Power BI certification, real-time analytics, organizer endorsement, or an external calendar write.
+SQLite is HumanWire’s local transactional and offline-proof boundary; production requires a managed relational database with equivalent constraints, migrations, operations, backups, retention, and separately verified cutover. Telegram outreach requires an existing bot conversation. The public product is an interactive, credential-free Standard-agent workflow that sends no external messages; separate fake-Caspian and fake-model proof are not live-provider, live-Featherless, or real-human proof. HumanWire does not claim production-security certification, Power BI certification, real-time analytics, organizer endorsement, or an external calendar write.
 
 This local packet is ready to pair with the safe screenshots, 75–90 second recording, signed-out repository/demo/video links, event-specific organizer evidence, and privately retained live-provider/model proof when those items exist. Until then, the only claimed ML evidence is the implemented, tested deterministic fake-model/fallback integration.

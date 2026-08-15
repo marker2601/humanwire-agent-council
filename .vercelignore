@@ -1,0 +1,16 @@
+.env
+.env.*
+.git
+.pytest_cache
+.ruff_cache
+.superpowers
+.venv
+__pycache__
+*.pyc
+data
+docs
+htmlcov
+submission
+tests
+work
+.devpost-hackathon-state.json
