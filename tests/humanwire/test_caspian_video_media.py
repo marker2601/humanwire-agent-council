@@ -93,10 +93,9 @@ def test_compose_uses_truthful_fixed_labels(tmp_path: Path) -> None:
     commands = build_compose_commands(manifest, tmp_path, tmp_path / "final.mp4")
     rendered = "\n".join(" ".join(command) for command in commands)
 
-    assert "Telegram provider proof · not recorded" in rendered
-    assert "Email provider proof · not recorded" in rendered
     assert rendered.count("Standard agents · no external messages") == 2
     assert "Recorded Caspian run" not in rendered
+    assert "provider proof" not in rendered
 
 
 def test_tracked_manifest_composes_only_truthful_provider_fallbacks(
@@ -107,7 +106,14 @@ def test_tracked_manifest_composes_only_truthful_provider_fallbacks(
     )
     create_minimal_fixture_assets(manifest, tmp_path)
 
+    from scripts.caspian_video.media import build_local_card_commands
+
     commands = build_compose_commands(manifest, tmp_path, tmp_path / "final.mp4")
+    commands += build_local_card_commands(
+        manifest,
+        tmp_path,
+        "https://github.com/marker2601/humanwire",
+    )
     rendered = "\n".join(" ".join(command) for command in commands)
 
     assert "Telegram provider proof · not recorded" in rendered
@@ -133,6 +139,65 @@ def test_local_cards_disclose_missing_provider_proof_and_exact_repository(
     assert rendered.count("Standard agents · no external messages") == 2
     assert "github.com/marker2601/humanwire" in rendered
     assert "Recorded Caspian run" not in rendered
+
+
+def test_local_cards_rasterize_once_then_loop_the_exact_png(
+    tmp_path: Path,
+) -> None:
+    from scripts.caspian_video.media import build_local_card_commands
+
+    commands = build_local_card_commands(
+        truth_safe_manifest(),
+        tmp_path,
+        "https://github.com/marker2601/humanwire",
+    )
+    rendered = "\n".join(" ".join(command) for command in commands)
+
+    assert len(commands) == 6
+    assert rendered.count("-frames:v 1") == 3
+    assert rendered.count("-loop 1") == 3
+    assert rendered.count("-framerate 30") == 3
+    assert rendered.count(".png") >= 6
+
+
+def test_public_product_segments_use_readable_chronological_zoom_cutins(
+    tmp_path: Path,
+) -> None:
+    manifest = truth_safe_manifest()
+    create_minimal_fixture_assets(manifest, tmp_path)
+
+    rendered = "\n".join(
+        " ".join(command)
+        for command in build_compose_commands(manifest, tmp_path, tmp_path / "final.mp4")
+    )
+
+    assert "crop=960:810:1600:" in rendered
+    assert "scale=1240:930" in rendered
+    assert "pad=1920:1080:680:150" in rendered
+    assert "if(lt(t,8)" in rendered
+
+
+def test_ass_captions_use_explicit_canvas_and_only_authored_line_breaks(
+    tmp_path: Path,
+) -> None:
+    from scripts.caspian_video.media import build_ass_captions
+
+    srt = tmp_path / "captions.srt"
+    srt.write_text(
+        "1\n00:00:00,100 --> 00:00:01,000\nLine one\nLine two\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "captions.ass"
+
+    assert build_ass_captions(truth_safe_manifest(), srt, output) == output.resolve()
+    rendered = output.read_text(encoding="utf-8")
+
+    assert "PlayResX: 1920" in rendered
+    assert "PlayResY: 1080" in rendered
+    assert "WrapStyle: 2" in rendered
+    assert "Segoe UI,32" in rendered
+    assert "Dialogue: 0,0:00:00.10,0:00:01.00" in rendered
+    assert "Line one\\NLine two" in rendered
 
 
 def test_drawtext_uses_an_explicit_windows_font_without_fontconfig(
@@ -184,7 +249,7 @@ def test_final_command_mixes_seven_timed_narrations_and_burns_captions(
     assert "-t 105" in rendered
 
 
-def test_captions_are_confined_to_the_opaque_left_title_safe_area(
+def test_final_encode_preserves_explicit_ass_canvas_and_safe_area(
     tmp_path: Path,
 ) -> None:
     from scripts.caspian_video.media import build_final_command
@@ -207,10 +272,9 @@ def test_captions_are_confined_to_the_opaque_left_title_safe_area(
         )
     )
 
-    assert "FontSize=16" in rendered
-    assert "Alignment=7" in rendered
-    assert "MarginL=20" in rendered
-    assert "MarginR=200" in rendered
+    assert "original_size=1920x1080" in rendered
+    assert "fontsdir='C\\:/Windows/Fonts'" in rendered
+    assert "force_style" not in rendered
 
 
 @pytest.mark.parametrize(

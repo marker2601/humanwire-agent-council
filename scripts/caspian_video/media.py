@@ -47,14 +47,14 @@ class CoverRegion(BaseModel):
     height: int = Field(ge=1, le=4320, strict=True)
 
 
-def _drawtext(label: str, y: int) -> str:
+def _drawtext(label: str, y: int, *, x: str = "(w-text_w)/2", size: int = 34) -> str:
     escaped = label.replace("\\", r"\\").replace("'", r"\'").replace(":", r"\:")
     return (
         "drawtext=fontfile='C\\:/Windows/Fonts/segoeui.ttf':"
         f"text='{escaped}':"
-        "fontcolor=white:fontsize=34:"
+        f"fontcolor=white:fontsize={size}:"
         "box=1:boxcolor=0x020d1c@0.88:boxborderw=18:"
-        f"x=(w-text_w)/2:y={y}"
+        f"x={x}:y={y}"
     )
 
 
@@ -66,12 +66,35 @@ def _composition_labels(segment: VideoSegment) -> tuple[str, ...]:
         expected = _PROVIDER_DISCLOSURES[segment_id]
         if proof_class is not ProofClass.GENERATED_VISUAL or expected not in required_copy:
             raise MediaPathError("recorded provider proof unavailable")
-        return ("Visual guide", expected)
+        return ()
     if proof_class is ProofClass.GENERATED_VISUAL:
         return ("Visual guide",)
     if proof_class is ProofClass.PUBLIC_PRODUCT:
         return (_PUBLIC_PRODUCT_DISCLOSURE,)
     return ()
+
+
+def _segment_filter(segment: VideoSegment, labels: tuple[str, ...]) -> str:
+    if segment.proof_class is ProofClass.PUBLIC_PRODUCT:
+        if segment.id == "decision_room":
+            y = "'if(lt(t,8),0,if(lt(t,16),210,if(lt(t,24),420,630)))'"
+        else:
+            y = "'if(lt(t,10),630,420)'"
+        filters = [
+            f"crop=960:810:1600:{y}",
+            "scale=1240:930",
+            "pad=1920:1080:680:150:color=0x020d1c",
+            "fps=30",
+            "format=yuv420p",
+        ]
+        filters.extend(_drawtext(label, 982, x="80", size=26) for label in labels)
+        return ",".join(filters)
+    filters = [_NORMALIZE_FILTER]
+    filters.extend(
+        _drawtext(label, 982 - label_index * 72)
+        for label_index, label in enumerate(labels)
+    )
+    return ",".join(filters)
 
 
 def build_compose_commands(
@@ -88,8 +111,6 @@ def build_compose_commands(
         if not _is_file(source):
             raise MediaPathError("missing approved asset")
         normalized = compose_root / f"{index:02d}-{segment.id}.mp4"
-        filters = [_NORMALIZE_FILTER]
-        filters.extend(_drawtext(label, 930 - label_index * 72) for label_index, label in enumerate(labels))
         commands.append(
             [
                 "ffmpeg",
@@ -102,7 +123,7 @@ def build_compose_commands(
                 "-t",
                 str(segment.duration_seconds),
                 "-vf",
-                ",".join(filters),
+                _segment_filter(segment, labels),
                 "-an",
                 "-c:v",
                 "libx264",
@@ -159,11 +180,14 @@ def validate_repository_url(repository_url: str) -> str:
     return repository_url
 
 
-def _color_card_command(
-    output: Path, duration: int, lines: tuple[tuple[str, int, int], ...]
-) -> list[str]:
-    filters = [_drawtext(text, y).replace("fontsize=34", f"fontsize={size}") for text, y, size in lines]
-    return [
+def _color_card_commands(
+    png: Path,
+    output: Path,
+    duration: int,
+    lines: tuple[tuple[str, int, int], ...],
+) -> tuple[list[str], list[str]]:
+    filters = [_drawtext(text, y, size=size) for text, y, size in lines]
+    raster = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
@@ -172,9 +196,27 @@ def _color_card_command(
         "-f",
         "lavfi",
         "-i",
-        f"color=c=0x020d1c:s=1920x1080:r=30:d={duration}",
+        "color=c=0x020d1c:s=1920x1080:r=1:d=1",
         "-vf",
         ",".join(filters),
+        "-frames:v",
+        "1",
+        "-update",
+        "1",
+        str(png.resolve()),
+    ]
+    loop = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-y",
+        "-loop",
+        "1",
+        "-framerate",
+        "30",
+        "-i",
+        str(png.resolve()),
         "-t",
         str(duration),
         "-an",
@@ -188,6 +230,7 @@ def _color_card_command(
         "yuv420p",
         str(output.resolve()),
     ]
+    return raster, loop
 
 
 def build_local_card_commands(
@@ -196,6 +239,7 @@ def build_local_card_commands(
     """Build truthful local disclosure cards and the final repository card."""
     validate_repository_url(repository_url)
     root = _resolved_path(work_root)
+    card_root = root / "compose" / "cards"
     by_id = {segment.id: segment for segment in manifest.segments}
     commands: list[list[str]] = []
     for segment_id, disclosure in _PROVIDER_DISCLOSURES.items():
@@ -206,8 +250,10 @@ def build_local_card_commands(
         ):
             raise MediaPathError("recorded provider proof unavailable")
         output = root / Path(segment.source).relative_to("work/caspian-video")
-        commands.append(
-            _color_card_command(
+        png = card_root / f"{segment.id}.png"
+        commands.extend(
+            _color_card_commands(
+                png,
                 output,
                 segment.duration_seconds,
                 (
@@ -219,8 +265,9 @@ def build_local_card_commands(
         )
     closing = by_id["closing_card"]
     closing_output = root / Path(closing.source).relative_to("work/caspian-video")
-    commands.append(
-        _color_card_command(
+    commands.extend(
+        _color_card_commands(
+            card_root / "closing-card.png",
             closing_output,
             closing.duration_seconds,
             (
@@ -233,6 +280,50 @@ def build_local_card_commands(
         )
     )
     return commands
+
+
+def _ass_time(groups: tuple[str, str, str, str]) -> str:
+    hours, minutes, seconds, milliseconds = (int(value) for value in groups)
+    centiseconds = milliseconds // 10
+    return f"{hours}:{minutes:02d}:{seconds:02d}.{centiseconds:02d}"
+
+
+def build_ass_captions(
+    manifest: VideoManifest, captions: Path, output: Path
+) -> Path:
+    """Render validated SRT cues into an explicit 1920x1080 ASS canvas."""
+    validated = validate_captions(manifest, captions)
+    blocks = re.split(
+        r"\r?\n\r?\n",
+        validated.read_text(encoding="utf-8-sig").strip(),
+    )
+    dialogues: list[str] = []
+    for block in blocks:
+        lines = block.splitlines()
+        match = _SRT_TIME.fullmatch(lines[1])
+        if match is None:
+            raise MediaPathError("captions invalid")
+        start = _ass_time(match.groups()[:4])
+        end = _ass_time(match.groups()[4:])
+        text = r"\N".join(lines[2:]).replace(",", r"\,")
+        dialogues.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}")
+    header = """[Script Info]
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Segoe UI,32,&H00FFFFFF,&H000000FF,&H00020D1C,&H80020D1C,0,0,0,0,100,100,0,0,1,2,0,7,80,820,40,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(header + "\n".join(dialogues) + "\n", encoding="utf-8")
+    return output.resolve()
 
 
 _SRT_TIME = re.compile(
@@ -286,12 +377,10 @@ def validate_captions(manifest: VideoManifest, captions: Path) -> Path:
 
 def _subtitle_filter(captions: Path) -> str:
     escaped = captions.resolve().as_posix().replace(":", r"\:").replace("'", r"\'")
-    style = (
-        "FontName=Segoe UI,FontSize=16,PrimaryColour=&H00FFFFFF,"
-        "OutlineColour=&H00020D1C,BorderStyle=1,Outline=2,Shadow=0,"
-        "Alignment=7,MarginL=20,MarginR=200,MarginV=20"
+    return (
+        f"subtitles=filename='{escaped}':"
+        "fontsdir='C\\:/Windows/Fonts':original_size=1920x1080"
     )
-    return f"subtitles=filename='{escaped}':force_style='{style}'"
 
 
 def build_final_command(
@@ -411,10 +500,15 @@ def compose_video(
         encoding="utf-8",
     )
     _run_ffmpeg(commands[-1], "segment concat failed")
+    ass_captions = build_ass_captions(
+        manifest,
+        validated_captions,
+        compose_root / "captions.ass",
+    )
     final_command = build_final_command(
         manifest,
         video_only,
-        validated_captions,
+        ass_captions,
         narration_dir,
         output,
     )

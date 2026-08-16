@@ -1,93 +1,99 @@
 1
-00:00:00,100 --> 00:00:03,400
+00:00:00,000 --> 00:00:04,120
 Important decisions rarely fail because
-teams lack messages.
+teams lack messages. They fail because
 
 2
-00:00:03,500 --> 00:00:05,700
-They fail because the right objection,
+00:00:04,120 --> 00:00:07,000
+the right objection, evidence, and
+authority never meet in one workflow.
 
 3
-00:00:05,800 --> 00:00:07,800
-evidence, and authority never meet
-in one workflow.
+00:00:08,000 --> 00:00:11,600
+This deployed workflow uses Standard
+agents and sends no external messages.
 
 4
-00:00:08,100 --> 00:00:13,800
-The deployed interactive workflow is
-demonstrated with Standard agents and
+00:00:12,410 --> 00:00:16,180
+HumanWire's gateway is where configured
+Caspian transport would carry consented
 
 5
-00:00:13,900 --> 00:00:17,000
-no external messages. Telegram provider
+00:00:16,180 --> 00:00:20,380
+Telegram delivery. Live Telegram proof
+was not configured or recorded.
 
 6
-00:00:17,100 --> 00:00:21,700
-proof was not configured or recorded.
+00:00:22,000 --> 00:00:26,700
+That gateway would carry consented email
+delivery. Here, Standard agents ask
 
 7
-00:00:22,100 --> 00:00:27,900
-It demonstrates targeted questions,
-confirmed evidence, and decision gates
+00:00:26,700 --> 00:00:31,020
+unresolved questions, save confirmed
+evidence, and block answers from shaping
 
 8
-00:00:28,000 --> 00:00:31,000
-locally. Email provider proof was not
+00:00:31,020 --> 00:00:35,560
+a decision until confirmation. Live email
+proof was not configured or recorded.
 
 9
-00:00:31,100 --> 00:00:37,700
-configured or recorded.
+00:00:38,000 --> 00:00:44,080
+Agents inform, answer, challenge,
+approve, confirm, or share availability.
 
 10
-00:00:38,100 --> 00:00:41,900
-Each stakeholder agent has a specific
-role: inform, acknowledge, answer,
+00:00:46,000 --> 00:00:49,120
+In the Decision Room, disagreement
+becomes a traceable decision.
 
 11
-00:00:42,000 --> 00:00:45,800
-challenge, approve, or provide
-availability.
+00:00:50,000 --> 00:00:54,720
+Anika raises a launch risk. HumanWire
+opens a focused interview, saves her
 
 12
-00:00:46,100 --> 00:00:50,800
-In the Decision Room, the saved workflow
-becomes visible. Anika raises a risk
+00:00:54,720 --> 00:00:59,240
+answer as evidence, and waits for
+confirmation. That proof changes the plan.
 
 13
-00:00:50,900 --> 00:00:55,800
-constraint. HumanWire opens a targeted
-interview, confirms the evidence,
+00:01:00,180 --> 00:01:04,280
+Sofia approves the revised plan. Only
+then does Daniel share availability,
 
 14
-00:00:55,900 --> 00:01:01,800
-and revises the proposal instead of
-hiding the disagreement.
+00:01:04,800 --> 00:01:08,020
+so HumanWire builds a decision-ready
+meeting package with the right record.
 
 15
-00:01:18,100 --> 00:01:22,400
-Only then does Sofia exercise approval
-authority. Daniel provides availability
+00:01:08,780 --> 00:01:12,100
+The trail shows conflict and evidence,
+revision, approval, and meeting.
 
 16
-00:01:22,500 --> 00:01:26,400
-after approval, and HumanWire assembles
-a decision-ready meeting package.
+00:01:18,000 --> 00:01:22,580
+Replay keeps saved events in source order.
+Reviewers inspect conflict, evidence,
 
 17
-00:01:26,500 --> 00:01:31,900
-Every step can be replayed, inspected,
-and downloaded as JSON or CSV,
+00:01:22,900 --> 00:01:28,280
+revision, approval, availability, and the
+meeting-ready result. JSON and CSV expose
 
 18
-00:01:32,000 --> 00:01:37,800
-while the public product remains clearly
-separated from external delivery.
+00:01:28,280 --> 00:01:33,140
+the audit trail. This public demo uses
+Standard agents, no external delivery.
 
 19
-00:01:38,100 --> 00:01:42,200
-HumanWire: one mandate, the right
-conversations, and a meeting built on
+00:01:38,000 --> 00:01:41,280
+HumanWire: one mandate, consented
+conversations through a configurable
 
 20
-00:01:42,300 --> 00:01:44,800
-confirmed decisions.
+00:01:41,280 --> 00:01:43,720
+gateway, and a decision-ready meeting
+built on confirmed decisions.
