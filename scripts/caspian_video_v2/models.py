@@ -51,7 +51,7 @@ class SpendAuthorization(BaseModel):
 class VideoJobSpec(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    name: Literal["visual_guide_v2", "agent_flow_v2"]
+    name: Literal["visual_guide_v2", "agent_flow_v2", "agent_flow_v2_retry"]
     model: Literal["kwaivgi/kling-v3.0-std", "bytedance/seedance-2.0"]
     duration_seconds: Literal[6]
     resolution: Literal["720p"]
@@ -83,16 +83,23 @@ class VideoJobSpec(BaseModel):
     @model_validator(mode="after")
     def validate_model_binding(self) -> VideoJobSpec:
         expected = {
-            "kwaivgi/kling-v3.0-std": (
+            (
+                "kwaivgi/kling-v3.0-std",
                 "visual_guide_v2",
                 Decimal("0.51"),
             ),
-            "bytedance/seedance-2.0": (
+            (
+                "bytedance/seedance-2.0",
                 "agent_flow_v2",
                 Decimal("0.91"),
             ),
+            (
+                "bytedance/seedance-2.0",
+                "agent_flow_v2_retry",
+                Decimal("1.50"),
+            ),
         }
-        if (self.name, self.reserved_usd) != expected[self.model]:
+        if (self.model, self.name, self.reserved_usd) not in expected:
             raise ValueError("name must match the approved model and reservation")
         return self
 
@@ -129,7 +136,12 @@ class PreflightResult(BaseModel):
 class MediaReceipt(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    name: Literal["visual_guide_v2", "agent_flow_v2", "narration_v2"]
+    name: Literal[
+        "visual_guide_v2",
+        "agent_flow_v2",
+        "agent_flow_v2_retry",
+        "narration_v2",
+    ]
     model: str = Field(min_length=3, max_length=100)
     status: Literal["completed"]
     cost_usd: Decimal = Field(ge=0, le=10)

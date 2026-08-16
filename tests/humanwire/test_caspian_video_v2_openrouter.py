@@ -122,7 +122,6 @@ def test_paid_video_post_follows_preflight_and_atomic_reservation(tmp_path: Path
                 json={
                     "id": "guide-job",
                     "status": "completed",
-                    "usage": {"cost": "0.50"},
                 },
             )
         if request.url.path == "/api/v1/videos/guide-job/content":
@@ -154,7 +153,7 @@ def test_paid_video_post_follows_preflight_and_atomic_reservation(tmp_path: Path
     )
     assert (tmp_path / receipt.output_path).read_bytes() == b"safe-mp4"
     assert json.loads(ledger.read_text())["visual_guide_v2"] == {
-        "cost_usd": "0.50",
+        "cost_usd": "0.51",
         "model": "kwaivgi/kling-v3.0-std",
         "reserved_usd": "0.51",
         "status": "completed",

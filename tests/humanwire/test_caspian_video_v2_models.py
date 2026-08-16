@@ -72,6 +72,27 @@ def test_video_job_model_name_duration_and_cost_are_bound_together() -> None:
         )
 
 
+def test_seedance_replacement_has_a_separate_conservative_reservation() -> None:
+    """Break caught: a failed completed-job receipt blocks the one bounded replacement."""
+    replacement = VideoJobSpec(
+        name="agent_flow_v2_retry",
+        model="bytedance/seedance-2.0",
+        duration_seconds=6,
+        resolution="720p",
+        aspect_ratio="16:9",
+        generate_audio=False,
+        prompt=(
+            "Six-second premium motion-graphics sequence with seven fictional "
+            "enterprise agents, one cyan coordination path, no text or channel UI."
+        ),
+        first_frame=Path("work/caspian-video-v2/references/agent-flow.png"),
+        output_path=Path("work/caspian-video-v2/generated/agent-flow.mp4"),
+        reserved_usd=Decimal("1.50"),
+    )
+
+    assert replacement.reserved_usd == Decimal("1.50")
+
+
 def test_narration_is_bound_to_professional_models_and_safe_output() -> None:
     """Break caught: the rejected desktop voice or an arbitrary output path returns."""
     narration = NarrationSpec(

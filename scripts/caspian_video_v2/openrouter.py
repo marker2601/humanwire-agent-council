@@ -393,7 +393,12 @@ class ProfessionalMediaClient:
         if completed is None:
             raise _error()
         usage = _mapping(completed.get("usage"))
-        cost = _decimal(usage.get("cost")) if usage is not None else None
+        reported_cost = usage.get("cost") if usage is not None else None
+        cost = (
+            spec.reserved_usd
+            if reported_cost is None
+            else _decimal(reported_cost)
+        )
         if cost is None or cost < 0 or cost > spec.reserved_usd:
             raise _error()
         output = repository_root / spec.output_path
