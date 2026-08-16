@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from decimal import Decimal
+from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
@@ -90,6 +91,22 @@ class VideoManifest(BaseModel):
     @classmethod
     def load(cls, path: Path) -> VideoManifest:
         return cls.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def validate_approved_visual_durations(
+    manifest: VideoManifest, durations: Mapping[str, object]
+) -> None:
+    """Require every generated visual to cover its complete editorial segment."""
+    for segment in manifest.segments:
+        if segment.proof_class is not ProofClass.GENERATED_VISUAL:
+            continue
+        raw_duration = durations.get(segment.source)
+        try:
+            duration = Decimal(str(raw_duration))
+        except (InvalidOperation, ValueError):
+            duration = Decimal("NaN")
+        if not duration.is_finite() or duration < segment.duration_seconds:
+            raise ValueError("approved visual duration is shorter than its segment")
 
 
 class SpendApproval(BaseModel):

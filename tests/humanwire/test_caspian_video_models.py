@@ -4,6 +4,7 @@ from typing import get_args
 import pytest
 from pydantic import ValidationError
 
+from scripts.caspian_video import models as video_models
 from scripts.caspian_video.models import (
     GenerationReceipt,
     GenerationSpec,
@@ -76,6 +77,27 @@ def test_offline_narration_fallback_requires_user_authorization() -> None:
         "Standing user authorization permits necessary production and submission spend "
         "up to USD $10.00 total without another approval request."
     ) in plan
+
+
+def test_approved_visuals_must_cover_their_manifest_segments() -> None:
+    manifest = VideoManifest.load(ROOT / "submission/caspian-video-manifest.json")
+
+    with pytest.raises(ValueError, match="approved visual duration"):
+        video_models.validate_approved_visual_durations(
+            manifest,
+            {
+                "work/caspian-video/approved/presenter.mp4": 6,
+                "work/caspian-video/approved/stakeholders.mp4": 8,
+            },
+        )
+
+    video_models.validate_approved_visual_durations(
+        manifest,
+        {
+            "work/caspian-video/approved/presenter.mp4": 8,
+            "work/caspian-video/approved/stakeholders.mp4": 8,
+        },
+    )
 
 
 def test_editorial_unicode_is_exact_utf8_not_mojibake() -> None:
