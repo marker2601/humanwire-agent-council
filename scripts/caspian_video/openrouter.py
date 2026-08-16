@@ -442,20 +442,36 @@ def _approved_specs(settings: VideoSettings) -> tuple[GenerationSpec, Generation
         GenerationSpec(
             name="presenter",
             model=settings.presenter_model,
-            prompt="Fictional professional visual guide in a dark enterprise studio, subtle push-in.",
+            prompt=(
+                "Six-second 16:9 cinematic commercial shot based on the provided first frame. "
+                "A fictional professional visual guide looks into camera with calm confidence, "
+                "makes one subtle open-hand gesture, and holds a natural attentive expression. "
+                "Slow controlled camera push-in, premium dark enterprise studio, restrained cyan "
+                "accent lights, realistic human motion, no speech, no lip-sync emphasis, no text, "
+                "no logos, no UI, no extra people, no camera shake."
+            ),
             duration=6,
             resolution="720p",
             aspect_ratio="16:9",
             generate_audio=False,
+            first_frame=Path("work/caspian-video/references/presenter.png"),
         ),
         GenerationSpec(
             name="stakeholders",
             model=settings.stakeholder_model,
-            prompt="Role-specific fictional software-agent stakeholders in a dark enterprise studio.",
+            prompt=(
+                "Eight-second 16:9 motion-graphics shot based on the provided first frame. Seven "
+                "illustrated enterprise software-agent role cards activate one after another around "
+                "a central cyan coordination path; fine connection lines flow from role to role and "
+                "converge toward a decision node. Smooth professional motion, coherent navy and cyan "
+                "palette, cards and faces remain stable, no speech bubbles, no typed messages, no text "
+                "mutation, no logos, no implication of real people or live communication."
+            ),
             duration=8,
             resolution="720p",
             aspect_ratio="16:9",
             generate_audio=False,
+            first_frame=Path("work/caspian-video/references/stakeholders.png"),
         ),
     )
 

@@ -40,6 +40,43 @@ def presenter() -> GenerationSpec:
     )
 
 
+def test_approved_specs_use_the_authorized_prompts_and_first_frames() -> None:
+    """Break caught: the paid CLI drifts from the two exact user-approved requests."""
+    settings = VideoSettings(
+        api_key=SecretStr("PRIVATE-OPENROUTER-SENTINEL"),
+        presenter_model="google/veo-3.1-fast",
+        stakeholder_model="bytedance/seedance-2.0-fast",
+    )
+
+    generated = openrouter._approved_specs(settings)
+
+    assert [(spec.prompt, spec.first_frame) for spec in generated] == [
+        (
+            (
+                "Six-second 16:9 cinematic commercial shot based on the provided first frame. "
+                "A fictional professional visual guide looks into camera with calm confidence, "
+                "makes one subtle open-hand gesture, and holds a natural attentive expression. "
+                "Slow controlled camera push-in, premium dark enterprise studio, restrained cyan "
+                "accent lights, realistic human motion, no speech, no lip-sync emphasis, no text, "
+                "no logos, no UI, no extra people, no camera shake."
+            ),
+            Path("work/caspian-video/references/presenter.png"),
+        ),
+        (
+            (
+                "Eight-second 16:9 motion-graphics shot based on the provided first frame. Seven "
+                "illustrated enterprise software-agent role cards activate one after another "
+                "around a central cyan coordination path; fine connection lines flow from role to "
+                "role and converge toward a decision node. Smooth professional motion, coherent "
+                "navy and cyan palette, cards and faces remain stable, no speech bubbles, no typed "
+                "messages, no text mutation, no logos, no implication of real people or live "
+                "communication."
+            ),
+            Path("work/caspian-video/references/stakeholders.png"),
+        ),
+    ]
+
+
 def test_submit_poll_and_download_use_exact_openrouter_routes(tmp_path: Path) -> None:
     """Break caught: a paid video job uses a wrong route or enables audio."""
     calls: list[httpx.Request] = []
