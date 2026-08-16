@@ -1,0 +1,93 @@
+1
+00:00:00,100 --> 00:00:03,400
+Important decisions rarely fail because
+teams lack messages.
+
+2
+00:00:03,500 --> 00:00:05,700
+They fail because the right objection,
+
+3
+00:00:05,800 --> 00:00:07,800
+evidence, and authority never meet
+in one workflow.
+
+4
+00:00:08,100 --> 00:00:13,800
+The deployed interactive workflow is
+demonstrated with Standard agents and
+
+5
+00:00:13,900 --> 00:00:17,000
+no external messages. Telegram provider
+
+6
+00:00:17,100 --> 00:00:21,700
+proof was not configured or recorded.
+
+7
+00:00:22,100 --> 00:00:27,900
+It demonstrates targeted questions,
+confirmed evidence, and decision gates
+
+8
+00:00:28,000 --> 00:00:31,000
+locally. Email provider proof was not
+
+9
+00:00:31,100 --> 00:00:37,700
+configured or recorded.
+
+10
+00:00:38,100 --> 00:00:41,900
+Each stakeholder agent has a specific
+role: inform, acknowledge, answer,
+
+11
+00:00:42,000 --> 00:00:45,800
+challenge, approve, or provide
+availability.
+
+12
+00:00:46,100 --> 00:00:50,800
+In the Decision Room, the saved workflow
+becomes visible. Anika raises a risk
+
+13
+00:00:50,900 --> 00:00:55,800
+constraint. HumanWire opens a targeted
+interview, confirms the evidence,
+
+14
+00:00:55,900 --> 00:01:01,800
+and revises the proposal instead of
+hiding the disagreement.
+
+15
+00:01:18,100 --> 00:01:22,400
+Only then does Sofia exercise approval
+authority. Daniel provides availability
+
+16
+00:01:22,500 --> 00:01:26,400
+after approval, and HumanWire assembles
+a decision-ready meeting package.
+
+17
+00:01:26,500 --> 00:01:31,900
+Every step can be replayed, inspected,
+and downloaded as JSON or CSV,
+
+18
+00:01:32,000 --> 00:01:37,800
+while the public product remains clearly
+separated from external delivery.
+
+19
+00:01:38,100 --> 00:01:42,200
+HumanWire: one mandate, the right
+conversations, and a meeting built on
+
+20
+00:01:42,300 --> 00:01:44,800
+confirmed decisions.

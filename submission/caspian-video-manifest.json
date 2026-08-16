@@ -18,18 +18,24 @@
       "start_seconds": 8,
       "duration_seconds": 14,
       "source": "work/caspian-video/approved/telegram.mp4",
-      "proof_class": "recorded_caspian",
-      "channel": "telegram",
-      "required_copy": ["Recorded Caspian run · Telegram"]
+      "proof_class": "generated_visual",
+      "disclosure": "Visual guide",
+      "required_copy": [
+        "Telegram provider proof · not recorded",
+        "Standard agents · no external messages"
+      ]
     },
     {
       "id": "email_evidence",
       "start_seconds": 22,
       "duration_seconds": 16,
       "source": "work/caspian-video/approved/email.mp4",
-      "proof_class": "recorded_caspian",
-      "channel": "email",
-      "required_copy": ["Same recorded Caspian run · Email"]
+      "proof_class": "generated_visual",
+      "disclosure": "Visual guide",
+      "required_copy": [
+        "Email provider proof · not recorded",
+        "Standard agents · no external messages"
+      ]
     },
     {
       "id": "stakeholder_roles",
@@ -62,7 +68,11 @@
       "duration_seconds": 7,
       "source": "work/caspian-video/approved/closing-card.mp4",
       "proof_class": "title_card",
-      "required_copy": ["One mandate. The right conversations. A decision-ready meeting."]
+      "required_copy": [
+        "One mandate. The right conversations. A decision-ready meeting.",
+        "secondsignal.vercel.app",
+        "github.com/marker2601/humanwire"
+      ]
     }
   ]
 }

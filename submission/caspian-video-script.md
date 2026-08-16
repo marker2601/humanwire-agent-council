@@ -6,11 +6,11 @@ Important decisions rarely fail because teams lack messages. They fail because t
 
 ## 8–22 seconds
 
-HumanWire begins with a mandate in Telegram. Before any outreach, Caspian returns a preview, and the operator explicitly authorizes the run with GO.
+The deployed interactive workflow is demonstrated with Standard agents and no external messages. Telegram provider proof was not configured or recorded.
 
 ## 22–38 seconds
 
-The same run continues by email, where HumanWire asks only the unresolved questions, records the response as evidence, and requires explicit confirmation before it can influence a decision.
+It demonstrates targeted questions, confirmed evidence, and decision gates locally. Email provider proof was not configured or recorded.
 
 ## 38–46 seconds
 

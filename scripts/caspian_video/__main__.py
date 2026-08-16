@@ -9,6 +9,7 @@ from pathlib import Path
 from scripts.caspian_video import media
 from scripts.caspian_video.media import (
     MediaPathError,
+    compose_video,
     cover_regions,
     load_cover_regions,
     run_capture,
@@ -52,6 +53,12 @@ def _parser() -> argparse.ArgumentParser:
     cover.add_argument("--source", required=True)
     cover.add_argument("--output", required=True)
     cover.add_argument("--regions", default="redactions.json")
+    compose = subcommands.add_parser("compose")
+    compose.add_argument("--manifest", type=Path, required=True)
+    compose.add_argument("--captions", type=Path, required=True)
+    compose.add_argument("--narration-dir", type=Path, required=True)
+    compose.add_argument("--repository-url", required=True)
+    compose.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -86,6 +93,23 @@ def _media_argument(parser: argparse.ArgumentParser, value: str) -> Path:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.command == "compose":
+        try:
+            manifest = VideoManifest.load(args.manifest)
+            output = compose_video(
+                manifest,
+                media.MEDIA_WORK_ROOT,
+                args.captions,
+                args.narration_dir,
+                args.repository_url,
+                args.output,
+            )
+            print(f"path={output}")
+            print(f"duration_seconds={manifest.total_duration_seconds}")
+            return 0
+        except (MediaPathError, OSError, ValueError) as exc:
+            print(str(exc))
+            return 1
     if args.command in {"capture", "trim", "cover"}:
         try:
             if args.command == "capture":

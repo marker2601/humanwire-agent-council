@@ -30,11 +30,18 @@ def test_submission_video_manifest_is_truthful_and_105_seconds() -> None:
         "replay_and_downloads",
         "closing_card",
     ]
-    assert {
-        segment.channel
+    assert not any(
+        segment.proof_class is ProofClass.RECORDED_CASPIAN
         for segment in manifest.segments
-        if segment.proof_class is ProofClass.RECORDED_CASPIAN
-    } == {"telegram", "email"}
+    )
+    assert {
+        segment.required_copy[0]
+        for segment in manifest.segments
+        if segment.id in {"telegram_authorization", "email_evidence"}
+    } == {
+        "Telegram provider proof · not recorded",
+        "Email provider proof · not recorded",
+    }
     assert all(
         segment.disclosure == "Visual guide"
         for segment in manifest.segments
@@ -87,6 +94,8 @@ def test_approved_visuals_must_cover_their_manifest_segments() -> None:
             manifest,
             {
                 "work/caspian-video/approved/presenter.mp4": 6,
+                "work/caspian-video/approved/telegram.mp4": 14,
+                "work/caspian-video/approved/email.mp4": 16,
                 "work/caspian-video/approved/stakeholders.mp4": 8,
             },
         )
@@ -95,6 +104,8 @@ def test_approved_visuals_must_cover_their_manifest_segments() -> None:
         manifest,
         {
             "work/caspian-video/approved/presenter.mp4": 8,
+            "work/caspian-video/approved/telegram.mp4": 14,
+            "work/caspian-video/approved/email.mp4": 16,
             "work/caspian-video/approved/stakeholders.mp4": 8,
         },
     )
