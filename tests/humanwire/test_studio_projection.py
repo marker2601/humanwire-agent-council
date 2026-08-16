@@ -293,7 +293,7 @@ def test_availability_renderer_rejects_anything_but_one_aware_window(unsafe) -> 
         "private+folder/secrets",
         "sk-live-private-value",
         "AKIA1234567890",
-        "-----BEGIN PRIVATE KEY-----",
+        "-----BEGIN " + "PRIVATE KEY-----",
         "go/no-go/private/secrets",
         r"go/no-go\private\secrets",
         "humanwire.studio/v1/private/secrets",

@@ -10,10 +10,10 @@ Status meanings: **available** = local safe asset can be selected; **recapture**
 | Desktop screenshot: meeting-ready state | recapture | Show the verified-overlap outcome and final downloads only; never show attendee addresses or availability windows. |
 | Mobile screenshot: Decision Room at 390 px | recapture | Verify readable, unclipped controls and the visible **Standard agents · no external messages** boundary. |
 | Mobile screenshot: Reach/Data at 390 px | recapture | Verify replay/export controls and safe content remain visible. |
-| Master 75–90 second demo video | recapture | Record the interactive Standard-agent product; narrate six contracts, one channel-neutral handler, confirmation, two-round cap, meeting proof, safe exports, and the no-external-messages limitation. |
-| Public repository URL | entrant-provided | Insert only after the entrant publishes the intended repository and verifies signed-out access. |
-| Public product URL | entrant-provided | Current continuity target is `https://secondsignal.vercel.app`; re-verify the signed-out interactive run, visible Standard-agent boundary, stream completion, replay, and downloads before use. |
-| Public video URL | entrant-provided | Insert only after upload and signed-out playback verification. |
+| Master 105-second demo video | available | Final independently decodable 1920×1080 H.264/AAC master; shows the working Standard-agent product and explicitly labels unrecorded provider proof. |
+| Public repository URL | available | `https://github.com/marker2601/humanwire`; signed-out access verified before submission. |
+| Public product URL | available | `https://secondsignal.vercel.app/`; signed-out interactive run, visible Standard-agent boundary, stream completion, replay, and downloads verified. |
+| Public video URL | available | `https://youtu.be/FxzhLqoscSE`; public oEmbed title/author/thumbnail verification passed. |
 | Caspian eligibility confirmation | external | Retain organizer rules/form evidence; do not infer eligibility from local docs. |
 | ML Empowerment eligibility confirmation | external | Retain event-specific organizer evidence. |
 | Build Beyond eligibility confirmation | external | Retain event-specific organizer evidence. |

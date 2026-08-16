@@ -108,27 +108,28 @@ Capture the interactive Standard-agent public product only after final QA; never
 5. Mobile (390 px) Decision Room: readable controls and the visible **Standard agents · no external messages** boundary.
 6. Mobile (390 px) Reach or Data: replay/export controls and safe content visible.
 
-## 75–90 second video beats
+## 105-second video beats
 
 1. **0–8s — Problem:** broadcasting makes silence look like progress; HumanWire asks for the minimum necessary contribution.
-2. **8–18s — Start:** submit the launch request and show the bounded live graph begin from Request through HumanWire and the Caspian Gateway boundary.
-3. **18–31s — Minimum path:** show named Standard agents receiving different engagement contracts rather than a broadcast.
-4. **31–43s — Truthful evidence:** follow the conflict, targeted interview, and confirmed-evidence milestones in synchronized Reach/Data panes.
-5. **43–55s — Decisions and bounded resolution:** show the revised proposal and explicit saved approval after evidence.
-6. **55–66s — Meeting proof:** show saved availability and the meeting-ready package only after approval.
-7. **66–78s — Inspect and replay:** use Decision Room, Reach, Data, Previous/Next, and final JSON/CSV downloads.
-8. **78–90s — Safe boundary:** show **Standard agents · no external messages** and state that live-provider proof remains pending.
+2. **8–22s — Telegram boundary:** explain where a configured Caspian Telegram route operates, while clearly stating that provider proof was not recorded.
+3. **22–38s — Email boundary:** explain the same authenticated, correlated Caspian boundary for email without presenting a generated visual as provider proof.
+4. **38–46s — Minimum path:** show the distinct stakeholder roles and engagement contracts.
+5. **46–78s — Working product:** run the public Standard-agent Decision Room through conflict, targeted evidence, proposal revision, approval, availability, and meeting-ready output.
+6. **78–98s — Inspect and replay:** use Decision Room, Reach, Data, Previous/Next, Follow live, and JSON/CSV downloads.
+7. **98–105s — Close:** show the public product and repository URLs with the truthful **Standard agents · no external messages** boundary.
 
 ## Submission links and official-form items
 
-- Public repository URL: **[entrant-provided after publication and signed-out verification]**
-- Public product URL: **[entrant-provided after signed-out interactive-run, replay, download, and Standard-agent-boundary verification; current continuity target: https://secondsignal.vercel.app]**
-- Public video URL: **[entrant-provided after upload and signed-out playback verification]**
-- Caspian registration evidence: **[entrant-provided privacy-safe confirmation]**
-- Caspian eligibility, team, reuse/originality, deadline, judging, and required form/media evidence: **[official organizer evidence pending]**
+- Public repository URL: **https://github.com/marker2601/humanwire**
+- Public product URL: **https://secondsignal.vercel.app/**
+- Public video URL: **https://youtu.be/FxzhLqoscSE**
+- Caspian registration evidence: **verified through the authenticated Devpost account on 2026-08-16**
+- Official deliverables: **public GitHub repository and demo video; no custom submission questions**
+- Live submission deadline: **2026-08-16 18:30 UTC**, from Devpost's live key-date endpoint
+- Judging criterion: **the most creative use case that actually works**, from Devpost's live submission requirements
 - Final submission receipt, timestamp, and submitted links: **[entrant-provided after submission]**
 
-No official event facts, eligibility, deadline, judging criterion, organizer approval, registration state, or endorsement is asserted here until supported by retained official evidence.
+No organizer endorsement is claimed. Event facts above are limited to the authenticated live Devpost records checked on 2026-08-16.
 
 ## Limitations and readiness
 
