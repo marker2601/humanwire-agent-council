@@ -450,7 +450,7 @@ class ProfessionalMediaClient:
         ledger = self._ledger_path(repository_root)
         self._reserve(
             ledger,
-            name="narration_v2",
+            name=spec.name,
             model=spec.model,
             reserved_usd=spec.reserved_usd,
             authorization=authorization,
@@ -461,7 +461,11 @@ class ProfessionalMediaClient:
             json_body={
                 "model": spec.model,
                 "input": spec.input_text,
-                "voice": "alloy",
+                "voice": (
+                    "English_captivating_female1"
+                    if spec.model == "minimax/speech-2.8-hd"
+                    else "alloy"
+                ),
                 "response_format": "mp3",
                 "speed": 1.0,
             },
@@ -482,11 +486,11 @@ class ProfessionalMediaClient:
         self._probe(output, "audio")
         self._complete(
             ledger,
-            name="narration_v2",
+            name=spec.name,
             cost_usd=spec.reserved_usd,
         )
         return MediaReceipt(
-            name="narration_v2",
+            name=spec.name,
             model=spec.model,
             status="completed",
             cost_usd=spec.reserved_usd,

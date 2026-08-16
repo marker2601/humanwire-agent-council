@@ -52,6 +52,21 @@ def _narration_spec() -> NarrationSpec:
     )
 
 
+def _narration_retry_spec() -> NarrationSpec:
+    return NarrationSpec(
+        name="narration_v2_retry",
+        model="minimax/speech-2.8-hd",
+        fallback_model="minimax/speech-2.8-hd",
+        input_text=(
+            "HumanWire turns one mandate into the right conversations. It saves "
+            "confirmed evidence, approval, availability, and a decision-ready result."
+        ),
+        voice="professional_female",
+        output_path=Path("work/caspian-video-v2/generated/narration.mp3"),
+        reserved_usd=Decimal("0.75"),
+    )
+
+
 def _catalog_payload() -> dict[str, object]:
     return {
         "data": [
@@ -215,6 +230,55 @@ def test_narration_post_is_reserved_and_written_under_safe_root(tmp_path: Path) 
 
     assert (tmp_path / receipt.output_path).read_bytes() == b"safe-mp3"
     assert json.loads(ledger.read_text())["narration_v2"]["status"] == "completed"
+
+
+def test_minimax_fallback_uses_a_known_professional_voice(tmp_path: Path) -> None:
+    """Break caught: the bounded fallback sends an invalid generic voice ID."""
+    ledger = tmp_path / "work/caspian-video-v2/openrouter/jobs.json"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/videos/models":
+            return httpx.Response(200, json=_catalog_payload())
+        if request.url.path == "/api/v1/models":
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "minimax/speech-2.8-hd"}]},
+            )
+        if request.url.path == "/api/v1/credits":
+            return httpx.Response(
+                200,
+                json={"data": {"total_credits": 20, "total_usage": 0}},
+            )
+        if request.method == "POST" and request.url.path == "/api/v1/audio/speech":
+            assert json.loads(ledger.read_text())["narration_v2_retry"]["status"] == (
+                "reserved"
+            )
+            body = json.loads(request.content)
+            assert body["model"] == "minimax/speech-2.8-hd"
+            assert body["voice"] == "English_captivating_female1"
+            return httpx.Response(
+                200,
+                headers={"content-type": "audio/mpeg"},
+                content=b"safe-minimax-mp3",
+            )
+        raise AssertionError(f"unexpected route: {request.method} {request.url}")
+
+    client = ProfessionalMediaClient(
+        api_key=SecretStr("PRIVATE-SENTINEL"),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        probe=lambda _path, _kind: None,
+    )
+    client.preflight((_guide_spec(),), _narration_retry_spec())
+    receipt = client.generate_narration(
+        _narration_retry_spec(),
+        authorization=SpendAuthorization(),
+        repository_root=tmp_path,
+    )
+
+    assert receipt.name == "narration_v2_retry"
+    assert json.loads(ledger.read_text())["narration_v2_retry"]["status"] == (
+        "completed"
+    )
 
 
 def test_provider_failure_is_fixed_and_drops_authenticated_exception_graph(

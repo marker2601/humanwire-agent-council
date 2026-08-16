@@ -107,12 +107,16 @@ class VideoJobSpec(BaseModel):
 class NarrationSpec(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    model: Literal["google/gemini-3.1-flash-tts-preview"]
+    name: Literal["narration_v2", "narration_v2_retry"] = "narration_v2"
+    model: Literal[
+        "google/gemini-3.1-flash-tts-preview",
+        "minimax/speech-2.8-hd",
+    ]
     fallback_model: Literal["minimax/speech-2.8-hd"]
     input_text: str = Field(min_length=80, max_length=2_000)
     voice: Literal["professional_female"]
     output_path: Path
-    reserved_usd: Literal[Decimal("0.50")]
+    reserved_usd: Literal[Decimal("0.50"), Decimal("0.75")]
 
     @field_validator("output_path")
     @classmethod
@@ -122,6 +126,24 @@ class NarrationSpec(BaseModel):
             location="generated",
             suffixes=frozenset({".mp3", ".wav"}),
         )
+
+    @model_validator(mode="after")
+    def validate_model_binding(self) -> NarrationSpec:
+        expected = {
+            (
+                "narration_v2",
+                "google/gemini-3.1-flash-tts-preview",
+                Decimal("0.50"),
+            ),
+            (
+                "narration_v2_retry",
+                "minimax/speech-2.8-hd",
+                Decimal("0.75"),
+            ),
+        }
+        if (self.name, self.model, self.reserved_usd) not in expected:
+            raise ValueError("name must match the approved model and reservation")
+        return self
 
 
 class PreflightResult(BaseModel):
@@ -141,6 +163,7 @@ class MediaReceipt(BaseModel):
         "agent_flow_v2",
         "agent_flow_v2_retry",
         "narration_v2",
+        "narration_v2_retry",
     ]
     model: str = Field(min_length=3, max_length=100)
     status: Literal["completed"]

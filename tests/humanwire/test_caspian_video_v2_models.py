@@ -119,6 +119,24 @@ def test_narration_is_bound_to_professional_models_and_safe_output() -> None:
         )
 
 
+def test_minimax_narration_retry_has_a_distinct_bounded_identity() -> None:
+    """Break caught: the fallback cannot run after the primary reservation fails."""
+    retry = NarrationSpec(
+        name="narration_v2_retry",
+        model="minimax/speech-2.8-hd",
+        fallback_model="minimax/speech-2.8-hd",
+        input_text=(
+            "HumanWire turns one mandate into a confirmed, inspectable decision "
+            "workflow with a professional and truthful public narration."
+        ),
+        voice="professional_female",
+        output_path=Path("work/caspian-video-v2/generated/narration.mp3"),
+        reserved_usd=Decimal("0.75"),
+    )
+
+    assert retry.name == "narration_v2_retry"
+
+
 def test_manifest_requires_contiguous_eighty_second_product_dominant_story() -> None:
     """Break caught: editorial changes shrink authentic product evidence below 70%."""
     segments = (
