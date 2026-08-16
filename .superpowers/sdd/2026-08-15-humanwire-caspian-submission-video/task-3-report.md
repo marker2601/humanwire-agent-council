@@ -103,3 +103,35 @@ The commit SHA for this tracked Task 3 change is reported in the task handoff be
 1. Narration is incomplete and blocks final composition until the user supplies seven locally recorded, manifest-aligned clips (or grants separate authority for another voice path).
 2. The paid client reserves a job before a credit GET and records only the reservation, so a sanitized failure cannot prove whether the video POST occurred. This report conservatively states “at most one presenter POST.”
 3. The generation loop is all-or-nothing: a fenced presenter failure aborts before Seedance, while the required existing-ledger refusal prevents resuming the second approved job. Both visual fallbacks are safe and accepted, but neither paid model produced an asset.
+
+## Offline narration completion addendum
+
+This addendum supersedes the earlier partial-status and missing-narration statements. Final Task 3 status is **DONE_WITH_CONCERNS**: all locally required media now exists and validates, with the accepted visual fallbacks and seven completed narration files. No additional provider/API call was made, and the paid ledger was not altered.
+
+### Local voice method
+
+Narration was produced entirely offline with the installed Windows `System.Speech`/SAPI engine and `Microsoft Zira Desktop` (`en-US`, female). The repository's existing `_script_sections()` parser supplied exactly the seven section prose strings from `submission/caspian-video-script.md`; headings and timing metadata were excluded. No script word was added, removed, or rewritten.
+
+The first render used SAPI rate `+2`. The opening and stakeholder-role sections exceeded their six-second slots, so only those two were rerendered at SAPI rate `+5`; the other five retained rate `+2`. No time-stretch was ultimately necessary. Each local PCM WAV was converted with FFmpeg/libmp3lame to mono 44.1 kHz, 128 kbps MP3 and normalized with `loudnorm=I=-16:TP=-1.5:LRA=11`. WAV intermediates were removed after validation, leaving exactly the seven required MP3 files beneath the ignored repository-owned narration directory.
+
+### Narration assets and validation
+
+| Asset | Slot | Duration | Mean / peak | Silence regions ≥0.5s | SHA-256 |
+|---|---:|---:|---:|---:|---|
+| `00-presenter_hook.mp3` | 6s | 5.467937s | -16.2 / -1.9 dB | 0 | `dd8b8234ec11ad0bc1cfea09d194cb4b3355cfcdc7fd17793f2cec334499ae94` |
+| `01-telegram_authorization.mp3` | 16s | 8.387982s | -16.6 / -1.9 dB | 2 | `28a92beb6970b91192528f584d4f93ba24e42962efe42bdd2df77552648789d4` |
+| `02-email_evidence.mp3` | 16s | 9.777506s | -16.9 / -1.9 dB | 1 | `a99685ce5900a24ab6e34bc7210fd8675f0c6571bde483729bd6c96938ac27b8` |
+| `03-stakeholder_roles.mp3` | 6s | 5.478186s | -17.1 / -1.9 dB | 0 | `f26b6d554e3539006c6b46e4ce9eb34fdf4df719c7a792516b2f8e3d663c59f8` |
+| `04-decision_room.mp3` | 34s | 11.502041s | -16.4 / -1.9 dB | 3 | `6afbb5f89699a59552d0efef6d1d4bc9907a56d1b122c201d723cb8f0095f7c4` |
+| `05-replay_and_downloads.mp3` | 20s | 15.931156s | -16.1 / -1.9 dB | 3 | `3aa6fab1ae56dc6eb40d0e3cba63fa07d7a3e43820133467901c8d0f95a8c92f` |
+| `06-closing_card.mp3` | 7s | 5.473424s | -16.6 / -1.9 dB | 1 | `536bf78636e70df7ec6d07d80c716717dcfc44cac7146b270d0df744bcdfb475` |
+
+All seven files decode successfully as MP3, mono, 44.1 kHz audio and fit within their manifest durations. FFmpeg waveform validation found non-silent program audio in every file, consistent normalized levels, no clipping, and only natural pause regions. Direct audible inspection is not available to the model in this tool environment; exact parser provenance plus codec, duration, decode, waveform, level, and silence checks are the truthful substitute. This is the remaining quality concern for later human review.
+
+### Final side-effect and cost confirmation
+
+- Additional OpenRouter/provider calls after the failed validation/generation phase: **0**.
+- Additional cost: **USD $0.00**; Task 3 actual total remains **USD $0.00**.
+- Paid ledger: unchanged, with the original presenter reservation and no stakeholder entry.
+- Git-tracked binary media: none; all seven MP3s, two stills, two generated clips, two approved clips, review frames, and the ledger remain ignored/local-only.
+- `.superpowers/brainstorm/`: preserved unchanged and untracked.
