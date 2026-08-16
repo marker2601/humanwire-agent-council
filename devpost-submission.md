@@ -28,7 +28,7 @@ The repository also includes an optional Pydantic AI / Featherless adapter. Mode
 
 ## How We Used Codex
 
-Codex helped turn the product specification into testable modules, write red tests before implementation, trace failures across the gateway/workflow/repository/viewer boundaries, perform independent review rounds, and run broad regression, privacy, replay, accessibility, responsive-layout, and media-quality gates. Codex also helped prepare the public repository, the 105-second demo, and this submission packet. Project documentation and executable tests remain the source of truth for every claim.
+Codex helped turn the product specification into testable modules, write red tests before implementation, trace failures across the gateway/workflow/repository/viewer boundaries, perform independent review rounds, and run broad regression, privacy, replay, accessibility, responsive-layout, and media-quality gates. Codex also helped prepare the public repository, the 80-second demo, and this submission packet. Project documentation and executable tests remain the source of truth for every claim.
 
 ## Key Features
 
@@ -93,9 +93,9 @@ https://github.com/marker2601/humanwire
 
 ## Demo Video
 
-https://youtu.be/FxzhLqoscSE
+https://youtu.be/OJS99qETl3M
 
-The independently reviewed master is 105 seconds, 1920×1080, H.264/AAC, and remains under the event's three-minute limit. Public signed-out availability was verified through YouTube's oEmbed endpoint.
+The professionally reviewed master is 80.021 seconds, 1920×1080, H.264/AAC, and remains under the event's three-minute limit. It devotes 82.5% of its running time to the real deployed product and is publicly embedded on Devpost.
 
 The video deliberately distinguishes the working public Standard-agent product from the configured Caspian transport boundary. Live Telegram/email provider verification was not configured or recorded, and the video does not claim otherwise.
 
@@ -118,7 +118,7 @@ The video deliberately distinguishes the working public Standard-agent product f
 - Official custom submission questions: none.
 - Public repository: live and signed-out reachable.
 - Public product: live and signed-out reachable.
-- Demo master: complete, independently approved, and public at https://youtu.be/FxzhLqoscSE.
+- Demo master: complete, professionally reviewed, and public at https://youtu.be/OJS99qETl3M.
 - Latest repository-wide tests: exit 0.
 - Secret/privacy/tracked-media scans: clean.
 
@@ -133,7 +133,7 @@ The video deliberately distinguishes the working public Standard-agent product f
 
 ## Official Form Fields
 
-- Video URL: https://youtu.be/FxzhLqoscSE
+- Video URL: https://youtu.be/OJS99qETl3M
 - Devpost project URL: https://devpost.com/software/humanwire
 - Submission receipt: 1140539
 - No custom submission questions were returned by the official Caspian form.

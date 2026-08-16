@@ -4,14 +4,14 @@ This record separates the working public product from provider evidence that was
 
 ## Final master
 
-- Duration: 105 seconds
+- Duration: 80.021333 seconds
 - Canvas: 1920×1080 at 30 fps
 - Video: H.264, yuv420p
 - Audio: AAC stereo, 48 kHz
-- Public video: `https://youtu.be/FxzhLqoscSE`
-- File size: 137,242,417 bytes
-- SHA-256: `0ECCD645F3C095515418E6B740755DC01CD5D8BCCD47CCA2945C65537402C907`
-- Generation spend: USD $0.00
+- Public video: `https://youtu.be/OJS99qETl3M`
+- File size: 37,111,977 bytes
+- SHA-256: `86782EFDB30508E8FEAC6DA441BF7DC726A6EEAB883B105588F74607BDC5A762`
+- Conservative provider exposure: USD $4.17, including reserved or ambiguous attempts; below the authorized USD $10 cap
 
 ## Product proof
 
@@ -30,9 +30,9 @@ This record separates the working public product from provider evidence that was
 ## Publication gates
 
 - [x] Exact-duration and codec probe passes on the final uploaded master.
-- [x] Every frame decodes continuously without an error (3,150/3,150 frames).
-- [x] Random-access checks at the previously defective 61.5s and 102s transitions are visually clean.
-- [x] Captions contain no literal escape characters and do not collide with product controls.
+- [x] Every frame decodes continuously without an error (2,400/2,400 frames).
+- [x] Both sides of every chapter boundary are visually populated; no black transition frame remains.
+- [x] Sixteen authored caption cues stay within the safe lower-left field and do not cover the active graph path.
 - [x] Private coordinates, credentials, direct destinations, provider bodies, and internal identifiers are absent.
 - [x] Public video resolves from a signed-out request and YouTube oEmbed returns its exact title.
 - [x] Devpost records the same public video URL; submission 1140539 was verified live.
