@@ -6,6 +6,14 @@ import argparse
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from scripts.caspian_video import media
+from scripts.caspian_video.media import (
+    MediaPathError,
+    cover_regions,
+    load_cover_regions,
+    run_capture,
+    trim_clip,
+)
 from scripts.caspian_video.models import SpendApproval, VideoManifest
 from scripts.caspian_video.openrouter import (
     REPOSITORY_ROOT,
@@ -33,6 +41,17 @@ def _parser() -> argparse.ArgumentParser:
     tts.add_argument("--script", type=Path, default=Path("submission/caspian-video-script.md"))
     tts.add_argument("--manifest", type=Path, default=Path("submission/caspian-video-manifest.json"))
     tts.add_argument("--output-dir", type=Path, default=_NARRATION_OUTPUT)
+    capture = subcommands.add_parser("capture")
+    capture.add_argument("--name", required=True)
+    trim = subcommands.add_parser("trim")
+    trim.add_argument("--source", required=True)
+    trim.add_argument("--output", required=True)
+    trim.add_argument("--start", required=True, type=float)
+    trim.add_argument("--duration", required=True, type=float)
+    cover = subcommands.add_parser("cover")
+    cover.add_argument("--source", required=True)
+    cover.add_argument("--output", required=True)
+    cover.add_argument("--regions", default="redactions.json")
     return parser
 
 
@@ -56,9 +75,37 @@ def _narration_output(parser: argparse.ArgumentParser, output_dir: Path) -> Path
     return output_dir
 
 
+def _media_argument(parser: argparse.ArgumentParser, value: str) -> Path:
+    try:
+        return media.safe_media_path(media.MEDIA_WORK_ROOT, value)
+    except MediaPathError as exc:
+        parser.error(str(exc))
+    raise AssertionError("argparse.error exits")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.command in {"capture", "trim", "cover"}:
+        try:
+            if args.command == "capture":
+                run_capture(args.name, media.MEDIA_WORK_ROOT.resolve())
+            elif args.command == "trim":
+                trim_clip(
+                    _media_argument(parser, args.source),
+                    _media_argument(parser, args.output),
+                    start=args.start,
+                    duration=args.duration,
+                )
+            else:
+                cover_regions(
+                    _media_argument(parser, args.source),
+                    _media_argument(parser, args.output),
+                    load_cover_regions(_media_argument(parser, args.regions)),
+                )
+            return 0
+        except MediaPathError as exc:
+            parser.error(str(exc))
     try:
         approval = _approval(parser, args) if args.command == "generate" else None
         narration_output = _narration_output(parser, args.output_dir) if args.command == "tts" else None
