@@ -1,0 +1,15 @@
+{
+  "width": 1920,
+  "height": 1080,
+  "fps": 30,
+  "segments": [
+    {"id": "hook", "start_seconds": 0, "duration_seconds": 6, "source_kind": "generated_visual"},
+    {"id": "request", "start_seconds": 6, "duration_seconds": 8, "source_kind": "public_product"},
+    {"id": "minimum_path", "start_seconds": 14, "duration_seconds": 12, "source_kind": "public_product"},
+    {"id": "conflict_to_revision", "start_seconds": 26, "duration_seconds": 18, "source_kind": "public_product"},
+    {"id": "approval_to_meeting", "start_seconds": 44, "duration_seconds": 12, "source_kind": "public_product"},
+    {"id": "replay_exports", "start_seconds": 56, "duration_seconds": 12, "source_kind": "public_product"},
+    {"id": "gateway_truth", "start_seconds": 68, "duration_seconds": 7, "source_kind": "public_product"},
+    {"id": "closing", "start_seconds": 75, "duration_seconds": 5, "source_kind": "title_card"}
+  ]
+}

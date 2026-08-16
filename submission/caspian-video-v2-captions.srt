@@ -1,0 +1,72 @@
+1
+00:00:00,000 --> 00:00:05,000
+Important decisions fail when objection,
+evidence, and authority never meet.
+
+2
+00:00:05,000 --> 00:00:09,000
+HumanWire brings them into one workflow.
+
+3
+00:00:09,000 --> 00:00:14,000
+A manager asks for tomorrow's
+launch decision.
+
+4
+00:00:14,000 --> 00:00:19,000
+HumanWire selects the minimum
+necessary stakeholder path.
+
+5
+00:00:19,000 --> 00:00:24,000
+One Caspian gateway coordinates
+the selected roles.
+
+6
+00:00:24,000 --> 00:00:29,000
+Anika flags a rollback risk.
+
+7
+00:00:29,000 --> 00:00:34,000
+HumanWire opens one focused interview.
+
+8
+00:00:34,000 --> 00:00:39,000
+Her answer becomes shareable evidence
+after confirmation.
+
+9
+00:00:39,000 --> 00:00:44,000
+Confirmed evidence revises the proposal.
+
+10
+00:00:44,000 --> 00:00:49,000
+Sofia approves the revised plan.
+
+11
+00:00:49,000 --> 00:00:54,000
+Only then does Daniel
+provide availability.
+
+12
+00:00:54,000 --> 00:00:59,000
+HumanWire builds a
+meeting-ready result.
+
+13
+00:00:59,000 --> 00:01:04,000
+Replay preserves every saved event.
+
+14
+00:01:04,000 --> 00:01:08,000
+JSON and CSV expose matching records.
+
+15
+00:01:08,000 --> 00:01:15,000
+Caspian is the configurable,
+consented-delivery boundary.
+
+16
+00:01:15,000 --> 00:01:20,000
+Standard agents · no external messages
+HumanWire · Decision-ready
