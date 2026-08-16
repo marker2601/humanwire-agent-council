@@ -34,6 +34,8 @@ POLL_INTERVAL_SECONDS = 30
 MAX_POLLS = 40
 MAX_VIDEO_BYTES = 200 * 1024 * 1024
 FFPROBE_TIMEOUT_SECONDS = 10
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+JOB_RESERVATIONS = {"presenter": Decimal("1.00"), "stakeholders": Decimal("2.00")}
 _JOB_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _SECTION_HEADING = re.compile(r"^## (\d+)–(\d+) seconds$")
 _SETTINGS_KEYS = frozenset(
@@ -191,7 +193,7 @@ class OpenRouterMediaClient:
             payload["frame_images"] = [
                 {
                     "frame_type": "first_frame",
-                    "image_url": self._frame_data_url(Path.cwd() / spec.first_frame),
+                    "image_url": self._frame_data_url(REPOSITORY_ROOT / spec.first_frame),
                 }
             ]
         return payload
@@ -462,7 +464,7 @@ def generate_approved_assets(
     settings: VideoSettings, approval: SpendApproval, work_root: Path
 ) -> tuple[GenerationReceipt, GenerationReceipt]:
     """Perform the two explicit, catalog-checked generation jobs after spend approval."""
-    canonical_root = Path.cwd().resolve()
+    canonical_root = REPOSITORY_ROOT
     if work_root.resolve() != canonical_root:
         raise _error("OpenRouter work root invalid")
     client = OpenRouterMediaClient(api_key=settings.api_key)
@@ -484,10 +486,11 @@ def generate_approved_assets(
                 raise _error("OpenRouter job ledger invalid")
             committed += amount
         remaining = approval.ceiling_usd - committed
-        if remaining <= 0:
+        reservation = JOB_RESERVATIONS[spec.name]
+        if remaining < reservation:
             raise _error("OpenRouter video cost exceeds approval")
         OpenRouterMediaClient.reserve_job(
-            ledger, name=spec.name, model=spec.model, reserved_usd=remaining
+            ledger, name=spec.name, model=spec.model, reserved_usd=reservation
         )
         if not client.credit_available():
             raise _error("OpenRouter credits unavailable")
@@ -524,7 +527,7 @@ def _script_sections(script: Path, manifest: VideoManifest) -> tuple[str, ...]:
             sections.append((int(heading.group(1)), int(heading.group(2)), []))
             current = sections[-1][2]
         elif line.startswith("#"):
-            current = None
+            continue
         elif current is not None and line.strip():
             current.append(line.strip())
     expected = [(segment.start_seconds, segment.start_seconds + segment.duration_seconds) for segment in manifest.segments]

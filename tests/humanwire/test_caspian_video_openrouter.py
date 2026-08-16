@@ -227,7 +227,7 @@ def test_generate_approved_assets_writes_only_under_its_canonical_work_root(
             )
 
     monkeypatch.setattr(openrouter, "OpenRouterMediaClient", FakeClient)
-    monkeypatch.setattr(openrouter.Path, "cwd", lambda: tmp_path)
+    monkeypatch.setattr(openrouter, "REPOSITORY_ROOT", tmp_path)
     settings = VideoSettings(
         api_key=SecretStr("PRIVATE-OPENROUTER-SENTINEL"),
         presenter_model="google/veo-3.1-fast",
@@ -298,7 +298,7 @@ def test_completed_job_is_ledgered_before_the_post_job_credit_check_fails(
             )
 
     monkeypatch.setattr(openrouter, "OpenRouterMediaClient", FakeClient)
-    monkeypatch.setattr(openrouter.Path, "cwd", lambda: tmp_path)
+    monkeypatch.setattr(openrouter, "REPOSITORY_ROOT", tmp_path)
     settings = VideoSettings(
         api_key=SecretStr("PRIVATE-OPENROUTER-SENTINEL"),
         presenter_model="google/veo-3.1-fast",
@@ -411,7 +411,7 @@ def test_tts_cli_accepts_only_the_canonical_narration_directory(
 
 
 def test_script_sections_stop_at_later_markdown_subheadings(tmp_path: Path) -> None:
-    """Break caught: Markdown labels are accidentally sent as narration."""
+    """Break caught: a subheading is narrated or discards the paragraph that follows it."""
     manifest = VideoManifest.load(Path("submission/caspian-video-manifest.json"))
     source = Path("submission/caspian-video-script.md").read_text(encoding="utf-8")
     script = tmp_path / "script.md"
@@ -420,7 +420,7 @@ def test_script_sections_stop_at_later_markdown_subheadings(tmp_path: Path) -> N
     sections = openrouter._script_sections(script, manifest)
 
     assert "Not narration" not in sections[0]
-    assert "Ignore this label" not in sections[0]
+    assert "Ignore this label" in sections[0]
 
 
 def test_probe_timeout_removes_rejected_mp3(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -471,7 +471,7 @@ def test_generation_reserves_the_job_in_its_ledger_before_post_failure(
             raise VideoGenerationError("OpenRouter request failed")
 
     monkeypatch.setattr(openrouter, "OpenRouterMediaClient", FakeClient)
-    monkeypatch.setattr(openrouter.Path, "cwd", lambda: tmp_path)
+    monkeypatch.setattr(openrouter, "REPOSITORY_ROOT", tmp_path)
     settings = VideoSettings(
         api_key=SecretStr("PRIVATE-OPENROUTER-SENTINEL"),
         presenter_model="google/veo-3.1-fast",
@@ -497,6 +497,7 @@ def test_second_two_dollar_job_is_rejected_against_remaining_total_budget(
         reserve_job = staticmethod(real_client.reserve_job)
         _ledger_data = staticmethod(real_client._ledger_data)
         last_job_id = "job-safe"
+        post_count = 0
 
         def __init__(self, *, api_key: SecretStr) -> None:
             del api_key
@@ -515,6 +516,7 @@ def test_second_two_dollar_job_is_rejected_against_remaining_total_budget(
             self, spec: GenerationSpec, approval: SpendApproval, output: Path, *, budget_usd: Decimal
         ) -> GenerationReceipt:
             del approval, output
+            FakeClient.post_count += 1
             return GenerationReceipt(
                 name=spec.name,
                 model=spec.model,
@@ -524,7 +526,7 @@ def test_second_two_dollar_job_is_rejected_against_remaining_total_budget(
             )
 
     monkeypatch.setattr(openrouter, "OpenRouterMediaClient", FakeClient)
-    monkeypatch.setattr(openrouter.Path, "cwd", lambda: tmp_path)
+    monkeypatch.setattr(openrouter, "REPOSITORY_ROOT", tmp_path)
     settings = VideoSettings(
         api_key=SecretStr("PRIVATE-OPENROUTER-SENTINEL"),
         presenter_model="google/veo-3.1-fast",
@@ -536,7 +538,8 @@ def test_second_two_dollar_job_is_rejected_against_remaining_total_budget(
 
     ledger = json.loads((tmp_path / "work/caspian-video/openrouter/jobs.json").read_text())
     assert ledger["presenter"]["cost_usd"] == "2.00"
-    assert ledger["stakeholders"]["status"] == "reserved"
+    assert "stakeholders" not in ledger
+    assert FakeClient.post_count == 1
 
 
 def test_second_work_root_is_rejected_before_creating_a_media_client(tmp_path: Path) -> None:
@@ -549,6 +552,33 @@ def test_second_work_root_is_rejected_before_creating_a_media_client(tmp_path: P
 
     with pytest.raises(VideoGenerationError, match="work root invalid"):
         openrouter.generate_approved_assets(settings, approved(), tmp_path)
+
+
+def test_generate_cli_uses_the_source_owned_repository_root_after_chdir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Break caught: changing CWD creates a fresh ledger identity before a provider POST."""
+    settings = VideoSettings(
+        api_key=SecretStr("PRIVATE-OPENROUTER-SENTINEL"),
+        presenter_model="google/veo-3.1-fast",
+        stakeholder_model="bytedance/seedance-2.0-fast",
+    )
+    received: list[Path] = []
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    monkeypatch.setattr("scripts.caspian_video.__main__.load_video_settings", lambda _path: settings)
+    monkeypatch.setattr(
+        "scripts.caspian_video.__main__.generate_approved_assets",
+        lambda _settings, _approval, root: received.append(root) or (),
+    )
+
+    for directory in (first, second):
+        monkeypatch.chdir(directory)
+        assert main(["generate", "--confirm-paid-generation", "--approve-spend-usd", "3.00"]) == 0
+
+    assert received == [openrouter.REPOSITORY_ROOT, openrouter.REPOSITORY_ROOT]
 
 
 @pytest.mark.parametrize("headers", [{"content-length": "5"}, {}])

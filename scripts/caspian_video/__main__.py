@@ -8,6 +8,7 @@ from pathlib import Path
 
 from scripts.caspian_video.models import SpendApproval, VideoManifest
 from scripts.caspian_video.openrouter import (
+    REPOSITORY_ROOT,
     OpenRouterMediaClient,
     VideoGenerationError,
     _approved_specs,
@@ -74,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "generate":
             if approval is None:
                 raise AssertionError("generate approval is required")
-            receipts = generate_approved_assets(settings, approval, Path("."))
+            receipts = generate_approved_assets(settings, approval, REPOSITORY_ROOT)
             for receipt in receipts:
                 print(f"{receipt.name}_cost_usd={receipt.cost_usd}")
             return 0
