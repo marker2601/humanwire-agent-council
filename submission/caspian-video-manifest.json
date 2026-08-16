@@ -1,5 +1,5 @@
 {
-  "title": "HumanWire â€” coordination that reaches a decision",
+  "title": "HumanWire — coordination that reaches a decision",
   "width": 1920,
   "height": 1080,
   "fps": 30,
@@ -11,7 +11,7 @@
       "source": "work/caspian-video/approved/presenter.mp4",
       "proof_class": "generated_visual",
       "disclosure": "Visual guide",
-      "required_copy": ["HumanWire â€” coordination that reaches a decision"]
+      "required_copy": ["HumanWire — coordination that reaches a decision"]
     },
     {
       "id": "telegram_authorization",
@@ -20,7 +20,7 @@
       "source": "work/caspian-video/approved/telegram.mp4",
       "proof_class": "recorded_caspian",
       "channel": "telegram",
-      "required_copy": ["Recorded Caspian run Â· Telegram"]
+      "required_copy": ["Recorded Caspian run · Telegram"]
     },
     {
       "id": "email_evidence",
@@ -29,7 +29,7 @@
       "source": "work/caspian-video/approved/email.mp4",
       "proof_class": "recorded_caspian",
       "channel": "email",
-      "required_copy": ["Same recorded Caspian run Â· Email"]
+      "required_copy": ["Same recorded Caspian run · Email"]
     },
     {
       "id": "stakeholder_roles",
@@ -46,7 +46,7 @@
       "duration_seconds": 34,
       "source": "work/caspian-video/approved/decision-room.mp4",
       "proof_class": "public_product",
-      "required_copy": ["Standard agents Â· no external messages"]
+      "required_copy": ["Standard agents · no external messages"]
     },
     {
       "id": "replay_and_downloads",
@@ -54,7 +54,7 @@
       "duration_seconds": 20,
       "source": "work/caspian-video/approved/replay-downloads.mp4",
       "proof_class": "public_product",
-      "required_copy": ["Standard agents Â· no external messages"]
+      "required_copy": ["Standard agents · no external messages"]
     },
     {
       "id": "closing_card",

@@ -5,7 +5,31 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
+
+
+def _validate_work_media_path(
+    path: Path, *, location: str, suffixes: frozenset[str]
+) -> Path:
+    required_prefix = ("work", "caspian-video", location)
+    if (
+        path.is_absolute()
+        or path.drive
+        or ".." in path.parts
+        or path.parts[:3] != required_prefix
+        or path.suffix.lower() not in suffixes
+    ):
+        raise ValueError(
+            f"path must be relative and under work/caspian-video/{location}/"
+        )
+    return path
 
 
 class ProofClass(StrEnum):
@@ -42,7 +66,7 @@ class VideoSegment(BaseModel):
 class VideoManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    title: Literal["HumanWire â€” coordination that reaches a decision"]
+    title: Literal["HumanWire — coordination that reaches a decision"]
     width: Literal[1920]
     height: Literal[1080]
     fps: Literal[30]
@@ -60,7 +84,7 @@ class VideoManifest(BaseModel):
                 raise ValueError("segments must be contiguous and ordered")
             expected_start += segment.duration_seconds
         if not 90 <= expected_start <= 110:
-            raise ValueError("editorial duration must be 90â€“110 seconds")
+            raise ValueError("editorial duration must be 90–110 seconds")
         return self
 
     @classmethod
@@ -73,6 +97,13 @@ class SpendApproval(BaseModel):
 
     approved: Literal[True]
     ceiling_usd: Decimal
+
+    @field_validator("approved", mode="before")
+    @classmethod
+    def validate_explicit_approval(cls, value: object) -> bool:
+        if type(value) is not bool or value is not True:
+            raise ValueError("spend approval must be the explicit boolean True")
+        return value
 
     @model_validator(mode="after")
     def validate_ceiling(self) -> SpendApproval:
@@ -93,6 +124,17 @@ class GenerationSpec(BaseModel):
     generate_audio: Literal[False]
     first_frame: Path | None = None
 
+    @field_validator("first_frame")
+    @classmethod
+    def validate_first_frame(cls, path: Path | None) -> Path | None:
+        if path is None:
+            return None
+        return _validate_work_media_path(
+            path,
+            location="references",
+            suffixes=frozenset({".png", ".jpg", ".jpeg"}),
+        )
+
     @model_validator(mode="after")
     def validate_model_duration(self) -> GenerationSpec:
         expected = {
@@ -112,6 +154,15 @@ class GenerationReceipt(BaseModel):
     status: Literal["completed"]
     cost_usd: Decimal = Field(ge=0, le=3)
     output_path: Path
+
+    @field_validator("output_path")
+    @classmethod
+    def validate_output_path(cls, path: Path) -> Path:
+        return _validate_work_media_path(
+            path,
+            location="generated",
+            suffixes=frozenset({".mp4"}),
+        )
 
 
 class VideoSettings(BaseModel):
