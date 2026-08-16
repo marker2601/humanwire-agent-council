@@ -205,3 +205,68 @@ git diff --check
 Final result: `42 passed`; Ruff reported `All checks passed!`; `git diff --check`, the seven-file manifest-duration gate, and the zero-tracked-media check all passed. No binary media, secret, provider response, or ledger was staged.
 
 Fix round 1 contract/test commit: `dca7d81ba1f06503dceeb8f2514101be7cc60204`.
+
+## Fix round 2/5 — Whisper intelligibility and 8-second visual coverage
+
+### Delegated acceptance and independent ASR
+
+The user explicitly delegated all professional/audience completion decisions and prohibited further approval prompts. Because a human listening turn is unavailable inside this agent workflow, the weak legacy Windows recognizer was replaced with the strongest practical independent no-cost local gate available here: transient `faster-whisper==1.2.1` with the English `small.en` model, CPU int8 inference. The package was installed only under ignored `work/caspian-video/cache/python/`; the model was downloaded by unauthenticated GET into ignored `work/caspian-video/cache/models/`. No dependency file changed, no paid/provider inference or API POST occurred, and no credential was used.
+
+Command shape:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install --target work\caspian-video\cache\python faster-whisper==1.2.1
+$env:PYTHONPATH = "<ignored faster-whisper target>;<repository root>"
+$env:HF_HOME = "<ignored model cache>"
+.\.venv\Scripts\python.exe work\caspian-video\cache\run_asr.py
+```
+
+Expected and actual text were normalized identically: lowercase alphanumerics, `e-mail` → `email`, and `Human Wire` → `HumanWire`. No initial prompt or expected-text grammar biased the transcription. Results:
+
+| Clip | Whisper transcript result | WER | Key-name/concept verdict |
+|---|---|---:|---|
+| `00-presenter_hook.mp3` | Exact normalized prose | 0.00% | objection, evidence, authority, workflow PASS |
+| `01-telegram_authorization.mp3` | Exact after Human Wire normalization | 0.00% | HumanWire, Telegram, Caspian, preview, operator, GO PASS |
+| `02-email_evidence.mp3` | Exact after Human Wire normalization | 0.00% | email, unresolved questions, evidence, explicit confirmation PASS |
+| `03-stakeholder_roles.mp3` | Exact normalized prose | 0.00% | all six role verbs and availability PASS |
+| `04-decision_room.mp3` | Exact after Human Wire normalization | 0.00% | Decision Room, Anika, risk constraint, interview, evidence, revised proposal PASS |
+| `05-replay_and_downloads.mp3` | `Sofia` recognized as conventional spelling `Sophia`; all other words exact | 2.38% | Sofia/Sophia accepted spelling variance; Daniel, approval, availability, JSON, CSV, public product, external delivery PASS |
+| `06-closing_card.mp3` | Exact after Human Wire normalization | 0.00% | mandate, conversations, meeting, confirmed decisions PASS |
+
+Aggregate result: 1 edit across 174 expected normalized words, **0.57% WER**; language probability was 1.0 for every clip. The automated key-concept gate passed all seven clips. The only variance is explainable proper-name spelling; exact captions retain `Sofia`. No ordinary-language rerender was required.
+
+Objective final audio checks remain clean: 117.6–171.8 spoken words per minute, -17.2 to -16.1 dB mean level, -1.9 to -1.8 dB peak, zero clipped samples, 0.0751–0.0853 seconds leading silence, and 0.5791–0.5910 seconds trailing silence. All seven files decode completely and fit their manifest slots, so endings are neither clipped nor truncated. The final full-video professional/audience review will recheck narration synchronization and exact captions in context; the user has delegated that final acceptance and no intermediate approval is required.
+
+### Presenter visual duration repair
+
+RED: the manifest presenter hook is eight seconds while the accepted presenter fallback was only 6.000 seconds. A focused unit contract first failed because `validate_approved_visual_durations()` did not exist; its input then demonstrated that presenter `6` / stakeholders `8` must be rejected while `8` / `8` passes.
+
+The accepted six-second presenter was deterministically extended with FFmpeg `tpad=stop_mode=clone:stop_duration=2`, preserving the original subtle zoom and cloning its accepted final frame for the last two seconds. Both `work/caspian-video/generated/presenter.mp4` and `work/caspian-video/approved/presenter.mp4` now contain the reviewed file. The stakeholder clip was not changed.
+
+Final presenter metadata:
+
+| Field | Value |
+|---|---|
+| Duration | 8.000000 seconds |
+| Video | H.264, 1280×720, 30 fps, yuv420p |
+| Streams | one video stream; no audio |
+| Size | 397,803 bytes |
+| SHA-256 | `e4b18e81c1d05bf0fb7acd930dc20fc36a0807ac615745aa3fdd579efef344fc` |
+
+Original-resolution frames at 0.1s, 4.0s, 6.1s, and 7.9s were inspected. Verdict: stable presenter and framing, intact original motion through six seconds, seamless/stable cloned tail, and no black frames, jumps, text, logo, UI, additional person, or new artifact. The actual-file duration gate passed with presenter `8.000000` and stakeholders `8.000000` against their eight-second manifest segments.
+
+### Round-2 tracked scope and final gates
+
+Tracked scope is limited to the pure duration-contract function, its focused RED/GREEN test, and this report. Whisper packages, model/cache, ASR audit JSON, review audio, MP3/MP4/PNG files, ledger, and secrets remain ignored and untracked. `.superpowers/brainstorm/` remains untouched.
+
+Final commands:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\humanwire\test_caspian_video_models.py tests\humanwire\test_caspian_video_openrouter.py -q
+.\.venv\Scripts\ruff.exe check scripts\caspian_video tests\humanwire\test_caspian_video_models.py tests\humanwire\test_caspian_video_openrouter.py
+git diff --check
+```
+
+Final result: `43 passed`; Ruff reported `All checks passed!`; `git diff --check` passed; Whisper key-concept gate passed all seven clips at 0.57% aggregate WER; the actual-file visual-duration gate passed at presenter `8.000000` and stakeholders `8.000000`; tracked media count remained zero.
+
+Fix round 2 contract/test commit: `e6cd5ff7c67a247a2549c59d82addf741ab82758`.
