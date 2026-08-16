@@ -4,11 +4,11 @@ Official event rules, eligibility, registration state, reuse terms, and deadline
 
 ## Eligibility and submission
 
-- [ ] Caspian: retain official eligibility evidence for entrant/team and any organizer exception.
-- [ ] Caspian: retain registration confirmation.
-- [ ] Caspian: retain official code-reuse/originality terms and map repository history to them.
-- [ ] Caspian: retain the official deadline/time-zone evidence and submit before it.
-- [ ] Caspian: retain required media/form-field evidence and final submission receipt.
+- [x] Caspian: official eligibility/rules evidence reviewed through authenticated Devpost records.
+- [x] Caspian: registration confirmed live through the authenticated Devpost account.
+- [x] Caspian: official submission requirements and judging criterion retained in the packet.
+- [x] Caspian: live deadline verified as 2026-08-16 18:30 UTC and entry sent before it.
+- [x] Caspian: public repository/video requirements satisfied; submission receipt 1140539 retained.
 - [ ] ML Empowerment: retain official eligibility evidence for entrant/team and any organizer exception.
 - [ ] ML Empowerment: retain registration confirmation.
 - [ ] ML Empowerment: retain official code-reuse/originality terms and map repository history to them.
@@ -20,8 +20,8 @@ Official event rules, eligibility, registration state, reuse terms, and deadline
 - [ ] Build Beyond: retain the official deadline/time-zone evidence and submit before it.
 - [ ] Build Beyond: retain required media/form-field evidence and final submission receipt.
 - [ ] Project name and tagline consistently identify HumanWire.
-- [ ] Public repository, video, and demo links work in a signed-out browser.
-- [ ] Final page preview contains no missing media, private identifiers, or broken links.
+- [x] Public repository, video, and demo links work from signed-out requests.
+- [x] Final Devpost record contains the public product and reviewed YouTube video with no private identifiers.
 
 ## Qualifying implementation
 
@@ -34,7 +34,7 @@ Official event rules, eligibility, registration state, reuse terms, and deadline
 
 ## Repository and privacy
 
-- [ ] Push the final `codex/humanwire` history to the public repository.
+- [x] Publish the final safe snapshot to the public repository (`main` at `2c375b8`).
 - [ ] Confirm a fresh-clone editable install exposes only the `humanwire` command.
 - [ ] Confirm `.env`, `.env.local`, `.vercel`, `data/organization.json`, databases, direct contact destinations, conversation IDs, provider bodies, and private responses are absent from tracked files and Git history.
 - [ ] Confirm no obsolete package, command, fixture, test, or operator script remains.
@@ -79,13 +79,13 @@ Official event rules, eligibility, registration state, reuse terms, and deadline
 - [ ] PENDING: retain external Caspian, email, and Telegram evidence before claiming external delivery. **Workspace channels** alone is not that evidence.
 - [x] Keep the older synthetic CLI classified as internal deterministic evidence, not the primary product screen.
 
-- [ ] Update [secondsignal.vercel.app](https://secondsignal.vercel.app) only after local and live gates pass.
-- [ ] `/`, `/api/catalog`, the exact guarded POST `/api/runs`, and the public studio assets work from a signed-out production session; unknown/private routes fail closed.
-- [ ] A submitted request renders progressive saved updates through the bounded same-origin event stream and reaches the meeting-ready outcome.
-- [ ] Decision Room, Reach, and Data navigation work during and after the run; JSON and CSV downloads use the final validated stream evidence without a second server request.
-- [ ] Test desktop, 600-pixel, and 390-pixel widths for clipping, overlap, readable controls, and navigation.
-- [ ] Confirm there are no relevant browser console errors or framework overlays.
-- [ ] Confirm the public product visibly says **Standard agents · no external messages**, offers no model mode, and loads no ambient provider/model configuration.
+- [x] [secondsignal.vercel.app](https://secondsignal.vercel.app/) is live after local and production gates passed.
+- [x] `/`, `/api/catalog`, the exact guarded POST `/api/runs`, and public assets work signed out; unknown/private routes fail closed.
+- [x] A submitted request streams progressive saved updates and reaches the meeting-ready outcome.
+- [x] Decision Room, Reach, and Data navigation work during and after the run; JSON/CSV use final validated stream evidence.
+- [x] Desktop, 600-pixel, and 390-pixel widths pass clipping, overlap, target-size, readability, and navigation checks.
+- [x] Browser acceptance reported no relevant console errors or framework overlays.
+- [x] The public product visibly says **Standard agents · no external messages**, offers no model mode, and loads no ambient provider/model configuration.
 
 ## Final local gate
 

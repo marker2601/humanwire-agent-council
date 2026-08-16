@@ -35,4 +35,4 @@ This record separates the working public product from provider evidence that was
 - [x] Captions contain no literal escape characters and do not collide with product controls.
 - [x] Private coordinates, credentials, direct destinations, provider bodies, and internal identifiers are absent.
 - [x] Public video resolves from a signed-out request and YouTube oEmbed returns its exact title.
-- [ ] Devpost records the same public video URL.
+- [x] Devpost records the same public video URL; submission 1140539 was verified live.

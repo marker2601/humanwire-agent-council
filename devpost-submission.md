@@ -112,6 +112,7 @@ The video deliberately distinguishes the working public Standard-agent product f
 - Devpost authentication: verified.
 - Caspian registration: verified live on Devpost.
 - Devpost project draft: https://devpost.com/software/humanwire
+- Caspian submission: verified live as submission 1140539 at 2026-08-16T11:13:49.137-04:00.
 - Project thumbnail: uploaded from the reviewed completed-workspace screenshot and processing on Devpost.
 - Official deliverables: public GitHub repository and public demo video.
 - Official custom submission questions: none.
@@ -134,4 +135,5 @@ The video deliberately distinguishes the working public Standard-agent product f
 
 - Video URL: https://youtu.be/FxzhLqoscSE
 - Devpost project URL: https://devpost.com/software/humanwire
+- Submission receipt: 1140539
 - No custom submission questions were returned by the official Caspian form.

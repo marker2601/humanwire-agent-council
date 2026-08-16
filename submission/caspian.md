@@ -127,7 +127,8 @@ Capture the interactive Standard-agent public product only after final QA; never
 - Official deliverables: **public GitHub repository and demo video; no custom submission questions**
 - Live submission deadline: **2026-08-16 18:30 UTC**, from Devpost's live key-date endpoint
 - Judging criterion: **the most creative use case that actually works**, from Devpost's live submission requirements
-- Final submission receipt, timestamp, and submitted links: **[entrant-provided after submission]**
+- Final submission receipt: **Devpost submission 1140539**, recorded at **2026-08-16T11:13:49.137-04:00**
+- Public project page: **https://devpost.com/software/humanwire**
 
 No organizer endorsement is claimed. Event facts above are limited to the authenticated live Devpost records checked on 2026-08-16.
 
