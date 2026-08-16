@@ -117,6 +117,26 @@ class NarrationSpec(BaseModel):
         )
 
 
+class PreflightResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    credential_valid: bool
+    video_models_ready: bool
+    narration_models_ready: bool
+    credit_available: bool
+
+
+class MediaReceipt(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    name: Literal["visual_guide_v2", "agent_flow_v2", "narration_v2"]
+    model: str = Field(min_length=3, max_length=100)
+    status: Literal["completed"]
+    cost_usd: Decimal = Field(ge=0, le=10)
+    output_path: Path
+    sha256: str = Field(pattern=r"^[0-9A-F]{64}$")
+
+
 class ProductionSegment(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
