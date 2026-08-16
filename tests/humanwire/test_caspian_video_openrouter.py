@@ -452,7 +452,7 @@ def test_script_sections_stop_at_later_markdown_subheadings(tmp_path: Path) -> N
     manifest = VideoManifest.load(Path("submission/caspian-video-manifest.json"))
     source = Path("submission/caspian-video-script.md").read_text(encoding="utf-8")
     script = tmp_path / "script.md"
-    script.write_text(source.replace("\n\n## 6–22 seconds", "\n\n### Not narration\n\nIgnore this label.\n\n## 6–22 seconds"), encoding="utf-8")
+    script.write_text(source.replace("\n\n## 8–22 seconds", "\n\n### Not narration\n\nIgnore this label.\n\n## 8–22 seconds"), encoding="utf-8")
 
     sections = openrouter._script_sections(script, manifest)
 

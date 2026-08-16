@@ -7,7 +7,7 @@
     {
       "id": "presenter_hook",
       "start_seconds": 0,
-      "duration_seconds": 6,
+      "duration_seconds": 8,
       "source": "work/caspian-video/approved/presenter.mp4",
       "proof_class": "generated_visual",
       "disclosure": "Visual guide",
@@ -15,8 +15,8 @@
     },
     {
       "id": "telegram_authorization",
-      "start_seconds": 6,
-      "duration_seconds": 16,
+      "start_seconds": 8,
+      "duration_seconds": 14,
       "source": "work/caspian-video/approved/telegram.mp4",
       "proof_class": "recorded_caspian",
       "channel": "telegram",
@@ -34,7 +34,7 @@
     {
       "id": "stakeholder_roles",
       "start_seconds": 38,
-      "duration_seconds": 6,
+      "duration_seconds": 8,
       "source": "work/caspian-video/approved/stakeholders.mp4",
       "proof_class": "generated_visual",
       "disclosure": "Visual guide",
@@ -42,8 +42,8 @@
     },
     {
       "id": "decision_room",
-      "start_seconds": 44,
-      "duration_seconds": 34,
+      "start_seconds": 46,
+      "duration_seconds": 32,
       "source": "work/caspian-video/approved/decision-room.mp4",
       "proof_class": "public_product",
       "required_copy": ["Standard agents · no external messages"]

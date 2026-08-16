@@ -45,6 +45,38 @@ def test_submission_video_manifest_is_truthful_and_105_seconds() -> None:
         if segment.proof_class is ProofClass.PUBLIC_PRODUCT
     )
 
+    assert [
+        (segment.id, segment.start_seconds, segment.duration_seconds)
+        for segment in manifest.segments[:2]
+    ] == [
+        ("presenter_hook", 0, 8),
+        ("telegram_authorization", 8, 14),
+    ]
+    assert [
+        (segment.id, segment.start_seconds, segment.duration_seconds)
+        for segment in manifest.segments[3:5]
+    ] == [
+        ("stakeholder_roles", 38, 8),
+        ("decision_room", 46, 32),
+    ]
+
+
+def test_offline_narration_fallback_requires_user_authorization() -> None:
+    plan = (
+        ROOT
+        / "docs/superpowers/plans/2026-08-15-humanwire-caspian-submission-video.md"
+    ).read_text(encoding="utf-8")
+
+    assert (
+        "After explicit user authorization, use either human-recorded narration or "
+        "offline local speech synthesis; make no paid voice request and no additional "
+        "provider call."
+    ) in plan
+    assert (
+        "Standing user authorization permits necessary production and submission spend "
+        "up to USD $10.00 total without another approval request."
+    ) in plan
+
 
 def test_editorial_unicode_is_exact_utf8_not_mojibake() -> None:
     expected_title = "HumanWire — coordination that reaches a decision"
@@ -64,7 +96,7 @@ def test_editorial_unicode_is_exact_utf8_not_mojibake() -> None:
     assert VideoManifest.load(
         ROOT / "submission/caspian-video-manifest.json"
     ).title == expected_title
-    assert "## 0–6 seconds" in editorial_text
+    assert "## 0–8 seconds" in editorial_text
     assert "Standard agents · no external messages" in editorial_text
     assert not any(
         chr(codepoint) in editorial_text for codepoint in (0x00C3, 0x00C2, 0x00E2)

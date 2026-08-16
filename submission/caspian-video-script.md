@@ -1,10 +1,10 @@
 # HumanWire Caspian Video Script
 
-## 0–6 seconds
+## 0–8 seconds
 
 Important decisions rarely fail because teams lack messages. They fail because the right objection, evidence, and authority never meet in one workflow.
 
-## 6–22 seconds
+## 8–22 seconds
 
 HumanWire begins with a mandate in Telegram. Before any outreach, Caspian returns a preview, and the operator explicitly authorizes the run with GO.
 
@@ -12,11 +12,11 @@ HumanWire begins with a mandate in Telegram. Before any outreach, Caspian return
 
 The same run continues by email, where HumanWire asks only the unresolved questions, records the response as evidence, and requires explicit confirmation before it can influence a decision.
 
-## 38–44 seconds
+## 38–46 seconds
 
 Each stakeholder agent has a specific role: inform, acknowledge, answer, challenge, approve, or provide availability.
 
-## 44–78 seconds
+## 46–78 seconds
 
 In the Decision Room, the saved workflow becomes visible. Anika raises a risk constraint. HumanWire opens a targeted interview, confirms the evidence, and revises the proposal instead of hiding the disagreement.
 

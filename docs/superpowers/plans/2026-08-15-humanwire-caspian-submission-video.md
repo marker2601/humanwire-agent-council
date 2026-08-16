@@ -17,7 +17,8 @@
 - Generated presenter and stakeholder characters are explanatory visuals, never real participants or live-provider proof.
 - Never expose credentials, email addresses, Telegram identifiers, route or conversation IDs, database coordinates, tokens, private answers, or provider bodies.
 - `OPENROUTER_API_KEY` is read only from the ignored `.env.video`; it is never printed, serialized, placed in a command line, committed, or included in exception text.
-- Paid OpenRouter work requires a fresh explicit user approval of the **USD $3.00 total ceiling** before the first video submission.
+- Standing user authorization permits necessary production and submission spend up to USD $10.00 total without another approval request.
+- The completed Task 3 OpenRouter attempt retained its narrower USD $3.00 video-job ceiling and no-retry fence; do not alter its paid ledger or submit replacement video jobs when accepted local fallbacks exist.
 - Generate at most one `google/veo-3.1-fast` job and one `bytedance/seedance-2.0-fast` job; no automatic retries.
 - Store raw/generated/intermediate/final media only under ignored `work/caspian-video/`.
 - No provider or Devpost claim is promoted beyond what the final recording visibly proves.
@@ -261,11 +262,11 @@ Create `submission/caspian-video-script.md` with this final narration:
 ```markdown
 # HumanWire Caspian Video Script
 
-## 0–6 seconds
+## 0–8 seconds
 
 Important decisions rarely fail because teams lack messages. They fail because the right objection, evidence, and authority never meet in one workflow.
 
-## 6–22 seconds
+## 8–22 seconds
 
 HumanWire begins with a mandate in Telegram. Before any outreach, Caspian returns a preview, and the operator explicitly authorizes the run with GO.
 
@@ -273,11 +274,11 @@ HumanWire begins with a mandate in Telegram. Before any outreach, Caspian return
 
 The same run continues by email, where HumanWire asks only the unresolved questions, records the response as evidence, and requires explicit confirmation before it can influence a decision.
 
-## 38–44 seconds
+## 38–46 seconds
 
 Each stakeholder agent has a specific role: inform, acknowledge, answer, challenge, approve, or provide availability.
 
-## 44–78 seconds
+## 46–78 seconds
 
 In the Decision Room, the saved workflow becomes visible. Anika raises a risk constraint. HumanWire opens a targeted interview, confirms the evidence, and revises the proposal instead of hiding the disagreement.
 
@@ -304,7 +305,7 @@ Create `submission/caspian-video-manifest.json` with this exact content:
     {
       "id": "presenter_hook",
       "start_seconds": 0,
-      "duration_seconds": 6,
+      "duration_seconds": 8,
       "source": "work/caspian-video/approved/presenter.mp4",
       "proof_class": "generated_visual",
       "disclosure": "Visual guide",
@@ -312,8 +313,8 @@ Create `submission/caspian-video-manifest.json` with this exact content:
     },
     {
       "id": "telegram_authorization",
-      "start_seconds": 6,
-      "duration_seconds": 16,
+      "start_seconds": 8,
+      "duration_seconds": 14,
       "source": "work/caspian-video/approved/telegram.mp4",
       "proof_class": "recorded_caspian",
       "channel": "telegram",
@@ -331,7 +332,7 @@ Create `submission/caspian-video-manifest.json` with this exact content:
     {
       "id": "stakeholder_roles",
       "start_seconds": 38,
-      "duration_seconds": 6,
+      "duration_seconds": 8,
       "source": "work/caspian-video/approved/stakeholders.mp4",
       "proof_class": "generated_visual",
       "disclosure": "Visual guide",
@@ -339,8 +340,8 @@ Create `submission/caspian-video-manifest.json` with this exact content:
     },
     {
       "id": "decision_room",
-      "start_seconds": 44,
-      "duration_seconds": 34,
+      "start_seconds": 46,
+      "duration_seconds": 32,
       "source": "work/caspian-video/approved/decision-room.mp4",
       "proof_class": "public_product",
       "required_copy": ["Standard agents · no external messages"]
@@ -365,7 +366,7 @@ Create `submission/caspian-video-manifest.json` with this exact content:
 }
 ```
 
-The seven contiguous durations are `6, 16, 16, 6, 34, 20, 7`, totaling exactly 105 seconds.
+The seven contiguous durations are `8, 14, 16, 8, 32, 20, 7`, totaling exactly 105 seconds. The opening and stakeholder-role explanations each receive eight seconds for professionally understandable narration. The following authorization and Decision Room segments retain fourteen and thirty-two seconds respectively; the 22-second, 38-second, 78-second, 98-second, and 105-second boundaries remain unchanged.
 
 - [ ] **Step 5: Protect local configuration for every clone**
 
@@ -628,7 +629,7 @@ Inspect both images before continuing. Reject images containing text, logos, dup
 
 - [ ] **Step 3: Run the free narration validation and section synthesis**
 
-Synthesize only the opening sentence first using `deepgram/flux-tts:free`. Confirm the output is an MP3 and listen to it. If the endpoint rejects the missing voice or the pronunciation is unusable, stop and use locally recorded narration; do not invoke a paid voice automatically.
+Synthesize only the opening sentence first using `deepgram/flux-tts:free`. Confirm the output is an MP3 and listen to it. If the endpoint rejects the missing voice or the pronunciation is unusable, stop the provider path. After explicit user authorization, use either human-recorded narration or offline local speech synthesis; make no paid voice request and no additional provider call.
 
 If the validation passes, synthesize each of the seven Markdown sections independently so every voice clip can begin at its matching manifest time:
 
