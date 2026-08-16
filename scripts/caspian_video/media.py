@@ -30,13 +30,75 @@ class CoverRegion(BaseModel):
     height: int = Field(ge=1, le=4320, strict=True)
 
 
+def _resolved_path(path: Path) -> Path:
+    failed = False
+    resolved: Path | None = None
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError, ValueError):
+        failed = True
+    if failed or resolved is None:
+        raise MediaPathError("media path invalid")
+    return resolved
+
+
+def _trusted_media_root() -> Path:
+    repository_root = _resolved_path(REPOSITORY_ROOT)
+    configured_root = _resolved_path(MEDIA_WORK_ROOT)
+    expected_root = _resolved_path(repository_root / "work" / "caspian-video")
+    if configured_root != expected_root or not configured_root.is_relative_to(repository_root):
+        raise MediaPathError("media path invalid")
+    return configured_root
+
+
+def _make_parent(path: Path) -> None:
+    failed = False
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except (OSError, RuntimeError, ValueError):
+        failed = True
+    if failed:
+        raise MediaPathError("media path invalid")
+
+
+def _is_file(path: Path) -> bool:
+    failed = False
+    result = False
+    try:
+        result = path.is_file()
+    except (OSError, RuntimeError, ValueError):
+        failed = True
+    if failed:
+        raise MediaPathError("media path invalid")
+    return result
+
+
+def _exists(path: Path) -> bool:
+    failed = False
+    result = False
+    try:
+        result = path.exists()
+    except (OSError, RuntimeError, ValueError):
+        failed = True
+    if failed:
+        raise MediaPathError("media path invalid")
+    return result
+
+
 def safe_media_path(work_root: Path, value: str | Path) -> Path:
     """Resolve a relative path only when it stays inside ``work_root``."""
-    candidate = Path(value)
+    failed = False
+    candidate: Path | None = None
+    try:
+        candidate = Path(value)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        failed = True
+    if failed or candidate is None:
+        raise MediaPathError("media path invalid")
     if candidate.is_absolute() or candidate.drive or ".." in candidate.parts:
         raise MediaPathError("media path invalid")
-    root = work_root.resolve()
-    resolved = (root / candidate).resolve()
+    root = _resolved_path(work_root)
+    resolved = _resolved_path(root / candidate)
     if not resolved.is_relative_to(root):
         raise MediaPathError("media path invalid")
     return resolved
@@ -65,7 +127,8 @@ def build_capture_command(output: Path, fps: int) -> list[str]:
         "18",
         "-pix_fmt",
         "yuv420p",
-        str(output.resolve()),
+        "-n",
+        str(_resolved_path(output)),
     ]
 
 
@@ -75,20 +138,22 @@ def cover_filter(*, x: int, y: int, width: int, height: int) -> str:
 
 
 def _owned_existing_path(path: Path) -> Path:
-    resolved = path.resolve()
-    if not resolved.is_relative_to(MEDIA_WORK_ROOT.resolve()) or not resolved.is_file():
+    root = _trusted_media_root()
+    resolved = _resolved_path(path)
+    if not resolved.is_relative_to(root) or not _is_file(resolved):
         raise MediaPathError("media path invalid")
     return resolved
 
 
 def _owned_output_path(path: Path) -> Path:
-    resolved = path.resolve()
+    root = _trusted_media_root()
+    resolved = _resolved_path(path)
     if (
-        not resolved.is_relative_to(MEDIA_WORK_ROOT.resolve())
+        not resolved.is_relative_to(root)
         or resolved.suffix.lower() != ".mp4"
-        or resolved.exists()
+        or _exists(resolved)
     ):
-        raise MediaPathError("media output exists" if resolved.exists() else "media path invalid")
+        raise MediaPathError("media output exists" if _exists(resolved) else "media path invalid")
     return resolved
 
 
@@ -106,11 +171,13 @@ def run_capture(name: str, work_root: Path) -> Path:
     """Record the Windows desktop until FFmpeg receives ``q`` on this terminal's stdin."""
     if not _CAPTURE_NAME.fullmatch(name):
         raise MediaPathError("media path invalid")
-    root = work_root.resolve()
+    root = _resolved_path(work_root)
+    if root != _trusted_media_root():
+        raise MediaPathError("media path invalid")
     output = safe_media_path(root, Path("raw") / f"{name}.mp4")
-    if output.exists():
+    if _exists(output):
         raise MediaPathError("media output exists")
-    output.parent.mkdir(parents=True, exist_ok=True)
+    _make_parent(output)
     _run_ffmpeg(build_capture_command(output, fps=30), "media capture failed")
     return output
 
@@ -132,7 +199,7 @@ def trim_clip(source: Path, output: Path, start: float, duration: float) -> Path
         raise MediaPathError("media trim invalid")
     source_path = _owned_existing_path(source)
     output_path = _owned_output_path(output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _make_parent(output_path)
     _run_ffmpeg(
         [
             "ffmpeg",
@@ -174,7 +241,7 @@ def cover_regions(source: Path, output: Path, regions: tuple[CoverRegion, ...]) 
         cover_filter(x=region.x, y=region.y, width=region.width, height=region.height)
         for region in regions
     )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _make_parent(output_path)
     _run_ffmpeg(
         [
             "ffmpeg",
@@ -215,7 +282,7 @@ def load_cover_regions(regions_file: Path) -> tuple[CoverRegion, ...]:
             failed = True
         else:
             return tuple(CoverRegion.model_validate(region) for region in loaded)
-    except (OSError, json.JSONDecodeError, ValidationError, TypeError):
+    except (MediaPathError, OSError, RuntimeError, ValueError, json.JSONDecodeError, ValidationError, TypeError):
         failed = True
     if failed:
         raise MediaPathError("redaction regions invalid")

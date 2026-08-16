@@ -21,6 +21,7 @@ def test_capture_command_uses_argument_vector_and_ignored_root(tmp_path: Path) -
         "-framerate",
         "30",
     ]
+    assert command[-2] == "-n"
     assert command[-1] == str(output.resolve())
     assert "shell" not in " ".join(command).lower()
 
@@ -57,6 +58,8 @@ def test_run_capture_writes_only_a_new_raw_mp4_with_an_argument_vector(
         lambda command, **kwargs: calls.append((command, kwargs)),
     )
     work_root = tmp_path / "work" / "caspian-video"
+    monkeypatch.setattr(media, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(media, "MEDIA_WORK_ROOT", work_root)
 
     output = media.run_capture("capture-smoke", work_root)
 
@@ -79,6 +82,8 @@ def test_run_capture_refuses_to_overwrite_an_existing_raw_mp4(
     existing = work_root / "raw" / "capture-smoke.mp4"
     existing.parent.mkdir(parents=True)
     existing.write_bytes(b"existing")
+    monkeypatch.setattr(media, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(media, "MEDIA_WORK_ROOT", work_root)
     monkeypatch.setattr(media.subprocess, "run", lambda *_args, **_kwargs: pytest.fail("capture ran"))
 
     with pytest.raises(media.MediaPathError, match="^media output exists$") as raised:
@@ -101,7 +106,8 @@ def test_trim_and_cover_remove_source_audio_and_use_opaque_regions(
     trimmed = work_root / "trimmed" / "channels.mp4"
     redacted = work_root / "redacted" / "channels.mp4"
     calls: list[list[str]] = []
-    monkeypatch.setattr(media, "MEDIA_WORK_ROOT", work_root.resolve())
+    monkeypatch.setattr(media, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(media, "MEDIA_WORK_ROOT", work_root)
     monkeypatch.setattr(
         media.subprocess, "run", lambda command, **_kwargs: calls.append(command)
     )
@@ -129,7 +135,8 @@ def test_cover_regions_rejects_more_than_twenty_rectangles_before_running_ffmpeg
     source = work_root / "raw" / "channels.mp4"
     source.parent.mkdir(parents=True)
     source.write_bytes(b"source")
-    monkeypatch.setattr(media, "MEDIA_WORK_ROOT", work_root.resolve())
+    monkeypatch.setattr(media, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(media, "MEDIA_WORK_ROOT", work_root)
     monkeypatch.setattr(media.subprocess, "run", lambda *_args, **_kwargs: pytest.fail("ffmpeg ran"))
     regions = tuple(media.CoverRegion(x=index, y=0, width=1, height=1) for index in range(21))
 
@@ -157,7 +164,8 @@ def test_load_cover_regions_rejects_non_array_and_preserves_a_fixed_exception_bo
     regions_file = work_root / "redactions.json"
     regions_file.parent.mkdir(parents=True)
     regions_file.write_text('{"x": -1}', encoding="utf-8")
-    monkeypatch.setattr(media, "MEDIA_WORK_ROOT", work_root.resolve())
+    monkeypatch.setattr(media, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(media, "MEDIA_WORK_ROOT", work_root)
 
     with pytest.raises(media.MediaPathError, match="^redaction regions invalid$") as raised:
         media.load_cover_regions(regions_file)
@@ -175,7 +183,8 @@ def test_capture_cli_never_loads_video_credentials(
 
     work_root = tmp_path / "work" / "caspian-video"
     received: list[tuple[str, Path]] = []
-    monkeypatch.setattr(media, "MEDIA_WORK_ROOT", work_root.resolve())
+    monkeypatch.setattr(media, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(media, "MEDIA_WORK_ROOT", work_root)
     monkeypatch.setattr(command_line, "load_video_settings", lambda _path: pytest.fail("credentials loaded"))
     monkeypatch.setattr(
         command_line,
@@ -185,3 +194,90 @@ def test_capture_cli_never_loads_video_credentials(
 
     assert command_line.main(["capture", "--name", "capture-smoke"]) == 0
     assert received == [("capture-smoke", work_root.resolve())]
+
+
+def test_run_capture_requires_the_trusted_repository_media_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: a caller redirects a supposedly local capture outside the repository."""
+    from scripts.caspian_video import media
+
+    repository_root = tmp_path / "repository"
+    trusted_root = repository_root / "work" / "caspian-video"
+    escaped_root = tmp_path / "escaped"
+    calls: list[list[str]] = []
+    monkeypatch.setattr(media, "REPOSITORY_ROOT", repository_root)
+    monkeypatch.setattr(media, "MEDIA_WORK_ROOT", trusted_root)
+    monkeypatch.setattr(media.subprocess, "run", lambda command, **_kwargs: calls.append(command))
+
+    with pytest.raises(media.MediaPathError, match="^media path invalid$"):
+        media.run_capture("capture-smoke", escaped_root)
+
+    assert calls == []
+
+
+def test_trim_rejects_a_media_root_that_resolves_outside_the_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: trim trusts a redirected global media root outside the repository."""
+    from scripts.caspian_video import media
+
+    repository_root = tmp_path / "repository"
+    escaped_root = tmp_path / "escaped"
+    source = escaped_root / "raw" / "channels.mp4"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"source")
+    monkeypatch.setattr(media, "REPOSITORY_ROOT", repository_root)
+    monkeypatch.setattr(media, "MEDIA_WORK_ROOT", escaped_root)
+    monkeypatch.setattr(media.subprocess, "run", lambda *_args, **_kwargs: pytest.fail("ffmpeg ran"))
+
+    with pytest.raises(media.MediaPathError, match="^media path invalid$"):
+        media.trim_clip(source, escaped_root / "trimmed" / "channels.mp4", start=0, duration=1)
+
+
+def test_safe_media_path_discards_private_resolve_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: a failed resolution retains a private filesystem path in its exception graph."""
+    from scripts.caspian_video import media
+
+    sentinel = "PRIVATE-PATH-SENTINEL"
+    real_resolve = media.Path.resolve
+
+    def hostile_resolve(path: Path, *args: object, **kwargs: object) -> Path:
+        if path.name == "private.mp4":
+            raise OSError(sentinel)
+        return real_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(media.Path, "resolve", hostile_resolve)
+
+    with pytest.raises(media.MediaPathError, match="^media path invalid$") as raised:
+        media.safe_media_path(tmp_path, "private.mp4")
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert sentinel not in repr(raised.value)
+
+
+def test_capture_discards_private_mkdir_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: output-directory failure retains its private operating-system exception."""
+    from scripts.caspian_video import media
+
+    sentinel = "PRIVATE-MKDIR-SENTINEL"
+    work_root = tmp_path / "work" / "caspian-video"
+    monkeypatch.setattr(media, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(media, "MEDIA_WORK_ROOT", work_root)
+
+    def hostile_mkdir(*_args: object, **_kwargs: object) -> None:
+        raise OSError(sentinel)
+
+    monkeypatch.setattr(media.Path, "mkdir", hostile_mkdir)
+
+    with pytest.raises(media.MediaPathError, match="^media path invalid$") as raised:
+        media.run_capture("capture-smoke", work_root)
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert sentinel not in repr(raised.value)
