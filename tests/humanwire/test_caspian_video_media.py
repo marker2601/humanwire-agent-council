@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -322,3 +323,39 @@ def test_trusted_media_root_rejects_a_real_symlink_to_an_unignored_sibling(
 
     with pytest.raises(media.MediaPathError, match="^media path invalid$"):
         media._trusted_media_root()
+
+
+def test_redirected_path_detects_reparse_metadata_even_when_target_does_not_exist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: a dangling redirected component is treated as an absent safe directory."""
+    from scripts.caspian_video import media
+
+    component = tmp_path / "work" / "caspian-video"
+    monkeypatch.setattr(media.Path, "exists", lambda _path: False)
+    monkeypatch.setattr(
+        media.Path,
+        "lstat",
+        lambda _path: SimpleNamespace(st_file_attributes=media.stat.FILE_ATTRIBUTE_REPARSE_POINT),
+    )
+    monkeypatch.setattr(media.Path, "is_symlink", lambda _path: False)
+    monkeypatch.setattr(media.os.path, "isjunction", lambda _path: False)
+
+    assert media._is_redirected_path(component) is True
+
+
+def test_redirected_path_discards_private_lstat_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: a failed reparse inspection retains its private filesystem error."""
+    from scripts.caspian_video import media
+
+    sentinel = "PRIVATE-LSTAT-SENTINEL"
+    monkeypatch.setattr(media.Path, "lstat", lambda _path: (_ for _ in ()).throw(OSError(sentinel)))
+
+    with pytest.raises(media.MediaPathError, match="^media path invalid$") as raised:
+        media._is_redirected_path(tmp_path / "work")
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert sentinel not in repr(raised.value)

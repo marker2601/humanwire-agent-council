@@ -49,12 +49,11 @@ def _is_redirected_path(path: Path) -> bool:
     failed = False
     redirected = False
     try:
-        if path.exists():
-            metadata = path.lstat()
-            reparse_point = bool(
-                getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
-            )
-            redirected = path.is_symlink() or os.path.isjunction(path) or reparse_point
+        metadata = path.lstat()
+        reparse_point = bool(
+            getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        )
+        redirected = stat.S_ISLNK(getattr(metadata, "st_mode", 0)) or os.path.isjunction(path) or reparse_point
     except FileNotFoundError:
         redirected = False
     except (OSError, RuntimeError, ValueError):
