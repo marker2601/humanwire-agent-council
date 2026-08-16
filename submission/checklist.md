@@ -82,7 +82,7 @@ Official event rules, eligibility, registration state, reuse terms, and deadline
 - [x] [secondsignal.vercel.app](https://secondsignal.vercel.app/) is live after local and production gates passed.
 - [x] `/`, `/api/catalog`, the exact guarded POST `/api/runs`, and public assets work signed out; unknown/private routes fail closed.
 - [x] A submitted request streams progressive saved updates and reaches the meeting-ready outcome.
-- [x] Decision Room, Reach, and Data navigation work during and after the run; JSON/CSV use final validated stream evidence.
+- [x] Decision Room, Reach, and Data navigation work during and after the run; JSON and CSV downloads use final validated stream evidence.
 - [x] Desktop, 600-pixel, and 390-pixel widths pass clipping, overlap, target-size, readability, and navigation checks.
 - [x] Browser acceptance reported no relevant console errors or framework overlays.
 - [x] The public product visibly says **Standard agents · no external messages**, offers no model mode, and loads no ambient provider/model configuration.
