@@ -27,16 +27,17 @@ def test_timeline_is_exactly_eighty_seconds_and_product_dominant() -> None:
         for segment in manifest.segments
     ] == [
         ("hook", 0, 6),
-        ("request", 6, 8),
-        ("minimum_path", 14, 12),
-        ("conflict_to_revision", 26, 18),
-        ("approval_to_meeting", 44, 12),
-        ("replay_exports", 56, 12),
-        ("gateway_truth", 68, 7),
-        ("closing", 75, 5),
+        ("request", 6, 7),
+        ("minimum_path", 13, 8),
+        ("conflict_to_revision", 21, 14),
+        ("approval_to_meeting", 35, 11),
+        ("replay_exports", 46, 12),
+        ("gateway_truth", 58, 10),
+        ("result_recap", 68, 4),
+        ("closing", 72, 8),
     ]
     assert manifest.duration_seconds == 80
-    assert manifest.product_seconds == 69
+    assert manifest.product_seconds == 66
 
 
 def test_narration_is_concise_complete_and_truthful() -> None:

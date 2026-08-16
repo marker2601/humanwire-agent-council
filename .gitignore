@@ -16,3 +16,6 @@ __pycache__/
 htmlcov/
 .env.video
 .devpost-hackathon-state.json
+.cache/
+.remotion/
+node_modules/
