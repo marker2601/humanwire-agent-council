@@ -281,3 +281,44 @@ def test_capture_discards_private_mkdir_errors(
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
     assert sentinel not in repr(raised.value)
+
+
+def test_trusted_media_root_rejects_a_flagged_literal_work_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: canonical work media is redirected to an unignored repository sibling."""
+    from scripts.caspian_video import media
+
+    repository_root = tmp_path / "repository"
+    literal_root = repository_root / "work" / "caspian-video"
+    monkeypatch.setattr(media, "REPOSITORY_ROOT", repository_root)
+    monkeypatch.setattr(media, "MEDIA_WORK_ROOT", literal_root)
+    monkeypatch.setattr(media, "_is_redirected_path", lambda path: path == literal_root)
+
+    with pytest.raises(media.MediaPathError, match="^media path invalid$") as raised:
+        media._trusted_media_root()
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_trusted_media_root_rejects_a_real_symlink_to_an_unignored_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: resolving the canonical work path silently follows a sibling symlink."""
+    from scripts.caspian_video import media
+
+    repository_root = tmp_path / "repository"
+    literal_root = repository_root / "work" / "caspian-video"
+    sibling = repository_root / "unignored-sibling"
+    sibling.mkdir(parents=True)
+    literal_root.parent.mkdir(parents=True)
+    try:
+        literal_root.symlink_to(sibling, target_is_directory=True)
+    except OSError:
+        pytest.skip("Windows symlink creation is unavailable in this environment")
+    monkeypatch.setattr(media, "REPOSITORY_ROOT", repository_root)
+    monkeypatch.setattr(media, "MEDIA_WORK_ROOT", literal_root)
+
+    with pytest.raises(media.MediaPathError, match="^media path invalid$"):
+        media._trusted_media_root()

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import stat
 import subprocess
 from pathlib import Path
 
@@ -42,10 +44,35 @@ def _resolved_path(path: Path) -> Path:
     return resolved
 
 
+def _is_redirected_path(path: Path) -> bool:
+    """Return whether an existing Windows path is a symlink, junction, or reparse point."""
+    failed = False
+    redirected = False
+    try:
+        if path.exists():
+            metadata = path.lstat()
+            reparse_point = bool(
+                getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            )
+            redirected = path.is_symlink() or os.path.isjunction(path) or reparse_point
+    except FileNotFoundError:
+        redirected = False
+    except (OSError, RuntimeError, ValueError):
+        failed = True
+    if failed:
+        raise MediaPathError("media path invalid")
+    return redirected
+
+
 def _trusted_media_root() -> Path:
     repository_root = _resolved_path(REPOSITORY_ROOT)
+    literal_root = repository_root / "work" / "caspian-video"
+    if MEDIA_WORK_ROOT != literal_root:
+        raise MediaPathError("media path invalid")
+    if any(_is_redirected_path(component) for component in (repository_root / "work", literal_root)):
+        raise MediaPathError("media path invalid")
     configured_root = _resolved_path(MEDIA_WORK_ROOT)
-    expected_root = _resolved_path(repository_root / "work" / "caspian-video")
+    expected_root = _resolved_path(literal_root)
     if configured_root != expected_root or not configured_root.is_relative_to(repository_root):
         raise MediaPathError("media path invalid")
     return configured_root
