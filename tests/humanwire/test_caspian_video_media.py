@@ -90,12 +90,18 @@ def test_compose_uses_truthful_fixed_labels(tmp_path: Path) -> None:
     manifest = truth_safe_manifest()
     create_minimal_fixture_assets(manifest, tmp_path)
 
-    commands = build_compose_commands(manifest, tmp_path, tmp_path / "final.mp4")
-    rendered = "\n".join(" ".join(command) for command in commands)
+    from scripts.caspian_video.media import build_local_card_commands
 
-    assert rendered.count("Standard agents · no external messages") == 2
+    compose_commands = build_compose_commands(manifest, tmp_path, tmp_path / "final.mp4")
+    card_commands = build_local_card_commands(
+        manifest, tmp_path, "https://github.com/marker2601/humanwire"
+    )
+    rendered = "\n".join(" ".join(command) for command in compose_commands + card_commands)
+    normalized = "\n".join(" ".join(command) for command in compose_commands)
+
+    assert rendered.count("Standard agents · no external messages") == 3
     assert "Recorded Caspian run" not in rendered
-    assert "provider proof" not in rendered
+    assert "provider proof" not in normalized
 
 
 def test_tracked_manifest_composes_only_truthful_provider_fallbacks(
@@ -136,7 +142,7 @@ def test_local_cards_disclose_missing_provider_proof_and_exact_repository(
 
     assert "Telegram provider proof · not recorded" in rendered
     assert "Email provider proof · not recorded" in rendered
-    assert rendered.count("Standard agents · no external messages") == 2
+    assert rendered.count("Standard agents · no external messages") == 3
     assert "github.com/marker2601/humanwire" in rendered
     assert "Recorded Caspian run" not in rendered
 
@@ -153,11 +159,37 @@ def test_local_cards_rasterize_once_then_loop_the_exact_png(
     )
     rendered = "\n".join(" ".join(command) for command in commands)
 
-    assert len(commands) == 6
-    assert rendered.count("-frames:v 1") == 3
+    assert len(commands) == 7
+    assert rendered.count("-frames:v 1") == 4
     assert rendered.count("-loop 1") == 3
     assert rendered.count("-framerate 30") == 3
+    assert rendered.count("-g 1") == 3
     assert rendered.count(".png") >= 6
+
+
+def test_public_product_truth_label_is_rasterized_once_beside_product(
+    tmp_path: Path,
+) -> None:
+    from scripts.caspian_video.media import build_local_card_commands
+
+    manifest = truth_safe_manifest()
+    create_minimal_fixture_assets(manifest, tmp_path)
+    cards = build_local_card_commands(
+        manifest, tmp_path, "https://github.com/marker2601/humanwire"
+    )
+    public_commands = build_compose_commands(
+        manifest, tmp_path, tmp_path / "final.mp4"
+    )[4:6]
+
+    assert "public-product-left-panel.png" in " ".join(cards[-1])
+    assert "color=c=0x020d1c:s=680x1080" in " ".join(cards[-1])
+    assert "black@0.0" not in " ".join(cards[-1])
+    for command in public_commands:
+        rendered = " ".join(command)
+        assert "public-product-left-panel.png" in rendered
+        assert "hstack=inputs=2" in rendered
+        assert "overlay=" not in rendered
+        assert "drawtext=" not in rendered
 
 
 def test_public_product_segments_use_readable_chronological_zoom_cutins(
@@ -171,10 +203,19 @@ def test_public_product_segments_use_readable_chronological_zoom_cutins(
         for command in build_compose_commands(manifest, tmp_path, tmp_path / "final.mp4")
     )
 
-    assert "crop=960:810:1600:" in rendered
+    assert "trim=start=0:end=8,setpts=PTS-STARTPTS,crop=960:810:1600:0" in rendered
+    assert "trim=start=8:end=16,setpts=PTS-STARTPTS,crop=960:810:1600:210" in rendered
+    assert "trim=start=16:end=24,setpts=PTS-STARTPTS,crop=960:810:1600:420" in rendered
+    assert "trim=start=24:end=32,setpts=PTS-STARTPTS,crop=960:810:1600:630" in rendered
+    assert "trim=start=0:end=10,setpts=PTS-STARTPTS,crop=960:810:1600:630" in rendered
+    assert "trim=start=10:end=20,setpts=PTS-STARTPTS,crop=960:810:1600:420" in rendered
     assert "scale=1240:930" in rendered
-    assert "pad=1920:1080:680:150" in rendered
-    assert "if(lt(t,8)" in rendered
+    assert "pad=1240:1080:0:150" in rendered
+    assert "concat=n=4:v=1:a=0" in rendered
+    assert "concat=n=2:v=1:a=0" in rendered
+    assert r"select='not(eq(n\,431))'" in rendered
+    assert "hstack=inputs=2" in rendered
+    assert "if(lt(t," not in rendered
 
 
 def test_ass_captions_use_explicit_canvas_and_only_authored_line_breaks(
@@ -184,7 +225,7 @@ def test_ass_captions_use_explicit_canvas_and_only_authored_line_breaks(
 
     srt = tmp_path / "captions.srt"
     srt.write_text(
-        "1\n00:00:00,100 --> 00:00:01,000\nLine one\nLine two\n",
+        "1\n00:00:00,100 --> 00:00:01,000\nLine one, clean\nLine two\n",
         encoding="utf-8",
     )
     output = tmp_path / "captions.ass"
@@ -197,7 +238,34 @@ def test_ass_captions_use_explicit_canvas_and_only_authored_line_breaks(
     assert "WrapStyle: 2" in rendered
     assert "Segoe UI,32" in rendered
     assert "Dialogue: 0,0:00:00.10,0:00:01.00" in rendered
-    assert "Line one\\NLine two" in rendered
+    assert "Line one, clean\\NLine two" in rendered
+    assert r"\," not in rendered
+
+
+def test_segment_concat_resets_timestamps_and_reencodes_video(
+    tmp_path: Path,
+) -> None:
+    manifest = truth_safe_manifest()
+    create_minimal_fixture_assets(manifest, tmp_path)
+
+    concat = build_compose_commands(manifest, tmp_path, tmp_path / "final.mp4")[-1]
+    rendered = " ".join(concat)
+
+    assert "setpts=PTS-STARTPTS" in rendered
+    assert "-c:v libx264" in rendered
+    assert "-c:v copy" not in rendered
+
+
+def test_normalized_segments_use_independent_frames_before_concat(
+    tmp_path: Path,
+) -> None:
+    manifest = truth_safe_manifest()
+    create_minimal_fixture_assets(manifest, tmp_path)
+
+    normalized = build_compose_commands(manifest, tmp_path, tmp_path / "final.mp4")[:-1]
+
+    assert normalized
+    assert all("-g" in command and command[command.index("-g") + 1] == "1" for command in normalized)
 
 
 def test_drawtext_uses_an_explicit_windows_font_without_fontconfig(
@@ -244,6 +312,7 @@ def test_final_command_mixes_seven_timed_narrations_and_burns_captions(
     assert "amix=inputs=8:duration=longest:normalize=0" in rendered
     assert "subtitles=" in rendered
     assert "-c:v libx264" in rendered
+    assert command[command.index("-g") + 1] == "1"
     assert "-c:a aac" in rendered
     assert "-movflags +faststart" in rendered
     assert "-t 105" in rendered

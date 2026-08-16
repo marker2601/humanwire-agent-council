@@ -76,25 +76,37 @@ def _composition_labels(segment: VideoSegment) -> tuple[str, ...]:
 
 def _segment_filter(segment: VideoSegment, labels: tuple[str, ...]) -> str:
     if segment.proof_class is ProofClass.PUBLIC_PRODUCT:
-        if segment.id == "decision_room":
-            y = "'if(lt(t,8),0,if(lt(t,16),210,if(lt(t,24),420,630)))'"
-        else:
-            y = "'if(lt(t,10),630,420)'"
-        filters = [
-            f"crop=960:810:1600:{y}",
-            "scale=1240:930",
-            "pad=1920:1080:680:150:color=0x020d1c",
-            "fps=30",
-            "format=yuv420p",
-        ]
-        filters.extend(_drawtext(label, 982, x="80", size=26) for label in labels)
-        return ",".join(filters)
+        raise MediaPathError("public product requires sliced composition")
     filters = [_NORMALIZE_FILTER]
     filters.extend(
         _drawtext(label, 982 - label_index * 72)
         for label_index, label in enumerate(labels)
     )
     return ",".join(filters)
+
+
+def _public_product_filter(segment: VideoSegment) -> str:
+    """Build fixed crop slices and repair one known corrupt approved-source frame."""
+    if segment.id == "decision_room":
+        slices = ((0, 8, 0), (8, 16, 210), (16, 24, 420), (24, 32, 630))
+        source = "[0:v]select='not(eq(n\\,431))',setpts=PTS-STARTPTS[clean];[clean]"
+    else:
+        slices = ((0, 10, 630), (10, 20, 420))
+        source = "[0:v]setpts=PTS-STARTPTS[clean];[clean]"
+    split_outputs = "".join(f"[p{index}]" for index in range(len(slices)))
+    filters = [f"{source}split={len(slices)}{split_outputs}"]
+    for index, (start, end, y) in enumerate(slices):
+        filters.append(
+            f"[p{index}]trim=start={start}:end={end},setpts=PTS-STARTPTS,"
+            f"crop=960:810:1600:{y},scale=1240:930,"
+            "pad=1240:1080:0:150:color=0x020d1c,"
+            f"fps=30,format=yuv420p[s{index}]"
+        )
+    inputs = "".join(f"[s{index}]" for index in range(len(slices)))
+    filters.append(f"{inputs}concat=n={len(slices)}:v=1:a=0[product]")
+    filters.append("[1:v]fps=30,format=yuv420p[left]")
+    filters.append("[left][product]hstack=inputs=2:shortest=1,format=yuv420p[outv]")
+    return ";".join(filters)
 
 
 def build_compose_commands(
@@ -111,8 +123,7 @@ def build_compose_commands(
         if not _is_file(source):
             raise MediaPathError("missing approved asset")
         normalized = compose_root / f"{index:02d}-{segment.id}.mp4"
-        commands.append(
-            [
+        command = [
                 "ffmpeg",
                 "-hide_banner",
                 "-loglevel",
@@ -120,10 +131,35 @@ def build_compose_commands(
                 "-y",
                 "-i",
                 str(source.resolve()),
+        ]
+        if segment.proof_class is ProofClass.PUBLIC_PRODUCT:
+            label = compose_root / "cards" / "public-product-left-panel.png"
+            command.extend(
+                [
+                    "-loop",
+                    "1",
+                    "-framerate",
+                    "30",
+                    "-i",
+                    str(label.resolve()),
+                ]
+            )
+        command.extend(
+            [
                 "-t",
                 str(segment.duration_seconds),
-                "-vf",
-                _segment_filter(segment, labels),
+                "-filter_complex" if segment.proof_class is ProofClass.PUBLIC_PRODUCT else "-vf",
+                (
+                    _public_product_filter(segment)
+                    if segment.proof_class is ProofClass.PUBLIC_PRODUCT
+                    else _segment_filter(segment, labels)
+                ),
+            ]
+        )
+        if segment.proof_class is ProofClass.PUBLIC_PRODUCT:
+            command.extend(("-map", "[outv]"))
+        command.extend(
+            [
                 "-an",
                 "-c:v",
                 "libx264",
@@ -131,11 +167,14 @@ def build_compose_commands(
                 "18",
                 "-preset",
                 "slow",
+                "-g",
+                "1",
                 "-pix_fmt",
                 "yuv420p",
                 str(normalized.resolve()),
             ]
         )
+        commands.append(command)
     commands.append(
         [
             "ffmpeg",
@@ -161,8 +200,18 @@ def build_compose_commands(
             "1:a:0",
             "-t",
             str(manifest.total_duration_seconds),
+            "-vf",
+            "setpts=PTS-STARTPTS,fps=30,format=yuv420p",
             "-c:v",
-            "copy",
+            "libx264",
+            "-crf",
+            "18",
+            "-preset",
+            "slow",
+            "-g",
+            "1",
+            "-pix_fmt",
+            "yuv420p",
             "-c:a",
             "aac",
             "-b:a",
@@ -226,6 +275,8 @@ def _color_card_commands(
         "18",
         "-preset",
         "slow",
+        "-g",
+        "1",
         "-pix_fmt",
         "yuv420p",
         str(output.resolve()),
@@ -279,6 +330,27 @@ def build_local_card_commands(
             ),
         )
     )
+    public_label = card_root / "public-product-left-panel.png"
+    commands.append(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=0x020d1c:s=680x1080:r=1:d=1",
+            "-vf",
+            _drawtext(_PUBLIC_PRODUCT_DISCLOSURE, 982, x="80", size=26),
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+            str(public_label.resolve()),
+        ]
+    )
     return commands
 
 
@@ -305,7 +377,7 @@ def build_ass_captions(
             raise MediaPathError("captions invalid")
         start = _ass_time(match.groups()[:4])
         end = _ass_time(match.groups()[4:])
-        text = r"\N".join(lines[2:]).replace(",", r"\,")
+        text = r"\N".join(lines[2:])
         dialogues.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}")
     header = """[Script Info]
 ScriptType: v4.00+
@@ -441,6 +513,8 @@ def build_final_command(
             "18",
             "-preset",
             "slow",
+            "-g",
+            "1",
             "-pix_fmt",
             "yuv420p",
             "-c:a",
