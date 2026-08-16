@@ -135,3 +135,73 @@ All seven files decode successfully as MP3, mono, 44.1 kHz audio and fit within 
 - Paid ledger: unchanged, with the original presenter reservation and no stakeholder entry.
 - Git-tracked binary media: none; all seven MP3s, two stills, two generated clips, two approved clips, review frames, and the ledger remain ignored/local-only.
 - `.superpowers/brainstorm/`: preserved unchanged and untracked.
+
+## Fix round 1/5 — authorization and independent narration-quality gate
+
+### User resolution and contract amendment
+
+The user explicitly ruled that whatever is needed to complete and submit the project is authorized without further approval prompts. This resolves the earlier concern about whether the local Microsoft Zira/SAPI fallback satisfied the brief's “locally recorded” wording. The tracked production plan now states the narrow rule: after the free provider path fails and the user authorizes the fallback, narration may be human-recorded or synthesized entirely offline; no paid voice request or additional provider call is allowed.
+
+The user subsequently established a standing **USD $10.00 total production/submission cap** without another approval request. The plan records that superseding authorization while retaining the already-completed Task 3 client's narrower historical USD $3.00 video-job fence, immutable reservation ledger, and no-retry rule. This fix made zero provider/API calls and cost USD $0.00.
+
+### Professional pacing contract
+
+Objective review showed that forcing 22 opening words into 5.468 seconds was approximately 241 spoken words per minute and too aggressive for a professional gate. The timeline was rebalanced without changing a spoken word or the 105-second final duration:
+
+- presenter hook: 0–8 seconds (was 0–6);
+- Telegram authorization: 8–22 seconds / 14 seconds (was 6–22 / 16 seconds);
+- stakeholder roles: 38–46 seconds / 8 seconds (was 38–44 / 6 seconds);
+- Decision Room: 46–78 seconds / 32 seconds (was 44–78 / 34 seconds).
+
+All later boundaries remain unchanged. The opening and stakeholder narration were rerendered with the same offline Microsoft Zira Desktop voice at SAPI rate `+2`, replacing their prior rate `+5` versions. Their final durations are 7.772653 seconds and 7.653424 seconds, both inside their eight-second slots and approximately 170 and 118 spoken words per minute respectively. No time-stretch or script edit was used.
+
+Updated asset hashes:
+
+| Asset | Duration / slot | Mean / peak | SHA-256 |
+|---|---:|---:|---|
+| `00-presenter_hook.mp3` | 7.772653s / 8s | -16.5 / -1.9 dB | `5c5eac1a019503ab45fd7b8568412bffa760fd3cbb46c8a868023483c524bbab` |
+| `03-stakeholder_roles.mp3` | 7.653424s / 8s | -17.2 / -1.8 dB | `7e99abfd7ea837afa41cb0aee5b5ccb7375652ddde0446f6f75213f210d5033d` |
+
+The other five narration hashes and durations are unchanged; their new slot limits are 14, 16, 32, 20, and 7 seconds and all continue to fit.
+
+### Independent offline recognition and acoustic evidence
+
+Windows exposes `Microsoft Speech Recognizer 8.0 for Windows (English - US)`. A separate offline `System.Speech.Recognition` dictation pass consumed 16 kHz PCM copies of all seven MP3s. It recognized the complete phrase structure, but confidence was only 0.08–0.52 and it systematically mangled proper/product names (`HumanWire`, `Anika`, JSON/CSV), so it is advisory rather than a reliable acceptance oracle. The initially fast stakeholder clip scored 0.080 confidence. After the natural-rate rerender it scored 0.456 and produced:
+
+```text
+Each stakeholder agent has a specific role in form of knowledge answer should approve or provide availability
+```
+
+That is 5 edit operations across 15 expected normalized words (33.3% WER), with the errors concentrated in the enumerated role words. The opening's natural-rate transcript retained both sentences and all key concepts but still had proper/function-word substitutions. This confirms that Windows' legacy recognizer is useful for comparative pacing but not sufficiently accurate for semantic certification.
+
+The objective gate therefore also verified every clip independently:
+
+- exact prose source: repository `_script_sections()` parser, with per-section SHA-256 provenance retained in the local audit;
+- successful full decode as mono 44.1 kHz MP3;
+- duration below the manifest slot;
+- normalized mean level from -17.2 to -16.1 dB and peak from -1.9 to -1.8 dB;
+- zero clipped samples in every decoded clip;
+- leading silence 0.0751–0.0853 seconds and trailing silence 0.5791–0.5910 seconds, proving neither edge is truncated;
+- exactly seven narration MP3s and zero WAV intermediates in the narration directory.
+
+A locally playable concatenated review file was created at `work/caspian-video/review/narration-review.mp3`: MP3, mono 44.1 kHz, 69.998186 seconds, 1,121,009 bytes, with a half-second pad between clips. Media remains ignored and untracked. Human listening is deferred to the required final full-video review; unreliable offline ASR does not block composition.
+
+### TDD and commands
+
+RED first proved both missing timing allocations and the missing authorization language:
+
+```text
+2 failed, 17 passed
+```
+
+The later stakeholder timing test also failed against the old 6/34-second allocation before the 8/32-second correction. Commands used for the final gate:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\humanwire\test_caspian_video_models.py tests\humanwire\test_caspian_video_openrouter.py -q
+.\.venv\Scripts\ruff.exe check scripts\caspian_video tests\humanwire\test_caspian_video_models.py tests\humanwire\test_caspian_video_openrouter.py
+git diff --check
+```
+
+Final result: `42 passed`; Ruff reported `All checks passed!`; `git diff --check`, the seven-file manifest-duration gate, and the zero-tracked-media check all passed. No binary media, secret, provider response, or ledger was staged.
+
+Fix round 1 contract/test commit: `dca7d81ba1f06503dceeb8f2514101be7cc60204`.
