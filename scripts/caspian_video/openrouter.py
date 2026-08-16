@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import os
 import re
 import subprocess
 import time
@@ -32,6 +33,7 @@ CREDITS_PATH = "/api/v1/credits"
 POLL_INTERVAL_SECONDS = 30
 MAX_POLLS = 40
 MAX_VIDEO_BYTES = 200 * 1024 * 1024
+FFPROBE_TIMEOUT_SECONDS = 10
 _JOB_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _SECTION_HEADING = re.compile(r"^## (\d+)–(\d+) seconds$")
 _SETTINGS_KEYS = frozenset(
@@ -50,6 +52,13 @@ class VideoGenerationError(RuntimeError):
 def _error(message: str) -> VideoGenerationError:
     """Create a public error without carrying a provider response or secret."""
     return VideoGenerationError(message)
+
+
+def _remove_file(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _as_mapping(value: object) -> Mapping[str, object] | None:
@@ -123,6 +132,8 @@ class OpenRouterMediaClient:
         return self._last_job_id
 
     def _request(self, method: str, path: str, *, json_body: object | None = None) -> httpx.Response:
+        failed = False
+        response: httpx.Response | None = None
         try:
             response = self._client.request(
                 method,
@@ -130,9 +141,9 @@ class OpenRouterMediaClient:
                 headers={"Authorization": f"Bearer {self._api_key.get_secret_value()}"},
                 json=json_body,
             )
-        except httpx.HTTPError as exc:
-            raise _error("OpenRouter request failed") from exc
-        if not 200 <= response.status_code < 300:
+        except httpx.HTTPError:
+            failed = True
+        if failed or response is None or not 200 <= response.status_code < 300:
             raise _error("OpenRouter request failed")
         return response
 
@@ -200,8 +211,47 @@ class OpenRouterMediaClient:
             return output_path
         return expected
 
+    def _download_video(self, job_id: str, output_path: Path) -> None:
+        error_message: str | None = None
+        try:
+            with self._client.stream(
+                "GET",
+                f"{BASE_URL}{VIDEO_PATH}/{job_id}/content?index=0",
+                headers={"Authorization": f"Bearer {self._api_key.get_secret_value()}"},
+            ) as response:
+                if not 200 <= response.status_code < 300:
+                    error_message = "OpenRouter request failed"
+                else:
+                    content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+                    content_length = _decimal(response.headers.get("content-length"))
+                    if (
+                        content_type != "video/mp4"
+                        or content_length is None and "content-length" in response.headers
+                        or content_length is not None and content_length > MAX_VIDEO_BYTES
+                    ):
+                        error_message = "OpenRouter video content invalid"
+                    else:
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        total = 0
+                        with output_path.open("wb") as output:
+                            for chunk in response.iter_bytes():
+                                total += len(chunk)
+                                if total > MAX_VIDEO_BYTES:
+                                    error_message = "OpenRouter video content invalid"
+                                    break
+                                output.write(chunk)
+                        if total == 0 and error_message is None:
+                            error_message = "OpenRouter video content invalid"
+        except httpx.HTTPError:
+            error_message = "OpenRouter request failed"
+        except OSError:
+            error_message = "OpenRouter video output failed"
+        if error_message is not None:
+            _remove_file(output_path)
+            raise _error(error_message)
+
     def generate_video(
-        self, spec: GenerationSpec, approval: SpendApproval, output_path: Path
+        self, spec: GenerationSpec, approval: SpendApproval, output_path: Path, *, budget_usd: Decimal | None = None
     ) -> GenerationReceipt:
         """Submit exactly one approved video, then poll and download its first asset."""
         if approval.approved is not True:
@@ -228,24 +278,9 @@ class OpenRouterMediaClient:
             raise _error("OpenRouter video generation timed out")
 
         cost = self._cost(completed)
-        if cost > approval.ceiling_usd:
+        if cost > (budget_usd if budget_usd is not None else approval.ceiling_usd):
             raise _error("OpenRouter video cost exceeds approval")
-        content = self._request("GET", f"{VIDEO_PATH}/{job_id}/content?index=0")
-        content_type = content.headers.get("content-type", "").split(";", 1)[0].lower()
-        content_length = _decimal(content.headers.get("content-length"))
-        if content_type != "video/mp4" or (content_length is not None and content_length > MAX_VIDEO_BYTES):
-            raise _error("OpenRouter video content invalid")
-        try:
-            body = content.content
-        except httpx.HTTPError as exc:
-            raise _error("OpenRouter video content invalid") from exc
-        if not body or len(body) > MAX_VIDEO_BYTES:
-            raise _error("OpenRouter video content invalid")
-        try:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_bytes(body)
-        except OSError as exc:
-            raise _error("OpenRouter video output failed") from exc
+        self._download_video(job_id, output_path)
         self._last_job_id = job_id
         return GenerationReceipt(
             name=spec.name,
@@ -267,32 +302,6 @@ class OpenRouterMediaClient:
                 models.append(model)
         return models
 
-    @staticmethod
-    def _capability_values(model: Mapping[str, object], field: str) -> set[str]:
-        aliases = {
-            "duration": {"duration", "durations", "supported_durations"},
-            "resolution": {"resolution", "resolutions", "supported_resolutions"},
-            "aspect_ratio": {"aspect_ratio", "aspect_ratios", "supported_aspect_ratios"},
-        }[field]
-        values: set[str] = set()
-
-        def visit(value: object) -> None:
-            mapping = _as_mapping(value)
-            if mapping is not None:
-                for key, nested in mapping.items():
-                    if key in aliases:
-                        if isinstance(nested, list):
-                            values.update(str(item) for item in nested)
-                        else:
-                            values.add(str(nested))
-                    visit(nested)
-            elif isinstance(value, list):
-                for nested in value:
-                    visit(nested)
-
-        visit(model)
-        return values
-
     def model_supports(
         self, spec: GenerationSpec, catalog: Sequence[Mapping[str, object]] | None = None
     ) -> bool:
@@ -300,10 +309,25 @@ class OpenRouterMediaClient:
         for model in catalog if catalog is not None else self.video_models():
             if model.get("id", model.get("model")) != spec.model:
                 continue
+            durations = model.get("supported_durations")
+            resolutions = model.get("supported_resolutions")
+            aspect_ratios = model.get("supported_aspect_ratios")
+            if (
+                not isinstance(durations, list)
+                or not durations
+                or not all(type(value) is int for value in durations)
+                or not isinstance(resolutions, list)
+                or not resolutions
+                or not all(isinstance(value, str) and value for value in resolutions)
+                or not isinstance(aspect_ratios, list)
+                or not aspect_ratios
+                or not all(isinstance(value, str) and value for value in aspect_ratios)
+            ):
+                return False
             return (
-                str(spec.duration) in self._capability_values(model, "duration")
-                and spec.resolution in self._capability_values(model, "resolution")
-                and spec.aspect_ratio in self._capability_values(model, "aspect_ratio")
+                spec.duration in durations
+                and spec.resolution in resolutions
+                and spec.aspect_ratio in aspect_ratios
             )
         return False
 
@@ -316,38 +340,75 @@ class OpenRouterMediaClient:
         return total is not None and used is not None and total - used > 0
 
     @staticmethod
-    def guard_single_job(ledger: Path, name: str) -> None:
-        """Fail closed when a named job was previously recorded in the local ledger."""
+    def _ledger_data(ledger: Path) -> dict[str, object]:
         if not ledger.exists():
-            return
+            return {}
         try:
-            parsed = _as_mapping(json.loads(ledger.read_text(encoding="utf-8")))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise _error("OpenRouter job ledger invalid") from exc
-        if parsed is None:
+            data = _as_mapping(json.loads(ledger.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            data = None
+        if data is None:
             raise _error("OpenRouter job ledger invalid")
-        if name in parsed:
-            raise _error("OpenRouter job already recorded")
+        return dict(data)
 
     @staticmethod
-    def record_job(
-        ledger: Path, *, name: str, job_id: str, model: str, status: str, cost_usd: Decimal
-    ) -> None:
-        """Persist only the minimum local paid-job audit record."""
-        OpenRouterMediaClient.guard_single_job(ledger, name)
-        record = {"job_id": job_id, "model": model, "status": status, "cost_usd": str(cost_usd)}
+    def _lock_ledger(ledger: Path) -> Path:
+        lock = ledger.with_suffix(f"{ledger.suffix}.lock")
         try:
-            existing = (
-                _as_mapping(json.loads(ledger.read_text(encoding="utf-8"))) if ledger.exists() else {}
-            )
-            if existing is None:
-                raise _error("OpenRouter job ledger invalid")
             ledger.parent.mkdir(parents=True, exist_ok=True)
-            ledger.write_text(
-                json.dumps({**existing, name: record}, sort_keys=True) + "\n", encoding="utf-8"
-            )
-        except (OSError, json.JSONDecodeError) as exc:
-            raise _error("OpenRouter job ledger invalid") from exc
+            descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(descriptor)
+        except OSError:
+            raise _error("OpenRouter job ledger locked")
+        return lock
+
+    @classmethod
+    def _update_ledger(cls, ledger: Path, update: Callable[[dict[str, object]], None]) -> None:
+        lock = cls._lock_ledger(ledger)
+        temporary = ledger.with_suffix(f"{ledger.suffix}.tmp")
+        try:
+            data = cls._ledger_data(ledger)
+            update(data)
+            temporary.write_text(json.dumps(data, sort_keys=True) + "\n", encoding="utf-8")
+            os.replace(temporary, ledger)
+        except OSError:
+            raise _error("OpenRouter job ledger invalid")
+        finally:
+            _remove_file(temporary)
+            _remove_file(lock)
+
+    @classmethod
+    def guard_single_job(cls, ledger: Path, name: str) -> None:
+        """Fail closed when a named job was previously reserved or recorded."""
+        if name in cls._ledger_data(ledger):
+            raise _error("OpenRouter job already recorded")
+
+    @classmethod
+    def reserve_job(cls, ledger: Path, *, name: str, model: str, reserved_usd: Decimal) -> None:
+        """Atomically fence a named paid job before the first provider POST."""
+        def reserve(data: dict[str, object]) -> None:
+            if name in data:
+                raise _error("OpenRouter job already recorded")
+            data[name] = {
+                "model": model,
+                "status": "reserved",
+                "cost_usd": "0",
+                "reserved_usd": str(reserved_usd),
+            }
+
+        cls._update_ledger(ledger, reserve)
+
+    @classmethod
+    def record_job(
+        cls, ledger: Path, *, name: str, job_id: str, model: str, status: str, cost_usd: Decimal
+    ) -> None:
+        """Convert a prior reservation into the completed job's minimum audit record."""
+        def record(data: dict[str, object]) -> None:
+            if name not in data:
+                raise _error("OpenRouter job ledger invalid")
+            data[name] = {"job_id": job_id, "model": model, "status": status, "cost_usd": str(cost_usd)}
+
+        cls._update_ledger(ledger, record)
 
     def synthesize_speech(self, narration: str, output_path: Path) -> None:
         """Generate one free TTS section, without a paid fallback path."""
@@ -401,19 +462,39 @@ def generate_approved_assets(
     settings: VideoSettings, approval: SpendApproval, work_root: Path
 ) -> tuple[GenerationReceipt, GenerationReceipt]:
     """Perform the two explicit, catalog-checked generation jobs after spend approval."""
+    canonical_root = Path.cwd().resolve()
+    if work_root.resolve() != canonical_root:
+        raise _error("OpenRouter work root invalid")
     client = OpenRouterMediaClient(api_key=settings.api_key)
     specs = _approved_specs(settings)
     catalog = client.video_models()
     if not all(client.model_supports(spec, catalog) for spec in specs):
         raise _error("OpenRouter model capability unavailable")
-    ledger = work_root / "work/caspian-video/openrouter/jobs.json"
+    ledger = canonical_root / "work/caspian-video/openrouter/jobs.json"
     receipts: list[GenerationReceipt] = []
     for spec in specs:
-        OpenRouterMediaClient.guard_single_job(ledger, spec.name)
+        ledger_data = OpenRouterMediaClient._ledger_data(ledger)
+        committed = Decimal(0)
+        for record in ledger_data.values():
+            mapped = _as_mapping(record)
+            if mapped is None:
+                raise _error("OpenRouter job ledger invalid")
+            amount = _decimal(mapped.get("cost_usd", mapped.get("reserved_usd")))
+            if amount is None or amount < 0:
+                raise _error("OpenRouter job ledger invalid")
+            committed += amount
+        remaining = approval.ceiling_usd - committed
+        if remaining <= 0:
+            raise _error("OpenRouter video cost exceeds approval")
+        OpenRouterMediaClient.reserve_job(
+            ledger, name=spec.name, model=spec.model, reserved_usd=remaining
+        )
         if not client.credit_available():
             raise _error("OpenRouter credits unavailable")
-        output = work_root / "work/caspian-video/generated" / f"{spec.name}.mp4"
-        receipt = client.generate_video(spec, approval, output)
+        output = canonical_root / "work/caspian-video/generated" / f"{spec.name}.mp4"
+        receipt = client.generate_video(spec, approval, output, budget_usd=remaining)
+        if receipt.cost_usd > remaining:
+            raise _error("OpenRouter video cost exceeds approval")
         if client.last_job_id is None:
             raise _error("OpenRouter video response invalid")
         OpenRouterMediaClient.record_job(
@@ -442,6 +523,8 @@ def _script_sections(script: Path, manifest: VideoManifest) -> tuple[str, ...]:
         if heading is not None:
             sections.append((int(heading.group(1)), int(heading.group(2)), []))
             current = sections[-1][2]
+        elif line.startswith("#"):
+            current = None
         elif current is not None and line.strip():
             current.append(line.strip())
     expected = [(segment.start_seconds, segment.start_seconds + segment.duration_seconds) for segment in manifest.segments]
@@ -453,19 +536,31 @@ def _script_sections(script: Path, manifest: VideoManifest) -> tuple[str, ...]:
 
 
 def _probe_mp3_duration(path: Path) -> float:
+    failed = False
+    duration: float | None = None
     try:
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nk=1:nw=1", str(path)],
             check=True,
             capture_output=True,
             text=True,
+            timeout=FFPROBE_TIMEOUT_SECONDS,
         )
         duration = float(probe.stdout.strip())
-    except (OSError, subprocess.SubprocessError, ValueError) as exc:
-        raise _error("Narration audio invalid") from exc
-    if not math.isfinite(duration) or duration <= 0:
+    except (OSError, subprocess.SubprocessError, ValueError):
+        failed = True
+    if failed or duration is None or not math.isfinite(duration) or duration <= 0:
         raise _error("Narration audio invalid")
     return duration
+
+
+def _validate_mp3_duration(path: Path, maximum_seconds: int) -> None:
+    try:
+        if _probe_mp3_duration(path) > maximum_seconds:
+            raise _error("Narration audio invalid")
+    except VideoGenerationError:
+        _remove_file(path)
+        raise
 
 
 def synthesize_narration_sections(
@@ -483,11 +578,6 @@ def synthesize_narration_sections(
     for index, (narration, segment) in enumerate(zip(narrations, manifest.segments, strict=True), start=1):
         output = output_dir / f"{index:02d}-{segment.id}.mp3"
         client.synthesize_speech(narration, output)
-        if _probe_mp3_duration(output) > segment.duration_seconds:
-            try:
-                output.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise _error("Narration audio invalid")
+        _validate_mp3_duration(output, segment.duration_seconds)
         outputs.append(output)
     return tuple(outputs)

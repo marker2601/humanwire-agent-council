@@ -16,6 +16,8 @@ from scripts.caspian_video.openrouter import (
     synthesize_narration_sections,
 )
 
+_NARRATION_OUTPUT = Path("work/caspian-video/generated/narration")
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m scripts.caspian_video")
@@ -26,11 +28,10 @@ def _parser() -> argparse.ArgumentParser:
     generate = subcommands.choices["generate"]
     generate.add_argument("--confirm-paid-generation", action="store_true")
     generate.add_argument("--approve-spend-usd")
-    generate.add_argument("--work-root", type=Path, default=Path("."))
     tts = subcommands.choices["tts"]
     tts.add_argument("--script", type=Path, default=Path("submission/caspian-video-script.md"))
     tts.add_argument("--manifest", type=Path, default=Path("submission/caspian-video-manifest.json"))
-    tts.add_argument("--output-dir", type=Path, default=Path("work/caspian-video/narration"))
+    tts.add_argument("--output-dir", type=Path, default=_NARRATION_OUTPUT)
     return parser
 
 
@@ -48,11 +49,18 @@ def _approval(parser: argparse.ArgumentParser, args: argparse.Namespace) -> Spen
     raise AssertionError("argparse.error exits")
 
 
+def _narration_output(parser: argparse.ArgumentParser, output_dir: Path) -> Path:
+    if output_dir.is_absolute() or ".." in output_dir.parts or output_dir != _NARRATION_OUTPUT:
+        parser.error("--output-dir must equal work/caspian-video/generated/narration")
+    return output_dir
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
         approval = _approval(parser, args) if args.command == "generate" else None
+        narration_output = _narration_output(parser, args.output_dir) if args.command == "tts" else None
         settings = load_video_settings(args.env_file)
         if args.command == "preflight":
             client = OpenRouterMediaClient(api_key=settings.api_key)
@@ -66,13 +74,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "generate":
             if approval is None:
                 raise AssertionError("generate approval is required")
-            receipts = generate_approved_assets(settings, approval, args.work_root)
+            receipts = generate_approved_assets(settings, approval, Path("."))
             for receipt in receipts:
                 print(f"{receipt.name}_cost_usd={receipt.cost_usd}")
             return 0
         manifest = VideoManifest.load(args.manifest)
         client = OpenRouterMediaClient(api_key=settings.api_key)
-        synthesize_narration_sections(args.script, manifest, args.output_dir, client=client)
+        if narration_output is None:
+            raise AssertionError("narration output is required")
+        synthesize_narration_sections(args.script, manifest, narration_output, client=client)
         return 0
     except (ValueError, VideoGenerationError) as exc:
         print(str(exc))

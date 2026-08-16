@@ -1,4 +1,5 @@
 import json
+import subprocess
 from decimal import Decimal
 from pathlib import Path
 
@@ -185,7 +186,7 @@ def test_empty_tts_response_is_rejected_without_writing_an_audio_file(tmp_path: 
     assert not output.exists()
 
 
-def test_generate_approved_assets_writes_only_under_its_supplied_work_root(
+def test_generate_approved_assets_writes_only_under_its_canonical_work_root(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Break caught: a gated generation writes into the process directory, not its work root."""
@@ -195,6 +196,8 @@ def test_generate_approved_assets_writes_only_under_its_supplied_work_root(
         last_job_id = "job-safe"
         guard_single_job = staticmethod(real_client.guard_single_job)
         record_job = staticmethod(real_client.record_job)
+        reserve_job = staticmethod(real_client.reserve_job)
+        _ledger_data = staticmethod(real_client._ledger_data)
 
         def __init__(self, *, api_key: SecretStr) -> None:
             del api_key
@@ -210,9 +213,9 @@ def test_generate_approved_assets_writes_only_under_its_supplied_work_root(
             return True
 
         def generate_video(
-            self, spec: GenerationSpec, approval: SpendApproval, output: Path
+            self, spec: GenerationSpec, approval: SpendApproval, output: Path, *, budget_usd: Decimal
         ) -> GenerationReceipt:
-            del approval
+            del approval, budget_usd
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_bytes(b"safe-mp4")
             return GenerationReceipt(
@@ -224,6 +227,7 @@ def test_generate_approved_assets_writes_only_under_its_supplied_work_root(
             )
 
     monkeypatch.setattr(openrouter, "OpenRouterMediaClient", FakeClient)
+    monkeypatch.setattr(openrouter.Path, "cwd", lambda: tmp_path)
     settings = VideoSettings(
         api_key=SecretStr("PRIVATE-OPENROUTER-SENTINEL"),
         presenter_model="google/veo-3.1-fast",
@@ -261,6 +265,8 @@ def test_completed_job_is_ledgered_before_the_post_job_credit_check_fails(
         last_job_id = "job-safe"
         guard_single_job = staticmethod(real_client.guard_single_job)
         record_job = staticmethod(real_client.record_job)
+        reserve_job = staticmethod(real_client.reserve_job)
+        _ledger_data = staticmethod(real_client._ledger_data)
 
         def __init__(self, *, api_key: SecretStr) -> None:
             del api_key
@@ -278,9 +284,9 @@ def test_completed_job_is_ledgered_before_the_post_job_credit_check_fails(
             return self.credit_checks == 1
 
         def generate_video(
-            self, spec: GenerationSpec, approval: SpendApproval, output: Path
+            self, spec: GenerationSpec, approval: SpendApproval, output: Path, *, budget_usd: Decimal
         ) -> GenerationReceipt:
-            del approval
+            del approval, budget_usd
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_bytes(b"safe-mp4")
             return GenerationReceipt(
@@ -292,6 +298,7 @@ def test_completed_job_is_ledgered_before_the_post_job_credit_check_fails(
             )
 
     monkeypatch.setattr(openrouter, "OpenRouterMediaClient", FakeClient)
+    monkeypatch.setattr(openrouter.Path, "cwd", lambda: tmp_path)
     settings = VideoSettings(
         api_key=SecretStr("PRIVATE-OPENROUTER-SENTINEL"),
         presenter_model="google/veo-3.1-fast",
@@ -309,3 +316,265 @@ def test_completed_job_is_ledgered_before_the_post_job_credit_check_fails(
             "status": "completed",
         }
     }
+
+
+def test_transport_failure_has_no_recursive_authenticated_exception_graph() -> None:
+    """Break caught: an httpx cause retains the Authorization-bearing request graph."""
+    sentinel = "PRIVATE-OPENROUTER-SENTINEL"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("offline", request=request)
+
+    client = OpenRouterMediaClient(
+        api_key=SecretStr(sentinel), client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    with pytest.raises(VideoGenerationError) as raised:
+        client.generate_video(presenter(), approved(), Path("unused.mp4"))
+
+    seen: set[int] = set()
+
+    def contains_secret(value: object) -> bool:
+        if id(value) in seen:
+            return False
+        seen.add(id(value))
+        if isinstance(value, str):
+            return sentinel in value
+        if isinstance(value, BaseException):
+            return any(
+                contains_secret(item)
+                for item in (*value.args, value.__cause__, value.__context__, value.__traceback__)
+                if item is not None
+            )
+        if isinstance(value, httpx.Request):
+            return any(contains_secret(item) for item in value.headers.values())
+        return False
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert not contains_secret(raised.value)
+
+
+def test_catalog_rejects_nested_capability_lookalikes_when_top_level_is_malformed() -> None:
+    """Break caught: unrelated nested metadata makes an unsupported paid spec look supported."""
+    client = OpenRouterMediaClient(api_key=SecretStr("PRIVATE-OPENROUTER-SENTINEL"))
+    hostile_catalog = [
+        {
+            "id": "google/veo-3.1-fast",
+            "supported_durations": [],
+            "supported_resolutions": "720p",
+            "supported_aspect_ratios": ["16:9"],
+            "metadata": {
+                "supported_durations": [6],
+                "supported_resolutions": ["720p"],
+                "supported_aspect_ratios": ["16:9"],
+            },
+        }
+    ]
+
+    assert client.model_supports(presenter(), hostile_catalog) is False
+
+
+def test_tts_cli_rejects_noncanonical_output_before_loading_credentials(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: narration output can escape its canonical generated directory."""
+    monkeypatch.setattr(
+        "scripts.caspian_video.__main__.load_video_settings",
+        lambda _path: pytest.fail("credentials were read before output-path validation"),
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        main(["tts", "--output-dir", "../outside"])
+
+    assert raised.value.code == 2
+
+
+def test_tts_cli_accepts_only_the_canonical_narration_directory(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: the approved narration output directory is rejected with the unsafe ones."""
+    settings = VideoSettings(
+        api_key=SecretStr("PRIVATE-OPENROUTER-SENTINEL"),
+        presenter_model="google/veo-3.1-fast",
+        stakeholder_model="bytedance/seedance-2.0-fast",
+    )
+    received: list[Path] = []
+    monkeypatch.setattr("scripts.caspian_video.__main__.load_video_settings", lambda _path: settings)
+    monkeypatch.setattr("scripts.caspian_video.__main__.OpenRouterMediaClient", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        "scripts.caspian_video.__main__.synthesize_narration_sections",
+        lambda _script, _manifest, output_dir, **_kwargs: received.append(output_dir),
+    )
+
+    assert main(["tts", "--output-dir", "work/caspian-video/generated/narration"]) == 0
+    assert received == [Path("work/caspian-video/generated/narration")]
+
+
+def test_script_sections_stop_at_later_markdown_subheadings(tmp_path: Path) -> None:
+    """Break caught: Markdown labels are accidentally sent as narration."""
+    manifest = VideoManifest.load(Path("submission/caspian-video-manifest.json"))
+    source = Path("submission/caspian-video-script.md").read_text(encoding="utf-8")
+    script = tmp_path / "script.md"
+    script.write_text(source.replace("\n\n## 6–22 seconds", "\n\n### Not narration\n\nIgnore this label.\n\n## 6–22 seconds"), encoding="utf-8")
+
+    sections = openrouter._script_sections(script, manifest)
+
+    assert "Not narration" not in sections[0]
+    assert "Ignore this label" not in sections[0]
+
+
+def test_probe_timeout_removes_rejected_mp3(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Break caught: a timed-out duration probe leaves a potentially invalid MP3 behind."""
+    output = tmp_path / "section.mp3"
+    output.write_bytes(b"mp3")
+    monkeypatch.setattr(
+        openrouter.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired("ffprobe", 1)),
+    )
+
+    with pytest.raises(VideoGenerationError, match="Narration audio invalid"):
+        openrouter._validate_mp3_duration(output, 6)
+
+    assert not output.exists()
+
+
+def test_generation_reserves_the_job_in_its_ledger_before_post_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Break caught: a pre-POST interruption leaves the job name eligible for a paid retry."""
+    real_client = OpenRouterMediaClient
+
+    class FakeClient:
+        guard_single_job = staticmethod(real_client.guard_single_job)
+        record_job = staticmethod(real_client.record_job)
+        reserve_job = staticmethod(real_client.reserve_job)
+        _ledger_data = staticmethod(real_client._ledger_data)
+
+        def __init__(self, *, api_key: SecretStr) -> None:
+            del api_key
+
+        def video_models(self) -> list[dict[str, object]]:
+            return []
+
+        def model_supports(self, spec: GenerationSpec, catalog: object) -> bool:
+            del spec, catalog
+            return True
+
+        def credit_available(self) -> bool:
+            return True
+
+        def generate_video(self, *args: object, **kwargs: object) -> GenerationReceipt:
+            del args, kwargs
+            ledger = tmp_path / "work/caspian-video/openrouter/jobs.json"
+            assert json.loads(ledger.read_text())["presenter"]["status"] == "reserved"
+            raise VideoGenerationError("OpenRouter request failed")
+
+    monkeypatch.setattr(openrouter, "OpenRouterMediaClient", FakeClient)
+    monkeypatch.setattr(openrouter.Path, "cwd", lambda: tmp_path)
+    settings = VideoSettings(
+        api_key=SecretStr("PRIVATE-OPENROUTER-SENTINEL"),
+        presenter_model="google/veo-3.1-fast",
+        stakeholder_model="bytedance/seedance-2.0-fast",
+    )
+
+    with pytest.raises(VideoGenerationError, match="request failed"):
+        openrouter.generate_approved_assets(settings, approved(), tmp_path)
+
+    with pytest.raises(VideoGenerationError, match="job already recorded"):
+        real_client.guard_single_job(tmp_path / "work/caspian-video/openrouter/jobs.json", "presenter")
+
+
+def test_second_two_dollar_job_is_rejected_against_remaining_total_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Break caught: each job is checked against $3 instead of their cumulative approved total."""
+    real_client = OpenRouterMediaClient
+
+    class FakeClient:
+        guard_single_job = staticmethod(real_client.guard_single_job)
+        record_job = staticmethod(real_client.record_job)
+        reserve_job = staticmethod(real_client.reserve_job)
+        _ledger_data = staticmethod(real_client._ledger_data)
+        last_job_id = "job-safe"
+
+        def __init__(self, *, api_key: SecretStr) -> None:
+            del api_key
+
+        def video_models(self) -> list[dict[str, object]]:
+            return []
+
+        def model_supports(self, spec: GenerationSpec, catalog: object) -> bool:
+            del spec, catalog
+            return True
+
+        def credit_available(self) -> bool:
+            return True
+
+        def generate_video(
+            self, spec: GenerationSpec, approval: SpendApproval, output: Path, *, budget_usd: Decimal
+        ) -> GenerationReceipt:
+            del approval, output
+            return GenerationReceipt(
+                name=spec.name,
+                model=spec.model,
+                status="completed",
+                cost_usd=Decimal("2.00"),
+                output_path=Path(f"work/caspian-video/generated/{spec.name}.mp4"),
+            )
+
+    monkeypatch.setattr(openrouter, "OpenRouterMediaClient", FakeClient)
+    monkeypatch.setattr(openrouter.Path, "cwd", lambda: tmp_path)
+    settings = VideoSettings(
+        api_key=SecretStr("PRIVATE-OPENROUTER-SENTINEL"),
+        presenter_model="google/veo-3.1-fast",
+        stakeholder_model="bytedance/seedance-2.0-fast",
+    )
+
+    with pytest.raises(VideoGenerationError, match="cost exceeds approval"):
+        openrouter.generate_approved_assets(settings, approved(), tmp_path)
+
+    ledger = json.loads((tmp_path / "work/caspian-video/openrouter/jobs.json").read_text())
+    assert ledger["presenter"]["cost_usd"] == "2.00"
+    assert ledger["stakeholders"]["status"] == "reserved"
+
+
+def test_second_work_root_is_rejected_before_creating_a_media_client(tmp_path: Path) -> None:
+    """Break caught: a new root selects a fresh ledger and bypasses a prior reservation."""
+    settings = VideoSettings(
+        api_key=SecretStr("PRIVATE-OPENROUTER-SENTINEL"),
+        presenter_model="google/veo-3.1-fast",
+        stakeholder_model="bytedance/seedance-2.0-fast",
+    )
+
+    with pytest.raises(VideoGenerationError, match="work root invalid"):
+        openrouter.generate_approved_assets(settings, approved(), tmp_path)
+
+
+@pytest.mark.parametrize("headers", [{"content-length": "5"}, {}])
+def test_oversized_video_content_is_rejected_without_leaving_partial_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, headers: dict[str, str]
+) -> None:
+    """Break caught: declared or chunked oversized content is buffered or left on disk."""
+    monkeypatch.setattr(openrouter, "MAX_VIDEO_BYTES", 4)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(202, json={"id": "job-safe", "status": "pending"})
+        if request.url.path.endswith("/content"):
+            return httpx.Response(200, content=b"12345", headers={"content-type": "video/mp4", **headers})
+        return httpx.Response(
+            200, json={"id": "job-safe", "status": "completed", "usage": {"cost": 0.48}}
+        )
+
+    client = OpenRouterMediaClient(
+        api_key=SecretStr("PRIVATE-OPENROUTER-SENTINEL"),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        sleep=lambda _seconds: None,
+    )
+    output = tmp_path / "presenter.mp4"
+
+    with pytest.raises(VideoGenerationError, match="video content invalid"):
+        client.generate_video(presenter(), approved(), output)
+
+    assert not output.exists()
