@@ -121,3 +121,11 @@
 - Added atomic queued-dispatch failure so a Pub/Sub publish error releases active ownership and produces a fixed failed workspace with no exports.
 - Focused dispatch/worker/store tests, worker/manager/Google compatibility, Ruff, compile, privacy scan, and diff checks passed with only the explicit Firestore emulator test skipped.
 - Platform authentication is deliberately enforced by Cloud Run IAM rather than trusting an application header; Item 10 will verify the invoker binding. No cloud resource or spend was created.
+
+## Build item 6 - Hardened public Cloud Run application - 2026-08-16
+
+- Added a separate durable Cloud web factory with composer, catalog, queued creation, workspace, snapshot, cold JSON/CSV export, and fixed health routes.
+- The public service stores Google ADK runs before dispatch, returns `202`, never invokes the coordination worker or reads model credentials, and atomically fails/releases a queued run when publication fails.
+- Snapshot polling is reconstructed from the repository with stable ETags and saved-ordinal headers; terminal exports are regenerated and digest-checked from immutable records on any cold instance.
+- Exact Host/same-origin/action/raw-path/query/method/content-length/type/encoding/body guards and fixed security headers apply to success and failure paths. Active conflicts, provider failures, and repository failures expose no alias or private detail.
+- Focused coverage includes simultaneous starts, malformed/duplicate/non-ASCII headers, encoded paths, no-run GETs, cold workspaces, `304`, pending/final exports, real inline queue-to-worker completion, and public/private route separation. No Gemini, Pub/Sub, Firestore, or other live cloud call was made.

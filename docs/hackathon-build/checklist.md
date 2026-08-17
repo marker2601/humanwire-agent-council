@@ -62,7 +62,7 @@ Submission story assets to capture during the build:
   Acceptance: Messages contain only schema/alias/idempotency data; duplicate push cannot execute twice; terminal duplicates return safely; transient infrastructure errors retry; malformed envelopes fail closed; terminal response follows cleanup; no request, provider detail, credential, stack, or exception graph escapes.
   Verify: `.venv\Scripts\python.exe -m pytest tests\humanwire\test_cloud_dispatch.py tests\humanwire\test_cloud_worker.py tests\humanwire\test_studio_run.py -q` and repeat the claim/redelivery concurrency selection ten times.
 
-- [ ] **6. Create the hardened public Cloud Run application**
+- [x] **6. Create the hardened public Cloud Run application**
   Spec ref: `spec.md > 4.1 Public web service; 6.1 Public routes; 8.5 Public boundary`
   What to build: Add the separate cloud FastAPI factory and entry point for composer/catalog/create/workspace/snapshot/export/health routes. Create queued Firestore state before dispatch and return `202` plus the dedicated workspace URL.
   Acceptance: No run is created on GET; exact same-origin/raw-path/content-length/type/body limits hold; simultaneous starts yield one safe winner; active conflict discloses no alias; web service never runs coordination or reads model credentials; all fixed errors include required headers.
