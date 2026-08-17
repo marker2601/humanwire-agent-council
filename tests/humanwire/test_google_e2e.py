@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
 from datetime import UTC, datetime
 
 import pytest
@@ -173,6 +174,28 @@ def test_cloud_queue_worker_cold_poll_and_exports_preserve_authority_story() -> 
     assert proof.meeting_ordinal == proof.event_count
     assert proof.terminal_state == "meeting_ready"
     assert snapshot_response.headers["x-humanwire-saved-ordinal"] == "52"
+
+    public_artifacts = b"\n".join(
+        (snapshot_response.content, evidence_response.content, csv_response.content)
+    )
+    folded_artifacts = public_artifacts.lower()
+    for forbidden in (
+        b"private-",
+        b"api_key",
+        b"authorization",
+        b"route_id",
+        b"conversation_id",
+        b"assignment_id",
+        b"/confirm",
+        b"/decide",
+        b"/available",
+    ):
+        assert forbidden not in folded_artifacts
+    assert re.search(rb"\b[^\s@]+@[^\s@]+\b", public_artifacts) is None
+    assert re.search(
+        rb"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+        folded_artifacts,
+    ) is None
 
     json_events = evidence_response.json()["events"]
     csv_events = list(csv.DictReader(io.StringIO(csv_response.text)))

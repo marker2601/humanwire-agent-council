@@ -150,3 +150,15 @@
 - Terminal duplicate delivery is byte-stable and does not rebuild the factory or rerun authority. Cold ETag refresh returns `304`; JSON and CSV contain one row per event with exact ordinal, persisted ordinal, effect, and data-point parity.
 - Hostile tests prove that reordered approval/evidence or any CSV drift fails the shared verifier. The 286-test cloud E2E, studio E2E, workflow, and Caspian gateway gate exited 0; the checklist's legacy `test_gateway.py` path is named `test_caspian_gateway.py` in this repository.
 - Scoped Ruff and diff checks passed. All Google/ADK output was deterministic and fake; no provider credential, live Gemini call, or billable cloud resource was used.
+
+## Build item 9 - Privacy, IAM, recovery, and compatibility hardening - 2026-08-16
+
+- RED: `test_google_hardening.py` failed during collection because the exact cloud IAM and safe observability boundaries did not exist.
+- Added a frozen least-privilege IAM contract: web has only Datastore User and Pub/Sub Publisher; worker has Vertex AI User, Datastore User, and Logs Writer; the push identity alone has Cloud Run Invoker. The web app declares that runtime credentials are forbidden, while the worker declares platform authentication and no browser invocation.
+- Added fixed structured cloud events containing only event type, state, and service role. The logging handler now follows the process's current stderr stream so captured/rotated streams cannot become stale or leak logging diagnostics.
+- Cloud requests receive an explicit NFKC-normalized product-safety pass before durable creation. Fullwidth path, credential, slash-command, URI, and AWS access-key variants return the same fixed `400 invalid_request` before ownership or dispatch.
+- Missing Google credentials produce one fixed failed workspace with no runner or Standard fallback. A lost heartbeat lease returns retry, preserves the nonterminal prefix, and cannot bind a late worker result.
+- Completed cloud snapshot/JSON/CSV artifacts are scanned together for credentials, internal keys, commands, email addresses, UUIDs, and private sentinels. The strict E2E verifier continues to reject reordered authority and export drift.
+- The sandbox read-only test was narrowed to repository-owned files; it no longer reads ignored video/review workspaces or private local artifacts. Its exact 22 checks now complete in seconds while retaining the source mutation boundary.
+- The adjacent Google/cloud/logging/projection/synthetic/cutover gate passed. Both exact full invocations completed all 1,904 collected tests with 14 documented opt-in/platform skips and the existing ADK deprecation warning only.
+- Ruff across the repository, both Node syntax checks, `git diff --check`, production-diff privacy scanning, and both byte-identical 11-line offline smoke entrypoints passed. No provider or cloud call occurred.

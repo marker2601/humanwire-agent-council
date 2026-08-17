@@ -17,7 +17,18 @@ SAFE_METADATA_FIELDS = (
     "duration_ms",
     "reason",
     "correlation_id",
+    "service_role",
 )
+
+
+class _DynamicStderr:
+    """Follow the process's current stderr across test/runtime stream rotation."""
+
+    def write(self, content: str) -> int:
+        return sys.stderr.write(content)
+
+    def flush(self) -> None:
+        sys.stderr.flush()
 
 
 class JsonFormatter(logging.Formatter):
@@ -54,6 +65,6 @@ def configure_logging(level: int = logging.INFO) -> None:
 
 
 def _handler(*, redact_message: bool) -> logging.Handler:
-    handler = logging.StreamHandler(sys.stderr)
+    handler = logging.StreamHandler(_DynamicStderr())
     handler.setFormatter(JsonFormatter(redact_message=redact_message))
     return handler

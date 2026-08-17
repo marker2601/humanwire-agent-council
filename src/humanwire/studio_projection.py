@@ -163,6 +163,13 @@ def _assert_product_safe(value: object, forbidden_texts: Sequence[str] = ()) -> 
             raise ValueError("studio projection text must be product-safe")
 
 
+def validate_product_safe_request(request: CoordinationRequest) -> CoordinationRequest:
+    """Validate one normalized request before it reaches durable cloud storage."""
+    validated = CoordinationRequest.model_validate(request)
+    _assert_product_safe(validated.model_dump(mode="json"))
+    return validated
+
+
 class _StudioProjection(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 

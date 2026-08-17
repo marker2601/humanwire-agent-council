@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import re
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
@@ -17,6 +18,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from humanwire.cloud_contracts import RunDispatcher, RunRepository
 from humanwire.cloud_dispatch import DispatchUnavailable
+from humanwire.cloud_observability import CloudLogEvent, log_cloud_event
 from humanwire.cloud_progress import bound_cloud_exports
 from humanwire.cloud_store import (
     CloudActiveRunError,
@@ -34,10 +36,12 @@ from humanwire.studio_app import (
     _raw_headers,
 )
 from humanwire.studio_models import StudioAgentMode, product_catalog
+from humanwire.studio_projection import validate_product_safe_request
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
 _PUBLIC_HOST = re.compile(r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")
 _RUN_PATH = b"/api/runs"
+logger = logging.getLogger("humanwire.cloud.web")
 
 
 def _normalized_hosts(values: Iterable[str]) -> frozenset[str]:
@@ -99,6 +103,9 @@ def create_google_submission_app(
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.state.repository = repository
     app.state.dispatcher = dispatcher
+    app.state.service_role = "web"
+    app.state.requires_platform_authentication = False
+    app.state.runtime_credentials_allowed = False
     app.mount(
         "/studio-static",
         StaticFiles(directory=str(_PACKAGE_DIR / "studio_static")),
@@ -217,6 +224,10 @@ def create_google_submission_app(
         if coordination.agent_mode is not StudioAgentMode.GOOGLE_ADK:
             return _fixed_error(409, "google_runtime_required")
         try:
+            coordination = validate_product_safe_request(coordination)
+        except ValueError:
+            return _fixed_error(400, "invalid_request")
+        try:
             created = repository.create_run(coordination, now=now())
         except CloudActiveRunError:
             return _fixed_error(409, "active_run")
@@ -246,6 +257,12 @@ def create_google_submission_app(
             except Exception:  # noqa: BLE001 - cleanup details remain private
                 return _fixed_error(500, "run_unavailable")
             return _fixed_error(503, "dispatch_unavailable")
+        log_cloud_event(
+            CloudLogEvent.RUN_QUEUED,
+            state="queued",
+            service_role="web",
+            logger=logger,
+        )
         return JSONResponse(
             status_code=202,
             content={

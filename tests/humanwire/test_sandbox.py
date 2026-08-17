@@ -270,10 +270,20 @@ def test_check_is_read_only_and_does_not_call_external_or_persistence_boundaries
     monkeypatch.setattr(model_client.FeatherlessJsonClient, "complete_json", forbidden)
     monkeypatch.setattr(repository.SqlAlchemyHumanWireRepository, "transaction", forbidden)
 
+    ignored_roots = {
+        ".git",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".superpowers",
+        ".venv",
+        "__pycache__",
+        "work",
+    }
     before = {
         path: path.read_bytes()
         for path in ROOT.rglob("*")
-        if path.is_file() and ".git" not in path.parts and ".venv" not in path.parts
+        if path.is_file() and not ignored_roots.intersection(path.relative_to(ROOT).parts)
     }
     assert all(line.startswith("PASS ") for line in check_lines(sandbox_environment, ROOT))
     after = {path: path.read_bytes() for path in before}

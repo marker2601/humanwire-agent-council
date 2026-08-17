@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import re
 import secrets
 import threading
@@ -20,6 +21,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from humanwire.cloud_dispatch import RunDispatchMessage
+from humanwire.cloud_observability import CloudLogEvent, log_cloud_event
 from humanwire.cloud_progress import CloudProgressPublisher
 from humanwire.cloud_store import (
     CloudClaimStatus,
@@ -50,6 +52,7 @@ _SUBSCRIPTION = re.compile(
     r"^projects/[a-z][a-z0-9-]{4,62}/subscriptions/[A-Za-z][A-Za-z0-9._~-]{2,254}$"
 )
 _MESSAGE_ID = r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$"
+logger = logging.getLogger("humanwire.cloud.worker")
 
 
 class _RunRepository(Protocol):
@@ -275,7 +278,20 @@ class CloudRunWorker:
                 )
             except Exception:  # noqa: BLE001 - recovery finalization is retry-only
                 return WorkerDisposition.RETRY
+            log_cloud_event(
+                CloudLogEvent.RUN_RECOVERED,
+                state="failed",
+                service_role="worker",
+                logger=logger,
+            )
             return WorkerDisposition.ACCEPTED
+
+        log_cloud_event(
+            CloudLogEvent.RUN_CLAIMED,
+            state="running",
+            service_role="worker",
+            logger=logger,
+        )
 
         try:
             metadata = self._repository.load_metadata(dispatch.run_alias)
@@ -363,12 +379,22 @@ class CloudRunWorker:
             if terminal_failure or completed_snapshot is None:
                 store.publish_failed()
                 publisher.bind_failure(store.snapshot())
+                terminal_event = CloudLogEvent.RUN_FAILED
+                terminal_state = "failed"
             else:
                 publisher.bind_completion(completed_snapshot)
+                terminal_event = CloudLogEvent.RUN_COMPLETED
+                terminal_state = "complete"
         except (CloudStoreError, ValueError):
             return WorkerDisposition.RETRY
         except Exception:  # noqa: BLE001 - provider/storage details remain fixed
             return WorkerDisposition.RETRY
+        log_cloud_event(
+            terminal_event,
+            state=terminal_state,
+            service_role="worker",
+            logger=logger,
+        )
         return WorkerDisposition.ACCEPTED
 
 
@@ -399,6 +425,8 @@ def create_cloud_worker_app(
     hosts = _normalized_hosts(allowed_hosts)
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.state.requires_platform_authentication = True
+    app.state.service_role = "worker"
+    app.state.browser_invocation_allowed = False
 
     @app.middleware("http")
     async def worker_boundary(request: Request, call_next):

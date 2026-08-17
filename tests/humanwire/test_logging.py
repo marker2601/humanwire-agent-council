@@ -1,9 +1,26 @@
 import json
 import logging
+import sys
+from io import StringIO
 
 from caspian_sdk import CommError
 
 from humanwire.logging_config import configure_logging
+
+
+def test_json_handler_follows_the_current_stderr_stream(monkeypatch) -> None:
+    first = StringIO()
+    second = StringIO()
+    monkeypatch.setattr(sys, "stderr", first)
+    configure_logging()
+    logger = logging.getLogger("humanwire.stream")
+    logger.info("first_event")
+
+    monkeypatch.setattr(sys, "stderr", second)
+    logger.info("second_event")
+
+    assert json.loads(first.getvalue())["event"] == "first_event"
+    assert json.loads(second.getvalue())["event"] == "second_event"
 
 
 def test_json_logging_emits_only_allowlisted_operational_metadata(capsys) -> None:

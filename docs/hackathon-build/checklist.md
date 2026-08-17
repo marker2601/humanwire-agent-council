@@ -80,7 +80,7 @@ Submission story assets to capture during the build:
   Acceptance: Default order is request → outreach → conflict → targeted interview → confirmed evidence → proposal → revision → approval → availability → meeting package; Sofia/Daniel never act early; conflict-disabled still engages Anika truthfully and reaches meeting-ready; refresh/redelivery produce no duplicate or reordered event.
   Verify: `.venv\Scripts\python.exe -m pytest tests\humanwire\test_google_e2e.py tests\humanwire\test_studio_e2e.py tests\humanwire\test_workflow.py tests\humanwire\test_gateway.py -q` and compare the final snapshot, JSON, and CSV row-for-row.
 
-- [ ] **9. Harden privacy, IAM, failure recovery, and compatibility**
+- [x] **9. Harden privacy, IAM, failure recovery, and compatibility**
   Spec ref: `spec.md > 8. Security, Privacy, And Authority; 13. Failure And Recovery; 12.7 Compatibility gates`
   What to build: Add deployment-contract/IAM tests, safe structured logging, Unicode-normalized hostile privacy coverage, credential/exception graph checks, lease-recovery failures, missing-config truth, and comprehensive regression gates. Resolve only defects attributable to the Google adaptation.
   Acceptance: No secret/private/provider/path/command/internal identifier reaches Firestore, public JSON/CSV, logs, DOM, or errors; Gemini cannot cross authority gates; missing config never falls back; failed stages remain non-complete; Standard transcript bytes/hashes and existing Vercel/local product behavior remain intact.
