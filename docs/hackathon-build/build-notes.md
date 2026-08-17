@@ -162,3 +162,14 @@
 - The sandbox read-only test was narrowed to repository-owned files; it no longer reads ignored video/review workspaces or private local artifacts. Its exact 22 checks now complete in seconds while retaining the source mutation boundary.
 - The adjacent Google/cloud/logging/projection/synthetic/cutover gate passed. Both exact full invocations completed all 1,904 collected tests with 14 documented opt-in/platform skips and the existing ADK deprecation warning only.
 - Ruff across the repository, both Node syntax checks, `git diff --check`, production-diff privacy scanning, and both byte-identical 11-line offline smoke entrypoints passed. No provider or cloud call occurred.
+
+## Build item 10 - Google Cloud packaging (deployment pending) - 2026-08-16
+
+- RED: `test_google_deployment_contract.py` failed during collection because the private worker application builder did not exist.
+- Added one digest-pinned Python 3.12 image with explicit web/worker role selection, a non-root runtime user, Google optional dependencies, and a private build context that excludes credentials, repositories, environments, reports, data, and work artifacts.
+- Added the ADC-only worker builder. It reads only project/database/host/model/location, validates before constructing a client, and never reads an API key or public-origin configuration.
+- Added PowerShell and Bash deployment paths for one Artifact Registry digest, dedicated web/worker/push service accounts, exact least-privilege roles, an unauthenticated public web service, an IAM-private worker, authenticated Pub/Sub OIDC push, exact public origin, and bounded scale-to-zero resources.
+- Added deny-all client Firestore rules, an explicit empty index contract, current operational inspection commands, and rollback instructions that preserve Firestore history and the Pub/Sub backlog.
+- The official Cloud SDK 580.0.0 is installed locally and recognizes every deployment command used by the scripts. Current Google state remains deliberately empty: no authenticated account, selected project, ADC, or live provider call.
+- Focused deployment and adjacent cloud boundary tests pass; PowerShell and Bash parse checks pass. The pinned Docker image builds successfully, and both web and worker roles boot independently as the `humanwire` user and return their exact health response using local emulator endpoints.
+- Item 10 remains unchecked because the external deployment and cloud inspection steps cannot truthfully run until a billing-enabled project and Google authentication are available. No cloud resource or spend was created.

@@ -1,0 +1,16 @@
+.env
+.env.*
+.git
+.github
+.venv
+.superpowers
+data
+work
+__pycache__
+.pytest_cache
+.ruff_cache
+*.pyc
+*.sqlite3
+tests
+docs
+submission

@@ -91,6 +91,7 @@ Submission story assets to capture during the build:
   What to build: Add Dockerfile, `.dockerignore`, Cloud Build/deployment files, Firestore indexes, dedicated service-account/IAM instructions, authenticated push subscription, scale-to-zero/bounded runtime settings, rollback steps, and clean-environment reproduction. Deploy one image as public web and private worker.
   Acceptance: Worker rejects unauthenticated access; Pub/Sub identity alone can invoke it; web identity cannot invoke Vertex AI; cloud uses ADC, not browser/API-key transport; revision/image are pinned; exact public origin is configured; rollback does not delete history; no open-ended spend setting is introduced.
   Verify: `.venv\Scripts\python.exe -m pytest tests\humanwire\test_google_deployment_contract.py -q`, build the container locally, run both entry points, then execute documented `gcloud` inspection/smoke commands against deployed revisions.
+  Current evidence: local packaging, deployment-contract tests, pinned Docker build, and non-root web/worker startup checks are complete. Live deployment remains pending an authenticated Google account, a selected billing-enabled project, and the requested hackathon access/credits.
 
 - [ ] **11. Run live Gemini, durability, and judge-view browser acceptance**
   Spec ref: `spec.md > 12.5 Live Gemini proof; 12.6 Browser verification; 18. Definition Of Done`
