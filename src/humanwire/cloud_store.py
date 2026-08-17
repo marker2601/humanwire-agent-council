@@ -7,13 +7,17 @@ import json
 import re
 import secrets
 import threading
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from humanwire.studio_models import CoordinationRequest, StudioAgentMode
+from humanwire.studio_models import (
+    CoordinationRequest,
+    StudioAgentMode,
+    coordination_target_date,
+)
 from humanwire.studio_projection import (
     StudioConversationItem,
     StudioDataPoint,
@@ -174,6 +178,7 @@ class CloudRunMetadata(_CloudModel):
     request: CoordinationRequest
     agent_mode: Literal[StudioAgentMode.GOOGLE_ADK] = StudioAgentMode.GOOGLE_ADK
     model_id: Literal["gemini-3.6-flash"] = "gemini-3.6-flash"
+    target_date: date
     state: CloudRunState
     lifecycle_stage: StudioLifecycleStage
     saved_ordinal: int = Field(ge=0)
@@ -308,6 +313,7 @@ def _new_metadata(
         run_alias=run_alias,
         idempotency_key_hash=_digest(idempotency_key),
         request=request,
+        target_date=coordination_target_date(request, reference_date=now.date()),
         state=CloudRunState.QUEUED,
         lifecycle_stage=initial.lifecycle.current,
         saved_ordinal=0,
@@ -390,6 +396,25 @@ def _terminal_metadata(
             "transcript_digest": binding.transcript_digest,
             "json_digest": binding.json_digest,
             "csv_digest": binding.csv_digest,
+            "updated_at": now,
+            "completed_at": now,
+        }
+    )
+
+
+def _dispatch_failed_metadata(
+    metadata: CloudRunMetadata,
+    now: datetime,
+) -> CloudRunMetadata:
+    return metadata.model_copy(
+        update={
+            "state": CloudRunState.FAILED,
+            "version": metadata.version + 1,
+            "outcome": StudioOutcome(
+                state="failed",
+                headline="Coordination stopped",
+                summary="The saved workspace remains available for review.",
+            ),
             "updated_at": now,
             "completed_at": now,
         }
@@ -522,6 +547,32 @@ class InMemoryRunRepository:
                 raise CloudUnknownRunError()
             records = tuple(self._timeline[alias][item] for item in sorted(self._timeline[alias]))
             return _reconstruct_snapshot(metadata, records).model_copy(deep=True)
+
+    def fail_queued_dispatch(
+        self,
+        run_alias: str,
+        idempotency_key: str,
+        *,
+        now: datetime,
+    ) -> bool:
+        alias = _safe_alias(run_alias)
+        key = _safe_opaque(idempotency_key, label="idempotency key")
+        at = _aware(now)
+        with self._lock:
+            metadata = self._runs.get(alias)
+            if metadata is None:
+                raise CloudUnknownRunError()
+            if metadata.idempotency_key_hash != _digest(key):
+                raise CloudDivergenceError("idempotency_mismatch")
+            if metadata.state is CloudRunState.FAILED:
+                return False
+            if metadata.state is not CloudRunState.QUEUED:
+                raise CloudDivergenceError("dispatch_state_conflict")
+            if self._active_run != alias:
+                raise CloudDivergenceError("active_owner_lost")
+            self._runs[alias] = _dispatch_failed_metadata(metadata, at)
+            self._active_run = None
+            return True
 
     def claim_run(
         self,
@@ -787,6 +838,48 @@ class FirestoreRunRepository:
             data.pop("written_at", None)
             records.append(_model_from_document(CloudTimelineRecord, data))
         return _reconstruct_snapshot(metadata, tuple(records))
+
+    def fail_queued_dispatch(
+        self,
+        run_alias: str,
+        idempotency_key: str,
+        *,
+        now: datetime,
+    ) -> bool:
+        from google.cloud import firestore
+
+        alias = _safe_alias(run_alias)
+        key = _safe_opaque(idempotency_key, label="idempotency key")
+        at = _aware(now)
+        run_ref = self._run_ref(alias)
+        active_ref = self._active_ref()
+
+        @firestore.transactional
+        def fail_dispatch(transaction):
+            run_row = run_ref.get(transaction=transaction)
+            if not run_row.exists:
+                raise CloudUnknownRunError()
+            metadata = _model_from_document(CloudRunMetadata, run_row.to_dict())
+            if metadata.idempotency_key_hash != _digest(key):
+                raise CloudDivergenceError("idempotency_mismatch")
+            if metadata.state is CloudRunState.FAILED:
+                return False
+            if metadata.state is not CloudRunState.QUEUED:
+                raise CloudDivergenceError("dispatch_state_conflict")
+            active_row = active_ref.get(transaction=transaction)
+            _assert_active_document(
+                active_row.to_dict() if active_row.exists else None,
+                alias,
+            )
+            updated = _dispatch_failed_metadata(metadata, at)
+            document = _metadata_document(updated)
+            document["updated_at"] = firestore.SERVER_TIMESTAMP
+            document["completed_at"] = firestore.SERVER_TIMESTAMP
+            transaction.set(run_ref, document)
+            transaction.delete(active_ref)
+            return True
+
+        return fail_dispatch(self._client.transaction())
 
     def claim_run(
         self,

@@ -56,7 +56,7 @@ Submission story assets to capture during the build:
   Acceptance: Visible panes share the selected ordinal; inert and persisted records retain unique timeline provenance/effect; complete/failed publication is exact-idempotent; exports remain disabled until both bindings are valid; JSON/CSV parity and privacy/formula defenses pass.
   Verify: `.venv\Scripts\python.exe -m pytest tests\humanwire\test_cloud_progress.py tests\humanwire\test_studio_projection.py tests\humanwire\test_synthetic_viewer.py -q` plus the existing frozen transcript/semantic/restart hash probes.
 
-- [ ] **5. Build authenticated Pub/Sub dispatch and private worker execution**
+- [x] **5. Build authenticated Pub/Sub dispatch and private worker execution**
   Spec ref: `spec.md > 4.2 Private worker service; 4.9 Pub/Sub dispatcher; 6.2 Private worker route; 7.2 Claim and execute`
   What to build: Implement the safe versioned message, publisher adapter, private FastAPI worker route, envelope validation, transactional claim, Google execution, progress publication, cleanup, retry classification, and duplicate-delivery behavior.
   Acceptance: Messages contain only schema/alias/idempotency data; duplicate push cannot execute twice; terminal duplicates return safely; transient infrastructure errors retry; malformed envelopes fail closed; terminal response follows cleanup; no request, provider detail, credential, stack, or exception graph escapes.

@@ -108,3 +108,16 @@
 - Canonical JSON and CSV are regenerated from the immutable prefix on any instance; their row order, ordinal, effect, provenance, and digests match, while failed runs never expose downloads.
 - Focused cloud progress passed 5 tests; the broader projection/viewer/studio/public-app/frozen-hash gate passed with one documented emulator skip.
 - Ruff, compile, privacy/formula defenses, and `git diff --check` passed. No provider or billable cloud call occurred.
+
+## Build item 5 - Pub/Sub dispatch and private worker - 2026-08-16
+
+- RED: focused dispatch/worker tests failed during collection because `humanwire.cloud_dispatch` and `humanwire.cloud_worker` did not exist.
+- Added one strict versioned message containing only run alias and opaque idempotency key, plus inline and bounded Pub/Sub dispatchers with fixed exception-graph-safe failure.
+- Added the IAM-private worker app boundary: exact host/path/query/method/content-length/type/encoding rules, strict Pub/Sub envelope/base64/message validation, fixed responses, and no docs or provider details.
+- The execution service transactionally claims before building the Google ADK factory, heartbeats a bounded lease on one joined non-daemon thread, runs in an isolated temporary root, and binds terminal state only after cleanup.
+- A real deterministic workflow under the worker orchestration completed through the durable publisher while receiving the actual frozen Google ADK factory type; no provider call was made.
+- Healthy duplicate/terminal delivery is accepted without rerun; competing claims return conflict; malformed or binding-mismatched messages are irreparable; unexpected pre-progress infrastructure failure remains retryable.
+- Expired ownership appends one visible inert recovery record and fails the saved workspace rather than replaying already-persisted authority. Ten concurrent claim races each produced one executor and one fenced conflict.
+- Added atomic queued-dispatch failure so a Pub/Sub publish error releases active ownership and produces a fixed failed workspace with no exports.
+- Focused dispatch/worker/store tests, worker/manager/Google compatibility, Ruff, compile, privacy scan, and diff checks passed with only the explicit Firestore emulator test skipped.
+- Platform authentication is deliberately enforced by Cloud Run IAM rather than trusting an application header; Item 10 will verify the invoker binding. No cloud resource or spend was created.

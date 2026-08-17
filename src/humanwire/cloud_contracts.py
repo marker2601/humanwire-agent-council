@@ -35,6 +35,16 @@ class RunRepository(Protocol):
         """Reconstruct the current immutable public prefix."""
         raise NotImplementedError
 
+    def fail_queued_dispatch(
+        self,
+        run_alias: str,
+        idempotency_key: str,
+        *,
+        now,
+    ) -> bool:
+        """Atomically fail and release a queued run after publication failure."""
+        raise NotImplementedError
+
     def claim_run(self, *args, **kwargs) -> CloudClaimResult:
         """Claim a queued run or classify a bounded duplicate delivery."""
         raise NotImplementedError

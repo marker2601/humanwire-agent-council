@@ -158,6 +158,7 @@ def test_creation_stores_only_normalized_request_and_hashed_dispatch_key() -> No
 
     assert metadata.state is CloudRunState.QUEUED
     assert metadata.request.agent_mode is StudioAgentMode.GOOGLE_ADK
+    assert metadata.target_date == NOW.date() + timedelta(days=1)
     assert metadata.idempotency_key_hash != KEY
     assert len(metadata.idempotency_key_hash) == 64
     assert KEY not in metadata.model_dump_json()
@@ -185,6 +186,34 @@ def test_claim_is_idempotent_for_owner_and_fences_a_healthy_duplicate() -> None:
     assert duplicate.status is CloudClaimStatus.DUPLICATE
     assert conflict.status is CloudClaimStatus.CONFLICT
     assert repository.load_metadata(alias).version == 2
+
+
+@pytest.mark.parametrize("_attempt", range(10))
+def test_concurrent_claim_has_one_executor_and_one_healthy_conflict(_attempt: int) -> None:
+    repository, alias = created_repository()
+    owners = (
+        "worker-owner-000000000000001",
+        "worker-owner-000000000000002",
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(
+            executor.map(
+                lambda owner: repository.claim_run(
+                    alias,
+                    KEY,
+                    owner,
+                    now=NOW,
+                    lease_seconds=60,
+                ),
+                owners,
+            )
+        )
+
+    assert {item.status for item in results} == {
+        CloudClaimStatus.CLAIMED,
+        CloudClaimStatus.CONFLICT,
+    }
 
 
 def test_claim_renewal_is_owner_fenced_and_idempotency_mismatch_is_inert() -> None:
@@ -225,6 +254,27 @@ def test_unsafe_public_request_fails_before_active_ownership_is_created() -> Non
         )
 
     assert repository.active_run is None
+
+
+def test_dispatch_failure_atomically_fails_queued_run_and_releases_owner() -> None:
+    repository, alias = created_repository()
+
+    assert repository.fail_queued_dispatch(alias, KEY, now=NOW) is True
+    assert repository.fail_queued_dispatch(alias, KEY, now=NOW) is False
+    metadata = repository.load_metadata(alias)
+    snapshot = repository.load_snapshot(alias)
+    assert metadata.state is CloudRunState.FAILED
+    assert snapshot.run_state == "failed"
+    assert snapshot.current_event_ordinal == 0
+    assert snapshot.downloads_ready is False
+    assert repository.active_run is None
+
+    with pytest.raises(CloudDivergenceError, match="idempotency_mismatch"):
+        repository.fail_queued_dispatch(
+            alias,
+            "dispatch-key-0000000000000099",
+            now=NOW,
+        )
 
 
 def test_timeline_append_is_contiguous_idempotent_and_divergence_safe() -> None:
