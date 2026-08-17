@@ -10,7 +10,7 @@ Only checked items may become final Devpost claims.
 | Gemini 3.5+ | Gemini 3.6 Flash Vertex/ADK runtime contract | PENDING live invocation |
 | Google agent framework | Google ADK 2.7 coordinator/specialists and typed output | PASS implementation; PENDING live |
 | Google Cloud infrastructure | Two Cloud Run services, Firestore, Pub/Sub deployment package | PASS locally; PENDING deployed proof |
-| Repository + spin-up instructions | Public repository and `infra/google/README.md` | PASS locally; signed-out branch check pending |
+| Repository + spin-up instructions | Public `codex/humanwire` branch and `infra/google/README.md` | PASS signed out |
 | Architecture diagram | `submission/all-things-agentic-architecture.png` | PASS asset |
 | ~4-minute video | Locked script requires continuous live run and cloud console evidence | PENDING |
 

@@ -100,7 +100,7 @@ See `infra/google/README.md` for exact IAM, role-local startup, deployed inspect
 
 ## Public Repository Link
 
-https://github.com/marker2601/humanwire
+https://github.com/marker2601/humanwire/tree/codex/humanwire
 
 Google adaptation branch: `codex/humanwire`
 
@@ -148,7 +148,7 @@ The locked four-minute outline is in `submission/all-things-agentic-video-script
 - **Category (28085):** Taskmaster
 - **Organization name (28086):** Not applicable — individual submission
 - **Project start date (28087):** 08-16-26
-- **Repository (28141):** https://github.com/marker2601/humanwire
+- **Repository (28141):** https://github.com/marker2601/humanwire/tree/codex/humanwire
 - **Reproducible README instructions (28089):** Yes
 - **Hosted URL (28088):** TODO — qualifying Cloud Run URL after live deployment
 - **Private testing instructions (28090):** Use the deterministic E2E command above; then open the Cloud Run URL, start Launch decision, refresh during execution, and verify the restored prefix and terminal JSON/CSV digests.
