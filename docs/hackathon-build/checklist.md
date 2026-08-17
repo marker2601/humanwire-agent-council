@@ -38,7 +38,7 @@ Submission story assets to capture during the build:
   Acceptance: Google mode cannot initialize without explicit qualifying configuration; configuration retains no credential value; Standard generation preserves existing frozen transcript/semantic behavior; importing the base package does not require Google credentials.
   Verify: `.venv\Scripts\python.exe -m pytest tests\humanwire\test_google_config.py tests\humanwire\test_studio_models.py tests\humanwire\test_synthetic.py -q` and `.venv\Scripts\ruff.exe check src\humanwire tests\humanwire`.
 
-- [ ] **2. Prove one real ADK/Gemini decision through HumanWire authority**
+- [x] **2. Prove one real ADK/Gemini decision through HumanWire authority**
   Spec ref: `spec.md > 4.3 Google ADK coordinator; 4.4 Specialist agents; 4.5 Gemini decision-engine factory; 4.6 HumanWire authority layer`
   What to build: Implement the frozen spawn-safe Google factory, ADK coordinator, initial specialist definitions, Pydantic structured decision output, and conversion into the current `PersonaDecision`. Start with fake-runner tests, then perform one explicit bounded live Gemini probe when credentials are ready.
   Acceptance: A qualifying Gemini decision is produced through ADK, centrally validated, and delivered through exactly one existing gateway handler; malformed, mismatched, late, unsafe, or unauthorized output is inert; a timed-out child is terminated with no surviving worker; no Standard fallback occurs.

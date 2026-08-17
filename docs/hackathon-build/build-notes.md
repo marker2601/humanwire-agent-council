@@ -71,3 +71,14 @@
 - Compatibility gate for Google config, studio models, and the full synthetic test file exited 0 with two existing skips.
 - Ruff, provider-free base imports, and `git diff --check` passed.
 - Completion audit caught and fixed two issues before commit: eager evaluation of a type-only annotation and an incorrect projection type name.
+
+## Build item 2 - Google ADK decision authority - 2026-08-16
+
+- RED: the focused Google-agent suite failed during collection because `humanwire.google_agents` and `humanwire.google_decision_engine` did not exist.
+- Added Google ADK 2.7.0 specialist agents and a frozen spawn-safe Gemini factory using typed `PersonaDecision` output.
+- The real ADK `InMemoryRunner` is exercised at its model boundary; the captured request contains the delivered HumanWire assignment and permitted intent.
+- A spawned Google decision traverses exactly one existing HumanWire gateway and a hostile hanging model is hard-terminated with one inert timeout action and no surviving child or persona thread.
+- Unsafe authority or private-fact output remains centrally rejected by the existing HumanWire validator; provider exceptions are normalized to fixed safe reasons.
+- Focused Google tests passed, and the Google-agent plus existing Pydantic persona and full synthetic compatibility gate exited 0 with two existing Windows skips.
+- Ruff and `git diff --check` passed; the factory pickle and representation contain no API key.
+- Live provider probe is intentionally deferred to Item 11: the current environment has no Google Cloud project, ADC, `gcloud`, or AI Studio key. No provider call or Google spend occurred.
