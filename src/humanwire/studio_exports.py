@@ -102,6 +102,20 @@ def product_evidence(binding: StudioFinalBinding) -> StudioProductEvidence:
         or bundle.trace_sha256 != snapshot._final_trace_sha256
     ):
         raise ValueError("final studio evidence binding is inconsistent")
+    return product_evidence_from_snapshot(snapshot)
+
+
+def product_evidence_from_snapshot(
+    snapshot: StudioWorkspaceSnapshot,
+) -> StudioProductEvidence:
+    """Build deterministic evidence from one fully bound immutable snapshot."""
+    if (
+        snapshot.run_state != "complete"
+        or not snapshot.downloads_ready
+        or snapshot._final_trace_sha256 is None
+        or snapshot._transcript_sha256 is None
+    ):
+        raise ValueError("final studio evidence is unavailable")
 
     conversations = _conversation_by_event(snapshot)
     stakeholders = _stakeholder_labels(snapshot)

@@ -96,3 +96,15 @@
 - Adjacent cloud/studio models/projection/manager compatibility passed; Ruff, compile, privacy-boundary checks, and `git diff --check` passed.
 - No Firestore service, live credential, or billable Google resource was used.
 - Completion audit caught and fixed active-control drift: every Firestore claim, renewal, recovery, and append now validates the same global owner and advances its safe owner version transactionally.
+
+## Build item 4 - Durable projection and bound exports - 2026-08-16
+
+- RED: `test_cloud_progress.py` failed during collection because `humanwire.cloud_progress` did not exist.
+- Added an optional validated snapshot publisher to `StudioProgressStore`; `publisher=None` preserves the existing in-memory behavior and frozen generation path.
+- Added `CloudProgressPublisher`, which converts each stable product ordinal into one hash-bound event/conversation/data/lifecycle record through the claimed repository.
+- The first real-run integration failed closed because events 11-15 were published before their batched presentation callbacks arrived. Evidence tracing showed a later callback can attach to the newest saved event on the next capture.
+- Fixed the root cause with a durable stabilization watermark: early conversation-free batches stay staged, the newest conversation-bearing ordinal remains staged for one capture, and terminal snapshots flush the exact remaining prefix without rewriting history.
+- A real launch run now persists 52 authoritative records plus 3 inert attempts, survives cold reconstruction, and binds complete evidence exactly once.
+- Canonical JSON and CSV are regenerated from the immutable prefix on any instance; their row order, ordinal, effect, provenance, and digests match, while failed runs never expose downloads.
+- Focused cloud progress passed 5 tests; the broader projection/viewer/studio/public-app/frozen-hash gate passed with one documented emulator skip.
+- Ruff, compile, privacy/formula defenses, and `git diff --check` passed. No provider or billable cloud call occurred.

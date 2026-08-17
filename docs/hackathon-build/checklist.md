@@ -50,7 +50,7 @@ Submission story assets to capture during the build:
   Acceptance: Two concurrent creates yield one owner; same ordinal/hash is idempotent; divergent duplicate rejects; no ordinal is skipped or rewritten; expired recovery is explicit; terminal binding and active-owner release are atomic; only the safe public request/projection is stored.
   Verify: `.venv\Scripts\python.exe -m pytest tests\humanwire\test_cloud_store.py -q`; with emulator configured, `.venv\Scripts\python.exe -m pytest tests\humanwire\test_cloud_store.py -m firestore_emulator -q` repeated for the concurrency slice.
 
-- [ ] **4. Persist synchronized progress and bind truthful exports**
+- [x] **4. Persist synchronized progress and bind truthful exports**
   Spec ref: `spec.md > 4.7 Durable progress publisher; 4.11 Exports; 5.5 Final binding`
   What to build: Connect `StudioProgressObserver` to an optional Firestore publisher, append synchronized event/conversation/data/transition records, reconstruct snapshots, and generate bound JSON/CSV from the immutable timeline. Preserve byte-identical `publisher=None` behavior.
   Acceptance: Visible panes share the selected ordinal; inert and persisted records retain unique timeline provenance/effect; complete/failed publication is exact-idempotent; exports remain disabled until both bindings are valid; JSON/CSV parity and privacy/formula defenses pass.

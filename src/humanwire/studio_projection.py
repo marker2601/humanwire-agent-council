@@ -632,6 +632,12 @@ def _initial_snapshot(
     )
 
 
+class StudioSnapshotPublisher(Protocol):
+    def publish(self, snapshot: StudioWorkspaceSnapshot) -> None:
+        """Persist one validated immutable public snapshot prefix."""
+        raise NotImplementedError
+
+
 class StudioProgressStore:
     """Thread-safe immutable store for the product-only workspace contract."""
 
@@ -640,15 +646,19 @@ class StudioProgressStore:
         initial: StudioWorkspaceSnapshot,
         *,
         forbidden_texts: Sequence[str] = (),
+        publisher: StudioSnapshotPublisher | None = None,
     ) -> None:
         self._lock = threading.Lock()
         self._forbidden_texts = tuple(item for item in forbidden_texts if item)
+        self._publisher = publisher
         self._snapshot = self._validated_copy(initial)
 
     def publish(self, snapshot: StudioWorkspaceSnapshot) -> None:
         with self._lock:
             candidate = self._validated_copy(snapshot)
             self._assert_transition(self._snapshot, candidate)
+            if self._publisher is not None:
+                self._publisher.publish(candidate.model_copy(deep=True))
             self._snapshot = candidate
 
     def snapshot(self) -> StudioWorkspaceSnapshot:
@@ -675,6 +685,8 @@ class StudioProgressStore:
             candidate._transcript_sha256 = None
             validated = self._validated_copy(candidate)
             self._assert_transition(self._snapshot, validated)
+            if self._publisher is not None:
+                self._publisher.publish(validated.model_copy(deep=True))
             self._snapshot = validated
 
     def _validated_copy(self, snapshot: StudioWorkspaceSnapshot) -> StudioWorkspaceSnapshot:
@@ -1391,6 +1403,8 @@ class StudioProgressObserver:
 def create_studio_progress(
     request: CoordinationRequest,
     scenario: _ScenarioView,
+    *,
+    publisher: StudioSnapshotPublisher | None = None,
 ) -> tuple[StudioProgressStore, StudioProgressObserver]:
     """Create the safe product store and its repository/presentation observer."""
     request = CoordinationRequest.model_validate(request)
@@ -1398,7 +1412,11 @@ def create_studio_progress(
     _validate_scenario_identities(scenario, identities)
     initial = _initial_snapshot(request, scenario, identities)
     private_facts = tuple(fact for person in scenario.personas for fact in person.private_facts)
-    store = StudioProgressStore(initial, forbidden_texts=private_facts)
+    store = StudioProgressStore(
+        initial,
+        forbidden_texts=private_facts,
+        publisher=publisher,
+    )
     internal_store = SyntheticProgressStore(initial_progress(scenario))
     delegate = RepositoryProgressObserver(internal_store)
     return store, StudioProgressObserver(store, delegate, request, scenario, identities)
