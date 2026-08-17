@@ -36,6 +36,7 @@ class TargetTiming(StrEnum):
 class StudioAgentMode(StrEnum):
     STANDARD = "standard"
     MODEL_ASSISTED = "model_assisted"
+    GOOGLE_ADK = "google_adk"
 
 
 class StakeholderCard(_StudioModel):
