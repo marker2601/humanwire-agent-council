@@ -82,3 +82,17 @@
 - Focused Google tests passed, and the Google-agent plus existing Pydantic persona and full synthetic compatibility gate exited 0 with two existing Windows skips.
 - Ruff and `git diff --check` passed; the factory pickle and representation contain no API key.
 - Live provider probe is intentionally deferred to Item 11: the current environment has no Google Cloud project, ADC, `gcloud`, or AI Studio key. No provider call or Google spend occurred.
+
+## Build item 3 - Durable Firestore run repository - 2026-08-16
+
+- RED: `test_cloud_store.py` failed during collection because `humanwire.cloud_store` did not exist.
+- Added matching thread-safe in-memory and transactional Firestore repositories behind the expanded cloud repository contract.
+- Concurrent creation has one global owner and returns only fixed `active_run` on conflict; the dispatch key is stored only as a SHA-256 binding.
+- Claims are lease-fenced, owner-idempotent, and explicit about healthy conflict, terminal redelivery, renewal, and expired recovery.
+- Immutable records use eight-digit padded document IDs, canonical record hashes, exact ordinal/persisted-ordinal progression, and same-hash idempotence with divergent duplicates rejected.
+- Refresh reconstructs the synchronized public prefix from normalized request metadata plus timeline documents, never from worker memory.
+- Complete/failed binding and active-owner release share one transaction; failed runs keep the prefix without enabling exports, while complete runs require all evidence digests.
+- Focused gate passed 11 tests with one documented emulator skip; the emulator-only transaction test is registered and will run when `FIRESTORE_EMULATOR_HOST` is explicit.
+- Adjacent cloud/studio models/projection/manager compatibility passed; Ruff, compile, privacy-boundary checks, and `git diff --check` passed.
+- No Firestore service, live credential, or billable Google resource was used.
+- Completion audit caught and fixed active-control drift: every Firestore claim, renewal, recovery, and append now validates the same global owner and advances its safe owner version transactionally.

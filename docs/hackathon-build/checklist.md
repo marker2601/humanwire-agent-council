@@ -44,7 +44,7 @@ Submission story assets to capture during the build:
   Acceptance: A qualifying Gemini decision is produced through ADK, centrally validated, and delivered through exactly one existing gateway handler; malformed, mismatched, late, unsafe, or unauthorized output is inert; a timed-out child is terminated with no surviving worker; no Standard fallback occurs.
   Verify: `.venv\Scripts\python.exe -m pytest tests\humanwire\test_google_agents.py tests\humanwire\test_google_decision_engine.py tests\humanwire\test_pydantic_persona.py tests\humanwire\test_synthetic.py -q`, then run the documented opt-in live probe and record only safe model/project/result metadata.
 
-- [ ] **3. Implement the durable run repository and immutable timeline**
+- [x] **3. Implement the durable run repository and immutable timeline**
   Spec ref: `spec.md > 4.8 Firestore run repository; 5. Firestore Data Model`
   What to build: Implement in-memory and Firestore repositories for active ownership, normalized run creation, transactional claims/leases, monotonic timeline appends, safe reconstruction, exact terminal idempotence, and ownership release. Add emulator-compatible tests for races and redelivery.
   Acceptance: Two concurrent creates yield one owner; same ordinal/hash is idempotent; divergent duplicate rejects; no ordinal is skipped or rewritten; expired recovery is explicit; terminal binding and active-owner release are atomic; only the safe public request/projection is stored.

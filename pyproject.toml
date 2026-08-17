@@ -54,6 +54,9 @@ humanwire = [
 testpaths = ["tests"]
 pythonpath = ["tests"]
 addopts = "-q --import-mode=importlib"
+markers = [
+  "firestore_emulator: opt-in transaction tests against an explicit disposable emulator",
+]
 
 [tool.ruff]
 line-length = 100
