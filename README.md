@@ -24,6 +24,41 @@ The public product is deployed at [secondsignal.vercel.app](https://secondsignal
 
 The private local studio uses the same product UI with polling and isolated file-backed run roots. External Caspian/email/Telegram delivery and live Featherless evidence remain separate operator-configured modes; the public URL does not claim those external connections.
 
+## All Things Agentic Google Cloud adaptation
+
+The `codex/humanwire` branch adds an explicit qualifying Google runtime for the All Things Agentic Taskmaster entry. Google ADK coordinates Gemini 3.6 Flash specialists; HumanWire still owns identity, evidence confirmation, engagement contracts, approval, availability, scheduling, and repository mutation.
+
+```mermaid
+flowchart LR
+    Owner["Decision owner"] --> Web["Cloud Run · public web"]
+    Web -->|"queued run"| Firestore[("Firestore")]
+    Web -->|"alias + idempotency"| PubSub["Pub/Sub"]
+    PubSub -->|"OIDC push"| Worker["Cloud Run · private worker"]
+    Worker --> ADK["Google ADK specialists"]
+    ADK --> Gemini["Gemini 3.6 Flash · Vertex AI"]
+    Gemini -->|"typed candidate"| Authority["HumanWire authority gateway"]
+    Authority -->|"validated event"| Firestore
+    Firestore -->|"cold polling + exports"| Web
+```
+
+The cloud uses one digest-pinned image with explicit service roles and dedicated identities. The web identity has only Firestore and Pub/Sub publish access. The worker alone has Vertex AI, Firestore, and logging access. A dedicated Pub/Sub identity alone receives Cloud Run Invoker on the worker. Cloud authentication uses Application Default Credentials; the image and deployment files contain no Gemini API key.
+
+Install the qualifying dependencies and run the deterministic cloud proof:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[dev,google]"
+.\.venv\Scripts\python.exe -m pytest tests\humanwire\test_google_e2e.py tests\humanwire\test_studio_e2e.py -q
+```
+
+Build the shared container and deploy it after selecting a billing-enabled Google project:
+
+```powershell
+docker build --pull --tag humanwire-google:local .
+.\infra\google\deploy.ps1 -ProjectId YOUR_PROJECT_ID -Region us-central1
+```
+
+The exact IAM, local role checks, Cloud Run/Pub/Sub/Firestore inspection steps, live acceptance, and history-preserving rollback are documented in [infra/google/README.md](infra/google/README.md). The current repository does **not** claim a live Google deployment or Gemini invocation until those recorded checks pass. The existing Vercel URL remains the separate credential-free Standard-agent product.
+
 ## The coordination problem
 
 Most coordination software treats reach as a broadcast problem. Real decisions need different contributions from different people, and asking everyone for the same response creates delay without adding authority or evidence.
