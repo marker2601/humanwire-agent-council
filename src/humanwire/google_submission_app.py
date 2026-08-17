@@ -174,7 +174,7 @@ def create_google_submission_app(
         return templates.TemplateResponse(
             request=request,
             name="coordination_studio.html",
-            context={"action_token": action_token, "delivery_mode": "poll"},
+            context={"action_token": action_token, "delivery_mode": "cloud"},
         )
 
     @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)

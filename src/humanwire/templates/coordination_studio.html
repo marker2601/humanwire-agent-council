@@ -22,11 +22,11 @@
         <button type="button" data-studio-nav="reach" disabled aria-disabled="true" title="Available after coordination starts">Reach</button>
         <button type="button" data-studio-nav="data" disabled aria-disabled="true" title="Available after coordination starts">Data</button>
       </nav>
-      <div class="coordination-studio-page__status-mark" aria-label="{% if delivery_mode | default('poll') == 'stream' %}Interactive coordination studio{% else %}Private coordination studio{% endif %}">
+      <div class="coordination-studio-page__status-mark" aria-label="{% if delivery_mode | default('poll') == 'cloud' %}Google Cloud coordination studio{% elif delivery_mode | default('poll') == 'stream' %}Interactive coordination studio{% else %}Private coordination studio{% endif %}">
         <span aria-hidden="true"></span>
         <div>
-          <strong>{% if delivery_mode | default('poll') == 'stream' %}Interactive workspace{% else %}Private workspace{% endif %}</strong>
-          {% if delivery_mode | default('poll') == 'stream' %}<small>Standard agents · no external messages</small>{% endif %}
+          <strong>{% if delivery_mode | default('poll') == 'cloud' %}Durable AI workspace{% elif delivery_mode | default('poll') == 'stream' %}Interactive workspace{% else %}Private workspace{% endif %}</strong>
+          {% if delivery_mode | default('poll') == 'cloud' %}<small>Google ADK · Gemini 3.6 Flash</small>{% elif delivery_mode | default('poll') == 'stream' %}<small>Standard agents · no external messages</small>{% endif %}
         </div>
       </div>
     </header>
@@ -77,7 +77,13 @@
               <input type="date" aria-label="Coordination date" data-custom-date disabled>
             </fieldset>
             <label class="coordination-studio-page__switch-row"><input type="checkbox" data-include-conflict checked><span>Resolve disagreement before approval</span></label>
-            {% if delivery_mode | default('poll') != 'stream' %}
+            {% if delivery_mode | default('poll') == 'cloud' %}
+              <div class="coordination-studio-page__runtime-card" aria-label="Google agent runtime">
+                <strong>Google ADK agents</strong>
+                <span>Gemini 3.6 Flash proposes persona decisions.</span>
+                <small>HumanWire authority gates · No external stakeholder messages</small>
+              </div>
+            {% elif delivery_mode | default('poll') != 'stream' %}
               <fieldset class="coordination-studio-page__compact-fieldset">
                 <legend>Agent mode</legend>
                 <label><input type="radio" name="agent_mode" value="standard" checked><span>Standard agents</span></label>

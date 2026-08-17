@@ -68,7 +68,7 @@ Submission story assets to capture during the build:
   Acceptance: No run is created on GET; exact same-origin/raw-path/content-length/type/body limits hold; simultaneous starts yield one safe winner; active conflict discloses no alias; web service never runs coordination or reads model credentials; all fixed errors include required headers.
   Verify: `.venv\Scripts\python.exe -m pytest tests\humanwire\test_cloud_web.py tests\humanwire\test_studio_app.py tests\humanwire\test_submission_app.py tests\humanwire\test_web.py -q` and `.venv\Scripts\ruff.exe check src\humanwire tests\humanwire`.
 
-- [ ] **7. Add durable browser polling without weakening replay**
+- [x] **7. Add durable browser polling without weakening replay**
   Spec ref: `spec.md > 4.10 Browser controller; 6.1 Public routes; 12.6 Browser verification`
   What to build: Add the ETag/saved-ordinal polling adapter, Cloud workspace hydration, terminal export URLs, and truthful Gemini/ADK/Cloud disclosure while retaining stream and local-poll modes. Extend the hostile async harness for unchanged snapshots, `304`, refresh, stale queues, failed terminal state, mobile tabs, and New coordination.
   Acceptance: First progress appears automatically; `304` does not erase graph/selection; manual replay stays selected; Follow Live cancels stale work; refresh restores running/complete/failed truth; all panes share one selected event; mobile retains every required control; Standard product copy remains truthful.

@@ -203,7 +203,7 @@ def test_snapshot_poll_has_etag_saved_ordinal_and_cold_workspace() -> None:
         )
 
     assert page.status_code == 200
-    assert '<meta name="humanwire-delivery-mode" content="poll">' in page.text
+    assert '<meta name="humanwire-delivery-mode" content="cloud">' in page.text
     assert first.status_code == 200
     assert first.json()["run_state"] == "starting"
     assert first.headers["x-humanwire-saved-ordinal"] == "0"
@@ -252,12 +252,20 @@ def test_simultaneous_starts_have_one_safe_winner_and_one_dispatch() -> None:
 def test_catalog_health_head_and_private_worker_separation() -> None:
     application = app()
     with TestClient(application, base_url=f"https://{HOST}") as client:
+        page = client.get("/")
         catalog = client.get("/api/catalog")
         catalog_head = client.head("/api/catalog")
         health = client.get("/healthz")
         docs = client.get("/docs")
         worker = client.post("/internal/pubsub/runs", headers=headers(), json={})
 
+    assert '<meta name="humanwire-delivery-mode" content="cloud">' in page.text
+    assert "Google ADK agents" in page.text
+    assert "Gemini 3.6 Flash" in page.text
+    assert "HumanWire authority gates" in page.text
+    assert "No external stakeholder messages" in page.text
+    assert 'name="agent_mode" value="standard"' not in page.text
+    assert 'name="agent_mode" value="model_assisted"' not in page.text
     assert catalog.status_code == 200
     assert catalog_head.status_code == 200 and catalog_head.content == b""
     assert health.json() == {"service_role": "web", "status": "ok"}

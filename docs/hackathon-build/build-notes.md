@@ -129,3 +129,13 @@
 - Snapshot polling is reconstructed from the repository with stable ETags and saved-ordinal headers; terminal exports are regenerated and digest-checked from immutable records on any cold instance.
 - Exact Host/same-origin/action/raw-path/query/method/content-length/type/encoding/body guards and fixed security headers apply to success and failure paths. Active conflicts, provider failures, and repository failures expose no alias or private detail.
 - Focused coverage includes simultaneous starts, malformed/duplicate/non-ASCII headers, encoded paths, no-run GETs, cold workspaces, `304`, pending/final exports, real inline queue-to-worker completion, and public/private route separation. No Gemini, Pub/Sub, Firestore, or other live cloud call was made.
+
+## Build item 7 - Durable cloud browser workspace - 2026-08-16
+
+- RED: cloud-page and controller contracts failed because the durable app still rendered local-poll copy and did not send or consume the saved-ordinal protocol.
+- Added a distinct cloud delivery mode that submits only `google_adk`, hydrates any non-stream workspace URL immediately, polls with both ETag and saved ordinal, and uses immutable terminal JSON plus evidence CSV export routes.
+- Preserved stream and local-poll behavior while extending the hostile controller harness across cloud start, cold refresh, alias-free active conflict, unchanged snapshots, terminal hydration, replay queues, failed state, mobile tabs, and full reset.
+- The rendered cloud surface now identifies Google ADK, Gemini 3.6 Flash, HumanWire authority gates, and the no-external-message boundary without exposing Standard/model mode controls.
+- In-app Browser verification passed at exact 1680x950, 1280x720, 600x900, and 390x844 viewports: 17 nodes and 57 edges, no graph collisions or page overflow, no visible control below 44x44, no meaningful text below 14px, and no console warnings or errors.
+- A completed 55-event durable run survived reload at Event 55, replay moved 55 to 54, and both JSON and CSV downloads fired without navigating away. The mobile composer and completed workspace retained all required controls and truthful runtime copy.
+- Automated frontend/cloud-page gates, Node syntax, Ruff, privacy scan, and diff checks passed. Browser QA used only the local in-memory repository and deterministic worker; no Gemini or live Google Cloud call occurred.

@@ -15,6 +15,7 @@ document.addEventListener("DOMContentLoaded", () => {
     snapshot: null,
     events: [],
     selectedOrdinal: 0,
+    savedOrdinal: 0,
     etag: null,
     followLive: true,
     visualsPaused: false,
@@ -260,7 +261,7 @@ document.addEventListener("DOMContentLoaded", () => {
         ? customDate.value
         : null,
       include_conflict: conflict !== null && conflict.checked,
-      agent_mode: selectedValue("agent_mode", "standard"),
+      agent_mode: deliveryMode === "cloud" ? "google_adk" : selectedValue("agent_mode", "standard"),
     };
   }
 
@@ -293,7 +294,7 @@ document.addEventListener("DOMContentLoaded", () => {
       }
       const result = await response.json();
       if (response.status === 409 && result.error === "active_run") {
-        if (deliveryMode === "stream") {
+        if (deliveryMode === "cloud" || deliveryMode === "stream") {
           setText(
             "[data-form-status]",
             "Another coordination is already running. Try again in a moment.",
@@ -301,13 +302,15 @@ document.addEventListener("DOMContentLoaded", () => {
           start.disabled = false;
           return;
         }
-        if (result.run_alias) {
+        if (deliveryMode === "poll" && result.run_alias) {
           enterWorkspace(result.run_alias, `/runs/${result.run_alias}`);
           return;
         }
       }
       if (!response.ok || !result.run_alias || !result.workspace_url) {
-        if (result.error === "model_unavailable") {
+        if (result.error === "google_runtime_required") {
+          setText("[data-form-status]", "Google agent mode is required for this workspace. Refresh to try again.");
+        } else if (result.error === "model_unavailable") {
           setText("[data-form-status]", "Model-assisted mode is unavailable. Choose Standard agents.");
         } else {
           setText("[data-form-status]", "The coordination could not start. Review the form and try again.");
@@ -414,6 +417,7 @@ document.addEventListener("DOMContentLoaded", () => {
       clearInterval(state.pollTimer);
     }
     state.pollTimer = setInterval(pollRun, 500);
+    void pollRun();
   }
 
   function stopPolling() {
@@ -430,6 +434,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const headers = {
       Accept: "application/json",
       "X-HumanWire-Event-Ordinal": String(state.events.length),
+      "X-HumanWire-Saved-Ordinal": String(state.savedOrdinal),
     };
     if (state.etag !== null) {
       headers["If-None-Match"] = state.etag;
@@ -446,6 +451,13 @@ document.addEventListener("DOMContentLoaded", () => {
       const etag = response.headers.get("ETag");
       if (etag !== null) {
         state.etag = etag;
+      }
+      const savedOrdinalText = response.headers.get("X-HumanWire-Saved-Ordinal");
+      if (/^(?:0|[1-9][0-9]*)$/.test(savedOrdinalText || "")) {
+        const savedOrdinal = Number(savedOrdinalText);
+        if (Number.isSafeInteger(savedOrdinal)) {
+          state.savedOrdinal = savedOrdinal;
+        }
       }
       receiveSnapshot(snapshot);
     } catch (_error) {
@@ -990,6 +1002,7 @@ document.addEventListener("DOMContentLoaded", () => {
     state.snapshot = null;
     state.events.length = 0;
     state.selectedOrdinal = 0;
+    state.savedOrdinal = 0;
     state.etag = null;
     state.followLive = true;
     state.visualsPaused = false;
@@ -1124,7 +1137,8 @@ document.addEventListener("DOMContentLoaded", () => {
     downloadAttachment("evidence.json", `${state.runAlias}-evidence.json`);
   });
   one("[data-download-csv]").addEventListener("click", () => {
-    downloadAttachment("events.csv", `${state.runAlias}-events.csv`);
+    const suffix = deliveryMode === "cloud" ? "evidence.csv" : "events.csv";
+    downloadAttachment(suffix, `${state.runAlias}-${suffix}`);
   });
   one("[data-new-coordination]").addEventListener("click", newCoordination);
   document.querySelectorAll("[data-studio-nav]").forEach((item) => {
@@ -1156,7 +1170,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  const route = deliveryMode === "poll"
+  const route = deliveryMode !== "stream"
     ? location.pathname.match(/^\/runs\/([A-Za-z0-9][A-Za-z0-9._-]{0,63})$/)
     : null;
   loadCatalog();

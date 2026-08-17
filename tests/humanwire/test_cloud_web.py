@@ -1,12 +1,29 @@
+from pathlib import Path
+
 import pytest
 
 from humanwire.cloud_store import FirestoreRunRepository
 from humanwire.cloud_web import build_google_web_app, create_cloud_web_app
 from humanwire.google_submission_app import create_google_submission_app
 
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = ROOT / "src/humanwire/studio_static/coordination-studio.js"
+
 
 def test_cloud_web_exposes_only_the_canonical_durable_app_factory() -> None:
     assert create_cloud_web_app is create_google_submission_app
+
+
+def test_cloud_controller_forces_google_mode_hydrates_immediately_and_uses_bound_exports() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+
+    assert 'deliveryMode === "cloud" ? "google_adk"' in source
+    assert 'deliveryMode !== "stream"' in source
+    assert "void pollRun();" in source
+    assert 'response.headers.get("X-HumanWire-Saved-Ordinal")' in source
+    assert '"X-HumanWire-Saved-Ordinal": String(state.savedOrdinal)' in source
+    assert 'deliveryMode === "cloud" ? "evidence.csv" : "events.csv"' in source
+    assert 'deliveryMode === "cloud" || deliveryMode === "stream"' in source
 
 
 class FakePublisher:

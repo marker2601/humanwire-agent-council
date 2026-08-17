@@ -576,7 +576,10 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
         });
         const meta = register('meta[name="humanwire-action-token"]', "meta"); meta.setAttribute("content", "test-token");
         const deliveryMeta = register('meta[name="humanwire-delivery-mode"]', "meta");
-        deliveryMeta.setAttribute("content", mode.startsWith("stream-") ? "stream" : "poll");
+        deliveryMeta.setAttribute(
+          "content",
+          mode.startsWith("stream-") ? "stream" : mode.startsWith("cloud-") ? "cloud" : "poll",
+        );
 
         const domListeners = {};
         global.document = {
@@ -611,7 +614,7 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
         global.clearInterval = () => {};
         global.setTimeout = (callback) => { callback(); return 1; };
         global.clearTimeout = () => {};
-        global.location = { pathname: ["refresh", "failed"].includes(mode) ? "/runs/launch-001" : "/" };
+        global.location = { pathname: ["refresh", "failed", "cloud-refresh"].includes(mode) ? "/runs/launch-001" : "/" };
         global.history = { replaceState(_state, _title, url) { location.pathname = url; } };
         global.window = global;
         global.URL = {
@@ -622,7 +625,18 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
         global.addEventListener = () => {};
 
         function jsonResponse(body, status = 200, etag = null) {
-          return { ok: status >= 200 && status < 300, status, headers: { get: () => etag }, json: async () => structuredClone(body) };
+          return {
+            ok: status >= 200 && status < 300,
+            status,
+            headers: {
+              get(name) {
+                if (String(name).toLowerCase() === "etag") return etag;
+                if (String(name).toLowerCase() === "x-humanwire-saved-ordinal") return "2";
+                return null;
+              },
+            },
+            json: async () => structuredClone(body),
+          };
         }
         function click(selector) { document.querySelector(selector).click(); return Promise.resolve(); }
         function text(selector) { return document.querySelector(selector).textContent.trim(); }
@@ -657,6 +671,9 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
               include_conflict: true
             }]
           }));
+          if (mode === "cloud-refresh") {
+            fetchQueue.push(jsonResponse(terminalSnapshot, 200, '"event-2"'));
+          }
           require(scriptPath);
           (domListeners.DOMContentLoaded || []).forEach((callback) => callback());
           await Promise.resolve(); await Promise.resolve();
@@ -688,7 +705,7 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
             return;
           }
 
-          if (mode === "stream-conflict") {
+          if (["stream-conflict", "cloud-conflict"].includes(mode)) {
             fetchQueue.push(jsonResponse({ error: "active_run" }, 409));
             await click("[data-start-coordination]");
             await Promise.resolve(); await Promise.resolve();
@@ -750,6 +767,15 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
             return;
           }
 
+          if (mode === "cloud-refresh") {
+            for (let index = 0; index < 8; index += 1) await Promise.resolve();
+            assert.equal(text("[data-event-progress]"), "Event 2 of 2");
+            assert.equal(fetchCalls[1].url, "/api/runs/launch-001");
+            assert.equal(fetchCalls[1].options.headers["X-HumanWire-Saved-Ordinal"], "0");
+            assert.equal(text("[data-current-stage]"), "Schedule");
+            return;
+          }
+
           if (["refresh", "failed"].includes(mode)) {
             const hydratedSnapshot = structuredClone(terminalSnapshot);
             if (mode === "failed") {
@@ -774,13 +800,20 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
             return;
           }
 
-          fetchQueue.push(jsonResponse({ run_alias: "launch-001", workspace_url: "/runs/launch-001" }, 201));
+          fetchQueue.push(jsonResponse(
+            { run_alias: "launch-001", workspace_url: "/runs/launch-001", state: "queued" },
+            mode === "cloud-start" ? 202 : 201,
+          ));
           await click("[data-start-coordination]");
           await Promise.resolve(); await Promise.resolve();
           assert.equal(fetchCalls[1].url, "/api/runs");
           assert.equal(fetchCalls[1].options.method, "POST");
           assert.equal(fetchCalls[1].options.headers["X-HumanWire-Action"], "test-token");
           assert.equal(JSON.parse(fetchCalls[1].options.body).requester_name, "Alex Morgan");
+          assert.equal(
+            JSON.parse(fetchCalls[1].options.body).agent_mode,
+            mode === "cloud-start" ? "google_adk" : "standard",
+          );
           assert.deepEqual(Object.keys(JSON.parse(fetchCalls[1].options.body)).sort(), ["agent_mode", "custom_date", "include_conflict", "objective", "participant_ids", "requester_name", "requester_role", "target_timing", "template_id"]);
           assert.equal(location.pathname, "/runs/launch-001");
 
@@ -815,8 +848,13 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
           assert.equal(lifecycleItems.schedule.classList.contains("is-current"), false);
           assert.equal(nodes["[data-download-json]"].disabled, false);
           assert.equal(nodes["[data-download-csv]"].disabled, false);
+          const latestPoll = fetchCalls.filter((call) => call.url === "/api/runs/launch-001").at(-1);
+          assert.equal(latestPoll.options.headers["X-HumanWire-Saved-Ordinal"], "2");
           const activeEdge = activeEdges()[0];
-          assert.equal(activeEdge.classList.contains("is-travelling"), mode === "normal");
+          assert.equal(
+            activeEdge.classList.contains("is-travelling"),
+            mode === "normal" || mode === "cloud-start",
+          );
 
           await click("[data-replay-previous]");
           assert.equal(text("[data-event-progress]"), "Event 1 of 2");
@@ -832,6 +870,13 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
           await click("[data-replay-next]");
           assert.equal(text("[data-event-progress]"), "Event 2 of 2");
           await click("[data-download-json]");
+          if (mode === "cloud-start") {
+            await click("[data-download-csv]");
+            assert.deepEqual(downloadClicks.slice(-2), [
+              { href: "/api/runs/launch-001/evidence.json", filename: "launch-001-evidence.json" },
+              { href: "/api/runs/launch-001/evidence.csv", filename: "launch-001-evidence.csv" },
+            ]);
+          }
           assert.equal(location.pathname, "/runs/launch-001");
           assert.equal(document.body.children.at(-1)?.tagName === "A", false);
         })().catch((error) => { process.stderr.write(error.stack + "\n"); process.exitCode = 1; });
@@ -842,6 +887,9 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
         "reduced",
         "refresh",
         "failed",
+        "cloud-start",
+        "cloud-refresh",
+        "cloud-conflict",
         "stream-conflict",
         "stream-complete",
         "stream-eof",
@@ -854,4 +902,4 @@ def test_controller_runs_submit_poll_replay_and_reduced_motion_contract() -> Non
             text=True,
             check=False,
         )
-        assert result.returncode == 0, result.stderr
+        assert result.returncode == 0, f"{mode}: {result.stderr}"
