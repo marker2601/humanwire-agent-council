@@ -139,3 +139,14 @@
 - In-app Browser verification passed at exact 1680x950, 1280x720, 600x900, and 390x844 viewports: 17 nodes and 57 edges, no graph collisions or page overflow, no visible control below 44x44, no meaningful text below 14px, and no console warnings or errors.
 - A completed 55-event durable run survived reload at Event 55, replay moved 55 to 54, and both JSON and CSV downloads fired without navigating away. The mobile composer and completed workspace retained all required controls and truthful runtime copy.
 - Automated frontend/cloud-page gates, Node syntax, Ruff, privacy scan, and diff checks passed. Browser QA used only the local in-memory repository and deterministic worker; no Gemini or live Google Cloud call occurred.
+
+## Build item 8 - Deterministic cloud authority E2E - 2026-08-16
+
+- RED: `test_google_e2e.py` failed during collection because the reusable `humanwire.cloud_e2e` authority-proof verifier did not exist.
+- Added a fail-closed verifier that consumes the cold public snapshot plus bound JSON/CSV together and rejects schema, request, outcome, graph, conversation, event, chronology, or byte-level export divergence.
+- The E2E test drives the actual public create boundary, records the safe dispatch message, claims it in the private worker, observes the explicit Google ADK factory, executes the deterministic fake-model path through one gateway, publishes the durable timeline, redelivers the queue message, and reads the result through a new cold web instance.
+- The default story is locked at exact ordinals 1, 4, 25, 31, 35, 36, 43, 49, 51, and 55 for request, outreach, conflict, interview, confirmed evidence, proposal, revision, approval, availability, and meeting readiness.
+- Sofia has no conversation before the proposal and Daniel has none before approval. The conflict-disabled branch still receives Anika's risk acknowledgement, contains no rollback, rejection, conflict, or targeted-interview transition, and reaches meeting-ready.
+- Terminal duplicate delivery is byte-stable and does not rebuild the factory or rerun authority. Cold ETag refresh returns `304`; JSON and CSV contain one row per event with exact ordinal, persisted ordinal, effect, and data-point parity.
+- Hostile tests prove that reordered approval/evidence or any CSV drift fails the shared verifier. The 286-test cloud E2E, studio E2E, workflow, and Caspian gateway gate exited 0; the checklist's legacy `test_gateway.py` path is named `test_caspian_gateway.py` in this repository.
+- Scoped Ruff and diff checks passed. All Google/ADK output was deterministic and fake; no provider credential, live Gemini call, or billable cloud resource was used.

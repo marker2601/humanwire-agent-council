@@ -74,7 +74,7 @@ Submission story assets to capture during the build:
   Acceptance: First progress appears automatically; `304` does not erase graph/selection; manual replay stays selected; Follow Live cancels stale work; refresh restores running/complete/failed truth; all panes share one selected event; mobile retains every required control; Standard product copy remains truthful.
   Verify: `.venv\Scripts\python.exe -m pytest tests\humanwire\test_studio_frontend.py tests\humanwire\test_cloud_web.py tests\humanwire\test_studio_e2e.py -q`, `node --check src\humanwire\studio_static\coordination-studio.js`, and computed-browser geometry/interaction checks at four approved viewports.
 
-- [ ] **8. Complete the deterministic cloud end-to-end authority story**
+- [x] **8. Complete the deterministic cloud end-to-end authority story**
   Spec ref: `spec.md > 7. End-To-End Flow; 12.4 Deterministic cloud E2E; PRD Epic 3`
   What to build: Wire the fake ADK runner through web → repository → dispatch → worker → gateway/workflow → projection → polling and encode the launch-decision chronology as strict ordered assertions, including the conflict-disabled path.
   Acceptance: Default order is request → outreach → conflict → targeted interview → confirmed evidence → proposal → revision → approval → availability → meeting package; Sofia/Daniel never act early; conflict-disabled still engages Anika truthfully and reaches meeting-ready; refresh/redelivery produce no duplicate or reordered event.
