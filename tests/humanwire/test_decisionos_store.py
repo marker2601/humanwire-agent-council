@@ -389,6 +389,26 @@ def test_firestore_rejects_invalid_organization_id_before_client_access(owner) -
         repository.load_context(owner, "../org")
 
 
+def test_firestore_default_collection_matches_the_decisionos_security_contract() -> None:
+    class Collection:
+        def document(self, identifier):
+            return ("document", identifier)
+
+    class RecordingClient:
+        def __init__(self) -> None:
+            self.names = []
+
+        def collection(self, name):
+            self.names.append(name)
+            return Collection()
+
+    client = RecordingClient()
+    repository = FirestoreDecisionOSRepository(client, clock=lambda: NOW)
+
+    assert repository._organization_ref(ORG_A) == ("document", ORG_A)
+    assert client.names == ["organizations"]
+
+
 @pytest.mark.parametrize(
     ("operation", "expected_error"),
     [

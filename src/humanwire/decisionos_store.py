@@ -606,7 +606,7 @@ class FirestoreDecisionOSRepository:
         *,
         clock: Callable[[], datetime] | None = None,
         identifiers: DecisionOSIdentifierFactory | None = None,
-        organization_collection: str = "humanwire_organizations",
+        organization_collection: str = "organizations",
         invitation_index_collection: str = "humanwire_invitation_tokens",
     ) -> None:
         self._client = client
