@@ -47,7 +47,7 @@ def test_health_check_is_fixed_and_does_not_construct_firebase(monkeypatch) -> N
     monkeypatch.setattr(decisionos_web, "build_decisionos_web_app", forbidden_build)
     client = TestClient(decisionos_web.app, base_url="https://decisionos.test")
 
-    response = client.get("/healthz")
+    response = client.get("/health")
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
@@ -145,6 +145,8 @@ def test_decisionos_deployments_are_separate_secret_bound_and_monitor_first() ->
         assert "roles/firebaseauth.admin" in source
         assert "roles/logging.logWriter" in source
         assert "roles/secretmanager.secretAccessor" in source
+        assert "firebasestorage.googleapis.com" in source
+        assert "recaptchaenterprise.googleapis.com" in source
         assert "--allow-unauthenticated" in source
         assert "--min-instances=0" in source
         assert "gemini" not in folded
@@ -175,3 +177,4 @@ def test_deployment_documentation_preserves_the_submitted_services() -> None:
     assert "does not update or route traffic to `humanwire-web`" in normalized
     assert "App Check" in documentation
     assert "monitor" in documentation.casefold()
+    assert "`/health`" in documentation

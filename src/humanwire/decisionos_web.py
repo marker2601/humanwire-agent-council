@@ -231,8 +231,13 @@ class _LazyDecisionOSApplication:
         return (
             scope.get("type") == "http"
             and scope.get("method") in {"GET", "HEAD"}
-            and scope.get("path") == "/healthz"
-            and scope.get("raw_path") == b"/healthz"
+            and (
+                (scope.get("path") == "/health" and scope.get("raw_path") == b"/health")
+                or (
+                    scope.get("path") == "/healthz"
+                    and scope.get("raw_path") == b"/healthz"
+                )
+            )
             and not scope.get("query_string")
         )
 

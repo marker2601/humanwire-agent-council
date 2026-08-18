@@ -26,7 +26,7 @@ for secret_name in "$FIREBASE_API_KEY_SECRET" "$FIREBASE_APP_ID_SECRET" "$APP_CH
 done
 
 gcloud config set project "$PROJECT_ID"
-gcloud services enable run.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com firestore.googleapis.com firebase.googleapis.com firebaseappcheck.googleapis.com firebaserules.googleapis.com identitytoolkit.googleapis.com iam.googleapis.com logging.googleapis.com secretmanager.googleapis.com storage.googleapis.com
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com firestore.googleapis.com firebase.googleapis.com firebaseappcheck.googleapis.com firebaserules.googleapis.com firebasestorage.googleapis.com identitytoolkit.googleapis.com iam.googleapis.com logging.googleapis.com recaptchaenterprise.googleapis.com secretmanager.googleapis.com storage.googleapis.com
 
 if ! gcloud artifacts repositories describe "$REPOSITORY" --location="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1; then
   gcloud artifacts repositories create "$REPOSITORY" --repository-format=docker --location="$REGION" --project="$PROJECT_ID"

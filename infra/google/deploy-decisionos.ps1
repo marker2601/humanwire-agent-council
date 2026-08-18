@@ -24,7 +24,7 @@ function Invoke-Gcloud {
 }
 
 Invoke-Gcloud config set project $ProjectId
-Invoke-Gcloud services enable run.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com firestore.googleapis.com firebase.googleapis.com firebaseappcheck.googleapis.com firebaserules.googleapis.com identitytoolkit.googleapis.com iam.googleapis.com logging.googleapis.com secretmanager.googleapis.com storage.googleapis.com
+Invoke-Gcloud services enable run.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com firestore.googleapis.com firebase.googleapis.com firebaseappcheck.googleapis.com firebaserules.googleapis.com firebasestorage.googleapis.com identitytoolkit.googleapis.com iam.googleapis.com logging.googleapis.com recaptchaenterprise.googleapis.com secretmanager.googleapis.com storage.googleapis.com
 
 & gcloud artifacts repositories describe $Repository --location=$Region --project=$ProjectId *> $null
 if ($LASTEXITCODE -ne 0) {

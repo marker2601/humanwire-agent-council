@@ -34,7 +34,7 @@ mode (`HUMANWIRE_DECISIONOS_APP_CHECK_ENFORCED=false`). Review valid/invalid tok
 metrics, register every production hostname, then change that flag to `true`; do
 not enforce it before verified traffic is visible. The service scales to zero.
 
-Verify `/healthz`, Firebase Google/email-link sign-in, two separate organizations,
+Verify `/health`, Firebase Google/email-link sign-in, two separate organizations,
 one invitation, one workspace per organization, and cross-tenant denial. Roll back
 only `humanwire-decisionos` traffic to its prior revision. Do not delete Firestore,
 Storage, Firebase identities, audit records, or the existing submission services.
