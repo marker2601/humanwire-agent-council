@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from datetime import timedelta
+from pathlib import Path
+from types import MappingProxyType
 from typing import Protocol
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -36,11 +40,24 @@ from humanwire.decisionos_store import (
 )
 
 _MAX_BODY_BYTES = 8192
+_PACKAGE_DIR = Path(__file__).resolve().parent
 _SESSION_COOKIE = "__Host-humanwire-session"
 _CSRF_COOKIE = "__Host-humanwire-csrf"
 _HOST = re.compile(r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?(?::([0-9]{1,5}))?$")
 _ORGANIZATION_ID = r"org_[0-9A-HJKMNP-TV-Z]{26}"
 _WORKSPACE_ID = r"wrk_[0-9A-HJKMNP-TV-Z]{26}"
+_PUBLIC_CONFIG_KEYS = frozenset({"firebase", "appCheckSiteKey"})
+_FIREBASE_PUBLIC_KEYS = frozenset(
+    {
+        "apiKey",
+        "appId",
+        "authDomain",
+        "messagingSenderId",
+        "projectId",
+        "storageBucket",
+    }
+)
+_FIREBASE_REQUIRED_KEYS = frozenset({"apiKey", "appId", "authDomain", "projectId"})
 _MUTATION_PATHS = (
     re.compile(r"^/api/session/login$"),
     re.compile(r"^/api/session/logout$"),
@@ -91,6 +108,7 @@ class DecisionOSDependencies:
     repository: DecisionOSRepository
     allowed_hosts: frozenset[str]
     csrf_token_factory: Callable[[], str]
+    firebase_public_config: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.allowed_hosts:
@@ -102,6 +120,38 @@ class DecisionOSDependencies:
             port = matched.group(1)
             if port is not None and not 1 <= int(port) <= 65535:
                 raise ValueError("DecisionOS allowed host is invalid")
+        config = _validated_public_config(self.firebase_public_config)
+        object.__setattr__(self, "firebase_public_config", MappingProxyType(config))
+
+
+def _public_value(value: object) -> bool:
+    return (
+        type(value) is str
+        and 1 <= len(value) <= 512
+        and value.isascii()
+        and not any(ord(character) < 32 or ord(character) == 127 for character in value)
+        and not any(character in "<>&\"'" for character in value)
+    )
+
+
+def _validated_public_config(value: Mapping[str, object]) -> dict[str, object]:
+    config = json.loads(json.dumps(value))
+    if not isinstance(config, dict):
+        raise TypeError("DecisionOS public configuration is invalid")
+    if not config:
+        return {}
+    if set(config) != _PUBLIC_CONFIG_KEYS:
+        raise ValueError("DecisionOS public configuration contains an unknown field")
+    firebase = config.get("firebase")
+    if (
+        not isinstance(firebase, dict)
+        or not _FIREBASE_REQUIRED_KEYS.issubset(firebase)
+        or not set(firebase).issubset(_FIREBASE_PUBLIC_KEYS)
+        or not all(_public_value(item) for item in firebase.values())
+        or not _public_value(config.get("appCheckSiteKey"))
+    ):
+        raise ValueError("DecisionOS public configuration is invalid")
+    return config
 
 
 class _BodyModel(BaseModel):
@@ -246,6 +296,18 @@ def _clear_session_cookies(response: Response) -> None:
 def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
     """Build a same-origin, App-Check-protected DecisionOS application."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    templates = Jinja2Templates(directory=str(_PACKAGE_DIR / "templates"))
+    public_config_json = json.dumps(
+        dict(dependencies.firebase_public_config),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    app.mount(
+        "/decisionos-static",
+        StaticFiles(directory=str(_PACKAGE_DIR / "decisionos_static")),
+        name="decisionos-static",
+    )
 
     @app.exception_handler(StarletteHTTPException)
     async def fixed_http_error(
@@ -342,9 +404,18 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
     def protected_app(request: Request) -> Response:
         if _principal(request, dependencies.authenticator) is None:
             return _fixed_error(401, "authentication_required")
-        return HTMLResponse(
-            "<!doctype html><html><head><title>HumanWire DecisionOS</title></head>"
-            "<body><main><h1>HumanWire DecisionOS</h1></main></body></html>"
+        return templates.TemplateResponse(
+            request=request,
+            name="decisionos_shell.html",
+            context={"public_config_json": public_config_json},
+        )
+
+    @app.api_route("/signin", methods=["GET", "HEAD"], response_class=HTMLResponse)
+    def sign_in(request: Request) -> Response:
+        return templates.TemplateResponse(
+            request=request,
+            name="decisionos_login.html",
+            context={"public_config_json": public_config_json},
         )
 
     @app.post("/api/session/login")

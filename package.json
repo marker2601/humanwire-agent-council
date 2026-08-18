@@ -1,0 +1,16 @@
+{
+  "name": "humanwire-decisionos-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "commonjs",
+  "scripts": {
+    "build:decisionos": "node scripts/build_decisionos_frontend.mjs",
+    "check:decisionos": "node --check src/humanwire/decisionos_static/decisionos-auth.js && node --check src/humanwire/decisionos_static/decisionos-app.js"
+  },
+  "dependencies": {
+    "firebase": "12.17.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

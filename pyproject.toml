@@ -51,6 +51,8 @@ humanwire = [
   "viewer_static/*.js",
   "studio_static/*.css",
   "studio_static/*.js",
+  "decisionos_static/*.css",
+  "decisionos_static/*.js",
 ]
 
 [tool.pytest.ini_options]

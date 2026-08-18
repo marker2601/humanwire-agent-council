@@ -1,0 +1,160 @@
+from __future__ import annotations
+
+import json
+from html.parser import HTMLParser
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+TEMPLATES = ROOT / "src" / "humanwire" / "templates"
+STATIC = ROOT / "src" / "humanwire" / "decisionos_static"
+
+
+def _source(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+class _HTMLFacts(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.text: list[str] = []
+        self.resources: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag not in {"script", "link"}:
+            return
+        values = dict(attrs)
+        resource = values.get("src") or values.get("href")
+        if resource:
+            self.resources.append(resource)
+
+    def handle_data(self, data: str) -> None:
+        normalized = " ".join(data.split())
+        if normalized:
+            self.text.append(normalized)
+
+
+def _visible_text(path: Path) -> str:
+    facts = _HTMLFacts()
+    facts.feed(_source(path))
+    return " ".join(facts.text)
+
+
+def test_signed_out_page_has_one_clear_authentication_path() -> None:
+    path = TEMPLATES / "decisionos_login.html"
+    source = _source(path)
+    visible = _visible_text(path)
+
+    assert "HumanWire DecisionOS" in visible
+    assert "Make the decision. Keep the evidence." in visible
+    assert "Sign in with Google" in visible
+    assert "Use email link" in visible
+    assert "people retain approval authority" in visible
+    assert "Firebase" not in visible
+    assert source.count("data-sign-in-google") == 1
+    assert "data-email-link" in source
+    assert "data-organization-onboarding" in source
+
+
+def test_workspace_shell_has_real_navigation_and_authority_regions() -> None:
+    path = TEMPLATES / "decisionos_shell.html"
+    source = _source(path)
+    visible = _visible_text(path)
+
+    for label in ("Home", "Decisions", "Evidence", "Team"):
+        assert f'data-panel-target="{label.casefold()}"' in source
+        assert label in visible
+    for label in (
+        "New decision",
+        "Invite teammate",
+        "Launch decision",
+        "Fundraising readiness",
+        "Readiness council",
+        "Evidence that changes the decision",
+        "Decision authority",
+        "Human approval required",
+    ):
+        assert label in visible
+    assert "data-organization-list" in source
+    assert "data-workspace-list" in source
+    assert "data-create-organization" in source
+    assert "data-create-workspace" in source
+    assert "data-invite-member" in source
+    assert "data-sign-out" in source
+
+
+def test_css_matches_the_locked_decisionos_design_system() -> None:
+    source = _source(STATIC / "decisionos.css")
+
+    assert "--decisionos-ink: #06152f" in source
+    assert "--decisionos-cyan: #06b9ed" in source
+    assert "--decisionos-white: #ffffff" in source
+    assert "min-height: 44px" in source
+    assert ":focus-visible" in source
+    assert "prefers-reduced-motion: reduce" in source
+    assert "@media (max-width: 759px)" in source
+    assert "overflow-x: hidden" not in source
+    assert "font-size: 1" in source
+
+
+def test_auth_controller_never_uses_browser_storage_or_logs_credentials() -> None:
+    source = _source(STATIC / "decisionos-auth.js")
+
+    for forbidden in (
+        "localStorage",
+        "sessionStorage",
+        "console.log",
+        "console.error",
+        "innerHTML",
+        "document.write",
+    ):
+        assert forbidden not in source
+    assert '"/api/session/login"' in source
+    assert "X-Firebase-AppCheck" in source
+    assert "credentials.idToken = \"\"" in source
+    assert "location.assign(\"/app\")" in source
+
+
+def test_app_controller_targets_only_real_protected_routes() -> None:
+    source = _source(STATIC / "decisionos-app.js")
+
+    for route in (
+        "/api/organizations",
+        "/api/session/logout",
+        "/api/invitations/accept",
+        "/workspaces",
+        "/invitations",
+    ):
+        assert route in source
+    for forbidden in (
+        "localStorage",
+        "sessionStorage",
+        "console.log",
+        "console.error",
+        "innerHTML",
+        "document.write",
+    ):
+        assert forbidden not in source
+    assert "X-HumanWire-CSRF" in source
+    assert "X-Firebase-AppCheck" in source
+    assert "aria-selected" in source
+
+
+def test_frontend_build_is_pinned_and_produces_a_local_firebase_adapter() -> None:
+    package = json.loads(_source(ROOT / "package.json"))
+    build = _source(ROOT / "scripts" / "build_decisionos_frontend.mjs")
+
+    assert package["scripts"]["build:decisionos"] == "node scripts/build_decisionos_frontend.mjs"
+    assert package["dependencies"]["firebase"].count(".") == 2
+    assert not package["dependencies"]["firebase"].startswith(("^", "~"))
+    assert package["devDependencies"]["esbuild"].count(".") == 2
+    assert "decisionos_static/firebase-adapter.js" in build.replace("\\", "/")
+    assert "initializeAppCheck" in build
+    assert "ReCaptchaEnterpriseProvider" in build
+
+
+def test_templates_load_only_local_scripts_and_styles() -> None:
+    for name in ("decisionos_login.html", "decisionos_shell.html"):
+        facts = _HTMLFacts()
+        facts.feed(_source(TEMPLATES / name))
+        assert facts.resources
+        assert all(item.startswith("/decisionos-static/") for item in facts.resources)

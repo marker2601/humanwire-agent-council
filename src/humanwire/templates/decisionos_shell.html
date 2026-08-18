@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="humanwire-public-config" content="{{ public_config_json | e }}">
+    <title>HumanWire DecisionOS</title>
+    <link rel="stylesheet" href="/decisionos-static/decisionos.css">
+  </head>
+  <body class="decisionos-app-page">
+    <a class="decisionos-skip" href="#decisionos-main">Skip to main content</a>
+    <header class="decisionos-appbar">
+      <a class="decisionos-brand" href="/app" aria-label="HumanWire DecisionOS home">
+        <svg aria-hidden="true" viewBox="0 0 42 32" width="42" height="32">
+          <path d="M3 3v26M39 3v26M3 16h9m18 0h9M12 5v22M30 5v22M12 16l9-9 9 9M12 16l9 9 9-9" />
+        </svg>
+        <span>HumanWire <strong>DecisionOS</strong></span>
+      </a>
+      <div class="decisionos-appbar__context">
+        <label>
+          <span>Organization</span>
+          <select data-organization-list aria-label="Organization"></select>
+        </label>
+        <label>
+          <span>Workspace</span>
+          <select data-workspace-list aria-label="Workspace" disabled></select>
+        </label>
+        <button class="decisionos-user-button" type="button" data-sign-out>Sign out</button>
+      </div>
+    </header>
+
+    <div class="decisionos-app-shell">
+      <nav class="decisionos-nav" aria-label="Product">
+        <button type="button" data-panel-target="home" aria-selected="true">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m3 11 9-8 9 8v9a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1v-9Z"/></svg><span>Home</span>
+        </button>
+        <button type="button" data-panel-target="decisions" aria-selected="false">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 6h14M5 12h9M5 18h14"/><circle cx="3" cy="6" r=".5"/><circle cx="3" cy="12" r=".5"/><circle cx="3" cy="18" r=".5"/></svg><span>Decisions</span>
+        </button>
+        <button type="button" data-panel-target="evidence" aria-selected="false">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6Z"/></svg><span>Evidence</span>
+        </button>
+        <button type="button" data-panel-target="team" aria-selected="false">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"/><circle cx="17" cy="9" r="2.5"/><path d="M3 20v-2a5 5 0 0 1 5-5h2a5 5 0 0 1 5 5v2M15 14h1a5 5 0 0 1 5 5v1"/></svg><span>Team</span>
+        </button>
+      </nav>
+
+      <main id="decisionos-main" class="decisionos-main">
+        <section data-panel="home">
+          <div class="decisionos-workspace-heading">
+            <div>
+              <h1 data-workspace-title>Fundraising readiness</h1>
+              <p data-workspace-summary>Turn scattered evidence into an investor-ready decision package.</p>
+            </div>
+            <div class="decisionos-heading-actions">
+              <button class="decisionos-primary-button" type="button" data-new-decision>New decision</button>
+              <button class="decisionos-secondary-button" type="button" data-open-invite>Invite teammate</button>
+            </div>
+          </div>
+
+          <section class="decisionos-onboarding" data-empty-organizations hidden>
+            <h2>Create your organization</h2>
+            <p>Start with the company or team that owns the decision and its evidence.</p>
+            <form data-create-organization>
+              <label for="organization-name">Organization name</label>
+              <div>
+                <input id="organization-name" name="name" maxlength="120" required>
+                <button class="decisionos-primary-button" type="submit">Create organization</button>
+              </div>
+            </form>
+          </section>
+
+          <section class="decisionos-workspace-creation" data-empty-workspaces hidden>
+            <h2>Create the first workspace</h2>
+            <p>Choose the decision pattern your team needs now.</p>
+            <form data-create-workspace>
+              <label for="workspace-name">Workspace name</label>
+              <input id="workspace-name" name="name" maxlength="120" required>
+              <fieldset>
+                <legend>Playbook</legend>
+                <label><input type="radio" name="playbook" value="launch_decision" checked> Launch decision</label>
+                <label><input type="radio" name="playbook" value="fundraising_readiness"> Fundraising readiness</label>
+              </fieldset>
+              <button class="decisionos-primary-button" type="submit">Create workspace</button>
+            </form>
+          </section>
+
+          <div class="decisionos-workspace" data-workspace-content hidden>
+            <aside class="decisionos-playbooks" aria-label="Playbooks">
+              <h2>Playbooks</h2>
+              <button type="button" data-playbook="launch_decision" aria-selected="false">Launch decision</button>
+              <button type="button" data-playbook="fundraising_readiness" aria-selected="true">Fundraising readiness</button>
+            </aside>
+
+            <div class="decisionos-workspace__canvas">
+              <section class="decisionos-council" aria-labelledby="council-title">
+                <h2 id="council-title">Readiness council</h2>
+                <p>Functional AI specialists prepare traceable work in sequence. Your team owns the decision.</p>
+                <ol class="decisionos-council__flow">
+                  <li aria-current="step"><span>1</span><strong>Market analyst</strong><small>Ready</small></li>
+                  <li><span>2</span><strong>Evidence analyst</strong><small>Reviewing evidence</small></li>
+                  <li><span>3</span><strong>Risk reviewer</strong><small>Ready</small></li>
+                  <li><span>4</span><strong>Investment memo editor</strong><small>Ready</small></li>
+                  <li class="decisionos-council__human"><span>5</span><strong>Founder approval</strong><small>Human approval required</small></li>
+                </ol>
+              </section>
+
+              <section class="decisionos-evidence-preview" aria-labelledby="evidence-title">
+                <h2 id="evidence-title">Evidence that changes the decision</h2>
+                <p>Source-backed inputs appear here as the team adds them.</p>
+                <ul>
+                  <li><strong>Market validation</strong><span>No evidence added</span></li>
+                  <li><strong>Financial runway</strong><span>No evidence added</span></li>
+                  <li><strong>Customer proof</strong><span>No evidence added</span></li>
+                </ul>
+                <p class="decisionos-availability-note">Evidence intake opens inside an active decision run.</p>
+              </section>
+            </div>
+
+            <aside class="decisionos-authority" aria-labelledby="authority-title">
+              <h2 id="authority-title">Decision authority</h2>
+              <p>Roles and approval for this workspace.</p>
+              <dl>
+                <div><dt>Decision owner</dt><dd data-current-role>Assigned by organization</dd></div>
+                <div><dt>Approver</dt><dd>Human approval required</dd></div>
+                <div><dt>Viewer</dt><dd>Read-only evidence access</dd></div>
+              </dl>
+              <div class="decisionos-approval-boundary">
+                <strong>Human approval required</strong>
+                <p>Specialists can prepare the package. Only an authorized person can finalize it.</p>
+                <p class="decisionos-availability-note">Approval opens only when the evidence package is ready.</p>
+              </div>
+            </aside>
+          </div>
+        </section>
+
+        <section data-panel="decisions" hidden>
+          <h1>Decisions</h1>
+          <p>Decisions created in this workspace will appear here with evidence and approval status.</p>
+          <button class="decisionos-primary-button" type="button" data-new-decision>New decision</button>
+        </section>
+
+        <section data-panel="evidence" hidden>
+          <h1>Evidence</h1>
+          <p>Source material remains organization-scoped and connected to the decisions it supports.</p>
+        </section>
+
+        <section data-panel="team" hidden>
+          <h1>Team</h1>
+          <p>Invite contributors, approvers, and viewers without transferring owner authority.</p>
+          <form class="decisionos-invite-form" data-invite-member>
+            <label for="invitation-role">Invitation role</label>
+            <select id="invitation-role" name="role">
+              <option value="contributor">Contributor</option>
+              <option value="approver">Approver</option>
+              <option value="viewer">Viewer</option>
+            </select>
+            <button class="decisionos-primary-button" type="submit">Create invitation</button>
+          </form>
+          <div class="decisionos-invitation-result" data-invitation-result hidden>
+            <strong>Invitation created</strong>
+            <p>Copy this one-time token and share it through a trusted channel.</p>
+            <output data-invitation-token></output>
+          </div>
+          <form class="decisionos-invite-form" data-accept-invitation>
+            <label for="invitation-token">Accept an invitation</label>
+            <input id="invitation-token" name="invitation_token" autocomplete="off" required>
+            <button class="decisionos-secondary-button" type="submit">Join organization</button>
+          </form>
+        </section>
+
+        <p class="decisionos-form-status" data-app-status role="status" aria-live="polite"></p>
+      </main>
+    </div>
+
+    <script src="/decisionos-static/firebase-adapter.js" defer></script>
+    <script src="/decisionos-static/decisionos-app.js" defer></script>
+  </body>
+</html>

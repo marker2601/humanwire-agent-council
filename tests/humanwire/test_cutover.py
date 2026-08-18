@@ -109,6 +109,8 @@ def test_installed_distribution_exposes_only_the_humanwire_product() -> None:
             "viewer_static/*.js",
             "studio_static/*.css",
             "studio_static/*.js",
+            "decisionos_static/*.css",
+            "decisionos_static/*.js",
         ]
     }
 

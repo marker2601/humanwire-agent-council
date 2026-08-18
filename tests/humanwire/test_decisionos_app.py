@@ -175,6 +175,40 @@ def test_protected_app_requires_verified_session(client) -> None:
     assert response.json() == {"error": "authentication_required"}
 
 
+def test_signin_and_authenticated_shell_use_local_product_assets(client) -> None:
+    sign_in = client.get("/signin")
+    _login(client)
+    workspace = client.get("/app")
+    stylesheet = client.get("/decisionos-static/decisionos.css")
+
+    assert sign_in.status_code == 200
+    assert "Make the decision." in sign_in.text
+    assert "Keep the evidence." in sign_in.text
+    assert workspace.status_code == 200
+    assert 'data-panel-target="home"' in workspace.text
+    assert stylesheet.status_code == 200
+    assert stylesheet.headers["content-type"].startswith("text/css")
+
+
+def test_public_configuration_rejects_private_or_unknown_fields(dependencies) -> None:
+    with pytest.raises(ValueError, match="public configuration"):
+        DecisionOSDependencies(
+            authenticator=dependencies.authenticator,
+            app_check=dependencies.app_check,
+            repository=dependencies.repository,
+            allowed_hosts=dependencies.allowed_hosts,
+            csrf_token_factory=dependencies.csrf_token_factory,
+            firebase_public_config={
+                "firebase": {
+                    "apiKey": "public-browser-key",
+                    "projectId": "humanwire",
+                    "privateKey": "server-only-value",
+                },
+                "appCheckSiteKey": "public-site-key",
+            },
+        )
+
+
 def test_login_sets_bounded_secure_session_and_csrf_cookies(client) -> None:
     response = client.post(
         "/api/session/login",

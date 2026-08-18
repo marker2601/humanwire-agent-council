@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="humanwire-public-config" content="{{ public_config_json | e }}">
+    <title>Sign in · HumanWire DecisionOS</title>
+    <link rel="stylesheet" href="/decisionos-static/decisionos.css">
+  </head>
+  <body class="decisionos-login-page">
+    <header class="decisionos-brandbar">
+      <a class="decisionos-brand" href="/signin" aria-label="HumanWire DecisionOS home">
+        <svg aria-hidden="true" viewBox="0 0 42 32" width="42" height="32">
+          <path d="M3 3v26M39 3v26M3 16h9m18 0h9M12 5v22M30 5v22M12 16l9-9 9 9M12 16l9 9 9-9" />
+        </svg>
+        <span>HumanWire <strong>DecisionOS</strong></span>
+      </a>
+    </header>
+
+    <main class="decisionos-login">
+      <section class="decisionos-login__story" aria-labelledby="decisionos-login-title">
+        <div class="decisionos-login__copy">
+          <h1 id="decisionos-login-title">Make the decision.<br>Keep the evidence.</h1>
+          <p>Bring your team, source material, and approval path into one accountable workspace.</p>
+        </div>
+
+        <ol class="decisionos-method" aria-label="Decision workflow">
+          <li>
+            <span class="decisionos-method__number">1</span>
+            <strong>Request</strong>
+            <small>Define the decision and context</small>
+          </li>
+          <li>
+            <span class="decisionos-method__number">2</span>
+            <strong>Evidence</strong>
+            <small>Collect and organize source material</small>
+          </li>
+          <li>
+            <span class="decisionos-method__number">3</span>
+            <strong>Review</strong>
+            <small>Evaluate and discuss with your team</small>
+          </li>
+          <li class="decisionos-method__approval">
+            <span class="decisionos-method__boundary">Human approval boundary</span>
+            <span class="decisionos-method__number">4</span>
+            <strong>Approval</strong>
+            <small>People retain approval authority</small>
+          </li>
+          <li>
+            <span class="decisionos-method__number">5</span>
+            <strong>Outcome</strong>
+            <small>Execute and record the decision</small>
+          </li>
+        </ol>
+
+        <div class="decisionos-playbook-links" aria-label="Available playbooks">
+          <span>Launch decision <span aria-hidden="true">→</span></span>
+          <span>Fundraising readiness <span aria-hidden="true">→</span></span>
+        </div>
+      </section>
+
+      <section class="decisionos-login__access" aria-labelledby="decisionos-signin-title">
+        <div class="decisionos-login__panel">
+          <h2 id="decisionos-signin-title">Sign in to HumanWire DecisionOS</h2>
+
+          <button class="decisionos-google-button" type="button" data-sign-in-google>
+            <svg aria-hidden="true" viewBox="0 0 24 24" width="22" height="22">
+              <path fill="#4285f4" d="M21.4 12.2c0-.7-.1-1.4-.2-2H12v3.8h5.3a4.5 4.5 0 0 1-2 3v2.5h3.2c1.9-1.8 2.9-4.3 2.9-7.3Z"/>
+              <path fill="#34a853" d="M12 21.8c2.7 0 5-.9 6.6-2.4l-3.2-2.5c-.9.6-2 1-3.4 1-2.6 0-4.8-1.8-5.6-4.2H3v2.6a10 10 0 0 0 9 5.5Z"/>
+              <path fill="#fbbc05" d="M6.4 13.7a6 6 0 0 1 0-3.4V7.7H3a10 10 0 0 0 0 8.6l3.4-2.6Z"/>
+              <path fill="#ea4335" d="M12 6.1c1.5 0 2.8.5 3.8 1.5l2.9-2.8A9.7 9.7 0 0 0 3 7.7l3.4 2.6C7.2 7.9 9.4 6.1 12 6.1Z"/>
+            </svg>
+            <span>Sign in with Google</span>
+          </button>
+
+          <div class="decisionos-login__separator"><span>or</span></div>
+
+          <button class="decisionos-link-button" type="button" data-email-link>Use email link</button>
+          <form class="decisionos-email-form" data-email-form hidden>
+            <label for="decisionos-email">Work email</label>
+            <input id="decisionos-email" name="email" type="email" autocomplete="email" required>
+            <button class="decisionos-primary-button" type="submit" data-email-submit>Send secure link</button>
+          </form>
+          <p class="decisionos-form-status" data-auth-status role="status" aria-live="polite"></p>
+
+          <div class="decisionos-trust">
+            <svg aria-hidden="true" viewBox="0 0 24 24" width="28" height="28">
+              <path d="M12 3 5 6v5c0 4.7 2.9 8.2 7 10 4.1-1.8 7-5.3 7-10V6l-7-3Z" />
+            </svg>
+            <p>Your organization controls access. AI specialists can prepare work; people retain approval authority.</p>
+          </div>
+
+          <section class="decisionos-login__onboarding" data-organization-onboarding aria-labelledby="onboarding-title">
+            <h3 id="onboarding-title">Create your organization workspace</h3>
+            <label for="preview-organization">Organization name</label>
+            <input id="preview-organization" type="text" placeholder="Enter organization name" disabled>
+            <button type="button" disabled>Create workspace</button>
+            <small>Sign in to enable workspace creation.</small>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <script src="/decisionos-static/firebase-adapter.js" defer></script>
+    <script src="/decisionos-static/decisionos-auth.js" defer></script>
+  </body>
+</html>
