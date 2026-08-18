@@ -169,7 +169,7 @@ def _raw_asgi_post(
 
 
 def test_protected_app_requires_verified_session(client) -> None:
-    response = client.get("/app")
+    response = client.get("/workspace")
 
     assert response.status_code == 401
     assert response.json() == {"error": "authentication_required"}
@@ -178,7 +178,7 @@ def test_protected_app_requires_verified_session(client) -> None:
 def test_signin_and_authenticated_shell_use_local_product_assets(client) -> None:
     sign_in = client.get("/signin")
     _login(client)
-    workspace = client.get("/app")
+    workspace = client.get("/workspace")
     stylesheet = client.get("/decisionos-static/decisionos.css")
 
     assert sign_in.status_code == 200
@@ -218,7 +218,7 @@ def test_login_sets_bounded_secure_session_and_csrf_cookies(client) -> None:
 
     assert response.status_code == 204
     cookies = response.headers.get_list("set-cookie")
-    session = next(item for item in cookies if item.startswith("__Host-humanwire-session="))
+    session = next(item for item in cookies if item.startswith("__session="))
     csrf = next(item for item in cookies if item.startswith("__Host-humanwire-csrf="))
     assert "HttpOnly" in session
     assert "Secure" in session
@@ -258,6 +258,82 @@ def test_mutations_require_same_origin_and_app_check(client, headers) -> None:
 
     assert response.status_code == 403
     assert response.json()["error"] in {"origin_forbidden", "app_check_failed"}
+
+
+def test_hosting_rewrite_accepts_an_exact_allowlisted_public_origin(dependencies) -> None:
+    hosted = DecisionOSDependencies(
+        authenticator=dependencies.authenticator,
+        app_check=dependencies.app_check,
+        repository=dependencies.repository,
+        allowed_hosts=frozenset(
+            {
+                "humanwire-decisionos-wjjhjrgnyq-uc.a.run.app",
+                "humanwire-agentic-2026.firebaseapp.com",
+            }
+        ),
+        csrf_token_factory=dependencies.csrf_token_factory,
+    )
+    body = b'{"id_token":"id-owner"}'
+
+    status, payload = _raw_asgi_post(
+        hosted,
+        path="/api/session/login",
+        headers=[
+            (b"host", b"humanwire-decisionos-wjjhjrgnyq-uc.a.run.app"),
+            (b"origin", b"https://humanwire-agentic-2026.firebaseapp.com"),
+            (b"x-firebase-appcheck", b"valid-app-check"),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+        ],
+        body=body,
+    )
+
+    assert status == 204
+    assert payload == {}
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        b"https://attacker.example",
+        b"http://humanwire-agentic-2026.firebaseapp.com",
+        b"https://humanwire-agentic-2026.firebaseapp.com/",
+    ],
+)
+def test_hosting_rewrite_rejects_noncanonical_or_untrusted_public_origin(
+    dependencies,
+    origin,
+) -> None:
+    hosted = DecisionOSDependencies(
+        authenticator=dependencies.authenticator,
+        app_check=dependencies.app_check,
+        repository=dependencies.repository,
+        allowed_hosts=frozenset(
+            {
+                "humanwire-decisionos-wjjhjrgnyq-uc.a.run.app",
+                "humanwire-agentic-2026.firebaseapp.com",
+                "humanwire-agentic-2026.web.app",
+            }
+        ),
+        csrf_token_factory=dependencies.csrf_token_factory,
+    )
+    body = b'{"id_token":"id-owner"}'
+
+    status, payload = _raw_asgi_post(
+        hosted,
+        path="/api/session/login",
+        headers=[
+            (b"host", b"humanwire-decisionos-wjjhjrgnyq-uc.a.run.app"),
+            (b"origin", origin),
+            (b"x-firebase-appcheck", b"valid-app-check"),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+        ],
+        body=body,
+    )
+
+    assert status == 403
+    assert payload == {"error": "origin_forbidden"}
 
 
 def test_app_check_monitor_mode_observes_without_blocking_login(dependencies) -> None:
@@ -329,7 +405,7 @@ def test_login_rejects_duplicate_security_headers(client) -> None:
             (
                 b"cookie",
                 (
-                    b"__Host-humanwire-session=session-owner; "
+                    b"__session=session-owner; "
                     b"__Host-humanwire-csrf=csrf-token-1234567890"
                 ),
             ),
@@ -353,7 +429,7 @@ def test_duplicate_app_check_csrf_and_cookie_headers_fail_closed(
         (
             b"cookie",
             (
-                b"__Host-humanwire-session=session-owner; "
+                b"__session=session-owner; "
                 b"__Host-humanwire-csrf=csrf-token-1234567890"
             ),
         ),
@@ -505,7 +581,7 @@ def test_logout_revokes_and_clears_both_cookies(client, dependencies) -> None:
     assert response.status_code == 204
     assert dependencies.authenticator.revoked == ["session-owner"]
     cookies = response.headers.get_list("set-cookie")
-    assert any(item.startswith("__Host-humanwire-session=") and "Max-Age=0" in item for item in cookies)
+    assert any(item.startswith("__session=") and "Max-Age=0" in item for item in cookies)
     assert any(item.startswith("__Host-humanwire-csrf=") and "Max-Age=0" in item for item in cookies)
 
 
@@ -571,3 +647,26 @@ def test_route_exception_is_redacted_and_security_headers_remain(dependencies) -
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["x-content-type-options"] == "nosniff"
     assert response.headers["x-frame-options"] == "DENY"
+
+
+def test_sign_in_csp_allows_only_required_firebase_and_recaptcha_origins(client) -> None:
+    response = client.get("/signin")
+
+    assert response.status_code == 200
+    csp = response.headers["content-security-policy"]
+    assert (
+        "script-src 'self' https://apis.google.com https://www.google.com/recaptcha/ "
+        "https://www.gstatic.com/recaptcha/"
+    ) in csp
+    assert (
+        "connect-src 'self' https://identitytoolkit.googleapis.com "
+        "https://securetoken.googleapis.com https://content-firebaseappcheck.googleapis.com "
+        "https://firebaseappcheck.googleapis.com "
+        "https://www.google.com/recaptcha/"
+    ) in csp
+    assert (
+        "frame-src 'self' https://www.google.com/recaptcha/ "
+        "https://recaptcha.google.com/recaptcha/"
+    ) in csp
+    assert "https:" not in csp.replace("https://", "")
+    assert "*" not in csp

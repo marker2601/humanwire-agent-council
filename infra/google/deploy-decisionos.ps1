@@ -47,7 +47,7 @@ foreach ($SecretName in @($FirebaseApiKeySecret, $FirebaseAppIdSecret, $AppCheck
     Invoke-Gcloud secrets add-iam-policy-binding $SecretName --project=$ProjectId --member="serviceAccount:$Account" --role=roles/secretmanager.secretAccessor --condition=None
 }
 
-& npx --yes firebase-tools@15.27.0 deploy --project $FirebaseProjectId --config infra/firebase/firebase.json --only 'firestore:rules,firestore:indexes,storage'
+& npx --yes firebase-tools@15.27.0 deploy --project $FirebaseProjectId --config infra/firebase/firebase.json --only 'firestore:rules,firestore:indexes,storage,hosting'
 if ($LASTEXITCODE -ne 0) { throw 'decisionos_rules_deployment_failed' }
 
 Invoke-Gcloud builds submit --config=infra/google/cloudbuild.yaml --substitutions="_IMAGE=$TaggedImage" .
@@ -59,7 +59,8 @@ $PublicEnvironment = "HUMANWIRE_SERVICE_ROLE=decisionos,HUMANWIRE_DECISIONOS_PRO
 Invoke-Gcloud run deploy $Service --image=$PinnedImage --region=$Region --project=$ProjectId --service-account=$Account --allow-unauthenticated --min-instances=0 --max-instances=3 --concurrency=40 --timeout=60 --cpu=1 --memory=512Mi --set-env-vars=$PublicEnvironment --set-secrets=$SecretBindings
 $DecisionOSUrl = (& gcloud run services describe $Service --region=$Region --project=$ProjectId --format='value(status.url)').Trim()
 $DecisionOSHost = ([Uri]$DecisionOSUrl).Host
-Invoke-Gcloud run services update $Service --region=$Region --project=$ProjectId --image=$PinnedImage --update-env-vars="HUMANWIRE_DECISIONOS_ALLOWED_HOSTS=$DecisionOSHost"
+$AllowedHosts = "$DecisionOSHost;$FirebaseProjectId.firebaseapp.com;$FirebaseProjectId.web.app"
+Invoke-Gcloud run services update $Service --region=$Region --project=$ProjectId --image=$PinnedImage --update-env-vars="HUMANWIRE_DECISIONOS_ALLOWED_HOSTS=$AllowedHosts"
 
 Write-Output "decisionos_url=$DecisionOSUrl"
 Write-Output "image_digest=$Digest"

@@ -98,7 +98,7 @@ def test_id_token_exchange_creates_secure_bounded_session() -> None:
     assert result.principal.email_verified is True
     assert result.principal.provider_ids == ("google.com",)
     assert result.cookie.value.get_secret_value() == "opaque-session-cookie"
-    assert result.cookie.name == "__Host-humanwire-session"
+    assert result.cookie.name == "__session"
     assert result.cookie.max_age_seconds == 432000
     assert result.cookie.secure is True
     assert result.cookie.http_only is True

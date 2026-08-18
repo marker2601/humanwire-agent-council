@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -60,7 +61,7 @@ def test_health_check_is_fixed_and_does_not_construct_firebase(monkeypatch) -> N
 def test_production_settings_bind_only_explicit_decisionos_environment(monkeypatch) -> None:
     values = {
         "PROJECT_ID": "humanwire-startup",
-        "ALLOWED_HOSTS": "decisionos.example.com",
+        "ALLOWED_HOSTS": "decisionos.example.com;humanwire-startup.firebaseapp.com",
         "FIREBASE_API_KEY": "public-web-key",
         "FIREBASE_APP_ID": "1:123:web:abc",
         "FIREBASE_AUTH_DOMAIN": "humanwire-startup.firebaseapp.com",
@@ -73,7 +74,9 @@ def test_production_settings_bind_only_explicit_decisionos_environment(monkeypat
 
     settings = decisionos_web.DecisionOSSettings()
 
-    assert settings.allowed_host_set == frozenset({"decisionos.example.com"})
+    assert settings.allowed_host_set == frozenset(
+        {"decisionos.example.com", "humanwire-startup.firebaseapp.com"}
+    )
     assert settings.app_check_enforced is False
     assert settings.firebase_public_config == {
         "firebase": {
@@ -141,6 +144,9 @@ def test_decisionos_deployments_are_separate_secret_bound_and_monitor_first() ->
         assert "firestore:rules" in source
         assert "firestore:indexes" in source
         assert "storage" in source
+        assert "hosting" in source
+        assert ".firebaseapp.com" in source
+        assert ".web.app" in source
         assert "roles/datastore.user" in source
         assert "roles/firebaseauth.admin" in source
         assert "roles/logging.logWriter" in source
@@ -157,6 +163,7 @@ def test_decisionos_deployments_are_separate_secret_bound_and_monitor_first() ->
 
 def test_firebase_config_deploys_rules_and_indexes() -> None:
     firebase = _source("infra/firebase/firebase.json")
+    config = json.loads(firebase)
     indexes = _source("infra/firebase/firestore.indexes.json")
 
     assert '"rules": "firestore.rules"' in firebase
@@ -166,6 +173,16 @@ def test_firebase_config_deploys_rules_and_indexes() -> None:
     assert '"collectionGroup": "members"' in indexes
     assert '"fieldPath": "uid"' in indexes
     assert '"queryScope": "COLLECTION_GROUP"' in indexes
+    assert config["hosting"]["public"] == "hosting-public"
+    assert config["hosting"]["rewrites"] == [
+        {
+            "source": "**",
+            "run": {
+                "serviceId": "humanwire-decisionos",
+                "region": "us-central1",
+            },
+        }
+    ]
 
 
 def test_deployment_documentation_preserves_the_submitted_services() -> None:

@@ -33,7 +33,7 @@ class _AuthModel(BaseModel):
 
 class SessionCookie(_AuthModel):
     value: SecretStr
-    name: Literal["__Host-humanwire-session"] = "__Host-humanwire-session"
+    name: Literal["__session"] = "__session"
     max_age_seconds: int = Field(ge=1, le=432000)
     secure: Literal[True] = True
     http_only: Literal[True] = True

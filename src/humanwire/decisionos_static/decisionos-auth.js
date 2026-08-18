@@ -2,6 +2,12 @@
   "use strict";
 
   const adapter = global.HumanWireFirebase;
+  const SAFE_AUTH_REASONS = Object.freeze({
+    "auth/network-request-failed": "network_request_failed",
+    "auth/operation-not-supported-in-this-environment": "environment_unsupported",
+    "auth/unauthorized-domain": "unauthorized_domain",
+    "auth/web-storage-unsupported": "web_storage_unsupported",
+  });
 
   function element(selector) {
     return global.document.querySelector(selector);
@@ -17,12 +23,23 @@
     }
   }
 
-  function setStatus(message, tone) {
+  function setStatus(message, tone, reason) {
     const target = element("[data-auth-status]");
     if (!target) return;
     target.textContent = message;
     if (tone) target.dataset.tone = tone;
     else delete target.dataset.tone;
+    if (reason) target.dataset.reason = reason;
+    else delete target.dataset.reason;
+  }
+
+  function safeAuthReason(error) {
+    const code = typeof error?.code === "string" ? error.code : "";
+    if (SAFE_AUTH_REASONS[code]) return SAFE_AUTH_REASONS[code];
+    if (/^(?:auth|appCheck)\/[a-z][a-z-]{0,79}$/.test(code)) {
+      return code.replace("/", "_").replaceAll("-", "_").toLowerCase();
+    }
+    return "unknown";
   }
 
   async function exchangeCredential(credentials) {
@@ -40,16 +57,24 @@
       body,
     });
     if (!response.ok) throw new Error("authentication_failed");
-    global.location.assign("/app");
+    global.location.assign("/workspace");
   }
 
   async function signInGoogle() {
-    setStatus("Opening secure sign in…");
+    setStatus("Redirecting to secure Google sign in…");
     try {
-      const credentials = await adapter.signInWithGoogle(readConfig());
-      await exchangeCredential(credentials);
-    } catch (_error) {
-      setStatus("Sign in could not be completed. Try again.", "error");
+      await adapter.beginGoogleSignIn(readConfig());
+    } catch (error) {
+      setStatus("Sign in could not be completed. Try again.", "error", safeAuthReason(error));
+    }
+  }
+
+  async function completeGoogleSignIn() {
+    try {
+      const credentials = await adapter.completeGoogleSignIn(readConfig());
+      if (credentials) await exchangeCredential(credentials);
+    } catch (error) {
+      setStatus("Sign in could not be completed. Try again.", "error", safeAuthReason(error));
     }
   }
 
@@ -91,6 +116,7 @@
     if (google) google.addEventListener("click", signInGoogle);
     if (email) email.addEventListener("click", showEmailForm);
     if (form) form.addEventListener("submit", submitEmail);
+    void completeGoogleSignIn();
     try {
       if (adapter.isEmailLink(readConfig(), global.location.href)) {
         showEmailForm();
@@ -102,6 +128,7 @@
   }
 
   global.HumanWireDecisionOSAuth = Object.freeze({
+    completeGoogleSignIn,
     exchangeCredential,
     signInGoogle,
   });

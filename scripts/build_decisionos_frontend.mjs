@@ -4,11 +4,12 @@ const source = String.raw`
 import {initializeApp} from "firebase/app";
 import {
   GoogleAuthProvider,
+  getRedirectResult,
   getAuth,
   isSignInWithEmailLink,
   sendSignInLinkToEmail,
   signInWithEmailLink,
-  signInWithPopup,
+  signInWithRedirect,
   signOut,
 } from "firebase/auth";
 import {
@@ -33,17 +34,30 @@ function configure(config) {
   return state;
 }
 
+async function optionalAppCheckToken() {
+  try {
+    return (await getToken(state.appCheck, false)).token;
+  } catch (_error) {
+    return "";
+  }
+}
+
 async function credential(result) {
   const idToken = await result.user.getIdToken();
-  const checked = await getToken(state.appCheck, false);
-  return {idToken, appCheckToken: checked.token};
+  return {idToken, appCheckToken: await optionalAppCheckToken()};
 }
 
 globalThis.HumanWireFirebase = Object.freeze({
   configure,
-  async signInWithGoogle(config) {
+  async beginGoogleSignIn(config) {
     const current = configure(config);
-    return credential(await signInWithPopup(current.auth, current.provider));
+    await signInWithRedirect(current.auth, current.provider);
+  },
+  async completeGoogleSignIn(config) {
+    const current = configure(config);
+    const result = await getRedirectResult(current.auth);
+    const user = result?.user || current.auth.currentUser;
+    return user ? credential({user}) : null;
   },
   async sendEmailLink(config, email, url) {
     const current = configure(config);

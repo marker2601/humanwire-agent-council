@@ -46,7 +46,7 @@ for secret_name in "$FIREBASE_API_KEY_SECRET" "$FIREBASE_APP_ID_SECRET" "$APP_CH
   gcloud secrets add-iam-policy-binding "$secret_name" --project="$PROJECT_ID" --member="serviceAccount:$ACCOUNT" --role=roles/secretmanager.secretAccessor --condition=None
 done
 
-npx --yes firebase-tools@15.27.0 deploy --project "$FIREBASE_PROJECT_ID" --config infra/firebase/firebase.json --only firestore:rules,firestore:indexes,storage
+npx --yes firebase-tools@15.27.0 deploy --project "$FIREBASE_PROJECT_ID" --config infra/firebase/firebase.json --only firestore:rules,firestore:indexes,storage,hosting
 
 gcloud builds submit --config=infra/google/cloudbuild.yaml --substitutions="_IMAGE=$TAGGED_IMAGE" .
 DIGEST="$(gcloud artifacts docker images describe "$TAGGED_IMAGE" --format='value(image_summary.digest)')"
@@ -57,7 +57,8 @@ PUBLIC_ENVIRONMENT="HUMANWIRE_SERVICE_ROLE=decisionos,HUMANWIRE_DECISIONOS_PROJE
 gcloud run deploy "$SERVICE" --image="$PINNED_IMAGE" --region="$REGION" --project="$PROJECT_ID" --service-account="$ACCOUNT" --allow-unauthenticated --min-instances=0 --max-instances=3 --concurrency=40 --timeout=60 --cpu=1 --memory=512Mi --set-env-vars="$PUBLIC_ENVIRONMENT" --set-secrets="$SECRET_BINDINGS"
 DECISIONOS_URL="$(gcloud run services describe "$SERVICE" --region="$REGION" --project="$PROJECT_ID" --format='value(status.url)')"
 DECISIONOS_HOST="${DECISIONOS_URL#https://}"
-gcloud run services update "$SERVICE" --region="$REGION" --project="$PROJECT_ID" --image="$PINNED_IMAGE" --update-env-vars="HUMANWIRE_DECISIONOS_ALLOWED_HOSTS=$DECISIONOS_HOST"
+ALLOWED_HOSTS="$DECISIONOS_HOST;$FIREBASE_PROJECT_ID.firebaseapp.com;$FIREBASE_PROJECT_ID.web.app"
+gcloud run services update "$SERVICE" --region="$REGION" --project="$PROJECT_ID" --image="$PINNED_IMAGE" --update-env-vars="HUMANWIRE_DECISIONOS_ALLOWED_HOSTS=$ALLOWED_HOSTS"
 
 printf 'decisionos_url=%s\n' "$DECISIONOS_URL"
 printf 'image_digest=%s\n' "$DIGEST"

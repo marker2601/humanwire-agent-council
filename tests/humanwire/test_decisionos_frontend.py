@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -111,7 +112,7 @@ def test_auth_controller_never_uses_browser_storage_or_logs_credentials() -> Non
     assert '"/api/session/login"' in source
     assert "X-Firebase-AppCheck" in source
     assert "credentials.idToken = \"\"" in source
-    assert "location.assign(\"/app\")" in source
+    assert "location.assign(\"/workspace\")" in source
 
 
 def test_app_controller_targets_only_real_protected_routes() -> None:
@@ -152,9 +153,32 @@ def test_frontend_build_is_pinned_and_produces_a_local_firebase_adapter() -> Non
     assert "ReCaptchaEnterpriseProvider" in build
 
 
+def test_login_defers_app_check_enforcement_to_the_server_boundary() -> None:
+    build = _source(ROOT / "scripts" / "build_decisionos_frontend.mjs")
+
+    assert "async function optionalAppCheckToken()" in build
+    assert "return (await getToken(state.appCheck, false)).token;" in build
+    assert 'return "";' in build
+    assert "appCheckToken: await optionalAppCheckToken()" in build
+    assert "result?.user || current.auth.currentUser" in build
+
+
 def test_templates_load_only_local_scripts_and_styles() -> None:
     for name in ("decisionos_login.html", "decisionos_shell.html"):
         facts = _HTMLFacts()
         facts.feed(_source(TEMPLATES / name))
         assert facts.resources
         assert all(item.startswith("/decisionos-static/") for item in facts.resources)
+
+
+def test_google_redirect_returns_into_the_server_session_boundary() -> None:
+    completed = subprocess.run(
+        ["node", "tests/humanwire/decisionos_frontend_harness.js"],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "decisionos frontend harness: PASS\n"

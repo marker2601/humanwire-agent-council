@@ -6,6 +6,23 @@
   "storage": {
     "rules": "storage.rules"
   },
+  "hosting": {
+    "public": "hosting-public",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "**",
+        "run": {
+          "serviceId": "humanwire-decisionos",
+          "region": "us-central1"
+        }
+      }
+    ]
+  },
   "emulators": {
     "firestore": {
       "host": "127.0.0.1",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping
@@ -42,7 +43,7 @@ from humanwire.decisionos_store import (
 
 _MAX_BODY_BYTES = 8192
 _PACKAGE_DIR = Path(__file__).resolve().parent
-_SESSION_COOKIE = "__Host-humanwire-session"
+_SESSION_COOKIE = "__session"
 _CSRF_COOKIE = "__Host-humanwire-csrf"
 _HOST = re.compile(r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?(?::([0-9]{1,5}))?$")
 _ORGANIZATION_ID = r"org_[0-9A-HJKMNP-TV-Z]{26}"
@@ -70,9 +71,17 @@ _MUTATION_PATHS = (
 _SAFE_HEADERS = {
     "Cache-Control": "no-store",
     "Content-Security-Policy": (
-        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
-        "connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
-        "form-action 'self'"
+        "default-src 'self'; "
+        "script-src 'self' https://apis.google.com https://www.google.com/recaptcha/ "
+        "https://www.gstatic.com/recaptcha/; "
+        "style-src 'self'; img-src 'self' data:; "
+        "connect-src 'self' https://identitytoolkit.googleapis.com "
+        "https://securetoken.googleapis.com https://content-firebaseappcheck.googleapis.com "
+        "https://firebaseappcheck.googleapis.com "
+        "https://www.google.com/recaptcha/; "
+        "frame-src 'self' https://www.google.com/recaptcha/ "
+        "https://recaptcha.google.com/recaptcha/; "
+        "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
     ),
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
     "Referrer-Policy": "no-referrer",
@@ -267,6 +276,11 @@ def _session_cookie(request: Request) -> str | None:
     return request.cookies.get(_SESSION_COOKIE)
 
 
+def _csrf_for_session(session_cookie: str) -> str:
+    """Bind the browser-readable CSRF token to Firebase Hosting's session cookie."""
+    return hashlib.sha256(session_cookie.encode("utf-8")).hexdigest()
+
+
 def _principal(
     request: Request,
     authenticator: SessionAuthenticator,
@@ -310,6 +324,7 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
         separators=(",", ":"),
         sort_keys=True,
     )
+    allowed_origins = frozenset(f"https://{host}" for host in dependencies.allowed_hosts)
     app.mount(
         "/decisionos-static",
         StaticFiles(directory=str(_PACKAGE_DIR / "decisionos_static")),
@@ -366,8 +381,7 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
                     else:
                         origins = _raw_headers(request, b"origin")
                         origin = _ascii_header(origins)
-                        expected_origin = f"{request.url.scheme}://{host.casefold()}"
-                        if origin != expected_origin:
+                        if origin not in allowed_origins:
                             response = _fixed_error(403, "origin_forbidden")
                         else:
                             app_check_token = _ascii_header(
@@ -399,8 +413,13 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
                                         csrf_header = _ascii_header(
                                             _raw_headers(request, b"x-humanwire-csrf")
                                         )
-                                        csrf_cookie = request.cookies.get(_CSRF_COOKIE)
-                                        if not csrf_matches(csrf_cookie, csrf_header):
+                                        session_cookie = _session_cookie(request)
+                                        expected_csrf = (
+                                            _csrf_for_session(session_cookie)
+                                            if session_cookie is not None
+                                            else None
+                                        )
+                                        if not csrf_matches(expected_csrf, csrf_header):
                                             response = _fixed_error(403, "csrf_failed")
                                         else:
                                             request.state.decisionos_principal = principal
@@ -414,6 +433,7 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
         return response
 
     @app.api_route("/app", methods=["GET", "HEAD"])
+    @app.api_route("/workspace", methods=["GET", "HEAD"])
     def protected_app(request: Request) -> Response:
         if _principal(request, dependencies.authenticator) is None:
             return _fixed_error(401, "authentication_required")
@@ -442,7 +462,9 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
             )
         except AuthenticationUnavailable:
             return _fixed_error(401, "authentication_failed")
-        csrf_token = dependencies.csrf_token_factory()
+        csrf_token = _csrf_for_session(
+            authenticated.cookie.value.get_secret_value()
+        )
         if not csrf_matches(csrf_token, csrf_token):
             return _fixed_error(500, "request_failed")
         response = Response(status_code=204)

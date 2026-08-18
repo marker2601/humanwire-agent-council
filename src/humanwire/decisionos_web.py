@@ -85,7 +85,8 @@ class DecisionOSSettings(BaseSettings):
 
     @property
     def allowed_host_set(self) -> frozenset[str]:
-        hosts = frozenset(item.strip() for item in self.allowed_hosts.split(",") if item.strip())
+        values = self.allowed_hosts.replace(";", ",")
+        hosts = frozenset(item.strip() for item in values.split(",") if item.strip())
         if not hosts:
             raise ValueError("DecisionOS requires an allowed host")
         return hosts
