@@ -28,6 +28,9 @@ google = [
   "google-cloud-pubsub>=2.0,<3.0",
   "google-cloud-logging>=3.0,<4.0",
 ]
+decisionos = [
+  "firebase-admin>=7,<8",
+]
 dev = [
   "pytest>=8.4,<9",
   "pytest-asyncio>=1.1,<2",
