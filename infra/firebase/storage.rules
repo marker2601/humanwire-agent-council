@@ -1,0 +1,24 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isActiveOrganizationMember(organizationId) {
+      let membership = /databases/(default)/documents/organizations/$(organizationId)/members/$(request.auth.uid);
+      return request.auth != null
+        && firestore.exists(membership)
+        && firestore.get(membership).data.status == "active";
+    }
+
+    // Artifacts are written by the trusted backend. The client can download
+    // a sanitized artifact only while its organization membership is active.
+    match /organizations/{organizationId}/workspaces/{workspaceId}/artifacts/{artifactId} {
+      allow get: if isActiveOrganizationMember(organizationId);
+      allow list: if false;
+      allow write: if false;
+    }
+
+    match /{object=**} {
+      allow read, write: if false;
+    }
+  }
+}

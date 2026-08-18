@@ -1,0 +1,29 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isActiveOrganizationMember(organizationId) {
+      let membership = /databases/$(database)/documents/organizations/$(organizationId)/members/$(request.auth.uid);
+      return request.auth != null
+        && exists(membership)
+        && get(membership).data.status == "active";
+    }
+
+    // Browsers receive only the sanitized, presentation-ready projection.
+    // Membership, invitations, audit records, and private run state remain
+    // server-authoritative even for organization owners.
+    match /organizations/{organizationId}/projections/{runId} {
+      allow get, list: if isActiveOrganizationMember(organizationId);
+      allow create, update, delete: if false;
+
+      match /timeline/{eventId} {
+        allow get, list: if isActiveOrganizationMember(organizationId);
+        allow create, update, delete: if false;
+      }
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

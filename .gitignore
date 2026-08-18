@@ -19,3 +19,7 @@ htmlcov/
 .cache/
 .remotion/
 node_modules/
+.firebase/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
