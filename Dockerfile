@@ -8,7 +8,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
-RUN python -m pip install --no-cache-dir ".[google]"
+RUN python -m pip install --no-cache-dir ".[google,decisionos]"
 RUN addgroup --system humanwire && adduser --system --ingroup humanwire humanwire
 
 USER humanwire

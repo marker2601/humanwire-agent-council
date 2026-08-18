@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -80,6 +81,10 @@ _SAFE_HEADERS = {
 }
 
 
+def _ignore_app_check_observation(_valid: bool) -> None:
+    return None
+
+
 class SessionAuthenticator(Protocol):
     def exchange_id_token(self, id_token: str) -> AuthenticatedSession:
         raise NotImplementedError
@@ -109,6 +114,8 @@ class DecisionOSDependencies:
     allowed_hosts: frozenset[str]
     csrf_token_factory: Callable[[], str]
     firebase_public_config: Mapping[str, object] = field(default_factory=dict)
+    app_check_enforced: bool = True
+    app_check_observer: Callable[[bool], None] = _ignore_app_check_observation
 
     def __post_init__(self) -> None:
         if not self.allowed_hosts:
@@ -366,11 +373,17 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
                             app_check_token = _ascii_header(
                                 _raw_headers(request, b"x-firebase-appcheck")
                             )
-                            try:
-                                if app_check_token is None:
-                                    raise AppCheckUnavailable()
-                                dependencies.app_check.verify(app_check_token)
-                            except AppCheckUnavailable:
+                            app_check_failed = False
+                            if app_check_token is None:
+                                app_check_failed = True
+                            else:
+                                try:
+                                    dependencies.app_check.verify(app_check_token)
+                                except AppCheckUnavailable:
+                                    app_check_failed = True
+                            with suppress(Exception):
+                                dependencies.app_check_observer(not app_check_failed)
+                            if app_check_failed and dependencies.app_check_enforced:
                                 response = _fixed_error(403, "app_check_failed")
                             else:
                                 if request.url.path == "/api/session/login":

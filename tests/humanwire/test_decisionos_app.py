@@ -260,6 +260,29 @@ def test_mutations_require_same_origin_and_app_check(client, headers) -> None:
     assert response.json()["error"] in {"origin_forbidden", "app_check_failed"}
 
 
+def test_app_check_monitor_mode_observes_without_blocking_login(dependencies) -> None:
+    observations: list[bool] = []
+    monitored = DecisionOSDependencies(
+        authenticator=dependencies.authenticator,
+        app_check=dependencies.app_check,
+        repository=dependencies.repository,
+        allowed_hosts=dependencies.allowed_hosts,
+        csrf_token_factory=dependencies.csrf_token_factory,
+        app_check_enforced=False,
+        app_check_observer=observations.append,
+    )
+    client = TestClient(create_decisionos_app(monitored), base_url=BASE_URL)
+
+    response = client.post(
+        "/api/session/login",
+        headers={"Origin": ORIGIN},
+        json={"id_token": "id-owner"},
+    )
+
+    assert response.status_code == 204
+    assert observations == [False]
+
+
 @pytest.mark.parametrize("raw_path", [b"/api%2Fsession/login", b"/%61pi/session/login"])
 def test_mutations_reject_encoded_raw_path_aliases(dependencies, raw_path) -> None:
     body = b'{"id_token":"id-owner"}'

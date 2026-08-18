@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -13,12 +13,15 @@ from humanwire.decisionos_auth import (
     csrf_matches,
 )
 
+NOW = datetime(2026, 8, 18, 6, 0, tzinfo=UTC)
+
 
 class FakeFirebaseAuth:
     def __init__(self) -> None:
         self.id_claims: object = {
             "uid": "firebase-user-01",
             "email_verified": True,
+            "auth_time": int(NOW.timestamp()),
             "firebase": {
                 "sign_in_provider": "google.com",
                 "identities": {"google.com": ["google-subject"]},
@@ -67,7 +70,7 @@ class FakeAppCheck:
 
 
 def _auth(client: FakeFirebaseAuth | None = None) -> FirebaseSessionAuthenticator:
-    return FirebaseSessionAuthenticator(client or FakeFirebaseAuth())
+    return FirebaseSessionAuthenticator(client or FakeFirebaseAuth(), clock=lambda: NOW)
 
 
 def _exception_graph(error: BaseException) -> tuple[str, ...]:
@@ -179,6 +182,26 @@ def test_invalid_opaque_tokens_fail_without_calling_firebase(token: str) -> None
 
     with pytest.raises(AuthenticationUnavailable, match="authentication_unavailable"):
         _auth(client).exchange_id_token(token)
+
+    assert client.created_tokens == []
+
+
+@pytest.mark.parametrize(
+    "auth_time",
+    [
+        int((NOW - timedelta(minutes=5, seconds=1)).timestamp()),
+        int((NOW + timedelta(seconds=31)).timestamp()),
+        "not-a-timestamp",
+        True,
+        None,
+    ],
+)
+def test_id_token_exchange_requires_recent_authentication(auth_time: object) -> None:
+    client = FakeFirebaseAuth()
+    client.id_claims = {**client.id_claims, "auth_time": auth_time}
+
+    with pytest.raises(AuthenticationUnavailable, match="authentication_unavailable"):
+        _auth(client).exchange_id_token("opaque-id-token")
 
     assert client.created_tokens == []
 

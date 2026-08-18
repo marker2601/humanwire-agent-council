@@ -1,5 +1,44 @@
 # HumanWire Google Cloud deployment
 
+## HumanWire DecisionOS service
+
+DecisionOS deploys as the separate `humanwire-decisionos` Cloud Run service with
+its own `humanwire-decisionos` service account. This deployment does not update or
+route traffic to `humanwire-web`, `humanwire-worker`, or the submitted public demo.
+It uses Firebase Authentication for identity, Firestore membership for tenant
+authority, and Secret Manager references for the Firebase web app ID, public API
+key, and App Check site key. No secret value is accepted on a command line.
+
+Before the first deploy, create a Firebase Web App in the same billing-enabled
+project, enable the approved sign-in providers, register reCAPTCHA Enterprise for
+App Check, and place the three configuration values into these secrets:
+
+- `decisionos-firebase-api-key`
+- `decisionos-firebase-app-id`
+- `decisionos-app-check-site-key`
+
+Then run one of:
+
+```powershell
+./infra/google/deploy-decisionos.ps1 -ProjectId YOUR_PROJECT_ID -Region us-central1
+```
+
+```bash
+./infra/google/deploy-decisionos.sh YOUR_PROJECT_ID us-central1
+```
+
+The script deploys Firestore indexes/rules and Storage rules, builds one immutable
+image, deploys by digest, binds the dedicated runtime identity, and prints only the
+DecisionOS URL, digest, and App Check rollout state. App Check begins in monitored
+mode (`HUMANWIRE_DECISIONOS_APP_CHECK_ENFORCED=false`). Review valid/invalid token
+metrics, register every production hostname, then change that flag to `true`; do
+not enforce it before verified traffic is visible. The service scales to zero.
+
+Verify `/healthz`, Firebase Google/email-link sign-in, two separate organizations,
+one invitation, one workspace per organization, and cross-tenant denial. Roll back
+only `humanwire-decisionos` traffic to its prior revision. Do not delete Firestore,
+Storage, Firebase identities, audit records, or the existing submission services.
+
 This stack deploys one immutable image as two Cloud Run services:
 
 - `humanwire-web` is public and can use only Firestore plus Pub/Sub publish.

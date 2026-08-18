@@ -9,6 +9,8 @@ if role == "web":
     from google_web_index import app
 elif role == "worker":
     from google_worker_index import app
+elif role == "decisionos":
+    from humanwire.decisionos_web import app
 else:
     raise RuntimeError("service_role_invalid") from None
 

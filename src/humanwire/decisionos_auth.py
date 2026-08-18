@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import hmac
 import re
-from collections.abc import Mapping
-from datetime import timedelta
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime, timedelta
 from typing import Literal, Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
@@ -131,15 +131,29 @@ def _principal_from_claims(value: object) -> DecisionOSPrincipal:
     )
 
 
+def _require_recent_authentication(value: object, now: datetime) -> None:
+    claims = _mapping(value)
+    auth_time = claims.get("auth_time")
+    if type(auth_time) is not int:
+        raise ValueError("authentication time is invalid")
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("authentication clock must be timezone-aware")
+    age_seconds = now.astimezone(UTC).timestamp() - auth_time
+    if not -30 <= age_seconds <= 300:
+        raise ValueError("recent authentication is required")
+
+
 class FirebaseSessionAuthenticator:
     def __init__(
         self,
         client: FirebaseAuthClient,
         *,
         cookie: SessionCookieConfig | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._client = client
         self._cookie = SessionCookieConfig() if cookie is None else cookie
+        self._clock = (lambda: datetime.now(UTC)) if clock is None else clock
 
     def exchange_id_token(self, id_token: str) -> AuthenticatedSession:
         if not _valid_opaque(id_token):
@@ -147,6 +161,7 @@ class FirebaseSessionAuthenticator:
         failed = False
         try:
             claims = self._client.verify_id_token(id_token, check_revoked=True)
+            _require_recent_authentication(claims, self._clock())
             principal = _principal_from_claims(claims)
         except Exception:  # noqa: BLE001 - provider details must not cross the boundary
             failed = True

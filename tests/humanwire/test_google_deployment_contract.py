@@ -61,11 +61,12 @@ def test_worker_entrypoint_fails_before_client_creation(environment) -> None:
     assert calls == []
 
 
-def test_one_image_launcher_has_only_exact_web_and_worker_roles() -> None:
+def test_one_image_launcher_has_only_exact_supported_roles() -> None:
     source = (ROOT / "src/google_service.py").read_text(encoding="utf-8")
     assert 'HUMANWIRE_SERVICE_ROLE' in source
     assert 'role == "web"' in source
     assert 'role == "worker"' in source
+    assert 'role == "decisionos"' in source
     assert "service_role_invalid" in source
     assert "GEMINI_API_KEY" not in source
 
@@ -74,7 +75,7 @@ def test_container_is_non_root_reproducible_and_installs_google_extra() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
     assert dockerfile.startswith("FROM python:3.12.13-slim-bookworm@sha256:")
-    assert 'RUN python -m pip install --no-cache-dir ".[google]"' in dockerfile
+    assert 'RUN python -m pip install --no-cache-dir ".[google,decisionos]"' in dockerfile
     assert "USER humanwire" in dockerfile
     assert 'CMD ["python", "-m", "uvicorn", "google_service:app"' in dockerfile
     for private in (".env", ".git", ".venv", ".superpowers", "data", "work"):
