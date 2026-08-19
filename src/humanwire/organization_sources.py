@@ -1184,8 +1184,7 @@ def _parse_pdf(content: bytes, limits: OrganizationSourceLimits) -> tuple[Source
 
     def count_provider_text(text: str, *_args: Any) -> None:
         nonlocal provider_text
-        normalized = re.sub(r"\s+", " ", unicodedata.normalize("NFC", text)).strip()
-        provider_text += len(normalized)
+        provider_text += len(text)
         if provider_text > maximum_text:
             raise _PdfTextLimitReached
 

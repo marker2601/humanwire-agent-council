@@ -689,6 +689,75 @@ def test_pdf_provider_text_budget_aborts_during_chunk_extraction(monkeypatch) ->
     assert emitted == 1
 
 
+def test_pdf_provider_text_budget_counts_raw_chunk_boundary_whitespace(monkeypatch) -> None:
+    private_sentinel = "PRIVATE-PDF-RAW-CHUNK-SENTINEL"
+    provider_calls = 0
+    emitted = 0
+    provider_returned = False
+
+    def emit_boundary_whitespace(self, *args, visitor_text=None, **kwargs):
+        nonlocal provider_calls, emitted, provider_returned
+        provider_calls += 1
+        _private_marker = private_sentinel
+        for _ in range(100):
+            emitted += 1
+            if visitor_text is not None:
+                visitor_text("x ", None, None, None, 12)
+        provider_returned = True
+        return "x " * 100
+
+    monkeypatch.setattr(PageObject, "extract_text", emit_boundary_whitespace)
+
+    with pytest.raises(OrganizationSourceRejected, match="^source_too_large$") as captured:
+        parse_organization_source(
+            source_request(
+                "sample.pdf",
+                limits=OrganizationSourceLimits(max_records=1),
+            )
+        )
+
+    assert provider_calls == 1
+    assert emitted == 61
+    assert provider_returned is False
+    assert private_sentinel not in exception_graph_text(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+def test_pdf_provider_text_budget_counts_an_all_whitespace_raw_chunk(monkeypatch) -> None:
+    private_sentinel = "PRIVATE-PDF-RAW-WHITESPACE-SENTINEL"
+    provider_calls = 0
+    emitted = 0
+    provider_returned = False
+
+    def emit_all_whitespace(self, *args, visitor_text=None, **kwargs):
+        nonlocal provider_calls, emitted, provider_returned
+        provider_calls += 1
+        _private_marker = private_sentinel
+        emitted += 1
+        if visitor_text is not None:
+            visitor_text(" " * 121, None, None, None, 12)
+        provider_returned = True
+        return ""
+
+    monkeypatch.setattr(PageObject, "extract_text", emit_all_whitespace)
+
+    with pytest.raises(OrganizationSourceRejected, match="^source_too_large$") as captured:
+        parse_organization_source(
+            source_request(
+                "sample.pdf",
+                limits=OrganizationSourceLimits(max_records=1),
+            )
+        )
+
+    assert provider_calls == 1
+    assert emitted == 1
+    assert provider_returned is False
+    assert private_sentinel not in exception_graph_text(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
 @pytest.mark.parametrize(
     "private_value",
     [
