@@ -79,6 +79,10 @@ class HostileString(str):
         return hash(self.allowed)
 
 
+class ScalarKey(str):
+    pass
+
+
 class ExplodesIfMaterialized:
     def __deepcopy__(self, _memo):
         raise AssertionError("irrelevant future transition was materialized")
@@ -157,13 +161,22 @@ class FakeQuery:
             raise RuntimeError(self.client.failure)
         rows = []
         for path in sorted(self.paths):
-            data = transaction._get(path) if transaction is not None else self.client.data.get(path)
-            if data is None:
+            candidate = (
+                transaction.staged.get(path, self.client.data.get(path))
+                if transaction is not None
+                else self.client.data.get(path)
+            )
+            if candidate is None:
                 continue
             if all(
-                self._matches(self._field(data, field), operator, value)
+                self._matches(self._field(candidate, field), operator, value)
                 for field, operator, value in self.filters
             ):
+                data = (
+                    transaction._get(path)
+                    if transaction is not None
+                    else candidate
+                )
                 rows.append(FakeSnapshot(FakeDocument(self.client, path), data))
         if self.ordering is not None:
             field, direction = self.ordering
@@ -179,6 +192,8 @@ class FakeQuery:
     def _matches(actual, operator, expected):
         if operator == "==":
             return actual == expected
+        if operator == ">=":
+            return actual is not None and actual >= expected
         if operator == "<=":
             return actual is not None and actual <= expected
         raise AssertionError(f"unsupported fake query operator: {operator}")
@@ -606,6 +621,31 @@ def replace_stored_graph(
         client.data[state_path]["payload_digest"] = storage["payload_digest"]
 
 
+def seed_activation_transition_range(
+    client: FakeClient,
+    *,
+    first_version: int,
+    last_version: int,
+) -> None:
+    for version in range(first_version, last_version + 1):
+        transition = organization_store._activation_transition(
+            organization_id=ORG,
+            kind="invitations_created",
+            subject_ids=(SUBJECT,),
+            prior_graph_version=version - 1,
+            member_uid=None,
+            occurred_at=NOW,
+        )
+        client.data[
+            (
+                COLLECTION,
+                ORG,
+                "organization_activation_transitions",
+                f"{version:020d}",
+            )
+        ] = transition.model_dump(mode="python")
+
+
 @pytest.mark.parametrize(
     ("operation", "expected_error"),
     (
@@ -816,7 +856,7 @@ def test_firestore_subject_acceptance_abort_rolls_back_and_retry_advances_once(
     assert repository.load_graph(context).version == 3
 
 
-def test_firestore_unknown_delivery_survives_restart_without_redelivery_grant(
+def test_firestore_pending_delivery_reissues_but_sending_survives_restart(
     fake_firestore,
 ) -> None:
     client, repository, context = fake_firestore
@@ -842,7 +882,6 @@ def test_firestore_unknown_delivery_survives_restart_without_redelivery_grant(
         delivery_route_id="consented_test_route",
     )[0]
     token = grant.token.get_secret_value()
-    before_pending_retry = client.provider_mutation_attempts
     pending_retry = repository.create_subject_invitations(
         decisionos,
         context,
@@ -851,14 +890,13 @@ def test_firestore_unknown_delivery_survives_restart_without_redelivery_grant(
         expires_in=timedelta(days=1),
         delivery_route_id="consented_test_route",
     )[0]
-    assert pending_retry.invitation_id == grant.invitation_id
-    assert pending_retry.token is None
+    assert pending_retry.invitation_id != grant.invitation_id
+    assert pending_retry.token is not None
     assert (
         pending_retry.delivery_status
         is SubjectInvitationDeliveryState.DELIVERY_PENDING
     )
-    assert client.provider_mutation_attempts == before_pending_retry
-    sending = decisionos.begin_subject_invitation_delivery(context, grant)
+    sending = decisionos.begin_subject_invitation_delivery(context, pending_retry)
     assert sending.delivery_status is SubjectInvitationDeliveryState.DELIVERY_SENDING
 
     restarted = FirestoreDecisionOSRepository(
@@ -878,7 +916,7 @@ def test_firestore_unknown_delivery_survives_restart_without_redelivery_grant(
         delivery_route_id="consented_test_route",
     )[0]
 
-    assert retry.invitation_id == grant.invitation_id
+    assert retry.invitation_id == pending_retry.invitation_id
     assert retry.token is None
     assert retry.delivery_status is SubjectInvitationDeliveryState.DELIVERY_SENDING
     assert repository.load_graph(context).version == 2
@@ -944,9 +982,13 @@ def test_firestore_activation_transitions_survive_restart_and_corruption_fails_c
     "corruption",
     [
         "boolean_state_schema",
+        "missing_subject_state",
         "missing_global_index",
         "extra_global_index_field",
         "boolean_invitation_schema",
+        "hostile_state_key",
+        "hostile_index_key",
+        "hostile_invitation_key",
         "phantom_delivered_invitation",
     ],
 )
@@ -964,7 +1006,7 @@ def test_firestore_subject_invitation_relation_fails_closed_on_corruption(
     decisionos = FirestoreDecisionOSRepository(
         client,
         clock=lambda: NOW,
-        identifiers=Identifiers(),
+        identifiers=SequenceFirestoreIdentifiers(),
         organization_collection=COLLECTION,
         invitation_index_collection="test_subject_invites",
     )
@@ -982,12 +1024,26 @@ def test_firestore_subject_invitation_relation_fails_closed_on_corruption(
     index_path = ("test_subject_invites", digest)
     if corruption == "boolean_state_schema":
         client.data[state_path]["schema_version"] = True
+    elif corruption == "missing_subject_state":
+        del client.data[state_path]
     elif corruption == "missing_global_index":
         del client.data[index_path]
     elif corruption == "extra_global_index_field":
         client.data[index_path]["private"] = PRIVATE
     elif corruption == "boolean_invitation_schema":
         client.data[invitation_path]["schema_version"] = True
+    elif corruption == "hostile_state_key":
+        client.data[state_path][ScalarKey("schema_version")] = client.data[
+            state_path
+        ].pop("schema_version")
+    elif corruption == "hostile_index_key":
+        client.data[index_path][ScalarKey("schema_version")] = client.data[
+            index_path
+        ].pop("schema_version")
+    elif corruption == "hostile_invitation_key":
+        client.data[invitation_path][ScalarKey("schema_version")] = client.data[
+            invitation_path
+        ].pop("schema_version")
     else:
         client.data[invitation_path]["delivery_status"] = "delivered"
 
@@ -1000,6 +1056,58 @@ def test_firestore_subject_invitation_relation_fails_closed_on_corruption(
             expires_in=timedelta(days=1),
             delivery_route_id=None,
         )
+
+
+def test_firestore_directory_graph_rejects_inverse_phantom_grant_relation(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    decisionos = FirestoreDecisionOSRepository(
+        client,
+        clock=lambda: NOW,
+        identifiers=SequenceFirestoreIdentifiers(),
+        organization_collection=COLLECTION,
+        invitation_index_collection="test_subject_invites",
+    )
+    repository.create_subject_invitations(
+        decisionos,
+        context,
+        subject_ids=(SUBJECT,),
+        role=DecisionOSRole.VIEWER,
+        expires_in=timedelta(days=1),
+        delivery_route_id=None,
+    )
+    invited = repository.load_graph(context)
+    forged = invited.model_copy(
+        update={
+            "subjects": tuple(
+                item.model_copy(update={"lifecycle": SubjectLifecycle.DIRECTORY_ONLY})
+                if item.subject_id == SUBJECT
+                else item
+                for item in invited.subjects
+            )
+        }
+    )
+    replace_stored_graph(client, repository, forged)
+    before = deepcopy(client.data)
+
+    with pytest.raises(InvitationUnavailable, match="invitation_unavailable"):
+        repository.create_subject_invitations(
+            decisionos,
+            context,
+            subject_ids=(SUBJECT,),
+            role=DecisionOSRole.VIEWER,
+            expires_in=timedelta(days=1),
+            delivery_route_id=None,
+        )
+
+    assert client.data == before
 
 
 def test_firestore_transition_replay_never_materializes_irrelevant_future_docs(
@@ -1038,6 +1146,78 @@ def test_firestore_transition_replay_never_materializes_irrelevant_future_docs(
         ] = ExplodesIfMaterialized()
 
     assert repository.load_committed_import(context, 2) == (saved, receipt)
+
+
+def test_firestore_transition_loader_accepts_full_five_thousand_subject_lifecycle(
+    fake_firestore,
+) -> None:
+    client, repository, _context = fake_firestore
+    seed_activation_transition_range(
+        client,
+        first_version=2,
+        last_version=5_051,
+    )
+
+    transitions = repository._activation_transition_chain(
+        None,
+        ORG,
+        receipt_version=1,
+        target_version=5_051,
+    )
+
+    assert len(transitions) == 5_050
+    assert transitions[0].new_graph_version == 2
+    assert transitions[-1].new_graph_version == 5_051
+
+
+def test_firestore_transition_loader_rejects_more_than_conservative_maximum(
+    fake_firestore,
+) -> None:
+    client, repository, _context = fake_firestore
+    before_limits = tuple(client.query_limits)
+
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        repository._activation_transition_chain(
+            None,
+            ORG,
+            receipt_version=1,
+            target_version=10_002,
+        )
+
+    assert tuple(client.query_limits) == before_limits
+
+
+def test_firestore_transition_loader_rejects_duplicate_claimed_version(
+    fake_firestore,
+) -> None:
+    client, repository, _context = fake_firestore
+    seed_activation_transition_range(
+        client,
+        first_version=2,
+        last_version=2,
+    )
+    canonical_path = (
+        COLLECTION,
+        ORG,
+        "organization_activation_transitions",
+        "00000000000000000002",
+    )
+    client.data[
+        (
+            COLLECTION,
+            ORG,
+            "organization_activation_transitions",
+            "duplicate_claim",
+        )
+    ] = deepcopy(client.data[canonical_path])
+
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        repository._activation_transition_chain(
+            None,
+            ORG,
+            receipt_version=1,
+            target_version=2,
+        )
 
 
 def test_firestore_receipt_rejects_unrelated_valid_v1_graph_with_matching_subjects(
@@ -1203,7 +1383,7 @@ def test_firestore_committed_import_carries_across_two_member_binding_versions(
 
     assert repository.load_committed_import(context, 2) == (saved, receipt)
     assert repository.load_committed_import(context, 3) == (saved, receipt)
-    assert client.query_limits[-2:] == [2, 2]
+    assert client.query_limits[-2:] == [2, 3]
 
 
 def test_firestore_committed_import_carry_rejects_reordered_subject_tuple(

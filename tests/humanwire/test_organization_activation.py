@@ -505,6 +505,47 @@ def test_delivery_exception_is_durable_unknown_and_never_auto_redelivered(
     assert len(transport.deliveries) == 2
 
 
+def test_pre_provider_failure_reissues_pending_grant_without_token_traceback(
+    activation_setup,
+    monkeypatch,
+) -> None:
+    transport = RecordingTransport()
+    first_service = _service(activation_setup, transport)
+    decisionos = activation_setup[1]
+    original_begin = decisionos.begin_subject_invitation_delivery
+    first_token = "opaque-subject-invitation-token-000001"
+
+    def fail_before_provider(_context, grant):
+        raise RuntimeError(grant.token.get_secret_value())
+
+    monkeypatch.setattr(
+        decisionos,
+        "begin_subject_invitation_delivery",
+        fail_before_provider,
+    )
+    with pytest.raises(InvitationUnavailable, match="invitation_unavailable") as caught:
+        first_service.create_invitations(activation_setup[3], _request(ALICE))
+
+    assert transport.deliveries == []
+    assert not _exception_reaches_secret(caught.value, first_token)
+    issued_version = activation_setup[2].load_graph(activation_setup[3]).version
+
+    monkeypatch.setattr(
+        decisionos,
+        "begin_subject_invitation_delivery",
+        original_begin,
+    )
+    restarted = _service(activation_setup, transport)
+    recovered = restarted.create_invitations(activation_setup[3], _request(ALICE))
+
+    assert recovered.invitations[0].status is ActivationDeliveryStatus.DELIVERED
+    assert recovered.invitations[0].invitation_id == "inv_00000000000000000000000002"
+    assert len(transport.deliveries) == 1
+    assert activation_setup[2].load_graph(activation_setup[3]).version == issued_version
+    with pytest.raises(InvitationUnavailable, match="invitation_unavailable"):
+        restarted.accept(principal("firebase-revoked-pending"), first_token)
+
+
 @pytest.mark.parametrize("subject_id", [AI, EXTERNAL, REVIEW, SUSPENDED])
 def test_non_directory_human_targets_are_rejected(activation_setup, subject_id) -> None:
     with pytest.raises(InvitationUnavailable, match="invitation_unavailable"):

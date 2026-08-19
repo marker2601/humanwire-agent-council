@@ -65,7 +65,9 @@ _ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _CHUNK_TARGET_BYTES = 350_000
 _MAX_DOCUMENT_BYTES = 450_000
 _MAX_TRANSACTION_WRITES = 450
-_MAX_ACTIVATION_TRANSITIONS = 4096
+# A 5,000-subject import needs at most 50 full invitation batches plus 5,000
+# acceptances. Keep a conservative bounded read ceiling above that lifecycle.
+_MAX_ACTIVATION_TRANSITIONS = 10_000
 _MAX_CHUNK_ITEMS = 200
 _CHUNK_KINDS = (
     "source_records",
@@ -1217,7 +1219,10 @@ class InMemoryOrganizationGraphRepository:
                     raise InvitationUnavailable()
                 lifecycles = {subject.lifecycle for subject in selected if subject is not None}
                 if lifecycles == {SubjectLifecycle.INVITED}:
-                    return _InMemoryPreparedMutation(replacements=())
+                    return _InMemoryPreparedMutation(
+                        replacements=(),
+                        subject_invitation_relation_required=True,
+                    )
                 if lifecycles != {SubjectLifecycle.DIRECTORY_ONLY}:
                     raise InvitationUnavailable()
                 now = _aware(self._clock())
@@ -1280,7 +1285,8 @@ class InMemoryOrganizationGraphRepository:
                             self._activation_transitions,
                             replacement_transitions,
                         ),
-                    )
+                    ),
+                    subject_invitation_relation_required=False,
                 )
 
             failed = False
@@ -1880,16 +1886,42 @@ class FirestoreOrganizationGraphRepository:
         receipt_version: int,
         target_version: int,
     ) -> tuple[_ActivationTransition, ...]:
+        from google.cloud.firestore_v1.base_query import FieldFilter
+
         count = target_version - receipt_version
         if count < 0 or count > _MAX_ACTIVATION_TRANSITIONS:
             raise ImportUnavailable()
-        relevant: list[_ActivationTransition] = []
-        for version in range(receipt_version + 1, target_version + 1):
-            row = self._activation_transition_ref(organization_id, version).get(
-                transaction=transaction
+        if count == 0:
+            return ()
+        rows = tuple(
+            self._organization_ref(organization_id)
+            .collection("organization_activation_transitions")
+            .where(
+                filter=FieldFilter(
+                    "new_graph_version",
+                    ">=",
+                    receipt_version + 1,
+                )
             )
-            if not row.exists:
-                raise ImportUnavailable()
+            .where(
+                filter=FieldFilter(
+                    "new_graph_version",
+                    "<=",
+                    target_version,
+                )
+            )
+            .order_by("new_graph_version")
+            .limit(count + 1)
+            .stream(transaction=transaction)
+        )
+        if len(rows) != count:
+            raise ImportUnavailable()
+        relevant: list[_ActivationTransition] = []
+        for version, row in zip(
+            range(receipt_version + 1, target_version + 1),
+            rows,
+            strict=True,
+        ):
             value = row.to_dict()
             transition = _transition_from_storage(value)
             if (
@@ -2511,7 +2543,11 @@ class FirestoreOrganizationGraphRepository:
                 raise InvitationUnavailable()
             lifecycles = {subject.lifecycle for subject in selected if subject is not None}
             if lifecycles == {SubjectLifecycle.INVITED}:
-                return _FirestorePreparedMutation(write_count=0, publish=lambda: None)
+                return _FirestorePreparedMutation(
+                    write_count=0,
+                    publish=lambda: None,
+                    subject_invitation_relation_required=True,
+                )
             if lifecycles != {SubjectLifecycle.DIRECTORY_ONLY}:
                 raise InvitationUnavailable()
             now = _aware(self._clock())
@@ -2598,6 +2634,7 @@ class FirestoreOrganizationGraphRepository:
             return _FirestorePreparedMutation(
                 write_count=write_count,
                 publish=publish,
+                subject_invitation_relation_required=False,
             )
 
         return decisionos.create_subject_invitations(

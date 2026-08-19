@@ -227,6 +227,7 @@ class _InMemoryReferenceReplacement:
 @dataclass(frozen=True, slots=True)
 class _InMemoryPreparedMutation:
     replacements: tuple[_InMemoryReferenceReplacement, ...]
+    subject_invitation_relation_required: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +235,7 @@ class _FirestorePreparedMutation:
     write_count: int
     publish: Callable[[], None]
     result: Any = None
+    subject_invitation_relation_required: bool | None = None
 
 
 def _publish_in_memory_replacements(
@@ -759,7 +761,11 @@ class InMemoryDecisionOSRepository:
         with self._lock:
             current = self._authorize(context, DecisionOSPermission.MANAGE_MEMBERS)
             organization_mutation = mutation(None, current)
-            if not isinstance(organization_mutation, _InMemoryPreparedMutation):
+            if (
+                type(organization_mutation) is not _InMemoryPreparedMutation
+                or type(organization_mutation.subject_invitation_relation_required)
+                is not bool
+            ):
                 raise InvitationUnavailable()
             now = _aware(self._clock())
             replacement_records = dict(self._subject_invitations)
@@ -777,6 +783,10 @@ class InMemoryDecisionOSRepository:
                     current.organization_id,
                     subject_id,
                 )
+                if (existing is not None) is not (
+                    organization_mutation.subject_invitation_relation_required
+                ):
+                    raise InvitationUnavailable()
                 if existing is not None:
                     if (
                         existing.status != "active"
@@ -795,7 +805,6 @@ class InMemoryDecisionOSRepository:
                         in {
                             SubjectInvitationDeliveryState.DELIVERED,
                             SubjectInvitationDeliveryState.NOT_DELIVERED,
-                            SubjectInvitationDeliveryState.DELIVERY_PENDING,
                             SubjectInvitationDeliveryState.DELIVERY_SENDING,
                         }
                         and existing.delivery_route_id == delivery_route_id
@@ -805,7 +814,10 @@ class InMemoryDecisionOSRepository:
                     if (
                         existing.delivery_route_id is None
                         and delivery_route_id is not None
-                    ) or existing.expires_at <= now or existing.delivery_status is SubjectInvitationDeliveryState.DELIVERY_FAILED:
+                    ) or existing.expires_at <= now or existing.delivery_status in {
+                        SubjectInvitationDeliveryState.DELIVERY_PENDING,
+                        SubjectInvitationDeliveryState.DELIVERY_FAILED,
+                    }:
                         pass
                     else:
                         raise InvitationUnavailable()
@@ -1452,12 +1464,24 @@ _SUBJECT_INVITATION_FIELDS = frozenset(
 )
 
 
+def _has_exact_builtin_keys(
+    value: object,
+    expected: frozenset[str] | set[str],
+) -> bool:
+    if type(value) is not dict:
+        return False
+    keys = tuple(dict.__iter__(value))
+    return all(type(key) is str for key in keys) and frozenset(keys) == frozenset(
+        expected
+    )
+
+
 def _firestore_subject_invitation(
     value: object,
     *,
     token_digest: str,
 ) -> _SubjectInvitationRecord:
-    if type(value) is not dict or set(value) != _SUBJECT_INVITATION_FIELDS:
+    if not _has_exact_builtin_keys(value, _SUBJECT_INVITATION_FIELDS):
         raise InvitationUnavailable()
     failed = False
     record = None
@@ -1559,7 +1583,7 @@ def _subject_invitation_index_payload(
 
 
 def _exact_stored_mapping(value: object, expected: dict[str, object]) -> bool:
-    if type(value) is not dict or set(value) != set(expected):
+    if not _has_exact_builtin_keys(value, set(expected)):
         return False
     for key, expected_value in expected.items():
         actual = value[key]
@@ -1677,7 +1701,7 @@ class FirestoreDecisionOSRepository:
         index_ref = self._invitation_index_ref(digest)
         index_row = index_ref.get(transaction=transaction)
         index = index_row.to_dict() if index_row.exists else None
-        if type(index) is not dict or set(index) != _SUBJECT_INVITATION_FIELDS:
+        if not _has_exact_builtin_keys(index, _SUBJECT_INVITATION_FIELDS):
             raise InvitationUnavailable()
         organization_id = index.get("organization_id")
         subject_id = index.get("subject_id")
@@ -1946,6 +1970,8 @@ class FirestoreDecisionOSRepository:
                 type(organization_mutation) is not _FirestorePreparedMutation
                 or type(organization_mutation.write_count) is not int
                 or organization_mutation.write_count < 0
+                or type(organization_mutation.subject_invitation_relation_required)
+                is not bool
             ):
                 raise InvitationUnavailable()
             grants: list[SubjectInvitationGrant] = []
@@ -1957,6 +1983,10 @@ class FirestoreDecisionOSRepository:
                     current.organization_id,
                     subject_id,
                 )
+                if (relation is not None) is not (
+                    organization_mutation.subject_invitation_relation_required
+                ):
+                    raise InvitationUnavailable()
                 existing = None
                 if relation is not None:
                     existing, existing_invitation_ref, existing_index_ref, state_ref = relation
@@ -1975,7 +2005,6 @@ class FirestoreDecisionOSRepository:
                         in {
                             SubjectInvitationDeliveryState.DELIVERED,
                             SubjectInvitationDeliveryState.NOT_DELIVERED,
-                            SubjectInvitationDeliveryState.DELIVERY_PENDING,
                             SubjectInvitationDeliveryState.DELIVERY_SENDING,
                         }
                         and existing.delivery_route_id == delivery_route_id
@@ -1989,7 +2018,10 @@ class FirestoreDecisionOSRepository:
                         )
                         or existing.expires_at <= now
                         or existing.delivery_status
-                        is SubjectInvitationDeliveryState.DELIVERY_FAILED
+                        in {
+                            SubjectInvitationDeliveryState.DELIVERY_PENDING,
+                            SubjectInvitationDeliveryState.DELIVERY_FAILED,
+                        }
                     ):
                         raise InvitationUnavailable()
                     revocations.append(
