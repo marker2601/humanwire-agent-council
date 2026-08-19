@@ -492,3 +492,38 @@ def test_nested_import_records_reject_cross_tenant_and_duplicate_tuples() -> Non
             reviewed_digest="b" * 64,
             acknowledged_codes=("leaderless_team", "leaderless_team"),
         )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"units": (organization_unit(), organization_unit())},
+        {"edges": (reporting_edge(), reporting_edge())},
+        {
+            "authority_assignments": (
+                authority_assignment(),
+                authority_assignment(),
+            )
+        },
+    ],
+)
+def test_projection_rejects_duplicate_nested_record_ids(
+    changes: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        OrganizationProjection(
+            organization_id=ORG,
+            graph_version=1,
+            generated_at=NOW,
+            **changes,
+        )
+
+
+def test_redacted_projection_subject_rejects_ai_invitation_lifecycle() -> None:
+    with pytest.raises(ValidationError):
+        OrganizationProjectionSubject(
+            subject_id=SUBJECT,
+            kind=OrganizationSubjectKind.AI_SPECIALIST,
+            lifecycle=SubjectLifecycle.INVITED,
+            display_name="Risk Challenger",
+        )

@@ -441,6 +441,15 @@ class OrganizationProjectionSubject(_OrganizationModel):
     def display_text_is_safe(cls, value: str | None) -> str | None:
         return None if value is None else _safe_display_text(value)
 
+    @model_validator(mode="after")
+    def has_kind_appropriate_lifecycle(self) -> Self:
+        if (
+            self.kind is OrganizationSubjectKind.AI_SPECIALIST
+            and self.lifecycle is not SubjectLifecycle.ACTIVE
+        ):
+            raise ValueError("AI specialists must use the active lifecycle")
+        return self
+
 
 class OrganizationProjection(_OrganizationModel):
     organization_id: str = Field(pattern=_ORGANIZATION_ID)
@@ -468,6 +477,12 @@ class OrganizationProjection(_OrganizationModel):
         ):
             raise ValueError("projection reconciliation is cross-tenant")
         _unique(tuple(subject.subject_id for subject in self.subjects), "subject IDs")
+        _unique(tuple(unit.unit_id for unit in self.units), "unit IDs")
+        _unique(tuple(edge.edge_id for edge in self.edges), "edge IDs")
+        _unique(
+            tuple(item.assignment_id for item in self.authority_assignments),
+            "authority assignment IDs",
+        )
         for record in (*self.units, *self.edges, *self.authority_assignments):
             if record.organization_id != self.organization_id:
                 raise ValueError("organization projection contains a cross-tenant record")
