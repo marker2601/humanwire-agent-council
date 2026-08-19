@@ -876,6 +876,38 @@ class WorkerProbeMapper:
                 for unit in candidate.units
             )
             return candidate.model_copy(update={"units": units})
+        if self.mode.startswith("duplicate_same_name_restore_"):
+            platform = next(unit for unit in candidate.units if unit.name == "Platform")
+            engineering = next(unit for unit in candidate.units if unit.name == "Engineering")
+            leader = next(
+                subject for subject in candidate.subjects if subject.unit_id == platform.unit_id
+            )
+            restored_controls = self.mode.removeprefix(
+                "duplicate_same_name_restore_"
+            )
+            duplicate_updates = {
+                "unit_id": "unit_01ARZ3NDEKTSV4RRFFQ69G5FZZ",
+            }
+            if restored_controls in {"parent", "parent_and_leader"}:
+                duplicate_updates["parent_unit_id"] = engineering.unit_id
+            if restored_controls in {"leader", "parent_and_leader"}:
+                duplicate_updates["leader_subject_id"] = leader.subject_id
+            duplicate = platform.model_copy(update=duplicate_updates)
+            return candidate.model_copy(update={"units": (*candidate.units, duplicate)})
+        if self.mode == "duplicate_clean_unit_name":
+            engineering = next(unit for unit in candidate.units if unit.name == "Engineering")
+            duplicate = engineering.model_copy(
+                update={"unit_id": "unit_01ARZ3NDEKTSV4RRFFQ69G5FZZ"}
+            )
+            first = candidate.subjects[0].model_copy(
+                update={"display_name": "Worker Output"}
+            )
+            return candidate.model_copy(
+                update={
+                    "subjects": (first, *candidate.subjects[1:]),
+                    "units": (*candidate.units, duplicate),
+                }
+            )
         if self.mode.startswith("rename_detach_restore_"):
             platform = next(unit for unit in candidate.units if unit.name == "Platform")
             engineering = next(unit for unit in candidate.units if unit.name == "Engineering")
@@ -1235,6 +1267,60 @@ def test_poisoned_unit_binding_rejects_rename_detach_and_restored_controls(
         and subject.unit_id == platform.unit_id
         for subject in draft.candidate.subjects
     )
+
+
+@pytest.mark.parametrize("reorder", [False, True])
+@pytest.mark.parametrize(
+    "restored_controls",
+    ["parent", "leader", "parent_and_leader"],
+)
+def test_poisoned_unit_binding_rejects_duplicate_same_name_unit_with_controls(
+    service_setup,
+    reorder,
+    restored_controls,
+) -> None:
+    _service, repository, _decisionos, context = service_setup
+    snapshot = malformed_unit_control_snapshot(reorder=reorder)
+    expected = RuleOrganizationMapper().map(snapshot, repository.load_graph(context))
+    service = OrganizationImportService(
+        repository=repository,
+        mapper=worker_spec_mapper(
+            f"duplicate_same_name_restore_{restored_controls}"
+        ),
+        mapper_timeout_seconds=2,
+        clock=lambda: NOW,
+    )
+
+    draft = service.create_draft(context, snapshot)
+
+    assert draft.candidate == expected
+    platform_units = tuple(
+        unit for unit in draft.candidate.units if unit.name == "Platform"
+    )
+    assert len(platform_units) == 1
+    assert platform_units[0].parent_unit_id is None
+    assert platform_units[0].leader_subject_id is None
+
+
+def test_clean_custom_candidate_preserves_duplicate_unit_names(service_setup) -> None:
+    _service, repository, _decisionos, context = service_setup
+    service = OrganizationImportService(
+        repository=repository,
+        mapper=worker_spec_mapper("duplicate_clean_unit_name"),
+        mapper_timeout_seconds=2,
+        clock=lambda: NOW,
+    )
+
+    draft = service.create_draft(context, complete_snapshot())
+
+    engineering_units = tuple(
+        unit for unit in draft.candidate.units if unit.name == "Engineering"
+    )
+    assert len(engineering_units) == 2
+    assert len({unit.unit_id for unit in engineering_units}) == 2
+    assert "Worker Output" in {
+        subject.display_name for subject in draft.candidate.subjects
+    }
 
 
 @pytest.mark.parametrize("mapper", [EmptyMapper(), PartialMapper()])

@@ -866,26 +866,33 @@ def _validated_candidate(
         for subject in validated.subjects
         if subject.source_identity is not None
     }
-    units_by_id = {unit.unit_id: unit for unit in validated.units}
-    poisoned_source_unit_names = {
-        record.source_identity: unit_name
-        for record in active_records
-        if (unit_name := _fields(record).get("unit_name"))
-        in diagnostics.structurally_ambiguous_units
-    }
-    poisoned_unit_ids: set[str] = set()
-    for source_identity, source_unit_name in poisoned_source_unit_names.items():
-        subject = subjects_by_source_identity.get(source_identity)
-        unit = None if subject is None else units_by_id.get(subject.unit_id or "")
-        if unit is None or unit.name != source_unit_name:
+    poisoned_participants_by_unit_name: dict[str, set[str]] = {}
+    for record in active_records:
+        source_unit_name = _fields(record).get("unit_name")
+        if source_unit_name in diagnostics.structurally_ambiguous_units:
+            poisoned_participants_by_unit_name.setdefault(
+                source_unit_name,
+                set(),
+            ).add(record.source_identity)
+    candidate_units_by_name: dict[str, list[OrganizationUnit]] = {}
+    for unit in validated.units:
+        candidate_units_by_name.setdefault(unit.name, []).append(unit)
+    for source_unit_name, source_identities in poisoned_participants_by_unit_name.items():
+        matching_units = candidate_units_by_name.get(source_unit_name, [])
+        if len(matching_units) != 1:
             return None
-        poisoned_unit_ids.add(unit.unit_id)
-    if any(
-        units_by_id[unit_id].parent_unit_id is not None
-        or units_by_id[unit_id].leader_subject_id is not None
-        for unit_id in poisoned_unit_ids
-    ):
-        return None
+        source_bound_unit = matching_units[0]
+        if (
+            source_bound_unit.parent_unit_id is not None
+            or source_bound_unit.leader_subject_id is not None
+        ):
+            return None
+        if any(
+            (subject := subjects_by_source_identity.get(source_identity)) is None
+            or subject.unit_id != source_bound_unit.unit_id
+            for source_identity in source_identities
+        ):
+            return None
     for edge in validated.edges:
         if edge.kind is not OrganizationEdgeKind.REPORTS_TO:
             continue
