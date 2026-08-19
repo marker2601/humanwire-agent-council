@@ -228,16 +228,19 @@ def activation_setup():
         draft_id=draft.import_id,
         reviewed_digest=draft.semantic_digest,
     )
+    graph.initialize_subject_invitation_schema(decisionos, owner_context)
     return clock, decisionos, graph, owner_context
 
 
 def _service(activation_setup, transport=None) -> ActivationService:
-    _clock, decisionos, graph, _context = activation_setup
-    return ActivationService(
+    _clock, decisionos, graph, context = activation_setup
+    service = ActivationService(
         decisionos_repository=decisionos,
         graph_repository=graph,
         transport=transport,
     )
+    service.initialize_tenant(context)
+    return service
 
 
 def _request(*subject_ids: str, role: DecisionOSRole = DecisionOSRole.CONTRIBUTOR):
@@ -296,6 +299,41 @@ def _exception_reaches_secret(error: BaseException, secret: str) -> bool:
         if type(state) is dict:
             pending.append(state)
     return False
+
+
+def test_activation_service_requires_explicit_tenant_initialization_before_use(
+    activation_setup,
+) -> None:
+    _clock, decisionos, graph, owner_context = activation_setup
+    service = ActivationService(
+        decisionos_repository=decisionos,
+        graph_repository=graph,
+    )
+
+    with pytest.raises(InvitationUnavailable, match="invitation_unavailable"):
+        service.create_invitations(owner_context, _request(ALICE))
+
+    service.initialize_tenant(owner_context)
+    receipt = service.create_invitations(owner_context, _request(ALICE))
+    assert receipt.requested_subject_ids == (ALICE,)
+
+
+def test_activation_service_restart_verifies_cutover_without_remigrating(
+    activation_setup,
+) -> None:
+    _clock, decisionos, graph, owner_context = activation_setup
+    first = _service(activation_setup)
+    issued = first.create_invitations(owner_context, _request(ALICE))
+    restarted = ActivationService(
+        decisionos_repository=decisionos,
+        graph_repository=graph,
+    )
+
+    restarted.initialize_tenant(owner_context)
+    retried = restarted.create_invitations(owner_context, _request(ALICE))
+
+    assert retried.invitations[0].invitation_id == issued.invitations[0].invitation_id
+    assert graph.load_graph(owner_context).version == 2
 
 
 def test_bulk_invite_only_targets_explicit_committed_human_subject_ids(

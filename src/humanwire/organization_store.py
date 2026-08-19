@@ -388,6 +388,12 @@ class OrganizationGraphRepository(Protocol):
         member_uid: str,
     ) -> OrganizationSubject: ...
 
+    def initialize_subject_invitation_schema(
+        self,
+        decisionos: DecisionOSRepository,
+        context: DecisionOSContext,
+    ) -> None: ...
+
     def create_subject_invitations(
         self,
         decisionos: DecisionOSRepository,
@@ -1181,6 +1187,45 @@ class InMemoryOrganizationGraphRepository:
         with self._lock:
             current = self._read(context)
             return self._graph(current.organization_id)
+
+    def initialize_subject_invitation_schema(
+        self,
+        decisionos: DecisionOSRepository,
+        context: DecisionOSContext,
+    ) -> None:
+        with self._lock:
+            current = self._manage(context)
+            if decisionos is not self._decisionos:
+                raise InvitationUnavailable()
+            graph = self._graph(current.organization_id)
+            graph_evidence = any(
+                subject.kind is OrganizationSubjectKind.HUMAN
+                and (
+                    subject.lifecycle
+                    in {SubjectLifecycle.INVITED, SubjectLifecycle.ACTIVE}
+                    or subject.member_uid is not None
+                )
+                for subject in graph.subjects
+            ) or any(
+                organization_id == current.organization_id
+                for organization_id, _version in self._activation_transitions
+            )
+
+            def evidence(
+                _transaction,
+                invitation_context: DecisionOSContext,
+            ) -> bool:
+                if (
+                    invitation_context.organization_id != current.organization_id
+                    or invitation_context.principal.uid != current.principal.uid
+                ):
+                    raise InvitationUnavailable()
+                return graph_evidence
+
+            decisionos.initialize_subject_invitation_schema(
+                current,
+                subject_schema_evidence=evidence,
+            )
 
     def create_subject_invitations(
         self,
@@ -2491,6 +2536,76 @@ class FirestoreOrganizationGraphRepository:
         if version and storage["payload_digest"] != _state["payload_digest"]:
             raise OrganizationUnavailable()
         return graph
+
+    @_firestore_error_barrier(InvitationUnavailable)
+    def initialize_subject_invitation_schema(
+        self,
+        decisionos: DecisionOSRepository,
+        context: DecisionOSContext,
+    ) -> None:
+        try:
+            same_client = object.__getattribute__(decisionos, "_client") is self._client
+            same_collection = (
+                object.__getattribute__(decisionos, "_organization_collection")
+                == self._organization_collection
+            )
+        except Exception:  # noqa: BLE001 - incompatible repositories fail closed
+            raise InvitationUnavailable() from None
+        if not same_client or not same_collection:
+            raise InvitationUnavailable()
+
+        def evidence(
+            transaction,
+            invitation_context: DecisionOSContext,
+        ) -> bool:
+            if (
+                invitation_context.organization_id != context.organization_id
+                or invitation_context.principal.uid != context.principal.uid
+            ):
+                raise InvitationUnavailable()
+            transition_rows = tuple(
+                self._organization_ref(invitation_context.organization_id)
+                .collection("organization_activation_transitions")
+                .limit(1)
+                .stream(transaction=transaction)
+            )
+            if transition_rows:
+                return True
+            state_row = self._state_ref(invitation_context.organization_id).get(
+                transaction=transaction
+            )
+            version, state = self._state_from_row(
+                invitation_context.organization_id,
+                state_row,
+            )
+            if version == 0:
+                return False
+            graph_row = self._version_ref(
+                invitation_context.organization_id,
+                version,
+            ).get(transaction=transaction)
+            graph, storage = self._graph_from_row(
+                invitation_context.organization_id,
+                version,
+                graph_row,
+                transaction=transaction,
+            )
+            if storage["payload_digest"] != state["payload_digest"]:
+                raise InvitationUnavailable()
+            return any(
+                subject.kind is OrganizationSubjectKind.HUMAN
+                and (
+                    subject.lifecycle
+                    in {SubjectLifecycle.INVITED, SubjectLifecycle.ACTIVE}
+                    or subject.member_uid is not None
+                )
+                for subject in graph.subjects
+            )
+
+        decisionos.initialize_subject_invitation_schema(
+            context,
+            subject_schema_evidence=evidence,
+        )
 
     @_firestore_error_barrier(InvitationUnavailable)
     def create_subject_invitations(

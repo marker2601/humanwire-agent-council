@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Literal, Protocol, Self
@@ -275,9 +276,18 @@ class ActivationService:
         self._graph = graph_repository
         self._transport = transport
         self._delivery_route_id = route_id
+        self._initialization_lock = threading.RLock()
+        self._initialized_organizations: set[str] = set()
 
     def __repr__(self) -> str:
         return "ActivationService()"
+
+    def initialize_tenant(self, context: DecisionOSContext) -> None:
+        if type(context) is not DecisionOSContext:
+            raise InvitationUnavailable()
+        self._decisionos.require_subject_invitation_schema(context)
+        with self._initialization_lock:
+            self._initialized_organizations.add(context.organization_id)
 
     def create_invitations(
         self,
@@ -285,6 +295,10 @@ class ActivationService:
         request: BulkInvitationRequest,
     ) -> BulkInvitationReceipt:
         if type(context) is not DecisionOSContext or type(request) is not BulkInvitationRequest:
+            raise InvitationUnavailable()
+        with self._initialization_lock:
+            initialized = context.organization_id in self._initialized_organizations
+        if not initialized:
             raise InvitationUnavailable()
         outcome = _create_invitations_internal(
             self._graph,
