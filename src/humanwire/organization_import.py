@@ -675,6 +675,47 @@ class OrganizationImportService:
         draft = self._repository.load_import_draft(context, import_id)
         return _reconcile(draft)
 
+    def load_import(
+        self,
+        context: DecisionOSContext,
+        import_id: str,
+    ) -> tuple[ImportDraft, ImportReconciliation, ImportReceipt | None]:
+        draft = self._repository.load_import_draft(context, import_id)
+        receipt = self._repository.load_import_receipt(context, import_id)
+        reconciliation = _reconcile(draft)
+        if not _loaded_import_is_bound(
+            context,
+            import_id,
+            draft,
+            reconciliation,
+            receipt,
+        ):
+            raise OrganizationImportUnavailable() from None
+        return draft, reconciliation, receipt
+
+    def review_for_graph(
+        self,
+        context: DecisionOSContext,
+        graph_version: int,
+    ) -> tuple[ImportReconciliation, ImportReceipt] | None:
+        committed = self._repository.load_committed_import(context, graph_version)
+        if committed is None:
+            if graph_version != 0:
+                raise OrganizationImportUnavailable() from None
+            return None
+        draft, receipt = committed
+        reconciliation = _reconcile(draft)
+        if not _loaded_import_is_bound(
+            context,
+            draft.import_id,
+            draft,
+            reconciliation,
+            receipt,
+            graph_version=graph_version,
+        ):
+            raise OrganizationImportUnavailable() from None
+        return reconciliation, receipt
+
     def apply_correction(
         self,
         context: DecisionOSContext,
@@ -800,6 +841,39 @@ def _digest_matches(candidate: object, expected: str) -> bool:
         type(candidate) is str
         and re.fullmatch(_SHA256, candidate) is not None
         and secrets.compare_digest(candidate, expected)
+    )
+
+
+def _loaded_import_is_bound(
+    context: DecisionOSContext,
+    import_id: str,
+    draft: ImportDraft,
+    reconciliation: ImportReconciliation,
+    receipt: ImportReceipt | None,
+    *,
+    graph_version: int | None = None,
+) -> bool:
+    if (
+        type(draft) is not ImportDraft
+        or type(reconciliation) is not ImportReconciliation
+        or draft.organization_id != context.organization_id
+        or draft.import_id != import_id
+        or reconciliation.organization_id != context.organization_id
+        or reconciliation.import_id != import_id
+    ):
+        return False
+    if receipt is None:
+        return graph_version is None
+    return (
+        type(receipt) is ImportReceipt
+        and receipt.organization_id == context.organization_id
+        and receipt.import_id == import_id
+        and receipt.source_snapshot_id == draft.source_snapshot.snapshot_id
+        and receipt.source_snapshot_digest == draft.source_snapshot.semantic_digest
+        and receipt.graph_version == draft.base_graph_version + 1
+        and (graph_version is None or receipt.graph_version == graph_version)
+        and receipt.committed_subject_count == len(draft.candidate.subjects)
+        and receipt.acknowledged_codes == reconciliation.acknowledged_codes
     )
 
 

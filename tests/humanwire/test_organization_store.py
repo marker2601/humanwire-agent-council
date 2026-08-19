@@ -237,6 +237,66 @@ def test_viewer_reads_graph_but_only_admin_can_manage_imports(setup_repositories
     assert repository.save_import_draft(admin_context, import_draft()).import_id == IMPORT_A
 
 
+def test_exact_receipt_and_graph_version_reads_use_required_permissions(
+    setup_repositories,
+) -> None:
+    repository, decisionos, owner_context = setup_repositories
+    viewer_context = make_member(
+        decisionos,
+        owner_context,
+        uid="firebase-viewer-01",
+        role=DecisionOSRole.VIEWER,
+    )
+    saved = repository.save_import_draft(owner_context, import_draft())
+    assert repository.load_import_receipt(owner_context, saved.import_id) is None
+    assert repository.load_committed_import(viewer_context, 0) is None
+    with pytest.raises(DecisionOSAuthorizationDenied, match="authorization_denied"):
+        repository.load_import_receipt(viewer_context, saved.import_id)
+
+    receipt = repository.commit_graph(
+        owner_context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+
+    assert repository.load_import_receipt(owner_context, saved.import_id) == receipt
+    assert repository.load_committed_import(viewer_context, receipt.graph_version) == (
+        saved,
+        receipt,
+    )
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        repository.load_committed_import(viewer_context, receipt.graph_version + 1)
+
+
+def test_graph_version_read_ignores_pending_latest_and_fails_on_corrupt_receipt(
+    setup_repositories,
+) -> None:
+    repository, _decisionos, owner_context = setup_repositories
+    committed_draft = repository.save_import_draft(owner_context, import_draft())
+    receipt = repository.commit_graph(
+        owner_context,
+        draft_id=committed_draft.import_id,
+        reviewed_digest=committed_draft.semantic_digest,
+    )
+    pending = import_draft(
+        import_id=IMPORT_B,
+        digest=DIGEST_B,
+        base_version=receipt.graph_version,
+    ).model_copy(update={"supersedes_import_id": committed_draft.import_id})
+    repository.save_import_draft(owner_context, pending)
+
+    assert repository.load_committed_import(owner_context, receipt.graph_version) == (
+        committed_draft,
+        receipt,
+    )
+    repository._imports[(ORG_A, committed_draft.import_id)].receipt = receipt.model_copy(
+        update={"organization_id": ORG_B}
+    )
+    with pytest.raises(ImportUnavailable, match="import_unavailable") as captured:
+        repository.load_committed_import(owner_context, receipt.graph_version)
+    assert PRIVATE_VALUE not in exception_graph_text(captured.value)
+
+
 def test_stale_draft_conflicts_and_duplicate_commit_returns_same_receipt(
     setup_repositories,
 ) -> None:

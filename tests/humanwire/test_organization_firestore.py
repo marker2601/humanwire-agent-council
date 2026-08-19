@@ -26,6 +26,7 @@ from humanwire.decisionos_store import (
 )
 from humanwire.organization_models import (
     ImportDraft,
+    ImportReceipt,
     OrganizationGraphCandidate,
     OrganizationSubject,
     OrganizationSubjectKind,
@@ -65,6 +66,15 @@ def independent_digest(data) -> str:
     return sha256(to_json(data)).hexdigest()
 
 
+def deterministic_ulid(*parts: str) -> str:
+    alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    value = int.from_bytes(
+        sha256("\0".join(parts).encode()).digest()[:16],
+        "big",
+    )
+    return "".join(alphabet[(value >> (5 * index)) & 31] for index in range(25, -1, -1))
+
+
 class FakeSnapshot:
     def __init__(self, reference, data):
         self.reference = reference
@@ -100,9 +110,18 @@ class FakeQuery:
             data = transaction._get(path) if transaction is not None else self.client.data.get(path)
             if data is None:
                 continue
-            if all(data.get(field) == value for field, value in self.filters):
+            if all(self._field(data, field) == value for field, value in self.filters):
                 rows.append(FakeSnapshot(FakeDocument(self.client, path), data))
         return tuple(rows)
+
+    @staticmethod
+    def _field(data, field):
+        value = data
+        for part in field.split("."):
+            if not isinstance(value, dict):
+                return None
+            value = value.get(part)
+        return value
 
 
 class FakeCollection:
@@ -469,6 +488,105 @@ def test_firestore_commit_keeps_strict_decisionos_root_compatible(fake_firestore
     )
     assert decisionos.load_context(OWNER, ORG) == context
     assert decisionos.list_organizations(OWNER)[0].organization_id == ORG
+
+
+def test_firestore_reads_exact_receipt_and_committed_graph_version(fake_firestore) -> None:
+    _client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    assert repository.load_import_receipt(context, saved.import_id) is None
+    assert repository.load_committed_import(context, 0) is None
+    receipt = repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+
+    assert repository.load_import_receipt(context, saved.import_id) == receipt
+    assert repository.load_committed_import(context, receipt.graph_version) == (
+        saved,
+        receipt,
+    )
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        repository.load_committed_import(context, receipt.graph_version + 1)
+
+
+def test_firestore_graph_version_read_ignores_pending_and_rejects_corrupt_shape(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    committed = repository.save_import_draft(context, draft())
+    receipt = repository.commit_graph(
+        context,
+        draft_id=committed.import_id,
+        reviewed_digest=committed.semantic_digest,
+    )
+    repository.save_import_draft(
+        context,
+        next_draft(committed, supersedes_import_id=committed.import_id),
+    )
+    assert repository.load_committed_import(context, receipt.graph_version) == (
+        committed,
+        receipt,
+    )
+
+    import_path = (COLLECTION, ORG, "imports", committed.import_id)
+    client.data[import_path]["receipt"]["organization_id"] = (
+        "org_01ARZ3NDEKTSV4RRFFQ69G5FAW"
+    )
+    client.data[import_path]["payload_digest"] = independent_digest(
+        {
+            key: value
+            for key, value in client.data[import_path].items()
+            if key != "payload_digest"
+        }
+    )
+    with pytest.raises(ImportUnavailable, match="import_unavailable") as captured:
+        repository.load_committed_import(context, receipt.graph_version)
+    assert PRIVATE not in exception_graph_text(captured.value)
+
+
+def test_firestore_graph_version_read_rejects_multiple_committed_records(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    first = repository.save_import_draft(context, draft())
+    first_receipt = repository.commit_graph(
+        context,
+        draft_id=first.import_id,
+        reviewed_digest=first.semantic_digest,
+    )
+    second = repository.save_import_draft(
+        context,
+        next_draft(first, supersedes_import_id=first.import_id),
+    )
+    second_receipt = ImportReceipt(
+        receipt_id=f"rcp_{deterministic_ulid(ORG, second.import_id)}",
+        import_id=second.import_id,
+        organization_id=ORG,
+        source_snapshot_id=second.source_snapshot.snapshot_id,
+        source_snapshot_digest=second.source_snapshot.semantic_digest,
+        graph_version=first_receipt.graph_version,
+        committed_subject_count=len(second.candidate.subjects),
+        committed_at=NOW,
+        committed_by_uid=OWNER.uid,
+    )
+    second_path = (COLLECTION, ORG, "imports", second.import_id)
+    client.data[second_path].update(
+        {
+            "status": "committed",
+            "receipt": second_receipt.model_dump(mode="python"),
+        }
+    )
+    client.data[second_path]["payload_digest"] = independent_digest(
+        {
+            key: value
+            for key, value in client.data[second_path].items()
+            if key != "payload_digest"
+        }
+    )
+
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        repository.load_committed_import(context, first_receipt.graph_version)
 
 
 def test_firestore_latest_import_lineage_rejects_superseded_commit(fake_firestore) -> None:

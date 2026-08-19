@@ -17,6 +17,38 @@ from humanwire.organization_models import (
     OrganizationUnit,
 )
 
+_CANONICAL_DIAGNOSTIC_CODES = frozenset(
+    {
+        "ai_approver_authority",
+        "authority_conflict",
+        "conflicting_unit_parent",
+        "cross_organization_authority",
+        "cross_organization_edge",
+        "cross_organization_subject",
+        "cross_organization_unit",
+        "duplicate_identity",
+        "duplicate_primary_manager",
+        "incomplete_authority",
+        "invalid_authority_interval",
+        "invalid_control_value",
+        "leaderless_team",
+        "missing_authority",
+        "multiple_unit_leaders",
+        "needs_review",
+        "orphan_unit",
+        "reporting_cycle",
+        "self_reporting",
+        "suspended_authority",
+        "unassigned_subject",
+        "unknown_authority_subject",
+        "unknown_edge_subject",
+        "unknown_edge_unit",
+        "unknown_unit_leader",
+        "unresolved_duplicate",
+        "unresolved_manager",
+    }
+)
+
 
 class OrganizationProjectionUnavailable(RuntimeError):
     """A fixed, content-free projection failure."""
@@ -85,6 +117,10 @@ def _reconciliation(value: ImportReconciliation | None) -> ImportReconciliation 
         return None
     if type(value) is not ImportReconciliation:
         raise TypeError("import reconciliation is invalid")
+    if not {*value.blocking_codes, *value.acknowledged_codes}.issubset(
+        _CANONICAL_DIAGNOSTIC_CODES
+    ):
+        raise ValueError("import reconciliation diagnostic is invalid")
     return ImportReconciliation(
         import_id=value.import_id,
         organization_id=value.organization_id,

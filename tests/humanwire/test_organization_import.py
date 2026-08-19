@@ -232,6 +232,68 @@ def test_draft_reconciles_every_source_row(service_setup) -> None:
     assert reconciliation.acknowledged_codes == ()
 
 
+def test_service_loads_exact_import_state_and_graph_version_review(service_setup) -> None:
+    service, _repository, decisionos, admin_context = service_setup
+    draft = service.create_draft(admin_context, complete_snapshot())
+
+    loaded, review, receipt = service.load_import(admin_context, draft.import_id)
+    assert loaded == draft
+    assert review == service.reconcile(admin_context, draft.import_id)
+    assert receipt is None
+    assert service.review_for_graph(admin_context, 0) is None
+
+    receipt = service.commit(
+        admin_context,
+        CommitImportRequest(
+            import_id=draft.import_id,
+            reviewed_digest=draft.semantic_digest,
+            acknowledged_codes=review.acknowledged_codes,
+        ),
+    )
+    viewer_context = make_member(
+        decisionos,
+        admin_context,
+        uid="firebase-viewer-01",
+        role=DecisionOSRole.VIEWER,
+    )
+    committed_review, committed_receipt = service.review_for_graph(
+        viewer_context,
+        receipt.graph_version,
+    )
+
+    assert committed_review == review
+    assert committed_receipt == receipt
+    with pytest.raises(DecisionOSAuthorizationDenied, match="authorization_denied"):
+        service.load_import(viewer_context, draft.import_id)
+
+
+def test_graph_version_review_never_selects_newer_pending_import(service_setup) -> None:
+    service, _repository, _decisionos, admin_context = service_setup
+    committed_draft = service.create_draft(admin_context, complete_snapshot())
+    committed_review = service.reconcile(admin_context, committed_draft.import_id)
+    receipt = service.commit(
+        admin_context,
+        CommitImportRequest(
+            import_id=committed_draft.import_id,
+            reviewed_digest=committed_draft.semantic_digest,
+            acknowledged_codes=committed_review.acknowledged_codes,
+        ),
+    )
+    pending = service.create_draft(
+        admin_context,
+        complete_snapshot(digest="2" * 64, source_kind="json"),
+    )
+
+    review, bound_receipt = service.review_for_graph(
+        admin_context,
+        receipt.graph_version,
+    )
+
+    assert review.import_id == committed_draft.import_id
+    assert review.import_id != pending.import_id
+    assert bound_receipt == receipt
+
+
 def test_rule_mapping_is_byte_identical_under_record_and_field_reordering() -> None:
     def build():
         decisionos = InMemoryDecisionOSRepository(

@@ -41,6 +41,38 @@ def test_decisionos_module_import_is_provider_lazy() -> None:
     assert result.stderr == ""
 
 
+def test_disabled_decisionos_import_does_not_require_organization_parsers() -> None:
+    environment = os.environ.copy()
+    for name in tuple(environment):
+        if name.startswith("HUMANWIRE_DECISIONOS_"):
+            environment.pop(name)
+    script = """
+import builtins
+original = builtins.__import__
+def guarded(name, *args, **kwargs):
+    if name.split('.', 1)[0] in {'openpyxl', 'pypdf'}:
+        raise ModuleNotFoundError(f'blocked optional dependency: {name}')
+    return original(name, *args, **kwargs)
+builtins.__import__ = guarded
+import humanwire.decisionos_web
+print('organization-parsers-lazy')
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "organization-parsers-lazy"
+    assert result.stderr == ""
+
+
 def test_health_check_is_fixed_and_does_not_construct_firebase(monkeypatch) -> None:
     def forbidden_build():
         raise AssertionError("health must not initialize Firebase")

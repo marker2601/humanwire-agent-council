@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -33,12 +33,6 @@ from humanwire.decisionos_models import (
     DecisionOSRole,
     WorkspacePlaybook,
 )
-from humanwire.decisionos_organization_routes import (
-    OrganizationProjectionBuilder,
-    OrganizationRouteDependencies,
-    OrganizationSourceParser,
-    create_organization_router,
-)
 from humanwire.decisionos_store import (
     DecisionOSAuthorizationDenied,
     DecisionOSRepository,
@@ -46,8 +40,14 @@ from humanwire.decisionos_store import (
     OrganizationUnavailable,
     WorkspaceUnavailable,
 )
-from humanwire.organization_import import OrganizationImportService
-from humanwire.organization_store import OrganizationGraphRepository
+
+if TYPE_CHECKING:
+    from humanwire.decisionos_organization_routes import (
+        OrganizationProjectionBuilder,
+        OrganizationSourceParser,
+    )
+    from humanwire.organization_import import OrganizationImportService
+    from humanwire.organization_store import OrganizationGraphRepository
 
 _MAX_BODY_BYTES = 8192
 _MAX_UPLOAD_BODY_BYTES = 10 * 1024 * 1024 + 4096
@@ -503,7 +503,10 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
                                     app_check_failed = True
                             with suppress(Exception):
                                 dependencies.app_check_observer(not app_check_failed)
-                            if app_check_failed and dependencies.app_check_enforced:
+                            if app_check_failed and (
+                                dependencies.app_check_enforced
+                                or isinstance(organization_profile, tuple)
+                            ):
                                 response = _fixed_error(403, "app_check_failed")
                             else:
                                 if request.url.path == "/api/session/login":
@@ -751,6 +754,11 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
         return JSONResponse(content=workspace.model_dump(mode="json"))
 
     if dependencies.organization_features_enabled:
+        from humanwire.decisionos_organization_routes import (
+            OrganizationRouteDependencies,
+            create_organization_router,
+        )
+
         assert dependencies.organization_source_parser is not None
         assert dependencies.organization_import_service is not None
         assert dependencies.organization_graph_repository is not None
@@ -767,7 +775,6 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
                         request,
                         dependencies.authenticator,
                     ),
-                    body_loader=_body,
                 )
             )
         )

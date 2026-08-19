@@ -213,6 +213,18 @@ class OrganizationGraphRepository(Protocol):
         draft_id: str,
     ) -> ImportDraft: ...
 
+    def load_import_receipt(
+        self,
+        context: DecisionOSContext,
+        import_id: str,
+    ) -> ImportReceipt | None: ...
+
+    def load_committed_import(
+        self,
+        context: DecisionOSContext,
+        graph_version: int,
+    ) -> tuple[ImportDraft, ImportReceipt] | None: ...
+
     def list_imports(self, context: DecisionOSContext) -> tuple[ImportDraft, ...]: ...
 
     def require_latest_import(
@@ -281,6 +293,32 @@ def _receipt_for(
         acknowledged_codes=acknowledged_codes,
         committed_at=committed_at,
         committed_by_uid=actor_uid,
+    )
+
+
+def _receipt_matches_draft(
+    receipt: ImportReceipt,
+    draft: ImportDraft,
+    *,
+    graph_version: int | None = None,
+    acknowledged_codes: tuple[str, ...] | None = None,
+) -> bool:
+    expected_id = f"rcp_{_deterministic_ulid(draft.organization_id, draft.import_id)}"
+    return (
+        type(receipt) is ImportReceipt
+        and type(draft) is ImportDraft
+        and receipt.receipt_id == expected_id
+        and receipt.organization_id == draft.organization_id
+        and receipt.import_id == draft.import_id
+        and receipt.source_snapshot_id == draft.source_snapshot.snapshot_id
+        and receipt.source_snapshot_digest == draft.source_snapshot.semantic_digest
+        and receipt.graph_version == draft.base_graph_version + 1
+        and (graph_version is None or receipt.graph_version == graph_version)
+        and receipt.committed_subject_count == len(draft.candidate.subjects)
+        and (
+            acknowledged_codes is None
+            or receipt.acknowledged_codes == acknowledged_codes
+        )
     )
 
 
@@ -490,6 +528,51 @@ class InMemoryOrganizationGraphRepository:
             if saved is None:
                 raise ImportUnavailable()
             return saved.draft
+
+    def load_import_receipt(
+        self,
+        context: DecisionOSContext,
+        import_id: str,
+    ) -> ImportReceipt | None:
+        with self._lock:
+            current = self._manage(context)
+            saved = self._imports.get((current.organization_id, import_id))
+            if saved is None:
+                raise ImportUnavailable()
+            if saved.receipt is None:
+                return None
+            if not _receipt_matches_draft(saved.receipt, saved.draft):
+                raise ImportUnavailable()
+            return saved.receipt
+
+    def load_committed_import(
+        self,
+        context: DecisionOSContext,
+        graph_version: int,
+    ) -> tuple[ImportDraft, ImportReceipt] | None:
+        with self._lock:
+            current = self._read(context)
+            if type(graph_version) is not int or graph_version < 0:
+                raise ImportUnavailable()
+            if graph_version == 0:
+                return None
+            matches = tuple(
+                (saved.draft, saved.receipt)
+                for (organization_id, _import_id), saved in self._imports.items()
+                if organization_id == current.organization_id
+                and saved.receipt is not None
+                and saved.receipt.graph_version == graph_version
+            )
+            if len(matches) != 1:
+                raise ImportUnavailable()
+            draft, receipt = matches[0]
+            if receipt is None or not _receipt_matches_draft(
+                receipt,
+                draft,
+                graph_version=graph_version,
+            ):
+                raise ImportUnavailable()
+            return draft, receipt
 
     def list_imports(self, context: DecisionOSContext) -> tuple[ImportDraft, ...]:
         with self._lock:
@@ -1168,6 +1251,102 @@ class FirestoreOrganizationGraphRepository:
             draft_ref,
             organization_id=current.organization_id,
         )
+
+    @_firestore_error_barrier(ImportUnavailable)
+    def load_import_receipt(
+        self,
+        context: DecisionOSContext,
+        import_id: str,
+    ) -> ImportReceipt | None:
+        current = self._authorize(context, DecisionOSPermission.MANAGE_MEMBERS)
+        draft_ref = self._import_ref(current.organization_id, import_id)
+        row = draft_ref.get()
+        if not row.exists:
+            raise ImportUnavailable()
+        draft = self._draft_from_row(
+            row,
+            draft_ref,
+            organization_id=current.organization_id,
+        )
+        payload = row.to_dict()
+        if payload.get("status") == "draft":
+            return None
+        receipt = None
+        try:
+            receipt = ImportReceipt.model_validate_json(to_json(payload["receipt"]))
+        except (
+            KeyError,
+            PydanticSerializationError,
+            TypeError,
+            ValueError,
+            ValidationError,
+        ):
+            pass
+        if (
+            payload.get("status") != "committed"
+            or receipt is None
+            or not _receipt_matches_draft(receipt, draft)
+        ):
+            raise ImportUnavailable() from None
+        return receipt
+
+    @_firestore_error_barrier(ImportUnavailable)
+    def load_committed_import(
+        self,
+        context: DecisionOSContext,
+        graph_version: int,
+    ) -> tuple[ImportDraft, ImportReceipt] | None:
+        from google.cloud.firestore_v1.base_query import FieldFilter
+
+        current = self._authorize(context, DecisionOSPermission.READ_WORKSPACE)
+        if type(graph_version) is not int or graph_version < 0:
+            raise ImportUnavailable()
+        if graph_version == 0:
+            return None
+        rows = tuple(
+            self._organization_ref(current.organization_id)
+            .collection("imports")
+            .where(
+                filter=FieldFilter(
+                    "receipt.graph_version",
+                    "==",
+                    graph_version,
+                )
+            )
+            .stream()
+        )
+        if len(rows) != 1:
+            raise ImportUnavailable()
+        row = rows[0]
+        draft_ref = self._import_ref(current.organization_id, row.id)
+        draft = self._draft_from_row(
+            row,
+            draft_ref,
+            organization_id=current.organization_id,
+        )
+        payload = row.to_dict()
+        receipt = None
+        try:
+            receipt = ImportReceipt.model_validate_json(to_json(payload["receipt"]))
+        except (
+            KeyError,
+            PydanticSerializationError,
+            TypeError,
+            ValueError,
+            ValidationError,
+        ):
+            pass
+        if (
+            payload.get("status") != "committed"
+            or receipt is None
+            or not _receipt_matches_draft(
+                receipt,
+                draft,
+                graph_version=graph_version,
+            )
+        ):
+            raise ImportUnavailable() from None
+        return draft, receipt
 
     @_firestore_error_barrier(ImportUnavailable)
     def list_imports(self, context: DecisionOSContext) -> tuple[ImportDraft, ...]:
@@ -1963,16 +2142,10 @@ class FirestoreOrganizationGraphRepository:
         *,
         acknowledged_codes: tuple[str, ...],
     ) -> bool:
-        expected_id = f"rcp_{_deterministic_ulid(draft.organization_id, draft.import_id)}"
-        return (
-            receipt.receipt_id == expected_id
-            and receipt.organization_id == draft.organization_id
-            and receipt.import_id == draft.import_id
-            and receipt.source_snapshot_id == draft.source_snapshot.snapshot_id
-            and receipt.source_snapshot_digest == draft.source_snapshot.semantic_digest
-            and receipt.graph_version == draft.base_graph_version + 1
-            and receipt.committed_subject_count == len(draft.candidate.subjects)
-            and receipt.acknowledged_codes == acknowledged_codes
+        return _receipt_matches_draft(
+            receipt,
+            draft,
+            acknowledged_codes=acknowledged_codes,
         )
 
     def _membership_change_transaction(
