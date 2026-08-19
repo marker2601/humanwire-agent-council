@@ -80,3 +80,17 @@ Addressed the two Important findings from the third independent review in a sepa
 Fresh focused activation + Firestore verification passed 155 tests with one explicit emulator skip (156 collected). The non-emulator organization + DecisionOS compatibility gate passed all 660 selected tests. Repository-wide Ruff and the scoped whitespace diff check passed. The explicit Firestore emulator test was skipped because `FIRESTORE_EMULATOR_HOST` was not configured.
 
 No external provider, invitation delivery, deployment, Firebase/cloud mutation, push, or emulator startup was performed.
+
+## Review fix round 4
+
+Addressed the two Important findings and one Minor finding from the fourth independent review in a separate TDD cycle.
+
+- RED: six targeted regressions reproduced exact SDK timestamp rejection, attacker datetime hook dispatch, both missing and digest-rebound subject-state disguises creating generic memberships, absent historical provenance, and equal-but-new in-memory state publication for expired `delivery_sending`. A seventh focused RED then proved that provenance creation time was not constrained to precede invitation expiry.
+- Firestore timestamp loading now accepts only exact built-in `datetime` or the exact trusted `google.api_core.datetime_helpers.DatetimeWithNanoseconds` type. It reads fields through base/member descriptors, accepts only built-in timezone objects, detaches to an exact aware UTC `datetime`, rejects non-microsecond nanoseconds rather than truncating them, and performs all invitation/state/index relational comparisons on normalized values. Datetime subclasses and hostile timezone hooks are rejected without dispatch.
+- The frozen legacy contract was traced to one discriminator-less invitation document, one digest-addressed global index document, and a generic audit event that did not bind invitation ID, digest, role, or expiry. Because that audit was insufficient provenance, exact historical records now receive a private immutable migration record. A tenant cutover marker is created atomically with the first subject invitation; an exact historical pair must have identical unmodified provider creation metadata before that marker. The one-time provenance record transactionally binds organization, invitation, digest, creation time, role, and expiry before membership creation. Missing/rebound subject state and exact legacy-shaped subject invitation/index disguises remain inert across restart.
+- Expired `delivery_sending` retry in the in-memory adapter now returns before replacement publication when no invitation was created, preserving every state/audit reference and the audit sequence exactly.
+- The conditional real-emulator scenario now covers SDK-decoded current generic acceptance, a frozen historical generic migration across repository restart, and subject issue → delivery → repository restart → acceptance. It is truthfully skipped when `FIRESTORE_EMULATOR_HOST` is unset.
+
+Fresh focused activation + Firestore verification passed 160 tests with one explicit emulator skip. The non-emulator organization + DecisionOS compatibility gate passed all 665 selected tests, with two emulator cases deselected. Both emulator-marked cases were then collected and truthfully skipped because `FIRESTORE_EMULATOR_HOST` was not configured. Repository-wide Ruff and the scoped whitespace diff check passed.
+
+No external provider, invitation delivery, deployment, Firebase/cloud mutation, push, or emulator startup was performed.

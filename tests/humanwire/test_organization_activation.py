@@ -523,6 +523,11 @@ def test_unknown_delivery_remains_token_free_and_never_resends_after_expiry(
     digest = hashlib.sha256(token.encode()).hexdigest()
     invitation_id = first.invitations[0].invitation_id
     issued_version = graph.load_graph(owner_context).version
+    records_reference = decisionos._subject_invitations
+    active_reference = decisionos._active_subject_invitations
+    index_reference = decisionos._invitation_token_index
+    audit_reference = decisionos._audit
+    audit_sequence = decisionos._audit_sequence
     records_before = dict(decisionos._subject_invitations)
     active_before = dict(decisionos._active_subject_invitations)
     index_before = dict(decisionos._invitation_token_index)
@@ -545,6 +550,11 @@ def test_unknown_delivery_remains_token_free_and_never_resends_after_expiry(
     assert decisionos._subject_invitations == records_before
     assert decisionos._active_subject_invitations == active_before
     assert decisionos._invitation_token_index == index_before
+    assert decisionos._subject_invitations is records_reference
+    assert decisionos._active_subject_invitations is active_reference
+    assert decisionos._invitation_token_index is index_reference
+    assert decisionos._audit is audit_reference
+    assert decisionos._audit_sequence == audit_sequence
     assert {
         organization_id: tuple(events)
         for organization_id, events in decisionos._audit.items()

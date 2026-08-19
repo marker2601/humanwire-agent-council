@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import os
 from copy import deepcopy
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from hashlib import sha256
 from uuid import uuid4
 
 import pytest
+from google.api_core.datetime_helpers import DatetimeWithNanoseconds
 from google.cloud.firestore_v1 import _helpers as firestore_helpers
 from google.cloud.firestore_v1.types import Document as FirestoreDocument
 from pydantic_core import to_json
 
-from humanwire import organization_store
+from humanwire import decisionos_store, organization_store
 from humanwire.decisionos_models import (
     DecisionOrganization,
     DecisionOSContext,
@@ -110,11 +111,13 @@ def deterministic_ulid(*parts: str) -> str:
 
 
 class FakeSnapshot:
-    def __init__(self, reference, data):
+    def __init__(self, reference, data, *, create_time=None, update_time=None):
         self.reference = reference
         self.id = reference.id
         self._data = data
         self.exists = data is not None
+        self.create_time = create_time
+        self.update_time = update_time
 
     def to_dict(self):
         return deepcopy(self._data)
@@ -177,7 +180,14 @@ class FakeQuery:
                     if transaction is not None
                     else candidate
                 )
-                rows.append(FakeSnapshot(FakeDocument(self.client, path), data))
+                rows.append(
+                    FakeSnapshot(
+                        FakeDocument(self.client, path),
+                        data,
+                        create_time=self.client.create_times.get(path),
+                        update_time=self.client.update_times.get(path),
+                    )
+                )
         if self.ordering is not None:
             field, direction = self.ordering
             rows.sort(
@@ -255,7 +265,12 @@ class FakeDocument:
             if transaction is not None
             else self.client.data.get(self.path)
         )
-        return FakeSnapshot(self, data)
+        return FakeSnapshot(
+            self,
+            data,
+            create_time=self.client.create_times.get(self.path),
+            update_time=self.client.update_times.get(self.path),
+        )
 
 
 class FakeTransaction:
@@ -308,11 +323,17 @@ class FakeTransaction:
             self.client.abort_next_transaction = False
             self.staged.clear()
             raise RuntimeError(PRIVATE)
+        commit_time = self.client.next_commit_time()
         for path, data in self.staged.items():
             if data is None:
                 self.client.data.pop(path, None)
+                self.client.create_times.pop(path, None)
+                self.client.update_times.pop(path, None)
             else:
+                if path not in self.client.data:
+                    self.client.create_times[path] = commit_time
                 self.client.data[path] = deepcopy(data)
+                self.client.update_times[path] = commit_time
         self.staged.clear()
 
     def rollback(self):
@@ -330,6 +351,23 @@ class FakeClient:
         self.abort_next_transaction = False
         self.transactions = []
         self.query_limits = []
+        self.create_times = {}
+        self.update_times = {}
+        self.commit_sequence = 0
+
+    def next_commit_time(self):
+        self.commit_sequence += 1
+        value = NOW - timedelta(days=7) + timedelta(microseconds=self.commit_sequence)
+        return DatetimeWithNanoseconds(
+            value.year,
+            value.month,
+            value.day,
+            value.hour,
+            value.minute,
+            value.second,
+            nanosecond=value.microsecond * 1000,
+            tzinfo=UTC,
+        )
 
     def collection(self, name):
         if self.failure is not None:
@@ -429,6 +467,121 @@ class SequenceFirestoreIdentifiers(Identifiers):
 
     def invitation_token(self) -> str:
         return f"opaque-invitation-token-{self.sequence:06d}"
+
+
+def _stored_generic_invitation(expires_at: object) -> dict[str, object]:
+    return {
+        "invitation_kind": "generic",
+        "invitation_id": "inv_00000000000000000000000001",
+        "organization_id": ORG,
+        "role": "viewer",
+        "expires_at": expires_at,
+        "status": "active",
+    }
+
+
+def _stored_subject_invitation(expires_at: object) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "invitation_kind": "organization_subject",
+        "invitation_id": "inv_00000000000000000000000002",
+        "organization_id": ORG,
+        "subject_id": SUBJECT,
+        "role": "viewer",
+        "expires_at": expires_at,
+        "delivery_status": "not_delivered",
+        "delivery_route_id": None,
+        "retry_sequence": 0,
+        "retry_of_invitation_id": None,
+        "status": "active",
+    }
+
+
+def test_firestore_invitation_loaders_normalize_exact_sdk_timestamps() -> None:
+    sdk_timestamp = DatetimeWithNanoseconds.from_rfc3339(
+        "2026-08-19T13:00:00.123456Z"
+    )
+    digest = "a" * 64
+
+    current_mapping = _stored_generic_invitation(sdk_timestamp)
+    historical_mapping = dict(current_mapping)
+    historical_mapping.pop("invitation_kind")
+    generic, is_legacy = decisionos_store._firestore_generic_invitation(
+        current_mapping,
+        token_digest=digest,
+    )
+    historical, historical_is_legacy = (
+        decisionos_store._firestore_generic_invitation(
+            historical_mapping,
+            token_digest=digest,
+        )
+    )
+    subject = decisionos_store._firestore_subject_invitation(
+        _stored_subject_invitation(sdk_timestamp),
+        token_digest=digest,
+    )
+    state = {
+        **_stored_subject_invitation(sdk_timestamp),
+        "token_digest": digest,
+    }
+
+    assert is_legacy is False
+    assert historical_is_legacy is True
+    assert type(generic.expires_at) is datetime
+    assert type(historical.expires_at) is datetime
+    assert type(subject.expires_at) is datetime
+    assert generic.expires_at == datetime(
+        2026,
+        8,
+        19,
+        13,
+        0,
+        0,
+        123456,
+        tzinfo=UTC,
+    )
+    assert historical.expires_at == generic.expires_at
+    assert subject.expires_at == generic.expires_at
+    assert decisionos_store._exact_stored_mapping(
+        state,
+        decisionos_store._subject_invitation_state_payload(subject),
+    )
+
+
+def test_firestore_invitation_timestamp_boundary_rejects_loss_and_hooks() -> None:
+    class HostileDatetime(datetime):
+        hook_called = False
+
+        def utcoffset(self):
+            type(self).hook_called = True
+            raise AssertionError("attacker datetime hook must not run")
+
+    class HostileTimezone(tzinfo):
+        hook_called = False
+
+        def utcoffset(self, _value):
+            type(self).hook_called = True
+            raise AssertionError("attacker timezone hook must not run")
+
+        def dst(self, _value):
+            type(self).hook_called = True
+            raise AssertionError("attacker timezone hook must not run")
+
+    nonrepresentable = DatetimeWithNanoseconds.from_rfc3339(
+        "2026-08-19T13:00:00.123456789Z"
+    )
+    hostile = HostileDatetime(2026, 8, 19, 13, 0, tzinfo=UTC)
+    hostile_zone = datetime(2026, 8, 19, 13, 0, tzinfo=HostileTimezone())
+
+    for value in (nonrepresentable, hostile, hostile_zone):
+        with pytest.raises(InvitationUnavailable, match="invitation_unavailable"):
+            decisionos_store._firestore_generic_invitation(
+                _stored_generic_invitation(value),
+                token_digest="b" * 64,
+            )
+
+    assert HostileDatetime.hook_called is False
+    assert HostileTimezone.hook_called is False
 
 
 def draft() -> ImportDraft:
@@ -1070,6 +1223,82 @@ def test_firestore_generic_acceptance_rejects_subject_invitation_with_removed_ki
     assert graph.subjects[0].member_uid is None
 
 
+@pytest.mark.parametrize("state_corruption", ["missing", "different_digest"])
+def test_firestore_legacy_generic_requires_positive_provenance_when_subject_state_is_corrupt(
+    fake_firestore,
+    state_corruption,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    decisionos = FirestoreDecisionOSRepository(
+        client,
+        clock=lambda: NOW,
+        identifiers=SequenceFirestoreIdentifiers(),
+        organization_collection=COLLECTION,
+        invitation_index_collection="test_subject_invites",
+    )
+    grant = repository.create_subject_invitations(
+        decisionos,
+        context,
+        subject_ids=(SUBJECT,),
+        role=DecisionOSRole.VIEWER,
+        expires_in=timedelta(days=1),
+        delivery_route_id=None,
+    )[0]
+    token = grant.token.get_secret_value()
+    digest = sha256(token.encode()).hexdigest()
+    invitation_path = (COLLECTION, ORG, "invitations", grant.invitation_id)
+    index_path = ("test_subject_invites", digest)
+    state_path = (COLLECTION, ORG, "subject_invitation_state", SUBJECT)
+    invitation = client.data[invitation_path]
+    client.data[invitation_path] = {
+        key: invitation[key]
+        for key in (
+            "invitation_id",
+            "organization_id",
+            "role",
+            "expires_at",
+            "status",
+        )
+    }
+    index = client.data[index_path]
+    client.data[index_path] = {
+        key: index[key]
+        for key in ("invitation_id", "organization_id", "status")
+    }
+    if state_corruption == "missing":
+        client.data.pop(state_path)
+    else:
+        client.data[state_path]["token_digest"] = "c" * 64
+    before = deepcopy(client.data)
+    invitee = DecisionOSPrincipal(
+        uid=f"firebase-corrupt-{state_corruption}",
+        email_verified=True,
+        provider_ids=("google.com",),
+    )
+
+    restarted = FirestoreDecisionOSRepository(
+        client,
+        clock=lambda: NOW,
+        organization_collection=COLLECTION,
+        invitation_index_collection="test_subject_invites",
+    )
+    with pytest.raises(InvitationUnavailable, match="invitation_unavailable"):
+        restarted.accept_invitation(invitee, token)
+
+    assert client.data == before
+    assert (COLLECTION, ORG, "members", invitee.uid) not in client.data
+    graph = repository.load_graph(context)
+    assert graph.version == 2
+    assert graph.subjects[0].lifecycle is SubjectLifecycle.INVITED
+    assert graph.subjects[0].member_uid is None
+
+
 def test_firestore_generic_invitation_supports_exact_new_and_historical_schemas(
     fake_firestore,
 ) -> None:
@@ -1129,11 +1358,108 @@ def test_firestore_generic_invitation_supports_exact_new_and_historical_schemas(
         email_verified=True,
         provider_ids=("google.com",),
     )
+    restarted = FirestoreDecisionOSRepository(
+        client,
+        clock=lambda: NOW,
+        organization_collection=COLLECTION,
+        invitation_index_collection="test_subject_invites",
+    )
 
-    assert decisionos.accept_invitation(
+    assert restarted.accept_invitation(
         historical_invitee,
         historical.token.get_secret_value(),
     ).uid == historical_invitee.uid
+    provenance_path = (
+        COLLECTION,
+        ORG,
+        "legacy_generic_invitation_provenance",
+        historical_digest,
+    )
+    marker_path = (
+        COLLECTION,
+        ORG,
+        "invitation_migrations",
+        "legacy_generic_cutover",
+    )
+    sdk_created_at = client.create_times[historical_invitation_path]
+    expected_created_at = datetime(
+        sdk_created_at.year,
+        sdk_created_at.month,
+        sdk_created_at.day,
+        sdk_created_at.hour,
+        sdk_created_at.minute,
+        sdk_created_at.second,
+        sdk_created_at.microsecond,
+        tzinfo=UTC,
+    )
+    assert client.data[marker_path] == {
+        "schema_version": 1,
+        "migration_kind": "legacy_generic_cutover",
+        "organization_id": ORG,
+    }
+    assert client.data[provenance_path] == {
+        "schema_version": 1,
+        "provenance_kind": "legacy_generic_invitation",
+        "organization_id": ORG,
+        "invitation_id": historical.invitation_id,
+        "token_digest": historical_digest,
+        "created_at": expected_created_at,
+        "role": DecisionOSRole.CONTRIBUTOR.value,
+        "expires_at": historical.expires_at,
+    }
+    assert type(client.data[provenance_path]["created_at"]) is datetime
+
+
+def test_firestore_historical_generic_provenance_rejects_creation_after_expiry(
+    fake_firestore,
+) -> None:
+    client, _repository, context = fake_firestore
+    decisionos = FirestoreDecisionOSRepository(
+        client,
+        clock=lambda: NOW,
+        identifiers=SequenceFirestoreIdentifiers(),
+        organization_collection=COLLECTION,
+        invitation_index_collection="test_subject_invites",
+    )
+    invitation = decisionos.create_invitation(
+        context,
+        role=DecisionOSRole.VIEWER,
+        expires_in=timedelta(days=1),
+    )
+    token = invitation.token.get_secret_value()
+    digest = sha256(token.encode()).hexdigest()
+    invitation_path = (
+        COLLECTION,
+        ORG,
+        "invitations",
+        invitation.invitation_id,
+    )
+    index_path = ("test_subject_invites", digest)
+    client.data[invitation_path].pop("invitation_kind")
+    client.data[index_path].pop("invitation_kind")
+    impossible_created_at = DatetimeWithNanoseconds(
+        2026,
+        8,
+        20,
+        15,
+        0,
+        tzinfo=UTC,
+    )
+    for path in (invitation_path, index_path):
+        client.create_times[path] = impossible_created_at
+        client.update_times[path] = impossible_created_at
+    before = deepcopy(client.data)
+    invitee = DecisionOSPrincipal(
+        uid="firebase-impossible-provenance",
+        email_verified=True,
+        provider_ids=("google.com",),
+    )
+
+    with pytest.raises(InvitationUnavailable, match="invitation_unavailable"):
+        decisionos.accept_invitation(invitee, token)
+
+    assert client.data == before
+    assert (COLLECTION, ORG, "members", invitee.uid) not in client.data
 
 
 def test_firestore_activation_transitions_survive_restart_and_corruption_fails_closed(
@@ -3033,19 +3359,22 @@ def test_firestore_current_chunk_cleanup_and_duplicate_retry_are_deterministic(
     reason="requires explicit Firestore emulator",
 )
 @pytest.mark.firestore_emulator
-def test_firestore_emulator_commits_one_tenant_bound_version_transactionally() -> None:
+def test_firestore_emulator_roundtrips_generic_and_subject_invitation_timestamps() -> None:
     from google.cloud import firestore
 
     suffix = uuid4().hex
     collection = f"humanwire_test_organizations_{suffix}"
     audit_collection = f"humanwire_test_org_audit_{suffix}"
     client = firestore.Client(project=os.environ.get("GOOGLE_CLOUD_PROJECT", "humanwire-test"))
+    emulator_now = datetime.now(UTC)
+    invitation_index_collection = f"humanwire_test_invites_{suffix}"
+    identifiers = SequenceFirestoreIdentifiers()
     decisionos = FirestoreDecisionOSRepository(
         client,
-        clock=lambda: NOW,
-        identifiers=Identifiers(),
+        clock=lambda: emulator_now,
+        identifiers=identifiers,
         organization_collection=collection,
-        invitation_index_collection=f"humanwire_test_invites_{suffix}",
+        invitation_index_collection=invitation_index_collection,
     )
     repository = FirestoreOrganizationGraphRepository(
         client,
@@ -3078,23 +3407,136 @@ def test_firestore_emulator_commits_one_tenant_bound_version_transactionally() -
         reviewed_digest=saved.semantic_digest,
     ) == receipt
     assert repository.list_audit(context)[0].receipt == receipt
-    invitee = DecisionOSPrincipal(
-        uid="firebase-alice-01",
+    current_invitee = DecisionOSPrincipal(
+        uid="firebase-current-generic-01",
         email_verified=True,
         provider_ids=("google.com",),
     )
-    invitation = decisionos.create_invitation(
+    current_invitation = decisionos.create_invitation(
         context,
         role=DecisionOSRole.VIEWER,
         expires_in=timedelta(days=1),
     )
-    decisionos.accept_invitation(invitee, invitation.token.get_secret_value())
-    repository.bind_member(context, subject_id=SUBJECT, member_uid=invitee.uid)
-    removal = repository.save_import_draft(context, _removal_draft(saved, base_version=2))
-    repository.commit_graph(
+    current_row = (
+        client.collection(collection)
+        .document(ORG)
+        .collection("invitations")
+        .document(current_invitation.invitation_id)
+        .get()
+    )
+    assert type(current_row.to_dict()["expires_at"]) is DatetimeWithNanoseconds
+    decisionos.accept_invitation(
+        current_invitee,
+        current_invitation.token.get_secret_value(),
+    )
+
+    legacy_invitation_id = "inv_99999999999999999999999999"
+    legacy_token = "historical-generic-invitation-token-01"
+    legacy_digest = sha256(legacy_token.encode()).hexdigest()
+    legacy_expires_at = emulator_now + timedelta(days=1)
+    legacy_invitation_ref = (
+        client.collection(collection)
+        .document(ORG)
+        .collection("invitations")
+        .document(legacy_invitation_id)
+    )
+    legacy_index_ref = client.collection(invitation_index_collection).document(
+        legacy_digest
+    )
+
+    @firestore.transactional
+    def seed_frozen_legacy_generic(transaction):
+        transaction.create(
+            legacy_invitation_ref,
+            {
+                "invitation_id": legacy_invitation_id,
+                "organization_id": ORG,
+                "role": DecisionOSRole.CONTRIBUTOR.value,
+                "expires_at": legacy_expires_at,
+                "status": "active",
+            },
+        )
+        transaction.create(
+            legacy_index_ref,
+            {
+                "invitation_id": legacy_invitation_id,
+                "organization_id": ORG,
+                "status": "active",
+            },
+        )
+
+    seed_frozen_legacy_generic(client.transaction())
+    assert type(legacy_invitation_ref.get().to_dict()["expires_at"]) is (
+        DatetimeWithNanoseconds
+    )
+    historical_invitee = DecisionOSPrincipal(
+        uid="firebase-historical-generic-01",
+        email_verified=True,
+        provider_ids=("google.com",),
+    )
+    restarted_generic = FirestoreDecisionOSRepository(
+        client,
+        clock=lambda: emulator_now,
+        identifiers=identifiers,
+        organization_collection=collection,
+        invitation_index_collection=invitation_index_collection,
+    )
+    assert restarted_generic.accept_invitation(
+        historical_invitee,
+        legacy_token,
+    ).role is DecisionOSRole.CONTRIBUTOR
+
+    pending = repository.create_subject_invitations(
+        restarted_generic,
+        context,
+        subject_ids=(SUBJECT,),
+        role=DecisionOSRole.VIEWER,
+        expires_in=timedelta(days=1),
+        delivery_route_id="consented_test_route",
+    )[0]
+    sending = restarted_generic.begin_subject_invitation_delivery(context, pending)
+    delivered = restarted_generic.record_subject_invitation_delivery(
+        context,
+        sending,
+        delivered=True,
+    )
+    subject_token = pending.token.get_secret_value()
+    assert delivered.delivery_status is SubjectInvitationDeliveryState.DELIVERED
+    subject_invitee = DecisionOSPrincipal(
+        uid="firebase-subject-invitee-01",
+        email_verified=True,
+        provider_ids=("google.com",),
+    )
+    restarted_decisionos = FirestoreDecisionOSRepository(
+        client,
+        clock=lambda: emulator_now,
+        identifiers=identifiers,
+        organization_collection=collection,
+        invitation_index_collection=invitation_index_collection,
+    )
+    restarted_repository = FirestoreOrganizationGraphRepository(
+        client,
+        clock=lambda: NOW,
+        organization_collection=collection,
+        audit_collection=audit_collection,
+    )
+    membership, subject = restarted_repository.accept_subject_invitation(
+        restarted_decisionos,
+        subject_invitee,
+        subject_token,
+    )
+    assert membership.uid == subject_invitee.uid
+    assert subject.member_uid == subject_invitee.uid
+    assert subject.lifecycle is SubjectLifecycle.ACTIVE
+
+    removal = restarted_repository.save_import_draft(
+        context,
+        _removal_draft(saved, base_version=3),
+    )
+    restarted_repository.commit_graph(
         context,
         draft_id=removal.import_id,
         reviewed_digest=removal.semantic_digest,
     )
     with pytest.raises(OrganizationUnavailable):
-        decisionos.load_context(invitee, ORG)
+        restarted_decisionos.load_context(subject_invitee, ORG)

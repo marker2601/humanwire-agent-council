@@ -8,7 +8,7 @@ import secrets
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from enum import StrEnum
 from typing import Any, Literal, Protocol, Self
 
@@ -365,10 +365,98 @@ class _InvitationTokenIndexRecord:
     status: Literal["active", "accepted", "revoked"] = "active"
 
 
+@dataclass(frozen=True, slots=True)
+class _LegacyGenericInvitationProvenance:
+    organization_id: str
+    invitation_id: str
+    token_digest: str
+    created_at: datetime
+    role: DecisionOSRole
+    expires_at: datetime
+
+
 def _aware(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("clock must return an aware datetime")
     return value.astimezone(UTC)
+
+
+def _normalize_stored_datetime(value: object) -> datetime:
+    """Detach one exact Firestore timestamp without invoking instance hooks."""
+
+    value_type = type(value)
+    nanoseconds = None
+    if value_type is not datetime:
+        try:
+            from google.api_core.datetime_helpers import DatetimeWithNanoseconds
+        except Exception:  # noqa: BLE001 - optional SDK details stay private
+            raise InvitationUnavailable() from None
+        if value_type is not DatetimeWithNanoseconds:
+            raise InvitationUnavailable()
+        descriptor = vars(DatetimeWithNanoseconds).get("_nanosecond")
+        if descriptor is None:
+            raise InvitationUnavailable()
+        try:
+            nanoseconds = descriptor.__get__(value, DatetimeWithNanoseconds)
+        except Exception:  # noqa: BLE001 - corrupt SDK values stay private
+            raise InvitationUnavailable() from None
+
+    try:
+        year = datetime.year.__get__(value, datetime)
+        month = datetime.month.__get__(value, datetime)
+        day = datetime.day.__get__(value, datetime)
+        hour = datetime.hour.__get__(value, datetime)
+        minute = datetime.minute.__get__(value, datetime)
+        second = datetime.second.__get__(value, datetime)
+        microsecond = datetime.microsecond.__get__(value, datetime)
+        fold = datetime.fold.__get__(value, datetime)
+        zone = datetime.tzinfo.__get__(value, datetime)
+    except Exception:  # noqa: BLE001 - corrupt timestamp details stay private
+        raise InvitationUnavailable() from None
+    if (
+        any(
+            type(part) is not int
+            for part in (
+                year,
+                month,
+                day,
+                hour,
+                minute,
+                second,
+                microsecond,
+                fold,
+            )
+        )
+        or type(zone) is not timezone
+    ):
+        raise InvitationUnavailable()
+    if nanoseconds is not None and (
+        type(nanoseconds) is not int
+        or not 0 <= nanoseconds <= 999_999_999
+        or (
+            nanoseconds != 0
+            and (
+                nanoseconds % 1_000 != 0
+                or nanoseconds // 1_000 != microsecond
+            )
+        )
+    ):
+        raise InvitationUnavailable()
+    try:
+        detached = datetime(
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            microsecond,
+            tzinfo=zone,
+            fold=fold,
+        )
+        return datetime.astimezone(detached, UTC)
+    except Exception:  # noqa: BLE001 - malformed stored values stay private
+        raise InvitationUnavailable() from None
 
 
 def _display_name(value: str) -> str:
@@ -876,6 +964,11 @@ class InMemoryDecisionOSRepository:
                 )
                 created_records.append(record)
                 grants.append(_subject_grant(record, token=token))
+
+            if not created_records:
+                if organization_mutation.replacements:
+                    raise InvitationUnavailable()
+                return tuple(grants)
 
             next_sequence = self._audit_sequence
             audit_events = list(self._audit.get(current.organization_id, ()))
@@ -1492,6 +1585,25 @@ _GENERIC_INVITATION_INDEX_FIELDS = frozenset(
 _LEGACY_GENERIC_INVITATION_INDEX_FIELDS = _GENERIC_INVITATION_INDEX_FIELDS - {
     "invitation_kind"
 }
+_LEGACY_GENERIC_CUTOVER_FIELDS = frozenset(
+    {
+        "schema_version",
+        "migration_kind",
+        "organization_id",
+    }
+)
+_LEGACY_GENERIC_PROVENANCE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "provenance_kind",
+        "organization_id",
+        "invitation_id",
+        "token_digest",
+        "created_at",
+        "role",
+        "expires_at",
+    }
+)
 
 
 def _has_exact_builtin_keys(
@@ -1533,7 +1645,7 @@ def _firestore_generic_invitation(
             organization_id=value["organization_id"],
             role=DecisionOSRole(value["role"]),
             token_digest=token_digest,
-            expires_at=_aware(value["expires_at"]),
+            expires_at=_normalize_stored_datetime(value["expires_at"]),
             status=value["status"],
         )
     except Exception:  # noqa: BLE001 - stored corruption details are sealed
@@ -1547,9 +1659,7 @@ def _firestore_generic_invitation(
         or re.fullmatch(_ORGANIZATION_ID, record.organization_id) is None
         or type(value["role"]) is not str
         or record.role in {DecisionOSRole.OWNER, DecisionOSRole.ADMIN}
-        or type(value["expires_at"]) is not datetime
-        or value["expires_at"].tzinfo is None
-        or value["expires_at"].utcoffset() is None
+        or type(record.expires_at) is not datetime
         or type(value["status"]) is not str
         or record.status != "active"
     ):
@@ -1596,6 +1706,95 @@ def _firestore_generic_invitation_index(
     return index, is_legacy
 
 
+def _immutable_snapshot_created_at(snapshot: object) -> datetime:
+    try:
+        created_at = _normalize_stored_datetime(snapshot.create_time)
+        updated_at = _normalize_stored_datetime(snapshot.update_time)
+    except Exception:  # noqa: BLE001 - provider metadata stays private
+        raise InvitationUnavailable() from None
+    if created_at != updated_at:
+        raise InvitationUnavailable()
+    return created_at
+
+
+def _firestore_legacy_generic_cutover(
+    value: object,
+    *,
+    organization_id: str,
+) -> None:
+    if not _has_exact_builtin_keys(value, _LEGACY_GENERIC_CUTOVER_FIELDS):
+        raise InvitationUnavailable()
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or type(value["migration_kind"]) is not str
+        or value["migration_kind"] != "legacy_generic_cutover"
+        or type(value["organization_id"]) is not str
+        or value["organization_id"] != organization_id
+    ):
+        raise InvitationUnavailable()
+
+
+def _firestore_legacy_generic_provenance(
+    value: object,
+) -> _LegacyGenericInvitationProvenance:
+    if not _has_exact_builtin_keys(value, _LEGACY_GENERIC_PROVENANCE_FIELDS):
+        raise InvitationUnavailable()
+    try:
+        provenance = _LegacyGenericInvitationProvenance(
+            organization_id=value["organization_id"],
+            invitation_id=value["invitation_id"],
+            token_digest=value["token_digest"],
+            created_at=_normalize_stored_datetime(value["created_at"]),
+            role=DecisionOSRole(value["role"]),
+            expires_at=_normalize_stored_datetime(value["expires_at"]),
+        )
+    except Exception:  # noqa: BLE001 - stored corruption details are sealed
+        raise InvitationUnavailable() from None
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or type(value["provenance_kind"]) is not str
+        or value["provenance_kind"] != "legacy_generic_invitation"
+        or type(value["organization_id"]) is not str
+        or re.fullmatch(_ORGANIZATION_ID, provenance.organization_id) is None
+        or type(value["invitation_id"]) is not str
+        or re.fullmatch(_INVITATION_ID, provenance.invitation_id) is None
+        or type(value["token_digest"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", provenance.token_digest) is None
+        or type(value["role"]) is not str
+        or provenance.role in {DecisionOSRole.OWNER, DecisionOSRole.ADMIN}
+        or type(provenance.created_at) is not datetime
+        or type(provenance.expires_at) is not datetime
+        or provenance.created_at >= provenance.expires_at
+    ):
+        raise InvitationUnavailable()
+    return provenance
+
+
+def _legacy_generic_cutover_payload(organization_id: str) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "migration_kind": "legacy_generic_cutover",
+        "organization_id": organization_id,
+    }
+
+
+def _legacy_generic_provenance_payload(
+    provenance: _LegacyGenericInvitationProvenance,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "provenance_kind": "legacy_generic_invitation",
+        "organization_id": provenance.organization_id,
+        "invitation_id": provenance.invitation_id,
+        "token_digest": provenance.token_digest,
+        "created_at": provenance.created_at,
+        "role": provenance.role.value,
+        "expires_at": provenance.expires_at,
+    }
+
+
 def _firestore_subject_invitation(
     value: object,
     *,
@@ -1614,7 +1813,7 @@ def _firestore_subject_invitation(
             subject_id=value["subject_id"],
             role=role,
             token_digest=token_digest,
-            expires_at=_aware(value["expires_at"]),
+            expires_at=_normalize_stored_datetime(value["expires_at"]),
             delivery_status=delivery_status,
             delivery_route_id=value["delivery_route_id"],
             retry_sequence=value["retry_sequence"],
@@ -1707,6 +1906,11 @@ def _exact_stored_mapping(value: object, expected: dict[str, object]) -> bool:
         return False
     for key, expected_value in expected.items():
         actual = value[key]
+        if type(expected_value) is datetime:
+            try:
+                actual = _normalize_stored_datetime(actual)
+            except InvitationUnavailable:
+                return False
         if type(actual) is not type(expected_value) or actual != expected_value:
             return False
     return True
@@ -1763,6 +1967,101 @@ class FirestoreDecisionOSRepository:
             .collection("subject_invitation_state")
             .document(subject_id)
         )
+
+    def _legacy_generic_cutover_ref(self, organization_id: str):
+        return (
+            self._organization_ref(organization_id)
+            .collection("invitation_migrations")
+            .document("legacy_generic_cutover")
+        )
+
+    def _legacy_generic_provenance_ref(
+        self,
+        organization_id: str,
+        token_digest: str,
+    ):
+        if (
+            type(token_digest) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", token_digest) is None
+        ):
+            raise InvitationUnavailable()
+        return (
+            self._organization_ref(organization_id)
+            .collection("legacy_generic_invitation_provenance")
+            .document(token_digest)
+        )
+
+    def _legacy_generic_cutover(
+        self,
+        transaction,
+        organization_id: str,
+    ) -> tuple[datetime | None, Any, dict[str, object] | None]:
+        marker_ref = self._legacy_generic_cutover_ref(organization_id)
+        marker_row = marker_ref.get(transaction=transaction)
+        if not marker_row.exists:
+            return (
+                None,
+                marker_ref,
+                _legacy_generic_cutover_payload(organization_id),
+            )
+        _firestore_legacy_generic_cutover(
+            marker_row.to_dict(),
+            organization_id=organization_id,
+        )
+        return _immutable_snapshot_created_at(marker_row), marker_ref, None
+
+    def _legacy_generic_provenance_plan(
+        self,
+        transaction,
+        *,
+        digest: str,
+        invitation: _InvitationRecord,
+        invitation_row: object,
+        index_row: object,
+    ) -> tuple[tuple[Any, dict[str, object]], ...]:
+        invitation_created_at = _immutable_snapshot_created_at(invitation_row)
+        index_created_at = _immutable_snapshot_created_at(index_row)
+        if invitation_created_at != index_created_at:
+            raise InvitationUnavailable()
+        marker_created_at, marker_ref, marker_payload = self._legacy_generic_cutover(
+            transaction,
+            invitation.organization_id,
+        )
+        if (
+            marker_created_at is not None
+            and invitation_created_at >= marker_created_at
+        ):
+            raise InvitationUnavailable()
+        provenance_ref = self._legacy_generic_provenance_ref(
+            invitation.organization_id,
+            digest,
+        )
+        provenance_row = provenance_ref.get(transaction=transaction)
+        expected = _LegacyGenericInvitationProvenance(
+            organization_id=invitation.organization_id,
+            invitation_id=invitation.invitation_id,
+            token_digest=digest,
+            created_at=invitation_created_at,
+            role=invitation.role,
+            expires_at=invitation.expires_at,
+        )
+        if expected.created_at >= expected.expires_at:
+            raise InvitationUnavailable()
+        writes: list[tuple[Any, dict[str, object]]] = []
+        if provenance_row.exists:
+            if marker_payload is not None:
+                raise InvitationUnavailable()
+            actual = _firestore_legacy_generic_provenance(provenance_row.to_dict())
+            _immutable_snapshot_created_at(provenance_row)
+            if actual != expected:
+                raise InvitationUnavailable()
+        else:
+            if marker_payload is not None:
+                writes.append((marker_ref, marker_payload))
+            writes.append(
+                (provenance_ref, _legacy_generic_provenance_payload(expected))
+            )
+        return tuple(writes)
 
     def _subject_invitation_relation(
         self,
@@ -1842,9 +2141,12 @@ class FirestoreDecisionOSRepository:
         digest: str,
         *,
         now: datetime,
-    ) -> tuple[_InvitationRecord, Any, Any]:
-        from google.cloud.firestore_v1.base_query import FieldFilter
-
+    ) -> tuple[
+        _InvitationRecord,
+        Any,
+        Any,
+        tuple[tuple[Any, dict[str, object]], ...],
+    ]:
         index_ref = self._invitation_index_ref(digest)
         index_row = index_ref.get(transaction=transaction)
         if not index_row.exists:
@@ -1871,16 +2173,18 @@ class FirestoreDecisionOSRepository:
             or invitation.expires_at <= now
         ):
             raise InvitationUnavailable()
-        subject_relations = (
-            self._organization_ref(index.organization_id)
-            .collection("subject_invitation_state")
-            .where(filter=FieldFilter("token_digest", "==", digest))
-            .limit(1)
-            .stream(transaction=transaction)
+        migration_writes = (
+            self._legacy_generic_provenance_plan(
+                transaction,
+                digest=digest,
+                invitation=invitation,
+                invitation_row=invitation_row,
+                index_row=index_row,
+            )
+            if legacy_invitation
+            else ()
         )
-        if any(True for _row in subject_relations):
-            raise InvitationUnavailable()
-        return invitation, invitation_ref, index_ref
+        return invitation, invitation_ref, index_ref, migration_writes
 
     def create_organization(
         self,
@@ -2049,7 +2353,7 @@ class FirestoreDecisionOSRepository:
 
         @firestore.transactional
         def accept(transaction):
-            invitation, invitation_ref, loaded_index_ref = (
+            invitation, invitation_ref, loaded_index_ref, migration_writes = (
                 self._generic_invitation_relation(
                     transaction,
                     digest,
@@ -2069,6 +2373,8 @@ class FirestoreDecisionOSRepository:
                 role=invitation.role,
                 status=MembershipStatus.ACTIVE,
             )
+            for migration_ref, migration_payload in migration_writes:
+                transaction.create(migration_ref, migration_payload)
             transaction.set(member_ref, membership.model_dump(mode="python"))
             transaction.update(invitation_ref, {"status": "accepted"})
             transaction.update(loaded_index_ref, {"status": "accepted"})
@@ -2123,6 +2429,12 @@ class FirestoreDecisionOSRepository:
                 is not bool
             ):
                 raise InvitationUnavailable()
+            _marker_created_at, marker_ref, marker_payload = (
+                self._legacy_generic_cutover(
+                    transaction,
+                    current.organization_id,
+                )
+            )
             grants: list[SubjectInvitationGrant] = []
             writes: list[tuple[object, object, object, _SubjectInvitationRecord]] = []
             revocations: list[tuple[object, object, _SubjectInvitationRecord]] = []
@@ -2217,13 +2529,19 @@ class FirestoreDecisionOSRepository:
                 writes.append((invitation_ref, index_ref, state_ref, record))
                 grants.append(_subject_grant(record, token=token))
 
-            decision_write_count = (4 * len(writes)) + (2 * len(revocations))
+            decision_write_count = (
+                (4 * len(writes))
+                + (2 * len(revocations))
+                + (1 if marker_payload is not None else 0)
+            )
             if (
                 organization_mutation.write_count + decision_write_count
                 > _MAX_TRANSACTION_WRITES
             ):
                 raise InvitationUnavailable()
             organization_mutation.publish()
+            if marker_payload is not None:
+                transaction.create(marker_ref, marker_payload)
             for invitation_ref, index_ref, _existing in revocations:
                 transaction.update(invitation_ref, {"status": "revoked"})
                 transaction.update(index_ref, {"status": "revoked"})
