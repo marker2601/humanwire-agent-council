@@ -861,26 +861,28 @@ def _validated_candidate(
         for subject in validated.subjects
     ):
         return None
-    units_by_id = {unit.unit_id: unit for unit in validated.units}
-    poisoned_unit_ids = {
-        unit.unit_id
-        for unit in validated.units
-        if unit.name in diagnostics.structurally_ambiguous_units
-    }
-    poisoned_unit_ids.update(
-        subject.unit_id
+    subjects_by_source_identity = {
+        subject.source_identity: subject
         for subject in validated.subjects
-        if subject.unit_id is not None
-        and subject.source_identity in records
-        and _fields(records[subject.source_identity or ""]).get("unit_name")
+        if subject.source_identity is not None
+    }
+    units_by_id = {unit.unit_id: unit for unit in validated.units}
+    poisoned_source_unit_names = {
+        record.source_identity: unit_name
+        for record in active_records
+        if (unit_name := _fields(record).get("unit_name"))
         in diagnostics.structurally_ambiguous_units
-    )
+    }
+    poisoned_unit_ids: set[str] = set()
+    for source_identity, source_unit_name in poisoned_source_unit_names.items():
+        subject = subjects_by_source_identity.get(source_identity)
+        unit = None if subject is None else units_by_id.get(subject.unit_id or "")
+        if unit is None or unit.name != source_unit_name:
+            return None
+        poisoned_unit_ids.add(unit.unit_id)
     if any(
-        unit_id in units_by_id
-        and (
-            units_by_id[unit_id].parent_unit_id is not None
-            or units_by_id[unit_id].leader_subject_id is not None
-        )
+        units_by_id[unit_id].parent_unit_id is not None
+        or units_by_id[unit_id].leader_subject_id is not None
         for unit_id in poisoned_unit_ids
     ):
         return None

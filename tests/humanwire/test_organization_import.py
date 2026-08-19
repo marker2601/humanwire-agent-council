@@ -876,6 +876,30 @@ class WorkerProbeMapper:
                 for unit in candidate.units
             )
             return candidate.model_copy(update={"units": units})
+        if self.mode.startswith("rename_detach_restore_"):
+            platform = next(unit for unit in candidate.units if unit.name == "Platform")
+            engineering = next(unit for unit in candidate.units if unit.name == "Engineering")
+            leader = next(
+                subject for subject in candidate.subjects if subject.unit_id == platform.unit_id
+            )
+            restored_controls = self.mode.removeprefix("rename_detach_restore_")
+            unit_updates = {"name": "Renamed Platform"}
+            if restored_controls in {"parent", "parent_and_leader"}:
+                unit_updates["parent_unit_id"] = engineering.unit_id
+            if restored_controls in {"leader", "parent_and_leader"}:
+                unit_updates["leader_subject_id"] = leader.subject_id
+            renamed = platform.model_copy(update=unit_updates)
+            units = tuple(
+                renamed if unit.unit_id == platform.unit_id else unit
+                for unit in candidate.units
+            )
+            subjects = tuple(
+                subject.model_copy(update={"unit_id": None})
+                if subject.unit_id == platform.unit_id
+                else subject
+                for subject in candidate.subjects
+            )
+            return candidate.model_copy(update={"subjects": subjects, "units": units})
         first = candidate.subjects[0].model_copy(update={"display_name": "Worker Output"})
         return candidate.model_copy(update={"subjects": (first, *candidate.subjects[1:])})
 
@@ -1178,6 +1202,39 @@ def test_central_validation_rejects_restored_controls_for_poisoned_unit(
 
     assert platform.parent_unit_id is None
     assert platform.leader_subject_id is None
+
+
+@pytest.mark.parametrize("reorder", [False, True])
+@pytest.mark.parametrize(
+    "restored_controls",
+    ["parent", "leader", "parent_and_leader"],
+)
+def test_poisoned_unit_binding_rejects_rename_detach_and_restored_controls(
+    service_setup,
+    reorder,
+    restored_controls,
+) -> None:
+    _service, repository, _decisionos, context = service_setup
+    snapshot = malformed_unit_control_snapshot(reorder=reorder)
+    expected = RuleOrganizationMapper().map(snapshot, repository.load_graph(context))
+    service = OrganizationImportService(
+        repository=repository,
+        mapper=worker_spec_mapper(f"rename_detach_restore_{restored_controls}"),
+        mapper_timeout_seconds=2,
+        clock=lambda: NOW,
+    )
+
+    draft = service.create_draft(context, snapshot)
+
+    assert draft.candidate == expected
+    platform = next(unit for unit in draft.candidate.units if unit.name == "Platform")
+    assert platform.parent_unit_id is None
+    assert platform.leader_subject_id is None
+    assert all(
+        subject.lifecycle is SubjectLifecycle.NEEDS_REVIEW
+        and subject.unit_id == platform.unit_id
+        for subject in draft.candidate.subjects
+    )
 
 
 @pytest.mark.parametrize("mapper", [EmptyMapper(), PartialMapper()])
