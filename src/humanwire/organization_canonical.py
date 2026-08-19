@@ -10,22 +10,33 @@ from pydantic import BaseModel
 _EXACT_SCALAR_TYPES = frozenset({str, int, float, bool, type(None)})
 
 
+def _has_only_empty_builtin_state(model: BaseModel, attribute: str) -> bool:
+    state = object.__getattribute__(model, attribute)
+    return state is None or (type(state) is dict and len(state) == 0)
+
+
 def _same_exact_value(raw: object, canonical: object) -> bool:
     if type(raw) is not type(canonical):
         return False
     if isinstance(raw, BaseModel):
         fields = set(type(raw).model_fields)
+        raw_values = object.__getattribute__(raw, "__dict__")
+        canonical_values = object.__getattribute__(canonical, "__dict__")
         if (
-            set(raw.__dict__) != fields
-            or set(canonical.__dict__) != fields
-            or getattr(raw, "__pydantic_extra__", None) not in (None, {})
-            or getattr(canonical, "__pydantic_extra__", None) not in (None, {})
-            or getattr(raw, "__pydantic_private__", None) not in (None, {})
-            or getattr(canonical, "__pydantic_private__", None) not in (None, {})
+            type(raw_values) is not dict
+            or type(canonical_values) is not dict
+            or any(type(key) is not str for key in raw_values)
+            or any(type(key) is not str for key in canonical_values)
+            or set(raw_values) != fields
+            or set(canonical_values) != fields
+            or not _has_only_empty_builtin_state(raw, "__pydantic_extra__")
+            or not _has_only_empty_builtin_state(canonical, "__pydantic_extra__")
+            or not _has_only_empty_builtin_state(raw, "__pydantic_private__")
+            or not _has_only_empty_builtin_state(canonical, "__pydantic_private__")
         ):
             return False
         return all(
-            _same_exact_value(raw.__dict__[field], canonical.__dict__[field])
+            _same_exact_value(raw_values[field], canonical_values[field])
             for field in fields
         )
     if isinstance(raw, tuple):

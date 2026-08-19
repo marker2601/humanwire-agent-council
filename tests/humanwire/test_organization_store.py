@@ -418,6 +418,72 @@ def test_committed_import_carries_across_two_exact_member_binding_versions(
     assert repository.load_committed_import(owner_context, 3) == (draft, receipt)
 
 
+def test_committed_import_carry_rejects_reordered_subject_tuple(
+    setup_repositories,
+) -> None:
+    repository, decisionos, owner_context = setup_repositories
+    member = make_member(
+        decisionos,
+        owner_context,
+        uid="firebase-viewer-01",
+        role=DecisionOSRole.VIEWER,
+    )
+    draft = repository.save_import_draft(owner_context, two_subject_draft())
+    repository.commit_graph(
+        owner_context,
+        draft_id=draft.import_id,
+        reviewed_digest=draft.semantic_digest,
+    )
+    repository.bind_member(
+        owner_context,
+        subject_id=SUBJECT_A,
+        member_uid=member.principal.uid,
+    )
+    target = repository._graphs[(ORG_A, 2)]
+    repository._graphs[(ORG_A, 2)] = target.model_copy(
+        update={"subjects": tuple(reversed(target.subjects))}
+    )
+
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        repository.load_committed_import(owner_context, 2)
+
+
+def test_committed_import_carry_rejects_suspended_subject_reactivation(
+    setup_repositories,
+) -> None:
+    repository, _decisionos, owner_context = setup_repositories
+    draft = repository.save_import_draft(owner_context, import_draft())
+    repository.commit_graph(
+        owner_context,
+        draft_id=draft.import_id,
+        reviewed_digest=draft.semantic_digest,
+    )
+    receipt_graph = repository._graphs[(ORG_A, 1)]
+    suspended = receipt_graph.subjects[0].model_copy(
+        update={"lifecycle": SubjectLifecycle.SUSPENDED}
+    )
+    repository._graphs[(ORG_A, 1)] = receipt_graph.model_copy(
+        update={"subjects": (suspended,)}
+    )
+    repository._graphs[(ORG_A, 2)] = receipt_graph.model_copy(
+        update={
+            "version": 2,
+            "subjects": (
+                suspended.model_copy(
+                    update={
+                        "lifecycle": SubjectLifecycle.ACTIVE,
+                        "member_uid": owner_context.principal.uid,
+                    }
+                ),
+            ),
+        }
+    )
+    repository._current_versions[ORG_A] = 2
+
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        repository.load_committed_import(owner_context, 2)
+
+
 def test_newer_committed_import_supersedes_prior_receipt_predecessor(
     setup_repositories,
 ) -> None:

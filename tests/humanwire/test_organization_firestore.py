@@ -501,6 +501,35 @@ def downgrade_to_legacy_v1(client: FakeClient, import_id: str) -> None:
     client.data.pop((COLLECTION, ORG, "organization_import_lineage", "csv"), None)
 
 
+def inject_phantom_committed_receipt(client: FakeClient, saved: ImportDraft) -> ImportReceipt:
+    receipt = ImportReceipt(
+        receipt_id=f"rcp_{deterministic_ulid(ORG, saved.import_id)}",
+        import_id=saved.import_id,
+        organization_id=ORG,
+        source_snapshot_id=saved.source_snapshot.snapshot_id,
+        source_snapshot_digest=saved.source_snapshot.semantic_digest,
+        graph_version=1,
+        committed_subject_count=len(saved.candidate.subjects),
+        committed_at=NOW,
+        committed_by_uid=OWNER.uid,
+    )
+    import_path = (COLLECTION, ORG, "imports", saved.import_id)
+    client.data[import_path].update(
+        {
+            "status": "committed",
+            "receipt": receipt.model_dump(mode="python"),
+        }
+    )
+    client.data[import_path]["payload_digest"] = independent_digest(
+        {
+            key: value
+            for key, value in client.data[import_path].items()
+            if key != "payload_digest"
+        }
+    )
+    return receipt
+
+
 @pytest.mark.parametrize(
     ("operation", "expected_error"),
     (
@@ -605,6 +634,36 @@ def test_firestore_reads_exact_receipt_and_committed_graph_version(fake_firestor
         repository.load_committed_import(context, receipt.graph_version + 1)
 
 
+@pytest.mark.parametrize(
+    "operation",
+    ["load_draft", "load_receipt", "list_imports", "load_committed"],
+)
+def test_firestore_import_reads_use_one_transactional_snapshot(
+    fake_firestore,
+    operation,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    if operation == "load_committed":
+        repository.commit_graph(
+            context,
+            draft_id=saved.import_id,
+            reviewed_digest=saved.semantic_digest,
+        )
+    client.transactions.clear()
+
+    if operation == "load_draft":
+        repository.load_import_draft(context, saved.import_id)
+    elif operation == "load_receipt":
+        repository.load_import_receipt(context, saved.import_id)
+    elif operation == "list_imports":
+        repository.list_imports(context)
+    else:
+        repository.load_committed_import(context, 1)
+
+    assert len(client.transactions) == 1
+
+
 def test_firestore_committed_import_carries_across_two_member_binding_versions(
     fake_firestore,
 ) -> None:
@@ -628,6 +687,109 @@ def test_firestore_committed_import_carries_across_two_member_binding_versions(
     assert repository.load_committed_import(context, 2) == (saved, receipt)
     assert repository.load_committed_import(context, 3) == (saved, receipt)
     assert client.query_limits[-2:] == [2, 2]
+
+
+def test_firestore_committed_import_carry_rejects_reordered_subject_tuple(
+    fake_firestore,
+    monkeypatch,
+) -> None:
+    client, repository, context = fake_firestore
+    second_uid = "firebase-viewer-02"
+    client.data[(COLLECTION, ORG, "members", second_uid)] = OrganizationMembership(
+        organization_id=ORG,
+        uid=second_uid,
+        role=DecisionOSRole.VIEWER,
+        status=MembershipStatus.ACTIVE,
+    ).model_dump(mode="python")
+    saved = repository.save_import_draft(context, two_subject_draft())
+    repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    repository.bind_member(context, subject_id=SUBJECT, member_uid=OWNER.uid)
+    receipt_graph, receipt_storage = repository._graph_from_row(
+        ORG,
+        1,
+        repository._version_ref(ORG, 1).get(),
+    )
+    target_graph, target_storage = repository._graph_from_row(
+        ORG,
+        2,
+        repository._version_ref(ORG, 2).get(),
+    )
+    target_graph = target_graph.model_copy(
+        update={"subjects": tuple(reversed(target_graph.subjects))}
+    )
+
+    def reordered_graph_from_row(
+        organization_id,
+        version,
+        row,
+        *,
+        transaction=None,
+    ):
+        del organization_id, row, transaction
+        if version == 1:
+            return receipt_graph, receipt_storage
+        assert version == 2
+        return target_graph, target_storage
+
+    monkeypatch.setattr(repository, "_graph_from_row", reordered_graph_from_row)
+
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        repository.load_committed_import(context, 2)
+
+
+def test_firestore_committed_import_carry_rejects_suspended_subject_reactivation(
+    fake_firestore,
+    monkeypatch,
+) -> None:
+    _client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    repository.bind_member(context, subject_id=SUBJECT, member_uid=OWNER.uid)
+    receipt_graph, receipt_storage = repository._graph_from_row(
+        ORG,
+        1,
+        repository._version_ref(ORG, 1).get(),
+    )
+    target_graph, target_storage = repository._graph_from_row(
+        ORG,
+        2,
+        repository._version_ref(ORG, 2).get(),
+    )
+    receipt_graph = receipt_graph.model_copy(
+        update={
+            "subjects": (
+                receipt_graph.subjects[0].model_copy(
+                    update={"lifecycle": SubjectLifecycle.SUSPENDED}
+                ),
+            )
+        }
+    )
+
+    def suspended_graph_from_row(
+        organization_id,
+        version,
+        row,
+        *,
+        transaction=None,
+    ):
+        del organization_id, row, transaction
+        if version == 1:
+            return receipt_graph, receipt_storage
+        assert version == 2
+        return target_graph, target_storage
+
+    monkeypatch.setattr(repository, "_graph_from_row", suspended_graph_from_row)
+
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        repository.load_committed_import(context, 2)
 
 
 def test_firestore_newer_committed_import_supersedes_prior_receipt_predecessor(
@@ -901,6 +1063,60 @@ def test_firestore_legacy_lineage_scan_rejects_pending_receipt_corruption(
     with pytest.raises(ImportUnavailable, match="import_unavailable"):
         repository.require_latest_import(context, second.import_id)
     assert repository.load_graph(context).version == 0
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "load_draft",
+        "load_receipt",
+        "list_imports",
+        "require_latest",
+        "legacy_scan",
+        "commit_retry",
+        "load_committed",
+    ],
+)
+def test_firestore_phantom_committed_receipt_fails_every_import_path(
+    fake_firestore,
+    operation,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    inject_phantom_committed_receipt(client, saved)
+    if operation == "legacy_scan":
+        client.data.pop((COLLECTION, ORG, "organization_import_lineage", "csv"), None)
+    before = deepcopy(client.data)
+
+    def invoke():
+        if operation == "load_draft":
+            return repository.load_import_draft(context, saved.import_id)
+        if operation == "load_receipt":
+            return repository.load_import_receipt(context, saved.import_id)
+        if operation == "list_imports":
+            return repository.list_imports(context)
+        if operation == "require_latest":
+            return repository.require_latest_import(context, saved.import_id)
+        if operation == "legacy_scan":
+            return repository.save_import_draft(
+                context,
+                next_draft(
+                    saved,
+                    import_id="imp_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+                    digest="2" * 64,
+                ),
+            )
+        if operation == "commit_retry":
+            return repository.commit_graph(
+                context,
+                draft_id=saved.import_id,
+                reviewed_digest=saved.semantic_digest,
+            )
+        return repository.load_committed_import(context, 1)
+
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        invoke()
+    assert client.data == before
 
 
 def test_firestore_graph_version_read_ignores_pending_and_rejects_corrupt_shape(

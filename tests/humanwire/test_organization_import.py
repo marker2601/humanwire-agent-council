@@ -5,7 +5,7 @@ import multiprocessing
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from pydantic import ValidationError
@@ -38,6 +38,10 @@ from humanwire.organization_store import (
 ORG_A = "org_01ARZ3NDEKTSV4RRFFQ69G5FAV"
 ORG_B = "org_01ARZ3NDEKTSV4RRFFQ69G5FAW"
 NOW = datetime(2026, 8, 18, 15, 0, tzinfo=UTC)
+
+
+class DatetimeSubclass(datetime):
+    pass
 
 
 class SequenceIdentifiers:
@@ -305,6 +309,27 @@ def test_service_load_import_rejects_forged_draft_digest_and_id(
     assert private not in exception_graph_text(captured.value)
 
 
+@pytest.mark.parametrize("forgery", ["changed", "offset", "subclass"])
+def test_service_load_import_rejects_created_at_not_exactly_bound_to_snapshot(
+    service_setup,
+    forgery,
+) -> None:
+    service, repository, _decisionos, admin_context = service_setup
+    draft = service.create_draft(admin_context, complete_snapshot())
+    if forgery == "changed":
+        created_at = NOW + timedelta(seconds=1)
+    elif forgery == "offset":
+        created_at = NOW.astimezone(timezone(timedelta(hours=-5)))
+    else:
+        created_at = DatetimeSubclass.fromtimestamp(NOW.timestamp(), tz=UTC)
+    repository._imports[(ORG_A, draft.import_id)].draft = draft.model_copy(
+        update={"created_at": created_at}
+    )
+
+    with pytest.raises((ImportUnavailable, OrganizationImportUnavailable)):
+        service.load_import(admin_context, draft.import_id)
+
+
 def test_graph_version_review_never_selects_newer_pending_import(service_setup) -> None:
     service, _repository, _decisionos, admin_context = service_setup
     committed_draft = service.create_draft(admin_context, complete_snapshot())
@@ -333,7 +358,7 @@ def test_graph_version_review_never_selects_newer_pending_import(service_setup) 
 
 
 def test_rule_mapping_is_byte_identical_under_record_and_field_reordering() -> None:
-    def build():
+    def build(clock):
         decisionos = InMemoryDecisionOSRepository(
             identifiers=SequenceIdentifiers(), clock=lambda: NOW
         )
@@ -344,14 +369,18 @@ def test_rule_mapping_is_byte_identical_under_record_and_field_reordering() -> N
             repository=InMemoryOrganizationGraphRepository(
                 decisionos=decisionos, clock=lambda: NOW
             ),
-            clock=lambda: NOW,
+            clock=clock,
         )
         return service, context
 
-    first_service, first_context = build()
-    second_service, second_context = build()
+    first_service, first_context = build(lambda: NOW - timedelta(days=7))
+    second_service, second_context = build(lambda: NOW + timedelta(days=7))
     first = first_service.create_draft(first_context, complete_snapshot())
     second = second_service.create_draft(second_context, complete_snapshot(reorder=True))
+    assert first.created_at == complete_snapshot().captured_at
+    assert second.created_at == complete_snapshot().captured_at
+    assert first.import_id == second.import_id
+    assert first.semantic_digest == second.semantic_digest
     assert first.model_dump_json() == second.model_dump_json()
     assert (
         first_service.reconcile(first_context, first.import_id).model_dump_json()
@@ -429,6 +458,38 @@ def test_manual_correction_binds_digest_and_record_and_supersedes_old_draft(
         )
     with pytest.raises(OrganizationImportStale, match="organization_import_stale"):
         service.apply_correction(context, request)
+
+
+def test_manual_correction_retains_exact_source_capture_time(service_setup) -> None:
+    service, _repository, _decisionos, context = service_setup
+    ambiguous = SourceSnapshot(
+        snapshot_id="snap_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        organization_id=ORG_A,
+        source_kind="csv",
+        captured_at=NOW,
+        records=(source_record(1, "row/one", (("title", "Founder"),)),),
+        semantic_digest="3" * 64,
+    )
+    draft = service.create_draft(context, ambiguous)
+    service._clock = lambda: NOW + timedelta(days=30)
+
+    corrected = service.apply_correction(
+        context,
+        ImportCorrectionRequest(
+            import_id=draft.import_id,
+            reviewed_digest=draft.semantic_digest,
+            kind=ImportCorrectionKind.CORRECT_RECORD,
+            source_record_ids=(ambiguous.records[0].record_id,),
+            replacement_fields=(
+                ("display_name", "Ada Lovelace"),
+                ("kind", "human"),
+                ("unit_leader", "true"),
+                ("unit_name", "Executive"),
+            ),
+        ),
+    )
+
+    assert corrected.created_at.isoformat() == ambiguous.captured_at.isoformat()
 
 
 def test_correction_contract_rejects_unbound_or_noncanonical_operations() -> None:

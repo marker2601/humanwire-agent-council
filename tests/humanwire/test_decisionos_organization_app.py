@@ -23,6 +23,7 @@ from humanwire.decisionos_auth import (
 )
 from humanwire.decisionos_models import DecisionOSPrincipal, DecisionOSRole
 from humanwire.decisionos_store import InMemoryDecisionOSRepository, OrganizationUnavailable
+from humanwire.organization_canonical import exact_canonical_model
 from humanwire.organization_import import OrganizationImportService
 from humanwire.organization_models import (
     AuthorityAssignment,
@@ -32,6 +33,7 @@ from humanwire.organization_models import (
     OrganizationEdge,
     OrganizationEdgeKind,
     OrganizationGraph,
+    OrganizationProjection,
     OrganizationSubject,
     OrganizationSubjectKind,
     OrganizationUnit,
@@ -83,6 +85,24 @@ class HostileString(str):
 
     def __hash__(self):
         return hash(self.allowed)
+
+
+class EqualitySpoofDict(dict):
+    def __init__(self, mutation) -> None:
+        super().__init__()
+        self.mutation = mutation
+        self.calls = 0
+
+    def __eq__(self, _other):
+        self.calls += 1
+        self.mutation()
+        return True
+
+
+def _install_hidden_equality_spoof(model, mutation) -> EqualitySpoofDict:
+    state = EqualitySpoofDict(mutation)
+    object.__setattr__(model, "__pydantic_private__", state)
+    return state
 
 
 def _principal(uid: str) -> DecisionOSPrincipal:
@@ -1222,6 +1242,86 @@ def test_pending_receipt_corruption_rejects_detail_and_commit_without_graph_publ
     assert bundle.graph_repository.load_graph(bundle.owner_context).version == 0
 
 
+@pytest.mark.parametrize(
+    "hidden_slot",
+    ["__pydantic_private__", "__pydantic_extra__"],
+)
+def test_exact_canonical_model_rejects_hidden_equality_spoof_without_calling_it(
+    hidden_slot,
+) -> None:
+    graph = OrganizationGraph(organization_id=ORG_A, version=0, created_at=NOW)
+    state = EqualitySpoofDict(
+        lambda: graph.__dict__.__setitem__("organization_id", "PRIVATE-HIDDEN-STATE")
+    )
+    object.__setattr__(graph, hidden_slot, state)
+
+    assert exact_canonical_model(graph, OrganizationGraph) is None
+    assert state.calls == 0
+
+
+def test_import_detail_never_serializes_draft_mutated_by_hidden_equality(
+    bundle,
+    monkeypatch,
+) -> None:
+    client = _client(bundle, "owner")
+    uploaded = _upload(client).json()
+    draft, reconciliation, receipt = bundle.import_service.load_import(
+        bundle.owner_context,
+        uploaded["import_id"],
+    )
+    private = "PRIVATE-HIDDEN-DRAFT-MUTATION"
+    state = _install_hidden_equality_spoof(
+        reconciliation,
+        lambda: draft.__dict__.__setitem__("organization_id", private),
+    )
+    monkeypatch.setattr(
+        bundle.import_service,
+        "load_import",
+        lambda _context, _import_id: (draft, reconciliation, receipt),
+    )
+
+    response = client.get(f"/api/organizations/{ORG_A}/imports/{draft.import_id}")
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "organization_not_found"}
+    assert private not in response.text
+    assert state.calls == 0
+
+
+def test_route_binding_helpers_return_detached_canonical_payload_values(bundle) -> None:
+    client = _client(bundle, "owner")
+    uploaded = _upload(client).json()
+    draft, reconciliation, receipt = bundle.import_service.load_import(
+        bundle.owner_context,
+        uploaded["import_id"],
+    )
+
+    bound = decisionos_organization_routes._canonical_bound_import(
+        bundle.owner_context,
+        ORG_A,
+        draft.import_id,
+        draft,
+        reconciliation,
+        receipt,
+    )
+
+    assert bound is not None
+    canonical_draft, canonical_reconciliation, canonical_receipt = bound
+    assert canonical_draft is not draft
+    assert canonical_reconciliation is not reconciliation
+    assert canonical_receipt is None
+    draft.__dict__["organization_id"] = "PRIVATE-RAW-DRAFT"
+    reconciliation.__dict__["organization_id"] = "PRIVATE-RAW-RECONCILIATION"
+    payload = decisionos_organization_routes._draft_payload(
+        canonical_draft,
+        canonical_reconciliation,
+        canonical_receipt,
+    )
+    serialized = json.dumps(payload)
+    assert "PRIVATE-RAW-DRAFT" not in serialized
+    assert "PRIVATE-RAW-RECONCILIATION" not in serialized
+
+
 def test_upload_rebinds_cross_tenant_draft_before_serialization(bundle, monkeypatch) -> None:
     client = _client(bundle, "owner")
     existing = _upload(client).json()
@@ -1812,6 +1912,100 @@ def test_projection_accepts_exact_known_diagnostic_codes() -> None:
     projected = build_organization_projection(graph, reconciliation)
 
     assert projected.reconciliation == reconciliation
+
+
+@pytest.mark.parametrize("attack", ["raw_enum", "list", "hostile_string", "extra"])
+def test_projection_builder_rejects_noncanonical_graph_at_entry(attack) -> None:
+    private = "PRIVATE-HOSTILE-GRAPH"
+    subject = OrganizationSubject(
+        subject_id=SUBJECT,
+        organization_id=ORG_A,
+        kind=OrganizationSubjectKind.HUMAN,
+        lifecycle=SubjectLifecycle.DIRECTORY_ONLY,
+        display_name="Alice Example",
+        source_identity="private/provider/alice",
+    )
+    graph = OrganizationGraph(
+        organization_id=ORG_A,
+        version=0,
+        subjects=(subject,),
+        created_at=NOW,
+    )
+    if attack == "raw_enum":
+        graph = graph.model_copy(
+            update={"subjects": (subject.model_copy(update={"kind": "human"}),)}
+        )
+    elif attack == "list":
+        graph = graph.model_copy(update={"subjects": list(graph.subjects)})
+    elif attack == "hostile_string":
+        graph = graph.model_copy(
+            update={
+                "subjects": (
+                    subject.model_copy(
+                        update={"display_name": HostileString("Alice Example", private)}
+                    ),
+                )
+            }
+        )
+    else:
+        graph = graph.model_copy(update={"private_provider_trace": private})
+
+    with pytest.raises(OrganizationProjectionUnavailable) as captured:
+        build_organization_projection(graph, None)
+
+    assert str(captured.value) == "organization_projection_unavailable"
+    assert private not in repr(captured.value)
+
+
+def test_projection_route_never_serializes_projection_mutated_by_hidden_equality(
+    bundle,
+    monkeypatch,
+) -> None:
+    owner = _client(bundle, "owner")
+    uploaded = _upload(owner).json()
+    committed = owner.post(
+        f"/api/organizations/{ORG_A}/imports/{uploaded['import_id']}/commit",
+        headers=_authorized_headers(owner),
+        json={
+            "reviewed_digest": uploaded["reviewed_digest"],
+            "acknowledged_codes": uploaded["acknowledged_codes"],
+        },
+    )
+    assert committed.status_code == 200
+    original_review = bundle.import_service.review_for_graph
+    private = "PRIVATE-HIDDEN-PROJECTION-MUTATION"
+    states = []
+
+    def mutate_projection_from_stack() -> None:
+        frame = inspect.currentframe()
+        while frame is not None:
+            candidate = frame.f_locals.get("projected")
+            if type(candidate) is OrganizationProjection:
+                candidate.__dict__["organization_id"] = private
+                return
+            frame = frame.f_back
+
+    def hostile_review(context, graph_version):
+        review = original_review(context, graph_version)
+        assert review is not None
+        reconciliation, receipt = review
+        states.append(
+            _install_hidden_equality_spoof(
+                reconciliation,
+                mutate_projection_from_stack,
+            )
+        )
+        return reconciliation, receipt
+
+    monkeypatch.setattr(bundle.import_service, "review_for_graph", hostile_review)
+    viewer = _client(bundle, "viewer")
+
+    response = viewer.get(f"/api/organizations/{ORG_A}/organization-graph")
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "organization_not_found"}
+    assert private not in response.text
+    assert states and all(state.calls == 0 for state in states)
 
 
 def test_graph_and_authority_routes_return_only_safe_projection(bundle) -> None:

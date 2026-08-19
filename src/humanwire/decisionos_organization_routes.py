@@ -262,64 +262,70 @@ async def _json_body(
         return None
 
 
-def _draft_is_bound(
+def _canonical_bound_import(
     context: DecisionOSContext,
     organization_id: str,
+    import_id: str,
     draft: object,
     reconciliation: object,
+    receipt: object | None,
     *,
-    import_id: str | None = None,
     supersedes_import_id: str | None = None,
-) -> bool:
+    graph_version: int | None = None,
+) -> tuple[ImportDraft, ImportReconciliation, ImportReceipt | None] | None:
     canonical_draft = exact_canonical_model(draft, ImportDraft)
     canonical_reconciliation = exact_canonical_model(
         reconciliation,
         ImportReconciliation,
     )
+    canonical_receipt = (
+        None if receipt is None else exact_canonical_model(receipt, ImportReceipt)
+    )
     if (
         canonical_draft is None
         or canonical_reconciliation is None
+        or (receipt is not None and canonical_receipt is None)
         or not organization_import_is_bound(
             context,
-            canonical_draft.import_id,
+            import_id,
             canonical_draft,
             canonical_reconciliation,
-            None,
+            canonical_receipt,
+            graph_version=graph_version,
         )
         or not organization_reconciliation_is_safe(canonical_reconciliation)
     ):
-        return False
-    expected_import_id = canonical_draft.import_id if import_id is None else import_id
-    return (
-        context.organization_id == organization_id
-        and canonical_draft.organization_id == organization_id
-        and canonical_draft.import_id == expected_import_id
-        and canonical_draft.source_snapshot.organization_id == organization_id
-        and canonical_draft.candidate.organization_id == organization_id
-        and canonical_draft.candidate.source_snapshot_id
-        == canonical_draft.source_snapshot.snapshot_id
-        and canonical_reconciliation.organization_id == organization_id
-        and canonical_reconciliation.import_id == canonical_draft.import_id
-        and (
-            supersedes_import_id is None
-            or canonical_draft.supersedes_import_id == supersedes_import_id
+        return None
+    if (
+        context.organization_id != organization_id
+        or canonical_draft.organization_id != organization_id
+        or canonical_draft.import_id != import_id
+        or canonical_draft.source_snapshot.organization_id != organization_id
+        or canonical_draft.candidate.organization_id != organization_id
+        or canonical_draft.candidate.source_snapshot_id
+        != canonical_draft.source_snapshot.snapshot_id
+        or canonical_reconciliation.organization_id != organization_id
+        or canonical_reconciliation.import_id != canonical_draft.import_id
+        or (
+            supersedes_import_id is not None
+            and canonical_draft.supersedes_import_id != supersedes_import_id
         )
-    )
+    ):
+        return None
+    return canonical_draft, canonical_reconciliation, canonical_receipt
 
 
-def _receipt_is_bound(
+def _canonical_bound_receipt(
     context: DecisionOSContext,
     organization_id: str,
     import_id: str,
     receipt: object,
     *,
-    draft: ImportDraft | None = None,
-    reconciliation: ImportReconciliation | None = None,
     graph_version: int | None = None,
-) -> bool:
+) -> ImportReceipt | None:
     canonical_receipt = exact_canonical_model(receipt, ImportReceipt)
     if canonical_receipt is None:
-        return False
+        return None
     if (
         context.organization_id != organization_id
         or canonical_receipt.organization_id != organization_id
@@ -329,35 +335,21 @@ def _receipt_is_bound(
             and canonical_receipt.graph_version > graph_version
         )
     ):
-        return False
-    if draft is None or reconciliation is None:
-        return True
-    return organization_import_is_bound(
-        context,
-        import_id,
-        draft,
-        reconciliation,
-        canonical_receipt,
-        graph_version=graph_version,
-    ) and (
-        draft.organization_id == organization_id
-        and draft.import_id == import_id
-        and canonical_receipt.source_snapshot_id == draft.source_snapshot.snapshot_id
-        and canonical_receipt.source_snapshot_digest
-        == draft.source_snapshot.semantic_digest
-        and canonical_receipt.graph_version == draft.base_graph_version + 1
-        and canonical_receipt.committed_subject_count == len(draft.candidate.subjects)
-        and canonical_receipt.acknowledged_codes == reconciliation.acknowledged_codes
-    )
+        return None
+    return canonical_receipt
 
 
-def _projection_is_bound(
+def _canonical_bound_projection(
     context: DecisionOSContext,
     organization_id: str,
-    graph: OrganizationGraph,
-    reconciliation: ImportReconciliation | None,
+    graph: object,
+    reconciliation: object | None,
     projected: object,
-) -> bool:
+) -> tuple[
+    OrganizationGraph,
+    ImportReconciliation | None,
+    OrganizationProjection,
+] | None:
     canonical_graph = exact_canonical_model(graph, OrganizationGraph)
     canonical_projection = exact_canonical_model(projected, OrganizationProjection)
     canonical_reconciliation = (
@@ -374,7 +366,7 @@ def _projection_is_bound(
             and not organization_reconciliation_is_safe(canonical_reconciliation)
         )
     ):
-        return False
+        return None
     projected_subjects = {
         item.subject_id: item for item in canonical_projection.subjects
     }
@@ -400,7 +392,7 @@ def _projection_is_bound(
     graph_assignments = {
         item.assignment_id: item for item in canonical_graph.authority_assignments
     }
-    return (
+    bound = (
         context.organization_id == organization_id
         and canonical_graph.organization_id == organization_id
         and canonical_projection.organization_id == organization_id
@@ -449,13 +441,33 @@ def _projection_is_bound(
             for key in graph_assignments
         )
     )
+    if not bound:
+        return None
+    return canonical_graph, canonical_reconciliation, canonical_projection
 
 
 def _draft_payload(
-    draft: ImportDraft,
-    reconciliation: ImportReconciliation,
-    receipt: ImportReceipt | None = None,
+    draft: object,
+    reconciliation: object,
+    receipt: object | None = None,
 ) -> dict[str, object]:
+    canonical_draft = exact_canonical_model(draft, ImportDraft)
+    canonical_reconciliation = exact_canonical_model(
+        reconciliation,
+        ImportReconciliation,
+    )
+    canonical_receipt = (
+        None if receipt is None else exact_canonical_model(receipt, ImportReceipt)
+    )
+    if (
+        canonical_draft is None
+        or canonical_reconciliation is None
+        or (receipt is not None and canonical_receipt is None)
+    ):
+        raise ValueError("organization import payload is invalid")
+    draft = canonical_draft
+    reconciliation = canonical_reconciliation
+    receipt = canonical_receipt
     payload: dict[str, object] = {
         "status": "committed" if receipt is not None else "draft",
         "import_id": draft.import_id,
@@ -482,7 +494,11 @@ def _draft_payload(
     return payload
 
 
-def _receipt_payload(receipt: ImportReceipt) -> dict[str, object]:
+def _receipt_payload(receipt: object) -> dict[str, object]:
+    canonical_receipt = exact_canonical_model(receipt, ImportReceipt)
+    if canonical_receipt is None:
+        raise ValueError("organization receipt payload is invalid")
+    receipt = canonical_receipt
     return {
         "status": "committed",
         "receipt_id": receipt.receipt_id,
@@ -566,13 +582,27 @@ def create_organization_router(
             ValidationError,
         ) as error:
             return _import_error(error)
-        if (
-            receipt is not None
-            or not exact_canonical_equal(draft, canonical_created, ImportDraft)
-            or not _draft_is_bound(context, organization_id, draft, reconciliation)
+        bound = _canonical_bound_import(
+            context,
+            organization_id,
+            canonical_created.import_id,
+            draft,
+            reconciliation,
+            receipt,
+        )
+        if bound is None:
+            return _fixed_error(404, "organization_not_found")
+        canonical_draft, canonical_reconciliation, canonical_receipt = bound
+        if canonical_receipt is not None or not exact_canonical_equal(
+            canonical_draft,
+            canonical_created,
+            ImportDraft,
         ):
             return _fixed_error(404, "organization_not_found")
-        return JSONResponse(status_code=201, content=_draft_payload(draft, reconciliation))
+        return JSONResponse(
+            status_code=201,
+            content=_draft_payload(canonical_draft, canonical_reconciliation),
+        )
 
     @router.api_route(
         "/api/organizations/{organization_id}/imports/{import_id}",
@@ -594,25 +624,24 @@ def create_organization_router(
             OrganizationUnavailable,
         ) as error:
             return _import_error(error)
-        if not _draft_is_bound(
+        bound = _canonical_bound_import(
             context,
             organization_id,
+            import_id,
             draft,
             reconciliation,
-            import_id=import_id,
-        ) or (
-            receipt is not None
-            and not _receipt_is_bound(
-                context,
-                organization_id,
-                import_id,
-                receipt,
-                draft=draft,
-                reconciliation=reconciliation,
-            )
-        ):
+            receipt,
+        )
+        if bound is None:
             return _fixed_error(404, "organization_not_found")
-        return JSONResponse(content=_draft_payload(draft, reconciliation, receipt))
+        canonical_draft, canonical_reconciliation, canonical_receipt = bound
+        return JSONResponse(
+            content=_draft_payload(
+                canonical_draft,
+                canonical_reconciliation,
+                canonical_receipt,
+            )
+        )
 
     @router.post(
         "/api/organizations/{organization_id}/imports/{import_id}/corrections"
@@ -657,19 +686,28 @@ def create_organization_router(
             ValidationError,
         ) as error:
             return _import_error(error)
-        if not _draft_is_bound(
+        bound = _canonical_bound_import(
             context,
             organization_id,
+            canonical_corrected.import_id,
             draft,
             reconciliation,
+            receipt,
             supersedes_import_id=import_id,
-        ) or receipt is not None or not exact_canonical_equal(
-            draft,
+        )
+        if bound is None:
+            return _fixed_error(404, "organization_not_found")
+        canonical_draft, canonical_reconciliation, canonical_receipt = bound
+        if canonical_receipt is not None or not exact_canonical_equal(
+            canonical_draft,
             canonical_corrected,
             ImportDraft,
         ):
             return _fixed_error(404, "organization_not_found")
-        return JSONResponse(status_code=201, content=_draft_payload(draft, reconciliation))
+        return JSONResponse(
+            status_code=201,
+            content=_draft_payload(canonical_draft, canonical_reconciliation),
+        )
 
     @router.post("/api/organizations/{organization_id}/imports/{import_id}/commit")
     async def commit_import(
@@ -692,15 +730,13 @@ def create_organization_router(
                     acknowledged_codes=tuple(body.acknowledged_codes),
                 ),
             )
-            canonical_receipt = exact_canonical_model(receipt, ImportReceipt)
-            if canonical_receipt is None:
-                return _fixed_error(404, "organization_not_found")
-            if not _receipt_is_bound(
+            canonical_receipt = _canonical_bound_receipt(
                 context,
                 organization_id,
                 import_id,
-                canonical_receipt,
-            ):
+                receipt,
+            )
+            if canonical_receipt is None:
                 return _fixed_error(404, "organization_not_found")
             draft, reconciliation, stored_receipt = dependencies.import_service.load_import(
                 context,
@@ -716,30 +752,29 @@ def create_organization_router(
             ValidationError,
         ) as error:
             return _import_error(error)
+        bound = _canonical_bound_import(
+            context,
+            organization_id,
+            import_id,
+            draft,
+            reconciliation,
+            stored_receipt,
+        )
+        if bound is None:
+            return _fixed_error(404, "organization_not_found")
+        canonical_draft, canonical_reconciliation, canonical_stored_receipt = bound
         if (
-            not _draft_is_bound(
-                context,
-                organization_id,
-                draft,
-                reconciliation,
-                import_id=import_id,
-            )
+            canonical_stored_receipt is None
             or not exact_canonical_equal(
-                stored_receipt,
+                canonical_stored_receipt,
                 canonical_receipt,
                 ImportReceipt,
             )
-            or not _receipt_is_bound(
-                context,
-                organization_id,
-                import_id,
-                canonical_receipt,
-                draft=draft,
-                reconciliation=reconciliation,
-            )
-            or draft.semantic_digest != body.reviewed_digest
+            or canonical_draft.semantic_digest != body.reviewed_digest
             or canonical_receipt.acknowledged_codes
             != tuple(body.acknowledged_codes)
+            or canonical_receipt.acknowledged_codes
+            != canonical_reconciliation.acknowledged_codes
         ):
             return _fixed_error(404, "organization_not_found")
         return JSONResponse(content=_receipt_payload(canonical_receipt))
@@ -749,9 +784,10 @@ def create_organization_router(
         if isinstance(context, Response):
             return context
         try:
-            graph = dependencies.graph_repository.load_graph(context)
+            raw_graph = dependencies.graph_repository.load_graph(context)
+            graph = exact_canonical_model(raw_graph, OrganizationGraph)
             if (
-                type(graph) is not OrganizationGraph
+                graph is None
                 or context.organization_id != organization_id
                 or graph.organization_id != organization_id
             ):
@@ -759,19 +795,25 @@ def create_organization_router(
             review = dependencies.import_service.review_for_graph(context, graph.version)
             reconciliation = None
             if review is not None:
-                reconciliation, receipt = review
+                raw_reconciliation, raw_receipt = review
+                reconciliation = exact_canonical_model(
+                    raw_reconciliation,
+                    ImportReconciliation,
+                )
+                receipt = _canonical_bound_receipt(
+                    context,
+                    organization_id,
+                    reconciliation.import_id if reconciliation is not None else "",
+                    raw_receipt,
+                    graph_version=graph.version,
+                )
                 if (
-                    type(reconciliation) is not ImportReconciliation
+                    reconciliation is None
+                    or receipt is None
                     or reconciliation.organization_id != organization_id
-                    or not _receipt_is_bound(
-                        context,
-                        organization_id,
-                        reconciliation.import_id,
-                        receipt,
-                        graph_version=graph.version,
-                    )
                     or receipt.acknowledged_codes
                     != reconciliation.acknowledged_codes
+                    or not organization_reconciliation_is_safe(reconciliation)
                 ):
                     return _fixed_error(404, "organization_not_found")
             elif graph.version != 0:
@@ -785,15 +827,16 @@ def create_organization_router(
             return _fixed_error(500, "request_failed")
         except (ImportUnavailable, OrganizationImportUnavailable):
             return _fixed_error(500, "request_failed")
-        canonical_projection = exact_canonical_model(projected, OrganizationProjection)
-        if canonical_projection is None or not _projection_is_bound(
+        bound_projection = _canonical_bound_projection(
             context,
             organization_id,
             graph,
             reconciliation,
-            canonical_projection,
-        ):
+            projected,
+        )
+        if bound_projection is None:
             return _fixed_error(404, "organization_not_found")
+        _canonical_graph, _canonical_reconciliation, canonical_projection = bound_projection
         return JSONResponse(content=canonical_projection.model_dump(mode="json"))
 
     router.add_api_route(

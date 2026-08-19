@@ -144,11 +144,14 @@ def _build_organization_projection(
     graph: OrganizationGraph,
     reconciliation: ImportReconciliation | None,
 ) -> OrganizationProjection:
-    if type(graph) is not OrganizationGraph:
+    canonical_graph = exact_canonical_model(graph, OrganizationGraph)
+    if canonical_graph is None:
         raise TypeError("organization graph is invalid")
+    graph = canonical_graph
     if not validate_organization_graph(graph).committable:
         raise ValueError("organization graph is invalid")
-    return OrganizationProjection(
+    canonical_reconciliation = _reconciliation(reconciliation)
+    projection = OrganizationProjection(
         organization_id=graph.organization_id,
         graph_version=graph.version,
         subjects=tuple(
@@ -166,9 +169,13 @@ def _build_organization_projection(
         # The authoritative graph/reconciliation inputs do not carry source provenance.
         source_kind=None,
         synchronized_at=graph.created_at,
-        reconciliation=_reconciliation(reconciliation),
+        reconciliation=canonical_reconciliation,
         generated_at=datetime.now(UTC),
     )
+    canonical_projection = exact_canonical_model(projection, OrganizationProjection)
+    if canonical_projection is None:
+        raise ValueError("organization projection is invalid")
+    return canonical_projection
 
 
 def build_organization_projection(

@@ -348,6 +348,43 @@ def _receipt_matches_draft(
     )
 
 
+def _member_binding_is_allowed(
+    prior: OrganizationSubject,
+    target: OrganizationSubject,
+    *,
+    target_subjects: tuple[OrganizationSubject, ...],
+) -> bool:
+    """Accept only the exact subject transition produced by ``bind_member``."""
+
+    canonical_prior = exact_canonical_model(prior, OrganizationSubject)
+    canonical_target = exact_canonical_model(target, OrganizationSubject)
+    if (
+        canonical_prior is None
+        or canonical_target is None
+        or type(target_subjects) is not tuple
+    ):
+        return False
+    canonical_subjects: list[OrganizationSubject] = []
+    for subject in target_subjects:
+        canonical_subject = exact_canonical_model(subject, OrganizationSubject)
+        if canonical_subject is None:
+            return False
+        canonical_subjects.append(canonical_subject)
+    target_uid = canonical_target.member_uid
+    if (
+        canonical_prior.kind is not OrganizationSubjectKind.HUMAN
+        or canonical_prior.lifecycle is SubjectLifecycle.SUSPENDED
+        or canonical_prior.member_uid is not None
+        or canonical_target.lifecycle is not SubjectLifecycle.ACTIVE
+        or target_uid is None
+        or sum(subject.member_uid == target_uid for subject in canonical_subjects) != 1
+    ):
+        return False
+    return to_json(
+        canonical_prior.model_dump(exclude={"lifecycle", "member_uid"})
+    ) == to_json(canonical_target.model_dump(exclude={"lifecycle", "member_uid"}))
+
+
 def _graphs_differ_only_by_member_bindings(
     receipt_graph: OrganizationGraph,
     target_graph: OrganizationGraph,
@@ -401,9 +438,9 @@ def _graphs_differ_only_by_member_bindings(
         )
     ):
         return False
-    receipt_subjects = {item.subject_id: item for item in canonical_receipt.subjects}
-    target_subjects = {item.subject_id: item for item in canonical_target.subjects}
-    if receipt_subjects.keys() != target_subjects.keys():
+    receipt_subject_ids = tuple(item.subject_id for item in canonical_receipt.subjects)
+    target_subject_ids = tuple(item.subject_id for item in canonical_target.subjects)
+    if receipt_subject_ids != target_subject_ids:
         return False
     target_member_uids = tuple(
         item.member_uid for item in canonical_target.subjects if item.member_uid is not None
@@ -411,17 +448,17 @@ def _graphs_differ_only_by_member_bindings(
     if len(target_member_uids) != len(set(target_member_uids)):
         return False
     newly_bound = 0
-    for subject_id, prior in receipt_subjects.items():
-        current = target_subjects[subject_id]
+    for prior, current in zip(
+        canonical_receipt.subjects,
+        canonical_target.subjects,
+        strict=True,
+    ):
         if exact_canonical_equal(prior, current, OrganizationSubject):
             continue
-        if (
-            to_json(prior.model_dump(exclude={"lifecycle", "member_uid"}))
-            != to_json(current.model_dump(exclude={"lifecycle", "member_uid"}))
-            or prior.kind is not OrganizationSubjectKind.HUMAN
-            or prior.member_uid is not None
-            or current.member_uid is None
-            or current.lifecycle is not SubjectLifecycle.ACTIVE
+        if not _member_binding_is_allowed(
+            prior,
+            current,
+            target_subjects=canonical_target.subjects,
         ):
             return False
         newly_bound += 1
@@ -921,14 +958,21 @@ class InMemoryOrganizationGraphRepository:
                 subject,
                 {"member_uid": member_uid, "lifecycle": SubjectLifecycle.ACTIVE},
             )
+            target_subjects = tuple(
+                bound if item.subject_id == subject_id else item
+                for item in prior.subjects
+            )
+            if not _member_binding_is_allowed(
+                subject,
+                bound,
+                target_subjects=target_subjects,
+            ):
+                raise OrganizationUnavailable()
             now = _aware(self._clock())
             graph = OrganizationGraph(
                 organization_id=prior.organization_id,
                 version=prior.version + 1,
-                subjects=tuple(
-                    bound if item.subject_id == subject_id else item
-                    for item in prior.subjects
-                ),
+                subjects=target_subjects,
                 units=prior.units,
                 edges=prior.edges,
                 authority_assignments=prior.authority_assignments,
@@ -1399,18 +1443,34 @@ class FirestoreOrganizationGraphRepository:
         context: DecisionOSContext,
         draft_id: str,
     ) -> ImportDraft:
-        current = self._authorize(context, DecisionOSPermission.MANAGE_MEMBERS)
-        draft_ref = self._import_ref(current.organization_id, draft_id)
-        row = draft_ref.get()
-        if not row.exists:
-            raise ImportUnavailable()
-        draft = self._draft_from_row(
-            row,
-            draft_ref,
-            organization_id=current.organization_id,
-        )
-        self._import_state(row.to_dict(), draft)
-        return draft
+        from google.cloud import firestore
+
+        @firestore.transactional
+        def load(transaction):
+            current = self._authorize_transaction(
+                transaction,
+                context,
+                DecisionOSPermission.MANAGE_MEMBERS,
+            )
+            draft_ref = self._import_ref(current.organization_id, draft_id)
+            row = draft_ref.get(transaction=transaction)
+            if not row.exists:
+                raise ImportUnavailable()
+            draft = self._draft_from_row(
+                row,
+                draft_ref,
+                organization_id=current.organization_id,
+                transaction=transaction,
+            )
+            self._import_state(
+                row.to_dict(),
+                draft,
+                transaction=transaction,
+                organization_id=current.organization_id,
+            )
+            return draft
+
+        return load(self._client.transaction())
 
     @_firestore_error_barrier(ImportUnavailable)
     def load_import_receipt(
@@ -1418,17 +1478,33 @@ class FirestoreOrganizationGraphRepository:
         context: DecisionOSContext,
         import_id: str,
     ) -> ImportReceipt | None:
-        current = self._authorize(context, DecisionOSPermission.MANAGE_MEMBERS)
-        draft_ref = self._import_ref(current.organization_id, import_id)
-        row = draft_ref.get()
-        if not row.exists:
-            raise ImportUnavailable()
-        draft = self._draft_from_row(
-            row,
-            draft_ref,
-            organization_id=current.organization_id,
-        )
-        return self._import_state(row.to_dict(), draft)
+        from google.cloud import firestore
+
+        @firestore.transactional
+        def load(transaction):
+            current = self._authorize_transaction(
+                transaction,
+                context,
+                DecisionOSPermission.MANAGE_MEMBERS,
+            )
+            draft_ref = self._import_ref(current.organization_id, import_id)
+            row = draft_ref.get(transaction=transaction)
+            if not row.exists:
+                raise ImportUnavailable()
+            draft = self._draft_from_row(
+                row,
+                draft_ref,
+                organization_id=current.organization_id,
+                transaction=transaction,
+            )
+            return self._import_state(
+                row.to_dict(),
+                draft,
+                transaction=transaction,
+                organization_id=current.organization_id,
+            )
+
+        return load(self._client.transaction())
 
     @_firestore_error_barrier(ImportUnavailable)
     def load_committed_import(
@@ -1439,85 +1515,126 @@ class FirestoreOrganizationGraphRepository:
         from google.cloud import firestore
         from google.cloud.firestore_v1.base_query import FieldFilter
 
-        current = self._authorize(context, DecisionOSPermission.READ_WORKSPACE)
         if type(graph_version) is not int or graph_version < 0:
             raise ImportUnavailable()
-        if graph_version == 0:
-            return None
-        rows = tuple(
-            self._organization_ref(current.organization_id)
-            .collection("imports")
-            .where(
-                filter=FieldFilter(
-                    "receipt.graph_version",
-                    "<=",
-                    graph_version,
+
+        @firestore.transactional
+        def load(transaction):
+            current = self._authorize_transaction(
+                transaction,
+                context,
+                DecisionOSPermission.READ_WORKSPACE,
+            )
+            if graph_version == 0:
+                return None
+            rows = tuple(
+                self._organization_ref(current.organization_id)
+                .collection("imports")
+                .where(
+                    filter=FieldFilter(
+                        "receipt.graph_version",
+                        "<=",
+                        graph_version,
+                    )
                 )
+                .order_by("receipt.graph_version", direction=firestore.Query.DESCENDING)
+                .limit(2)
+                .stream(transaction=transaction)
             )
-            .order_by("receipt.graph_version", direction=firestore.Query.DESCENDING)
-            .limit(2)
-            .stream()
-        )
-        if not rows:
-            raise ImportUnavailable()
-        parsed: list[tuple[ImportDraft, ImportReceipt]] = []
-        for row in rows:
-            draft_ref = self._import_ref(current.organization_id, row.id)
-            draft = self._draft_from_row(
-                row,
-                draft_ref,
-                organization_id=current.organization_id,
-            )
-            receipt = self._import_state(row.to_dict(), draft)
-            if receipt is None or receipt.graph_version > graph_version:
+            if not rows:
+                raise ImportUnavailable()
+            parsed: list[tuple[ImportDraft, ImportReceipt]] = []
+            for row in rows:
+                draft_ref = self._import_ref(current.organization_id, row.id)
+                draft = self._draft_from_row(
+                    row,
+                    draft_ref,
+                    organization_id=current.organization_id,
+                    transaction=transaction,
+                )
+                receipt = self._import_state(
+                    row.to_dict(),
+                    draft,
+                    transaction=transaction,
+                    organization_id=current.organization_id,
+                )
+                if receipt is None or receipt.graph_version > graph_version:
+                    raise ImportUnavailable() from None
+                parsed.append((draft, receipt))
+            draft, receipt = parsed[0]
+            if len(parsed) == 2 and parsed[1][1].graph_version == receipt.graph_version:
+                raise ImportUnavailable()
+            if any(
+                item_receipt.graph_version >= prior_receipt.graph_version
+                for (_item_draft, item_receipt), (_prior_draft, prior_receipt) in zip(
+                    parsed[1:], parsed
+                )
+            ):
+                raise ImportUnavailable()
+            try:
+                receipt_graph, _receipt_storage = self._graph_from_row(
+                    current.organization_id,
+                    receipt.graph_version,
+                    self._version_ref(current.organization_id, receipt.graph_version).get(
+                        transaction=transaction
+                    ),
+                    transaction=transaction,
+                )
+                target_graph, _target_storage = self._graph_from_row(
+                    current.organization_id,
+                    graph_version,
+                    self._version_ref(current.organization_id, graph_version).get(
+                        transaction=transaction
+                    ),
+                    transaction=transaction,
+                )
+            except OrganizationUnavailable:
                 raise ImportUnavailable() from None
-            parsed.append((draft, receipt))
-        draft, receipt = parsed[0]
-        if len(parsed) == 2 and parsed[1][1].graph_version == receipt.graph_version:
-            raise ImportUnavailable()
-        if any(
-            item_receipt.graph_version >= prior_receipt.graph_version
-            for (_item_draft, item_receipt), (_prior_draft, prior_receipt) in zip(
-                parsed[1:], parsed
-            )
-        ):
-            raise ImportUnavailable()
-        try:
-            receipt_graph, _receipt_storage = self._graph_from_row(
-                current.organization_id,
-                receipt.graph_version,
-                self._version_ref(current.organization_id, receipt.graph_version).get(),
-            )
-            target_graph, _target_storage = self._graph_from_row(
-                current.organization_id,
-                graph_version,
-                self._version_ref(current.organization_id, graph_version).get(),
-            )
-        except OrganizationUnavailable:
-            raise ImportUnavailable() from None
-        if not _graphs_differ_only_by_member_bindings(
-            receipt_graph,
-            target_graph,
-            receipt_version=receipt.graph_version,
-            target_version=graph_version,
-        ):
-            raise ImportUnavailable()
-        return draft, receipt
+            if not _graphs_differ_only_by_member_bindings(
+                receipt_graph,
+                target_graph,
+                receipt_version=receipt.graph_version,
+                target_version=graph_version,
+            ):
+                raise ImportUnavailable()
+            return draft, receipt
+
+        return load(self._client.transaction())
 
     @_firestore_error_barrier(ImportUnavailable)
     def list_imports(self, context: DecisionOSContext) -> tuple[ImportDraft, ...]:
-        current = self._authorize(context, DecisionOSPermission.MANAGE_MEMBERS)
-        rows = self._organization_ref(current.organization_id).collection("imports").stream()
-        drafts = []
-        for row in rows:
-            draft = self._draft_from_row(
-                row,
-                self._import_ref(current.organization_id, row.id),
-                organization_id=current.organization_id,
+        from google.cloud import firestore
+
+        @firestore.transactional
+        def load(transaction):
+            current = self._authorize_transaction(
+                transaction,
+                context,
+                DecisionOSPermission.MANAGE_MEMBERS,
             )
-            self._import_state(row.to_dict(), draft)
-            drafts.append(draft)
-        return tuple(sorted(drafts, key=lambda item: item.import_id))
+            rows = (
+                self._organization_ref(current.organization_id)
+                .collection("imports")
+                .stream(transaction=transaction)
+            )
+            drafts = []
+            for row in rows:
+                draft = self._draft_from_row(
+                    row,
+                    self._import_ref(current.organization_id, row.id),
+                    organization_id=current.organization_id,
+                    transaction=transaction,
+                )
+                self._import_state(
+                    row.to_dict(),
+                    draft,
+                    transaction=transaction,
+                    organization_id=current.organization_id,
+                )
+                drafts.append(draft)
+            return tuple(sorted(drafts, key=lambda item: item.import_id))
+
+        return load(self._client.transaction())
 
     @_firestore_error_barrier(ImportUnavailable)
     def require_latest_import(
@@ -1546,7 +1663,12 @@ class FirestoreOrganizationGraphRepository:
                 transaction=transaction,
             )
             payload = row.to_dict()
-            receipt = self._import_state(payload, draft)
+            receipt = self._import_state(
+                payload,
+                draft,
+                transaction=transaction,
+                organization_id=current.organization_id,
+            )
             if receipt is not None:
                 return
             lineage_ref = self._lineage_ref(
@@ -1612,7 +1734,12 @@ class FirestoreOrganizationGraphRepository:
                 or not _digest_matches(reviewed_digest, draft.semantic_digest)
             ):
                 raise ImportUnavailable()
-            receipt = self._import_state(payload, draft)
+            receipt = self._import_state(
+                payload,
+                draft,
+                transaction=transaction,
+                organization_id=current.organization_id,
+            )
             if receipt is not None:
                 if receipt.acknowledged_codes != acknowledged_codes:
                     raise ImportUnavailable() from None
@@ -1831,14 +1958,21 @@ class FirestoreOrganizationGraphRepository:
                 subject,
                 {"member_uid": member_uid, "lifecycle": SubjectLifecycle.ACTIVE},
             )
+            target_subjects = tuple(
+                bound if item.subject_id == subject_id else item
+                for item in prior.subjects
+            )
+            if not _member_binding_is_allowed(
+                subject,
+                bound,
+                target_subjects=target_subjects,
+            ):
+                raise OrganizationUnavailable()
             now = _aware(self._clock())
             graph = OrganizationGraph(
                 organization_id=prior.organization_id,
                 version=version + 1,
-                subjects=tuple(
-                    bound if item.subject_id == subject_id else item
-                    for item in prior.subjects
-                ),
+                subjects=target_subjects,
                 units=prior.units,
                 edges=prior.edges,
                 authority_assignments=prior.authority_assignments,
@@ -2043,7 +2177,12 @@ class FirestoreOrganizationGraphRepository:
                 organization_id=organization_id,
                 transaction=transaction,
             )
-            receipt = self._import_state(payload, draft)
+            receipt = self._import_state(
+                payload,
+                draft,
+                transaction=transaction,
+                organization_id=organization_id,
+            )
             if receipt is None:
                 candidates.append(draft)
         if not candidates:
@@ -2248,10 +2387,69 @@ class FirestoreOrganizationGraphRepository:
             acknowledged_codes=acknowledged_codes,
         )
 
+    def _committed_graph_for_receipt(
+        self,
+        transaction,
+        organization_id: str,
+        draft: ImportDraft,
+        receipt: ImportReceipt,
+    ) -> OrganizationGraph:
+        canonical_draft = exact_canonical_model(draft, ImportDraft)
+        canonical_receipt = exact_canonical_model(receipt, ImportReceipt)
+        if canonical_draft is None or canonical_receipt is None:
+            raise ImportUnavailable()
+        try:
+            state_row = self._state_ref(organization_id).get(transaction=transaction)
+            current_version, state = self._state_from_row(organization_id, state_row)
+            if current_version < canonical_receipt.graph_version:
+                raise ImportUnavailable()
+            version_row = self._version_ref(
+                organization_id,
+                canonical_receipt.graph_version,
+            ).get(transaction=transaction)
+            graph, storage = self._graph_from_row(
+                organization_id,
+                canonical_receipt.graph_version,
+                version_row,
+                transaction=transaction,
+            )
+        except OrganizationUnavailable:
+            raise ImportUnavailable() from None
+        canonical_graph = exact_canonical_model(graph, OrganizationGraph)
+        if (
+            canonical_graph is None
+            or canonical_graph.organization_id != organization_id
+            or canonical_graph.version != canonical_receipt.graph_version
+            or not validate_organization_graph(canonical_graph).committable
+            or canonical_receipt.committed_subject_count
+            != len(canonical_draft.candidate.subjects)
+            or canonical_receipt.committed_subject_count > len(canonical_graph.subjects)
+            or (
+                current_version == canonical_receipt.graph_version
+                and storage["payload_digest"] != state["payload_digest"]
+            )
+        ):
+            raise ImportUnavailable()
+        graph_subjects = {
+            subject.subject_id: subject for subject in canonical_graph.subjects
+        }
+        for candidate in canonical_draft.candidate.subjects:
+            committed = graph_subjects.get(candidate.subject_id)
+            if committed is None or to_json(
+                candidate.model_dump(exclude={"lifecycle", "member_uid"})
+            ) != to_json(
+                committed.model_dump(exclude={"lifecycle", "member_uid"})
+            ):
+                raise ImportUnavailable()
+        return canonical_graph
+
     def _import_state(
         self,
         payload: dict[str, Any],
         draft: ImportDraft,
+        *,
+        transaction,
+        organization_id: str,
     ) -> ImportReceipt | None:
         status = payload.get("status")
         if type(status) is not str:
@@ -2289,6 +2487,12 @@ class FirestoreOrganizationGraphRepository:
             acknowledged_codes=receipt.acknowledged_codes,
         ):
             raise ImportUnavailable() from None
+        self._committed_graph_for_receipt(
+            transaction,
+            organization_id,
+            draft,
+            receipt,
+        )
         return receipt
 
     def _membership_change_transaction(

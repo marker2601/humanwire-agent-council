@@ -792,7 +792,6 @@ class OrganizationImportService:
         supersedes_import_id: str | None = None,
     ) -> ImportDraft:
         candidate = self._mapped_candidate(snapshot, current)
-        created_at = _aware(self._clock())
         digest = _draft_digest(
             snapshot,
             candidate,
@@ -807,7 +806,7 @@ class OrganizationImportService:
             candidate=candidate,
             base_graph_version=current.version,
             semantic_digest=digest,
-            created_at=created_at,
+            created_at=snapshot.captured_at,
         )
 
     def _mapped_candidate(
@@ -927,6 +926,11 @@ def organization_import_is_bound(
 def _canonical_draft_identity(value: object) -> ImportDraft | None:
     draft = exact_canonical_model(value, ImportDraft)
     if draft is None:
+        return None
+    if (
+        draft.created_at.isoformat() != draft.source_snapshot.captured_at.isoformat()
+        or draft.created_at.fold != draft.source_snapshot.captured_at.fold
+    ):
         return None
     expected_digest = _draft_digest(
         draft.source_snapshot,
