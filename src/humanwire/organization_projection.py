@@ -5,6 +5,7 @@ from __future__ import annotations
 import traceback as traceback_module
 from datetime import UTC, datetime
 
+from humanwire.organization_canonical import exact_canonical_model
 from humanwire.organization_graph import validate_organization_graph
 from humanwire.organization_models import (
     AuthorityAssignment,
@@ -115,37 +116,28 @@ def _assignment(assignment: AuthorityAssignment) -> AuthorityAssignment:
 def _reconciliation(value: ImportReconciliation | None) -> ImportReconciliation | None:
     if value is None:
         return None
-    if not organization_reconciliation_is_safe(value):
+    canonical = _canonical_reconciliation(value)
+    if canonical is None:
         raise ValueError("import reconciliation diagnostic is invalid")
-    return ImportReconciliation(
-        import_id=value.import_id,
-        organization_id=value.organization_id,
-        source_count=value.source_count,
-        normalized_count=value.normalized_count,
-        rejected_count=value.rejected_count,
-        lifecycle_counts=tuple(value.lifecycle_counts),
-        blocking_codes=tuple(value.blocking_codes),
-        acknowledged_codes=tuple(value.acknowledged_codes),
-    )
+    return canonical
+
+
+def _canonical_reconciliation(value: object) -> ImportReconciliation | None:
+    canonical = exact_canonical_model(value, ImportReconciliation)
+    if canonical is None:
+        return None
+    codes = (*canonical.blocking_codes, *canonical.acknowledged_codes)
+    if any(type(code) is not str for code in codes) or not set(codes).issubset(
+        _CANONICAL_DIAGNOSTIC_CODES
+    ):
+        return None
+    return canonical
 
 
 def organization_reconciliation_is_safe(value: object) -> bool:
     """Return whether a reconciliation is canonical, finite, and round-trippable."""
 
-    if (
-        type(value) is not ImportReconciliation
-        or set(value.__dict__) != set(ImportReconciliation.model_fields)
-        or getattr(value, "__pydantic_extra__", None) not in (None, {})
-    ):
-        return False
-    try:
-        validated = ImportReconciliation.model_validate_json(value.model_dump_json())
-    except Exception:  # noqa: BLE001 - hostile seam output must fail closed
-        return False
-    return validated == value and {
-        *value.blocking_codes,
-        *value.acknowledged_codes,
-    }.issubset(_CANONICAL_DIAGNOSTIC_CODES)
+    return _canonical_reconciliation(value) is not None
 
 
 def _build_organization_projection(

@@ -19,6 +19,10 @@ from humanwire.decisionos_store import (
     DecisionOSRepository,
     OrganizationUnavailable,
 )
+from humanwire.organization_canonical import (
+    exact_canonical_equal,
+    exact_canonical_model,
+)
 from humanwire.organization_import import (
     ImportCorrectionKind,
     ImportCorrectionRequest,
@@ -29,12 +33,16 @@ from humanwire.organization_import import (
     organization_import_is_bound,
 )
 from humanwire.organization_models import (
+    AuthorityAssignment,
     CommitImportRequest,
     ImportDraft,
     ImportReceipt,
     ImportReconciliation,
+    OrganizationEdge,
     OrganizationGraph,
     OrganizationProjection,
+    OrganizationProjectionSubject,
+    OrganizationUnit,
     SourceSnapshot,
 )
 from humanwire.organization_projection import (
@@ -254,35 +262,6 @@ async def _json_body(
         return None
 
 
-def _strict_roundtrip(value: object, model_type: type[BaseModel]) -> bool:
-    if type(value) is not model_type:
-        return False
-    try:
-        return _has_exact_model_shape(value) and (
-            model_type.model_validate_json(value.model_dump_json()) == value
-        )
-    except Exception:  # noqa: BLE001 - hostile dependency output fails closed
-        return False
-
-
-def _has_exact_model_shape(value: object) -> bool:
-    if isinstance(value, BaseModel):
-        if (
-            set(value.__dict__) != set(type(value).model_fields)
-            or getattr(value, "__pydantic_extra__", None) not in (None, {})
-        ):
-            return False
-        return all(_has_exact_model_shape(item) for item in value.__dict__.values())
-    if isinstance(value, (list, tuple)):
-        return all(_has_exact_model_shape(item) for item in value)
-    if isinstance(value, dict):
-        return all(
-            _has_exact_model_shape(key) and _has_exact_model_shape(item)
-            for key, item in value.items()
-        )
-    return True
-
-
 def _draft_is_bound(
     context: DecisionOSContext,
     organization_id: str,
@@ -292,32 +271,38 @@ def _draft_is_bound(
     import_id: str | None = None,
     supersedes_import_id: str | None = None,
 ) -> bool:
+    canonical_draft = exact_canonical_model(draft, ImportDraft)
+    canonical_reconciliation = exact_canonical_model(
+        reconciliation,
+        ImportReconciliation,
+    )
     if (
-        type(draft) is not ImportDraft
-        or type(reconciliation) is not ImportReconciliation
+        canonical_draft is None
+        or canonical_reconciliation is None
         or not organization_import_is_bound(
             context,
-            draft.import_id,
-            draft,
-            reconciliation,
+            canonical_draft.import_id,
+            canonical_draft,
+            canonical_reconciliation,
             None,
         )
-        or not organization_reconciliation_is_safe(reconciliation)
+        or not organization_reconciliation_is_safe(canonical_reconciliation)
     ):
         return False
-    expected_import_id = draft.import_id if import_id is None else import_id
+    expected_import_id = canonical_draft.import_id if import_id is None else import_id
     return (
         context.organization_id == organization_id
-        and draft.organization_id == organization_id
-        and draft.import_id == expected_import_id
-        and draft.source_snapshot.organization_id == organization_id
-        and draft.candidate.organization_id == organization_id
-        and draft.candidate.source_snapshot_id == draft.source_snapshot.snapshot_id
-        and reconciliation.organization_id == organization_id
-        and reconciliation.import_id == draft.import_id
+        and canonical_draft.organization_id == organization_id
+        and canonical_draft.import_id == expected_import_id
+        and canonical_draft.source_snapshot.organization_id == organization_id
+        and canonical_draft.candidate.organization_id == organization_id
+        and canonical_draft.candidate.source_snapshot_id
+        == canonical_draft.source_snapshot.snapshot_id
+        and canonical_reconciliation.organization_id == organization_id
+        and canonical_reconciliation.import_id == canonical_draft.import_id
         and (
             supersedes_import_id is None
-            or draft.supersedes_import_id == supersedes_import_id
+            or canonical_draft.supersedes_import_id == supersedes_import_id
         )
     )
 
@@ -332,13 +317,17 @@ def _receipt_is_bound(
     reconciliation: ImportReconciliation | None = None,
     graph_version: int | None = None,
 ) -> bool:
-    if not _strict_roundtrip(receipt, ImportReceipt):
+    canonical_receipt = exact_canonical_model(receipt, ImportReceipt)
+    if canonical_receipt is None:
         return False
     if (
         context.organization_id != organization_id
-        or receipt.organization_id != organization_id
-        or receipt.import_id != import_id
-        or (graph_version is not None and receipt.graph_version > graph_version)
+        or canonical_receipt.organization_id != organization_id
+        or canonical_receipt.import_id != import_id
+        or (
+            graph_version is not None
+            and canonical_receipt.graph_version > graph_version
+        )
     ):
         return False
     if draft is None or reconciliation is None:
@@ -348,16 +337,17 @@ def _receipt_is_bound(
         import_id,
         draft,
         reconciliation,
-        receipt,
+        canonical_receipt,
         graph_version=graph_version,
     ) and (
         draft.organization_id == organization_id
         and draft.import_id == import_id
-        and receipt.source_snapshot_id == draft.source_snapshot.snapshot_id
-        and receipt.source_snapshot_digest == draft.source_snapshot.semantic_digest
-        and receipt.graph_version == draft.base_graph_version + 1
-        and receipt.committed_subject_count == len(draft.candidate.subjects)
-        and receipt.acknowledged_codes == reconciliation.acknowledged_codes
+        and canonical_receipt.source_snapshot_id == draft.source_snapshot.snapshot_id
+        and canonical_receipt.source_snapshot_digest
+        == draft.source_snapshot.semantic_digest
+        and canonical_receipt.graph_version == draft.base_graph_version + 1
+        and canonical_receipt.committed_subject_count == len(draft.candidate.subjects)
+        and canonical_receipt.acknowledged_codes == reconciliation.acknowledged_codes
     )
 
 
@@ -368,54 +358,96 @@ def _projection_is_bound(
     reconciliation: ImportReconciliation | None,
     projected: object,
 ) -> bool:
+    canonical_graph = exact_canonical_model(graph, OrganizationGraph)
+    canonical_projection = exact_canonical_model(projected, OrganizationProjection)
+    canonical_reconciliation = (
+        None
+        if reconciliation is None
+        else exact_canonical_model(reconciliation, ImportReconciliation)
+    )
     if (
-        not _strict_roundtrip(graph, OrganizationGraph)
-        or not _strict_roundtrip(projected, OrganizationProjection)
+        canonical_graph is None
+        or canonical_projection is None
+        or (reconciliation is not None and canonical_reconciliation is None)
         or (
-            reconciliation is not None
-            and not organization_reconciliation_is_safe(reconciliation)
+            canonical_reconciliation is not None
+            and not organization_reconciliation_is_safe(canonical_reconciliation)
         )
     ):
         return False
-    projected_subjects = {item.subject_id: item for item in projected.subjects}
-    graph_subjects = {item.subject_id: item for item in graph.subjects}
+    projected_subjects = {
+        item.subject_id: item for item in canonical_projection.subjects
+    }
+    graph_subjects = {item.subject_id: item for item in canonical_graph.subjects}
     expected_subjects = {
-        subject_id: {
-            "subject_id": item.subject_id,
-            "kind": item.kind,
-            "lifecycle": item.lifecycle,
-            "display_name": item.display_name,
-            "unit_id": item.unit_id,
-            "title": item.title,
-        }
+        subject_id: OrganizationProjectionSubject(
+            subject_id=item.subject_id,
+            kind=item.kind,
+            lifecycle=item.lifecycle,
+            display_name=item.display_name,
+            unit_id=item.unit_id,
+            title=item.title,
+        )
         for subject_id, item in graph_subjects.items()
     }
-    projected_units = {item.unit_id: item for item in projected.units}
-    graph_units = {item.unit_id: item for item in graph.units}
-    projected_edges = {item.edge_id: item for item in projected.edges}
-    graph_edges = {item.edge_id: item for item in graph.edges}
+    projected_units = {item.unit_id: item for item in canonical_projection.units}
+    graph_units = {item.unit_id: item for item in canonical_graph.units}
+    projected_edges = {item.edge_id: item for item in canonical_projection.edges}
+    graph_edges = {item.edge_id: item for item in canonical_graph.edges}
     projected_assignments = {
-        item.assignment_id: item for item in projected.authority_assignments
+        item.assignment_id: item for item in canonical_projection.authority_assignments
     }
     graph_assignments = {
-        item.assignment_id: item for item in graph.authority_assignments
+        item.assignment_id: item for item in canonical_graph.authority_assignments
     }
     return (
         context.organization_id == organization_id
-        and graph.organization_id == organization_id
-        and projected.organization_id == organization_id
-        and projected.graph_version == graph.version
-        and projected.source_kind is None
-        and projected.synchronized_at == graph.created_at
-        and projected.reconciliation == reconciliation
-        and {
-            subject_id: item.model_dump(mode="python")
-            for subject_id, item in projected_subjects.items()
-        }
-        == expected_subjects
-        and projected_units == graph_units
-        and projected_edges == graph_edges
-        and projected_assignments == graph_assignments
+        and canonical_graph.organization_id == organization_id
+        and canonical_projection.organization_id == organization_id
+        and canonical_projection.graph_version == canonical_graph.version
+        and canonical_projection.source_kind is None
+        and canonical_projection.synchronized_at is not None
+        and canonical_projection.synchronized_at.isoformat()
+        == canonical_graph.created_at.isoformat()
+        and (
+            (canonical_projection.reconciliation is None and reconciliation is None)
+            or (
+                canonical_reconciliation is not None
+                and exact_canonical_equal(
+                    canonical_projection.reconciliation,
+                    canonical_reconciliation,
+                    ImportReconciliation,
+                )
+            )
+        )
+        and projected_subjects.keys() == expected_subjects.keys()
+        and all(
+            exact_canonical_equal(
+                projected_subjects[subject_id],
+                expected,
+                OrganizationProjectionSubject,
+            )
+            for subject_id, expected in expected_subjects.items()
+        )
+        and projected_units.keys() == graph_units.keys()
+        and all(
+            exact_canonical_equal(projected_units[key], graph_units[key], OrganizationUnit)
+            for key in graph_units
+        )
+        and projected_edges.keys() == graph_edges.keys()
+        and all(
+            exact_canonical_equal(projected_edges[key], graph_edges[key], OrganizationEdge)
+            for key in graph_edges
+        )
+        and projected_assignments.keys() == graph_assignments.keys()
+        and all(
+            exact_canonical_equal(
+                projected_assignments[key],
+                graph_assignments[key],
+                AuthorityAssignment,
+            )
+            for key in graph_assignments
+        )
     )
 
 
@@ -513,14 +545,12 @@ def create_organization_router(
             ):
                 return _fixed_error(404, "organization_not_found")
             created = dependencies.import_service.create_draft(context, snapshot)
-            if (
-                type(created) is not ImportDraft
-                or created.organization_id != organization_id
-            ):
+            canonical_created = exact_canonical_model(created, ImportDraft)
+            if canonical_created is None or canonical_created.organization_id != organization_id:
                 return _fixed_error(404, "organization_not_found")
             draft, reconciliation, receipt = dependencies.import_service.load_import(
                 context,
-                created.import_id,
+                canonical_created.import_id,
             )
         except OrganizationSourceRejected as error:
             code = str(error)
@@ -538,7 +568,7 @@ def create_organization_router(
             return _import_error(error)
         if (
             receipt is not None
-            or draft != created
+            or not exact_canonical_equal(draft, canonical_created, ImportDraft)
             or not _draft_is_bound(context, organization_id, draft, reconciliation)
         ):
             return _fixed_error(404, "organization_not_found")
@@ -607,14 +637,15 @@ def create_organization_router(
                 replacement_fields=tuple(tuple(item) for item in body.replacement_fields),
             )
             corrected = dependencies.import_service.apply_correction(context, correction)
+            canonical_corrected = exact_canonical_model(corrected, ImportDraft)
             if (
-                type(corrected) is not ImportDraft
-                or corrected.organization_id != organization_id
+                canonical_corrected is None
+                or canonical_corrected.organization_id != organization_id
             ):
                 return _fixed_error(404, "organization_not_found")
             draft, reconciliation, receipt = dependencies.import_service.load_import(
                 context,
-                corrected.import_id,
+                canonical_corrected.import_id,
             )
         except (
             DecisionOSAuthorizationDenied,
@@ -632,7 +663,11 @@ def create_organization_router(
             draft,
             reconciliation,
             supersedes_import_id=import_id,
-        ) or receipt is not None or draft != corrected:
+        ) or receipt is not None or not exact_canonical_equal(
+            draft,
+            canonical_corrected,
+            ImportDraft,
+        ):
             return _fixed_error(404, "organization_not_found")
         return JSONResponse(status_code=201, content=_draft_payload(draft, reconciliation))
 
@@ -657,11 +692,14 @@ def create_organization_router(
                     acknowledged_codes=tuple(body.acknowledged_codes),
                 ),
             )
+            canonical_receipt = exact_canonical_model(receipt, ImportReceipt)
+            if canonical_receipt is None:
+                return _fixed_error(404, "organization_not_found")
             if not _receipt_is_bound(
                 context,
                 organization_id,
                 import_id,
-                receipt,
+                canonical_receipt,
             ):
                 return _fixed_error(404, "organization_not_found")
             draft, reconciliation, stored_receipt = dependencies.import_service.load_import(
@@ -686,20 +724,25 @@ def create_organization_router(
                 reconciliation,
                 import_id=import_id,
             )
-            or stored_receipt != receipt
+            or not exact_canonical_equal(
+                stored_receipt,
+                canonical_receipt,
+                ImportReceipt,
+            )
             or not _receipt_is_bound(
                 context,
                 organization_id,
                 import_id,
-                receipt,
+                canonical_receipt,
                 draft=draft,
                 reconciliation=reconciliation,
             )
             or draft.semantic_digest != body.reviewed_digest
-            or receipt.acknowledged_codes != tuple(body.acknowledged_codes)
+            or canonical_receipt.acknowledged_codes
+            != tuple(body.acknowledged_codes)
         ):
             return _fixed_error(404, "organization_not_found")
-        return JSONResponse(content=_receipt_payload(receipt))
+        return JSONResponse(content=_receipt_payload(canonical_receipt))
 
     def projection(organization_id: str, request: Request) -> Response:
         context = _context(request, organization_id, dependencies, manage=False)
@@ -742,15 +785,16 @@ def create_organization_router(
             return _fixed_error(500, "request_failed")
         except (ImportUnavailable, OrganizationImportUnavailable):
             return _fixed_error(500, "request_failed")
-        if not _projection_is_bound(
+        canonical_projection = exact_canonical_model(projected, OrganizationProjection)
+        if canonical_projection is None or not _projection_is_bound(
             context,
             organization_id,
             graph,
             reconciliation,
-            projected,
+            canonical_projection,
         ):
             return _fixed_error(404, "organization_not_found")
-        return JSONResponse(content=projected.model_dump(mode="json"))
+        return JSONResponse(content=canonical_projection.model_dump(mode="json"))
 
     router.add_api_route(
         "/api/organizations/{organization_id}/organization-graph",

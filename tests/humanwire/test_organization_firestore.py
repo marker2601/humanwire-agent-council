@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from copy import deepcopy
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from hashlib import sha256
 from uuid import uuid4
 
@@ -25,6 +25,8 @@ from humanwire.decisionos_store import (
     OrganizationUnavailable,
 )
 from humanwire.organization_models import (
+    AuthorityAssignment,
+    AuthorityFunction,
     ImportDraft,
     ImportReceipt,
     OrganizationGraphCandidate,
@@ -53,6 +55,22 @@ OWNER = DecisionOSPrincipal(
     email_verified=True,
     provider_ids=("google.com",),
 )
+
+
+class HostileString(str):
+    def __new__(cls, allowed: str, private: str):
+        value = super().__new__(cls, private)
+        value.allowed = allowed
+        return value
+
+    def __eq__(self, other):
+        return other in {self.allowed, str.__str__(self)}
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash(self.allowed)
 
 
 def actual_document_bytes(reference, data, *, include_name: bool = True) -> int:
@@ -640,7 +658,10 @@ def test_firestore_newer_committed_import_supersedes_prior_receipt_predecessor(
     assert repository.load_committed_import(context, 3) == (second, second_receipt)
 
 
-@pytest.mark.parametrize("corruption", ["subject", "lifecycle", "structure", "delta"])
+@pytest.mark.parametrize(
+    "corruption",
+    ["subject", "lifecycle", "structure", "delta", "scalar", "offset", "dangling"],
+)
 def test_firestore_predecessor_rejects_non_binding_graph_delta(
     fake_firestore,
     monkeypatch,
@@ -697,9 +718,54 @@ def test_firestore_predecessor_rejects_non_binding_graph_delta(
                 )
             }
         )
-    else:
+    elif corruption == "delta":
         target_version = 3
         target_graph = target_graph.model_copy(update={"version": target_version})
+    elif corruption == "scalar":
+        private_title = HostileString("Engineering Lead", PRIVATE)
+        receipt_graph = receipt_graph.model_copy(
+            update={
+                "subjects": (
+                    receipt_graph.subjects[0].model_copy(update={"title": private_title}),
+                )
+            }
+        )
+        target_graph = target_graph.model_copy(
+            update={
+                "subjects": (
+                    target_graph.subjects[0].model_copy(update={"title": private_title}),
+                )
+            }
+        )
+    elif corruption == "offset":
+        receipt_assignment = AuthorityAssignment(
+            assignment_id="auth_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            organization_id=ORG,
+            subject_id=SUBJECT,
+            decision_type="launch_decision",
+            function=AuthorityFunction.DECISION_OWNER,
+            effective_from=NOW,
+        )
+        target_assignment = receipt_assignment.model_copy(
+            update={
+                "effective_from": NOW.astimezone(timezone(timedelta(hours=-5)))
+            }
+        )
+        receipt_graph = receipt_graph.model_copy(
+            update={"authority_assignments": (receipt_assignment,)}
+        )
+        target_graph = target_graph.model_copy(
+            update={"authority_assignments": (target_assignment,)}
+        )
+    else:
+        dangling = OrganizationUnit(
+            unit_id="unit_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            organization_id=ORG,
+            name="Dangling",
+            leader_subject_id=SUBJECT_B,
+        )
+        receipt_graph = receipt_graph.model_copy(update={"units": (dangling,)})
+        target_graph = target_graph.model_copy(update={"units": (dangling,)})
 
     def corrupted_graph_from_row(
         organization_id,
@@ -749,6 +815,92 @@ def test_firestore_draft_status_rejects_receipt_even_with_valid_outer_digest(
 
     with pytest.raises(ImportUnavailable, match="import_unavailable"):
         repository.load_import_receipt(context, saved.import_id)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["load_draft", "list_imports", "require_latest", "commit"],
+)
+def test_firestore_every_draft_read_rejects_injected_receipt_without_graph_publish(
+    fake_firestore,
+    operation,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    receipt = ImportReceipt(
+        receipt_id=f"rcp_{deterministic_ulid(ORG, saved.import_id)}",
+        import_id=saved.import_id,
+        organization_id=ORG,
+        source_snapshot_id=saved.source_snapshot.snapshot_id,
+        source_snapshot_digest=saved.source_snapshot.semantic_digest,
+        graph_version=1,
+        committed_subject_count=len(saved.candidate.subjects),
+        committed_at=NOW,
+        committed_by_uid=OWNER.uid,
+    )
+    import_path = (COLLECTION, ORG, "imports", saved.import_id)
+    client.data[import_path]["receipt"] = receipt.model_dump(mode="python")
+    client.data[import_path]["payload_digest"] = independent_digest(
+        {
+            key: value
+            for key, value in client.data[import_path].items()
+            if key != "payload_digest"
+        }
+    )
+
+    def invoke():
+        if operation == "load_draft":
+            return repository.load_import_draft(context, saved.import_id)
+        if operation == "list_imports":
+            return repository.list_imports(context)
+        if operation == "require_latest":
+            return repository.require_latest_import(context, saved.import_id)
+        return repository.commit_graph(
+            context,
+            draft_id=saved.import_id,
+            reviewed_digest=saved.semantic_digest,
+        )
+
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        invoke()
+    assert repository.load_graph(context).version == 0
+
+
+def test_firestore_legacy_lineage_scan_rejects_pending_receipt_corruption(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    first = repository.save_import_draft(context, draft())
+    second = repository.save_import_draft(
+        context,
+        next_draft(first, supersedes_import_id=first.import_id),
+    )
+    downgrade_to_legacy_v1(client, first.import_id)
+    downgrade_to_legacy_v1(client, second.import_id)
+    receipt = ImportReceipt(
+        receipt_id=f"rcp_{deterministic_ulid(ORG, first.import_id)}",
+        import_id=first.import_id,
+        organization_id=ORG,
+        source_snapshot_id=first.source_snapshot.snapshot_id,
+        source_snapshot_digest=first.source_snapshot.semantic_digest,
+        graph_version=1,
+        committed_subject_count=len(first.candidate.subjects),
+        committed_at=NOW,
+        committed_by_uid=OWNER.uid,
+    )
+    first_path = (COLLECTION, ORG, "imports", first.import_id)
+    client.data[first_path]["receipt"] = receipt.model_dump(mode="python")
+    client.data[first_path]["payload_digest"] = independent_digest(
+        {
+            key: value
+            for key, value in client.data[first_path].items()
+            if key != "payload_digest"
+        }
+    )
+
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        repository.require_latest_import(context, second.import_id)
+    assert repository.load_graph(context).version == 0
 
 
 def test_firestore_graph_version_read_ignores_pending_and_rejects_corrupt_shape(

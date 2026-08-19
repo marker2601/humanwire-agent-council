@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from threading import Event
 
 import pytest
 
+from humanwire import organization_store
 from humanwire.decisionos_models import (
     DecisionOSPrincipal,
     DecisionOSRole,
@@ -19,6 +20,8 @@ from humanwire.decisionos_store import (
     OrganizationUnavailable,
 )
 from humanwire.organization_models import (
+    AuthorityAssignment,
+    AuthorityFunction,
     ImportDraft,
     OrganizationGraphCandidate,
     OrganizationSubject,
@@ -46,6 +49,22 @@ DIGEST_A = "1" * 64
 DIGEST_B = "2" * 64
 NOW = datetime(2026, 8, 18, 15, 0, tzinfo=UTC)
 PRIVATE_VALUE = "private-alice@example.invalid"
+
+
+class HostileString(str):
+    def __new__(cls, allowed: str, private: str):
+        value = super().__new__(cls, private)
+        value.allowed = allowed
+        return value
+
+    def __eq__(self, other):
+        return other in {self.allowed, str.__str__(self)}
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash(self.allowed)
 
 
 class SequenceIdentifiers:
@@ -295,6 +314,44 @@ def test_exact_receipt_and_graph_version_reads_use_required_permissions(
         repository.load_committed_import(viewer_context, receipt.graph_version + 1)
 
 
+@pytest.mark.parametrize(
+    "operation",
+    ["load_draft", "load_receipt", "require_latest", "commit"],
+)
+def test_pending_in_memory_import_rejects_injected_receipt_without_publishing_graph(
+    setup_repositories,
+    operation,
+) -> None:
+    repository, _decisionos, owner_context = setup_repositories
+    draft = repository.save_import_draft(owner_context, import_draft())
+    receipt = organization_store._receipt_for(
+        draft,
+        graph_version=1,
+        actor_uid=owner_context.principal.uid,
+        committed_subject_count=len(draft.candidate.subjects),
+        acknowledged_codes=(),
+        committed_at=NOW,
+    )
+    repository._imports[(ORG_A, draft.import_id)].receipt = receipt
+
+    def invoke():
+        if operation == "load_draft":
+            return repository.load_import_draft(owner_context, draft.import_id)
+        if operation == "load_receipt":
+            return repository.load_import_receipt(owner_context, draft.import_id)
+        if operation == "require_latest":
+            return repository.require_latest_import(owner_context, draft.import_id)
+        return repository.commit_graph(
+            owner_context,
+            draft_id=draft.import_id,
+            reviewed_digest=draft.semantic_digest,
+        )
+
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        invoke()
+    assert repository.load_graph(owner_context).version == 0
+
+
 def test_graph_version_read_ignores_pending_latest_and_fails_on_corrupt_receipt(
     setup_repositories,
 ) -> None:
@@ -399,7 +456,10 @@ def test_newer_committed_import_supersedes_prior_receipt_predecessor(
     )
 
 
-@pytest.mark.parametrize("corruption", ["subject", "lifecycle", "structure", "delta"])
+@pytest.mark.parametrize(
+    "corruption",
+    ["subject", "lifecycle", "structure", "delta", "scalar", "offset", "dangling"],
+)
 def test_committed_import_predecessor_rejects_non_binding_graph_delta(
     setup_repositories,
     corruption,
@@ -455,9 +515,59 @@ def test_committed_import_predecessor_rejects_non_binding_graph_delta(
                 )
             }
         )
-    else:
+    elif corruption == "delta":
         target = target.model_copy(update={"version": 3})
         repository._graphs[(ORG_A, 3)] = target
+    elif corruption == "scalar":
+        private_title = HostileString("Engineering Lead", PRIVATE_VALUE)
+        receipt_graph = repository._graphs[(ORG_A, 1)]
+        repository._graphs[(ORG_A, 1)] = receipt_graph.model_copy(
+            update={
+                "subjects": (
+                    receipt_graph.subjects[0].model_copy(update={"title": private_title}),
+                )
+            }
+        )
+        target = target.model_copy(
+            update={
+                "subjects": (
+                    target.subjects[0].model_copy(update={"title": private_title}),
+                )
+            }
+        )
+    elif corruption == "offset":
+        receipt_graph = repository._graphs[(ORG_A, 1)]
+        receipt_assignment = AuthorityAssignment(
+            assignment_id="auth_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            organization_id=ORG_A,
+            subject_id=SUBJECT_A,
+            decision_type="launch_decision",
+            function=AuthorityFunction.DECISION_OWNER,
+            effective_from=NOW,
+        )
+        target_assignment = receipt_assignment.model_copy(
+            update={
+                "effective_from": NOW.astimezone(timezone(timedelta(hours=-5)))
+            }
+        )
+        repository._graphs[(ORG_A, 1)] = receipt_graph.model_copy(
+            update={"authority_assignments": (receipt_assignment,)}
+        )
+        target = target.model_copy(
+            update={"authority_assignments": (target_assignment,)}
+        )
+    else:
+        dangling = OrganizationUnit(
+            unit_id="unit_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            organization_id=ORG_A,
+            name="Dangling",
+            leader_subject_id=SUBJECT_B,
+        )
+        receipt_graph = repository._graphs[(ORG_A, 1)]
+        repository._graphs[(ORG_A, 1)] = receipt_graph.model_copy(
+            update={"units": (dangling,)}
+        )
+        target = target.model_copy(update={"units": (dangling,)})
 
     repository._graphs[(ORG_A, target.version)] = target
     with pytest.raises(ImportUnavailable, match="import_unavailable"):

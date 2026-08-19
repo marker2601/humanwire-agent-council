@@ -4,7 +4,7 @@ import hashlib
 import inspect
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, ClassVar
 
 import anyio
@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
-from humanwire import decisionos_organization_routes
+from humanwire import decisionos_organization_routes, organization_store
 from humanwire.decisionos_app import DecisionOSDependencies, create_decisionos_app
 from humanwire.decisionos_auth import (
     AppCheckUnavailable,
@@ -67,6 +67,22 @@ MUTATION_HEADERS = {
     "Origin": ORIGIN,
     "X-Firebase-AppCheck": "valid-app-check",
 }
+
+
+class HostileString(str):
+    def __new__(cls, allowed: str, private: str):
+        value = super().__new__(cls, private)
+        value.allowed = allowed
+        return value
+
+    def __eq__(self, other):
+        return other in {self.allowed, str.__str__(self)}
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash(self.allowed)
 
 
 def _principal(uid: str) -> DecisionOSPrincipal:
@@ -1129,9 +1145,11 @@ def test_import_detail_uses_one_authoritative_service_load(bundle, monkeypatch) 
     assert response.json()["import_id"] == uploaded["import_id"]
 
 
+@pytest.mark.parametrize("hostile_subclass", [False, True])
 def test_import_detail_rejects_private_noncanonical_service_diagnostic(
     bundle,
     monkeypatch,
+    hostile_subclass,
 ) -> None:
     client = _client(bundle, "owner")
     uploaded = _upload(client).json()
@@ -1140,12 +1158,17 @@ def test_import_detail_rejects_private_noncanonical_service_diagnostic(
         uploaded["import_id"],
     )
     private = "provider_private_alice_email"
+    code = (
+        HostileString("missing_authority", private)
+        if hostile_subclass
+        else private
+    )
     monkeypatch.setattr(
         bundle.import_service,
         "load_import",
         lambda *_args: (
             draft,
-            reconciliation.model_copy(update={"blocking_codes": (private,)}),
+            reconciliation.model_copy(update={"blocking_codes": (code,)}),
             receipt,
         ),
     )
@@ -1157,6 +1180,46 @@ def test_import_detail_rejects_private_noncanonical_service_diagnostic(
     assert response.status_code == 404
     assert response.json() == {"error": "organization_not_found"}
     assert private not in response.text
+
+
+def test_pending_receipt_corruption_rejects_detail_and_commit_without_graph_publish(
+    bundle,
+) -> None:
+    client = _client(bundle, "owner")
+    uploaded = _upload(client).json()
+    draft = bundle.graph_repository.load_import_draft(
+        bundle.owner_context,
+        uploaded["import_id"],
+    )
+    receipt = organization_store._receipt_for(
+        draft,
+        graph_version=1,
+        actor_uid=bundle.owner_context.principal.uid,
+        committed_subject_count=len(draft.candidate.subjects),
+        acknowledged_codes=tuple(uploaded["acknowledged_codes"]),
+        committed_at=NOW,
+    )
+    bundle.graph_repository._imports[(ORG_A, draft.import_id)].receipt = receipt
+
+    detail = client.get(f"/api/organizations/{ORG_A}/imports/{draft.import_id}")
+    committed = client.post(
+        f"/api/organizations/{ORG_A}/imports/{draft.import_id}/commit",
+        headers=_authorized_headers(client),
+        json={
+            "reviewed_digest": uploaded["reviewed_digest"],
+            "acknowledged_codes": uploaded["acknowledged_codes"],
+        },
+    )
+
+    assert (detail.status_code, detail.json()) == (
+        404,
+        {"error": "import_not_found"},
+    )
+    assert (committed.status_code, committed.json()) == (
+        404,
+        {"error": "import_not_found"},
+    )
+    assert bundle.graph_repository.load_graph(bundle.owner_context).version == 0
 
 
 def test_upload_rebinds_cross_tenant_draft_before_serialization(bundle, monkeypatch) -> None:
@@ -1188,6 +1251,47 @@ def test_upload_rebinds_cross_tenant_draft_before_serialization(bundle, monkeypa
     assert response.status_code == 404
     assert response.json() == {"error": "organization_not_found"}
     assert "directory/ada" not in response.text
+
+
+@pytest.mark.parametrize("attack", ["raw_enum", "offset", "extra", "hostile_string"])
+def test_upload_requires_exact_canonical_mutation_result(bundle, monkeypatch, attack) -> None:
+    client = _client(bundle, "owner")
+    original_create = bundle.import_service.create_draft
+    private = "private_upload_provider_trace"
+
+    def hostile_create(context, snapshot):
+        created = original_create(context, snapshot)
+        if attack == "raw_enum":
+            subject = created.candidate.subjects[0]
+            candidate = created.candidate.model_copy(
+                update={
+                    "subjects": (
+                        subject.model_copy(update={"kind": subject.kind.value}),
+                    )
+                }
+            )
+            return created.model_copy(update={"candidate": candidate})
+        if attack == "offset":
+            return created.model_copy(
+                update={"created_at": created.created_at.astimezone(timezone(timedelta(hours=-5)))}
+            )
+        if attack == "extra":
+            return created.model_copy(update={"private_provider_trace": private})
+        return created.model_copy(
+            update={
+                "source_snapshot": created.source_snapshot.model_copy(
+                    update={"source_kind": HostileString("csv", private)}
+                )
+            }
+        )
+
+    monkeypatch.setattr(bundle.import_service, "create_draft", hostile_create)
+
+    response = _upload(client)
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "organization_not_found"}
+    assert private not in response.text
 
 
 def test_commit_rebinds_receipt_to_path_and_tenant_before_serialization(
@@ -1278,6 +1382,59 @@ def test_commit_post_mutation_reload_uses_one_authoritative_service_load(
 
     assert response.status_code == 200
     assert response.json()["status"] == "committed"
+
+
+@pytest.mark.parametrize("attack", ["offset", "extra", "hostile_string", "hostile_code"])
+def test_commit_requires_exact_canonical_mutation_result(bundle, monkeypatch, attack) -> None:
+    client = _client(bundle, "owner")
+    uploaded = _upload(
+        client,
+        content=(
+            b"source_identity,display_name,kind,unit_name\n"
+            b"row/one,Ada Lovelace,human,Executive\n"
+        ),
+    ).json()
+    assert uploaded["acknowledged_codes"]
+    original_commit = bundle.import_service.commit
+    private = "provider_private_commit_trace"
+
+    def hostile_commit(context, request):
+        receipt = original_commit(context, request)
+        if attack == "offset":
+            return receipt.model_copy(
+                update={
+                    "committed_at": receipt.committed_at.astimezone(
+                        timezone(timedelta(hours=-5))
+                    )
+                }
+            )
+        if attack == "extra":
+            return receipt.model_copy(update={"private_provider_trace": private})
+        if attack == "hostile_string":
+            return receipt.model_copy(
+                update={"import_id": HostileString(receipt.import_id, IMPORT_B)}
+            )
+        return receipt.model_copy(
+            update={
+                "acknowledged_codes": (
+                    HostileString(receipt.acknowledged_codes[0], private),
+                )
+            }
+        )
+
+    monkeypatch.setattr(bundle.import_service, "commit", hostile_commit)
+    response = client.post(
+        f"/api/organizations/{ORG_A}/imports/{uploaded['import_id']}/commit",
+        headers=_authorized_headers(client),
+        json={
+            "reviewed_digest": uploaded["reviewed_digest"],
+            "acknowledged_codes": uploaded["acknowledged_codes"],
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "organization_not_found"}
+    assert private not in response.text
 
 
 def test_correction_rebinds_new_draft_and_exact_superseded_import(
@@ -1379,6 +1536,67 @@ def test_correction_post_mutation_reload_uses_one_authoritative_service_load(
 
     assert response.status_code == 201
     assert response.json()["supersedes_import_id"] == uploaded["import_id"]
+
+
+@pytest.mark.parametrize("attack", ["raw_enum", "offset", "extra", "hostile_string"])
+def test_correction_requires_exact_canonical_mutation_result(
+    bundle,
+    monkeypatch,
+    attack,
+) -> None:
+    client = _client(bundle, "owner")
+    uploaded = _upload(
+        client,
+        content=b"source_identity,title\nrow/one,Founder\n",
+    ).json()
+    original_apply = bundle.import_service.apply_correction
+    private = "private_correction_provider_trace"
+
+    def hostile_apply(context, request):
+        corrected = original_apply(context, request)
+        if attack == "raw_enum":
+            subject = corrected.candidate.subjects[0]
+            candidate = corrected.candidate.model_copy(
+                update={
+                    "subjects": (
+                        subject.model_copy(update={"kind": subject.kind.value}),
+                    )
+                }
+            )
+            return corrected.model_copy(update={"candidate": candidate})
+        if attack == "offset":
+            return corrected.model_copy(
+                update={
+                    "created_at": corrected.created_at.astimezone(
+                        timezone(timedelta(hours=-5))
+                    )
+                }
+            )
+        if attack == "extra":
+            return corrected.model_copy(update={"private_provider_trace": private})
+        return corrected.model_copy(
+            update={
+                "source_snapshot": corrected.source_snapshot.model_copy(
+                    update={"source_kind": HostileString("csv", private)}
+                )
+            }
+        )
+
+    monkeypatch.setattr(bundle.import_service, "apply_correction", hostile_apply)
+    response = client.post(
+        f"/api/organizations/{ORG_A}/imports/{uploaded['import_id']}/corrections",
+        headers=_authorized_headers(client),
+        json={
+            "reviewed_digest": uploaded["reviewed_digest"],
+            "kind": "correct_record",
+            "source_record_ids": [uploaded["source_record_ids"][0]],
+            "replacement_fields": [["title", "Chief Executive"]],
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "organization_not_found"}
+    assert private not in response.text
 
 
 def test_viewer_reads_graph_but_unsigned_user_is_rejected(bundle) -> None:
@@ -1555,6 +1773,30 @@ def test_projection_rejects_noncanonical_private_diagnostic_codes(
     assert "provider_private_alice_email" not in graph_text
 
 
+def test_projection_rejects_hostile_string_subclass_diagnostic() -> None:
+    private = "provider_private_alice_email"
+    graph = OrganizationGraph(organization_id=ORG_A, version=0, created_at=NOW)
+    reconciliation = ImportReconciliation(
+        import_id=IMPORT,
+        organization_id=ORG_A,
+        source_count=0,
+        normalized_count=0,
+        rejected_count=0,
+    ).model_copy(
+        update={
+            "acknowledged_codes": (
+                HostileString("leaderless_team", private),
+            )
+        }
+    )
+
+    with pytest.raises(OrganizationProjectionUnavailable) as captured:
+        build_organization_projection(graph, reconciliation)
+
+    assert str(captured.value) == "organization_projection_unavailable"
+    assert private not in repr(captured.value)
+
+
 def test_projection_accepts_exact_known_diagnostic_codes() -> None:
     graph = OrganizationGraph(organization_id=ORG_A, version=0, created_at=NOW)
     reconciliation = ImportReconciliation(
@@ -1669,7 +1911,16 @@ def test_projection_route_rebinds_version_and_exact_graph_ids(
 
 @pytest.mark.parametrize(
     "mutation",
-    ["subject", "unit", "edge", "authority", "private_extra"],
+    [
+        "subject",
+        "unit",
+        "edge",
+        "authority",
+        "private_extra",
+        "raw_enum",
+        "offset",
+        "hostile_string",
+    ],
 )
 def test_projection_route_deep_binds_every_allowlisted_graph_field(
     bundle,
@@ -1756,6 +2007,39 @@ def test_projection_route_deep_binds_every_allowlisted_graph_field(
                     "subjects": (
                         projected.subjects[0].model_copy(
                             update={"private_connector_identity": private}
+                        ),
+                    )
+                }
+            )
+        if mutation == "raw_enum":
+            return projected.model_copy(
+                update={
+                    "subjects": (
+                        projected.subjects[0].model_copy(
+                            update={"kind": projected.subjects[0].kind.value}
+                        ),
+                    )
+                }
+            )
+        if mutation == "offset":
+            return projected.model_copy(
+                update={
+                    "synchronized_at": projected.synchronized_at.astimezone(
+                        timezone(timedelta(hours=-5))
+                    )
+                }
+            )
+        if mutation == "hostile_string":
+            return projected.model_copy(
+                update={
+                    "subjects": (
+                        projected.subjects[0].model_copy(
+                            update={
+                                "display_name": HostileString(
+                                    projected.subjects[0].display_name,
+                                    private,
+                                )
+                            }
                         ),
                     )
                 }

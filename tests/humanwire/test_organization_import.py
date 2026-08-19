@@ -19,6 +19,7 @@ from humanwire.organization_import import (
     OrganizationImportReviewRequired,
     OrganizationImportService,
     OrganizationImportStale,
+    OrganizationImportUnavailable,
     RuleOrganizationMapper,
 )
 from humanwire.organization_models import (
@@ -265,6 +266,43 @@ def test_service_loads_exact_import_state_and_graph_version_review(service_setup
     assert committed_receipt == receipt
     with pytest.raises(DecisionOSAuthorizationDenied, match="authorization_denied"):
         service.load_import(viewer_context, draft.import_id)
+
+
+@pytest.mark.parametrize("forgery", ["stale_digest", "same_id_new_payload"])
+def test_service_load_import_rejects_forged_draft_digest_and_id(
+    service_setup,
+    forgery,
+) -> None:
+    service, repository, _decisionos, admin_context = service_setup
+    draft = service.create_draft(admin_context, complete_snapshot())
+    private = "private-stale-source@example.invalid"
+    first = draft.source_snapshot.records[0]
+    snapshot = draft.source_snapshot.model_copy(
+        update={
+            "records": (
+                first.model_copy(update={"fields": (*first.fields, ("email", private))}),
+                *draft.source_snapshot.records[1:],
+            )
+        }
+    )
+    forged = draft.model_copy(update={"source_snapshot": snapshot})
+    if forgery == "same_id_new_payload":
+        digest = organization_import._draft_digest(
+            forged.source_snapshot,
+            forged.candidate,
+            forged.base_graph_version,
+            forged.supersedes_import_id,
+        )
+        forged = forged.model_copy(update={"semantic_digest": digest})
+    repository._imports[(ORG_A, draft.import_id)].draft = forged
+
+    with pytest.raises(
+        OrganizationImportUnavailable,
+        match="organization_import_unavailable",
+    ) as captured:
+        service.load_import(admin_context, draft.import_id)
+
+    assert private not in exception_graph_text(captured.value)
 
 
 def test_graph_version_review_never_selects_newer_pending_import(service_setup) -> None:

@@ -35,14 +35,21 @@ from humanwire.decisionos_store import (
     _publish_in_memory_replacements,
     require_permission,
 )
+from humanwire.organization_canonical import (
+    exact_canonical_equal,
+    exact_canonical_model,
+)
 from humanwire.organization_graph import validate_organization_graph
 from humanwire.organization_models import (
+    AuthorityAssignment,
     ImportDraft,
     ImportReceipt,
     ImportReconciliation,
+    OrganizationEdge,
     OrganizationGraph,
     OrganizationSubject,
     OrganizationSubjectKind,
+    OrganizationUnit,
     SubjectLifecycle,
 )
 
@@ -249,11 +256,12 @@ class OrganizationGraphRepository(Protocol):
 
 
 class _SavedImport:
-    __slots__ = ("draft", "receipt")
+    __slots__ = ("draft", "receipt", "status")
 
     def __init__(self, draft: ImportDraft) -> None:
         self.draft = draft
         self.receipt: ImportReceipt | None = None
+        self.status: Literal["draft", "committed"] = "draft"
 
 
 def _aware(value: datetime) -> datetime:
@@ -303,38 +311,41 @@ def _receipt_matches_draft(
     graph_version: int | None = None,
     acknowledged_codes: tuple[str, ...] | None = None,
 ) -> bool:
-    expected_id = f"rcp_{_deterministic_ulid(draft.organization_id, draft.import_id)}"
+    canonical_receipt = exact_canonical_model(receipt, ImportReceipt)
+    canonical_draft = exact_canonical_model(draft, ImportDraft)
+    if (
+        canonical_receipt is None
+        or canonical_draft is None
+        or any(
+            type(code) is not str for code in canonical_receipt.acknowledged_codes
+        )
+    ):
+        return False
+    expected_id = (
+        f"rcp_{_deterministic_ulid(canonical_draft.organization_id, canonical_draft.import_id)}"
+    )
     return (
-        type(receipt) is ImportReceipt
-        and type(draft) is ImportDraft
-        and receipt.receipt_id == expected_id
-        and receipt.organization_id == draft.organization_id
-        and receipt.import_id == draft.import_id
-        and receipt.source_snapshot_id == draft.source_snapshot.snapshot_id
-        and receipt.source_snapshot_digest == draft.source_snapshot.semantic_digest
-        and receipt.graph_version == draft.base_graph_version + 1
-        and (graph_version is None or receipt.graph_version == graph_version)
-        and receipt.committed_subject_count == len(draft.candidate.subjects)
+        canonical_receipt.receipt_id == expected_id
+        and canonical_receipt.organization_id == canonical_draft.organization_id
+        and canonical_receipt.import_id == canonical_draft.import_id
+        and canonical_receipt.source_snapshot_id
+        == canonical_draft.source_snapshot.snapshot_id
+        and canonical_receipt.source_snapshot_digest
+        == canonical_draft.source_snapshot.semantic_digest
+        and canonical_receipt.graph_version == canonical_draft.base_graph_version + 1
+        and (
+            graph_version is None or canonical_receipt.graph_version == graph_version
+        )
+        and canonical_receipt.committed_subject_count
+        == len(canonical_draft.candidate.subjects)
         and (
             acknowledged_codes is None
-            or receipt.acknowledged_codes == acknowledged_codes
+            or (
+                all(type(code) is str for code in acknowledged_codes)
+                and canonical_receipt.acknowledged_codes == acknowledged_codes
+            )
         )
     )
-
-
-def _has_exact_model_shape(value: object) -> bool:
-    if isinstance(value, BaseModel):
-        if (
-            set(value.__dict__) != set(type(value).model_fields)
-            or getattr(value, "__pydantic_extra__", None) not in (None, {})
-        ):
-            return False
-        return all(_has_exact_model_shape(item) for item in value.__dict__.values())
-    if isinstance(value, (list, tuple)):
-        return all(_has_exact_model_shape(item) for item in value)
-    if isinstance(value, dict):
-        return all(_has_exact_model_shape(item) for item in value.values())
-    return True
 
 
 def _graphs_differ_only_by_member_bindings(
@@ -346,50 +357,67 @@ def _graphs_differ_only_by_member_bindings(
 ) -> bool:
     """Recognize the only graph delta that may carry an import receipt forward."""
 
-    if type(receipt_graph) is not OrganizationGraph or type(target_graph) is not OrganizationGraph:
-        return False
-    try:
-        if not _has_exact_model_shape(receipt_graph) or not _has_exact_model_shape(
-            target_graph
-        ):
-            return False
-        validated_receipt = OrganizationGraph.model_validate_json(
-            to_json(receipt_graph.model_dump(mode="python"))
-        )
-        validated_target = OrganizationGraph.model_validate_json(
-            to_json(target_graph.model_dump(mode="python"))
-        )
-    except Exception:  # noqa: BLE001 - corrupted in-memory/provider objects fail closed
+    canonical_receipt = exact_canonical_model(receipt_graph, OrganizationGraph)
+    canonical_target = exact_canonical_model(target_graph, OrganizationGraph)
+    if canonical_receipt is None or canonical_target is None:
         return False
     if (
-        validated_receipt != receipt_graph
-        or validated_target != target_graph
-        or receipt_graph.organization_id != target_graph.organization_id
-        or receipt_graph.version != receipt_version
-        or target_graph.version != target_version
-        or receipt_version > target_version
-        or receipt_graph.units != target_graph.units
-        or receipt_graph.edges != target_graph.edges
-        or receipt_graph.authority_assignments != target_graph.authority_assignments
+        not validate_organization_graph(canonical_receipt).committable
+        or not validate_organization_graph(canonical_target).committable
     ):
         return False
-    receipt_subjects = {item.subject_id: item for item in receipt_graph.subjects}
-    target_subjects = {item.subject_id: item for item in target_graph.subjects}
+    if (
+        canonical_receipt.organization_id != canonical_target.organization_id
+        or canonical_receipt.version != receipt_version
+        or canonical_target.version != target_version
+        or receipt_version > target_version
+        or len(canonical_receipt.units) != len(canonical_target.units)
+        or any(
+            not exact_canonical_equal(left, right, OrganizationUnit)
+            for left, right in zip(
+                canonical_receipt.units,
+                canonical_target.units,
+                strict=True,
+            )
+        )
+        or len(canonical_receipt.edges) != len(canonical_target.edges)
+        or any(
+            not exact_canonical_equal(left, right, OrganizationEdge)
+            for left, right in zip(
+                canonical_receipt.edges,
+                canonical_target.edges,
+                strict=True,
+            )
+        )
+        or len(canonical_receipt.authority_assignments)
+        != len(canonical_target.authority_assignments)
+        or any(
+            not exact_canonical_equal(left, right, AuthorityAssignment)
+            for left, right in zip(
+                canonical_receipt.authority_assignments,
+                canonical_target.authority_assignments,
+                strict=True,
+            )
+        )
+    ):
+        return False
+    receipt_subjects = {item.subject_id: item for item in canonical_receipt.subjects}
+    target_subjects = {item.subject_id: item for item in canonical_target.subjects}
     if receipt_subjects.keys() != target_subjects.keys():
         return False
     target_member_uids = tuple(
-        item.member_uid for item in target_graph.subjects if item.member_uid is not None
+        item.member_uid for item in canonical_target.subjects if item.member_uid is not None
     )
     if len(target_member_uids) != len(set(target_member_uids)):
         return False
     newly_bound = 0
     for subject_id, prior in receipt_subjects.items():
         current = target_subjects[subject_id]
-        if prior == current:
+        if exact_canonical_equal(prior, current, OrganizationSubject):
             continue
         if (
-            prior.model_dump(exclude={"lifecycle", "member_uid"})
-            != current.model_dump(exclude={"lifecycle", "member_uid"})
+            to_json(prior.model_dump(exclude={"lifecycle", "member_uid"}))
+            != to_json(current.model_dump(exclude={"lifecycle", "member_uid"}))
             or prior.kind is not OrganizationSubjectKind.HUMAN
             or prior.member_uid is not None
             or current.member_uid is None
@@ -488,10 +516,10 @@ def _validated_subject(
 
 
 def _validated_draft(draft: ImportDraft) -> ImportDraft:
-    try:
-        return ImportDraft.model_validate_json(to_json(draft.model_dump(mode="python")))
-    except (PydanticSerializationError, ValidationError):
+    validated = exact_canonical_model(draft, ImportDraft)
+    if validated is None:
         raise ImportUnavailable() from None
+    return validated
 
 
 def _reconciliation(draft: ImportDraft) -> ImportReconciliation:
@@ -537,6 +565,38 @@ class InMemoryOrganizationGraphRepository:
 
     def __repr__(self) -> str:
         return "InMemoryOrganizationGraphRepository()"
+
+    def _saved_state(
+        self,
+        organization_id: str,
+        saved: object,
+    ) -> tuple[ImportDraft, ImportReceipt | None]:
+        if type(saved) is not _SavedImport:
+            raise ImportUnavailable()
+        draft = exact_canonical_model(saved.draft, ImportDraft)
+        if draft is None or draft.organization_id != organization_id:
+            raise ImportUnavailable()
+        if type(saved.status) is not str or saved.status not in {"draft", "committed"}:
+            raise ImportUnavailable()
+        if saved.status == "draft":
+            if saved.receipt is not None:
+                raise ImportUnavailable()
+            return draft, None
+        receipt = exact_canonical_model(saved.receipt, ImportReceipt)
+        if receipt is None or not _receipt_matches_draft(receipt, draft):
+            raise ImportUnavailable()
+        graph = self._graphs.get((organization_id, receipt.graph_version))
+        current_version = self._current_versions.get(organization_id, 0)
+        canonical_graph = exact_canonical_model(graph, OrganizationGraph)
+        if (
+            canonical_graph is None
+            or canonical_graph.organization_id != organization_id
+            or canonical_graph.version != receipt.graph_version
+            or current_version < receipt.graph_version
+            or not validate_organization_graph(canonical_graph).committable
+        ):
+            raise ImportUnavailable()
+        return draft, receipt
 
     def load_context(
         self,
@@ -605,7 +665,8 @@ class InMemoryOrganizationGraphRepository:
             saved = self._imports.get((current.organization_id, draft_id))
             if saved is None:
                 raise ImportUnavailable()
-            return saved.draft
+            draft, _receipt = self._saved_state(current.organization_id, saved)
+            return draft
 
     def load_import_receipt(
         self,
@@ -617,11 +678,8 @@ class InMemoryOrganizationGraphRepository:
             saved = self._imports.get((current.organization_id, import_id))
             if saved is None:
                 raise ImportUnavailable()
-            if saved.receipt is None:
-                return None
-            if not _receipt_matches_draft(saved.receipt, saved.draft):
-                raise ImportUnavailable()
-            return saved.receipt
+            _draft, receipt = self._saved_state(current.organization_id, saved)
+            return receipt
 
     def load_committed_import(
         self,
@@ -641,15 +699,15 @@ class InMemoryOrganizationGraphRepository:
             selected_version = -1
             selected_count = 0
             for (organization_id, _import_id), saved in self._imports.items():
-                if organization_id != current.organization_id or saved.receipt is None:
+                if organization_id != current.organization_id:
                     continue
-                receipt = saved.receipt
-                if not _receipt_matches_draft(receipt, saved.draft):
-                    raise ImportUnavailable()
+                saved_draft, receipt = self._saved_state(organization_id, saved)
+                if receipt is None:
+                    continue
                 if receipt.graph_version > graph_version:
                     continue
                 if receipt.graph_version > selected_version:
-                    selected = (saved.draft, receipt)
+                    selected = (saved_draft, receipt)
                     selected_version = receipt.graph_version
                     selected_count = 1
                 elif receipt.graph_version == selected_version:
@@ -673,7 +731,7 @@ class InMemoryOrganizationGraphRepository:
         with self._lock:
             current = self._manage(context)
             return tuple(
-                saved.draft
+                self._saved_state(organization_id, saved)[0]
                 for (organization_id, _draft_id), saved in sorted(self._imports.items())
                 if organization_id == current.organization_id
             )
@@ -688,11 +746,12 @@ class InMemoryOrganizationGraphRepository:
             saved = self._imports.get((current.organization_id, draft_id))
             if saved is None:
                 raise ImportUnavailable()
-            if saved.receipt is not None:
+            draft, receipt = self._saved_state(current.organization_id, saved)
+            if receipt is not None:
                 return
             lineage_key = (
                 current.organization_id,
-                saved.draft.source_snapshot.source_kind,
+                draft.source_snapshot.source_kind,
             )
             if self._latest_imports.get(lineage_key) != draft_id:
                 raise ImportLineageConflict()
@@ -716,33 +775,36 @@ class InMemoryOrganizationGraphRepository:
             acknowledged_codes = _canonical_acknowledgements(acknowledged_codes)
             current = self._manage(context)
             saved = self._imports.get((current.organization_id, draft_id))
-            if saved is None or not _digest_matches(reviewed_digest, saved.draft.semantic_digest):
+            if saved is None:
                 raise ImportUnavailable()
-            if saved.receipt is not None:
-                if saved.receipt.acknowledged_codes != acknowledged_codes:
+            draft, existing_receipt = self._saved_state(current.organization_id, saved)
+            if not _digest_matches(reviewed_digest, draft.semantic_digest):
+                raise ImportUnavailable()
+            if existing_receipt is not None:
+                if existing_receipt.acknowledged_codes != acknowledged_codes:
                     raise ImportUnavailable()
-                return saved.receipt
+                return existing_receipt
             lineage_key = (
                 current.organization_id,
-                saved.draft.source_snapshot.source_kind,
+                draft.source_snapshot.source_kind,
             )
-            if self._latest_imports.get(lineage_key) != saved.draft.import_id:
+            if self._latest_imports.get(lineage_key) != draft.import_id:
                 raise ImportLineageConflict()
             prior = self._graph(current.organization_id)
-            if saved.draft.base_graph_version != prior.version:
+            if draft.base_graph_version != prior.version:
                 raise GraphVersionConflict()
             now = _aware(self._clock())
             graph, carried_member_uids, removed_member_uids = _committed_graph(
-                saved.draft,
+                draft,
                 prior,
                 version=prior.version + 1,
                 created_at=now,
             )
             receipt = _receipt_for(
-                saved.draft,
+                draft,
                 graph_version=graph.version,
                 actor_uid=current.principal.uid,
-                committed_subject_count=len(saved.draft.candidate.subjects),
+                committed_subject_count=len(draft.candidate.subjects),
                 acknowledged_codes=acknowledged_codes,
                 committed_at=now,
             )
@@ -755,8 +817,9 @@ class InMemoryOrganizationGraphRepository:
                 replacement_graphs[(current.organization_id, graph.version)] = graph
                 replacement_versions = dict(self._current_versions)
                 replacement_versions[current.organization_id] = graph.version
-                replacement_saved = _SavedImport(saved.draft)
+                replacement_saved = _SavedImport(draft)
                 replacement_saved.receipt = receipt
+                replacement_saved.status = "committed"
                 replacement_imports = dict(self._imports)
                 replacement_imports[(current.organization_id, draft_id)] = replacement_saved
                 replacement_audit = {
@@ -1341,11 +1404,13 @@ class FirestoreOrganizationGraphRepository:
         row = draft_ref.get()
         if not row.exists:
             raise ImportUnavailable()
-        return self._draft_from_row(
+        draft = self._draft_from_row(
             row,
             draft_ref,
             organization_id=current.organization_id,
         )
+        self._import_state(row.to_dict(), draft)
+        return draft
 
     @_firestore_error_barrier(ImportUnavailable)
     def load_import_receipt(
@@ -1363,29 +1428,7 @@ class FirestoreOrganizationGraphRepository:
             draft_ref,
             organization_id=current.organization_id,
         )
-        payload = row.to_dict()
-        if payload.get("status") == "draft":
-            if payload.get("receipt") is not None:
-                raise ImportUnavailable()
-            return None
-        receipt = None
-        try:
-            receipt = ImportReceipt.model_validate_json(to_json(payload["receipt"]))
-        except (
-            KeyError,
-            PydanticSerializationError,
-            TypeError,
-            ValueError,
-            ValidationError,
-        ):
-            pass
-        if (
-            payload.get("status") != "committed"
-            or receipt is None
-            or not _receipt_matches_draft(receipt, draft)
-        ):
-            raise ImportUnavailable() from None
-        return receipt
+        return self._import_state(row.to_dict(), draft)
 
     @_firestore_error_barrier(ImportUnavailable)
     def load_committed_import(
@@ -1425,24 +1468,8 @@ class FirestoreOrganizationGraphRepository:
                 draft_ref,
                 organization_id=current.organization_id,
             )
-            payload = row.to_dict()
-            receipt = None
-            try:
-                receipt = ImportReceipt.model_validate_json(to_json(payload["receipt"]))
-            except (
-                KeyError,
-                PydanticSerializationError,
-                TypeError,
-                ValueError,
-                ValidationError,
-            ):
-                pass
-            if (
-                payload.get("status") != "committed"
-                or receipt is None
-                or not _receipt_matches_draft(receipt, draft)
-                or receipt.graph_version > graph_version
-            ):
+            receipt = self._import_state(row.to_dict(), draft)
+            if receipt is None or receipt.graph_version > graph_version:
                 raise ImportUnavailable() from None
             parsed.append((draft, receipt))
         draft, receipt = parsed[0]
@@ -1481,19 +1508,16 @@ class FirestoreOrganizationGraphRepository:
     def list_imports(self, context: DecisionOSContext) -> tuple[ImportDraft, ...]:
         current = self._authorize(context, DecisionOSPermission.MANAGE_MEMBERS)
         rows = self._organization_ref(current.organization_id).collection("imports").stream()
-        return tuple(
-            sorted(
-                (
-                    self._draft_from_row(
-                        row,
-                        self._import_ref(current.organization_id, row.id),
-                        organization_id=current.organization_id,
-                    )
-                    for row in rows
-                ),
-                key=lambda item: item.import_id,
+        drafts = []
+        for row in rows:
+            draft = self._draft_from_row(
+                row,
+                self._import_ref(current.organization_id, row.id),
+                organization_id=current.organization_id,
             )
-        )
+            self._import_state(row.to_dict(), draft)
+            drafts.append(draft)
+        return tuple(sorted(drafts, key=lambda item: item.import_id))
 
     @_firestore_error_barrier(ImportUnavailable)
     def require_latest_import(
@@ -1522,27 +1546,9 @@ class FirestoreOrganizationGraphRepository:
                 transaction=transaction,
             )
             payload = row.to_dict()
-            if payload.get("status") == "committed":
-                receipt = None
-                try:
-                    receipt = ImportReceipt.model_validate_json(to_json(payload["receipt"]))
-                except (
-                    KeyError,
-                    PydanticSerializationError,
-                    TypeError,
-                    ValueError,
-                    ValidationError,
-                ):
-                    pass
-                if receipt is None or not self._receipt_matches_draft(
-                    receipt,
-                    draft,
-                    acknowledged_codes=receipt.acknowledged_codes,
-                ):
-                    raise ImportUnavailable()
+            receipt = self._import_state(payload, draft)
+            if receipt is not None:
                 return
-            if payload.get("status") != "draft":
-                raise ImportUnavailable()
             lineage_ref = self._lineage_ref(
                 current.organization_id,
                 draft.source_snapshot.source_kind,
@@ -1606,27 +1612,11 @@ class FirestoreOrganizationGraphRepository:
                 or not _digest_matches(reviewed_digest, draft.semantic_digest)
             ):
                 raise ImportUnavailable()
-            if payload.get("status") == "committed":
-                receipt = None
-                try:
-                    receipt = ImportReceipt.model_validate_json(to_json(payload["receipt"]))
-                except (
-                    KeyError,
-                    PydanticSerializationError,
-                    TypeError,
-                    ValueError,
-                    ValidationError,
-                ):
-                    pass
-                if receipt is None or not self._receipt_matches_draft(
-                    receipt,
-                    draft,
-                    acknowledged_codes=acknowledged_codes,
-                ):
+            receipt = self._import_state(payload, draft)
+            if receipt is not None:
+                if receipt.acknowledged_codes != acknowledged_codes:
                     raise ImportUnavailable() from None
                 return receipt
-            if payload.get("status") != "draft":
-                raise ImportUnavailable()
             lineage_ref = self._lineage_ref(
                 current.organization_id,
                 draft.source_snapshot.source_kind,
@@ -2053,28 +2043,9 @@ class FirestoreOrganizationGraphRepository:
                 organization_id=organization_id,
                 transaction=transaction,
             )
-            if payload.get("status") == "draft":
+            receipt = self._import_state(payload, draft)
+            if receipt is None:
                 candidates.append(draft)
-            elif payload.get("status") == "committed":
-                receipt = None
-                try:
-                    receipt = ImportReceipt.model_validate_json(to_json(payload["receipt"]))
-                except (
-                    KeyError,
-                    PydanticSerializationError,
-                    TypeError,
-                    ValueError,
-                    ValidationError,
-                ):
-                    pass
-                if receipt is None or not self._receipt_matches_draft(
-                    receipt,
-                    draft,
-                    acknowledged_codes=receipt.acknowledged_codes,
-                ):
-                    raise ImportUnavailable()
-            else:
-                raise ImportUnavailable()
         if not candidates:
             return None, None
         latest = max(candidates, key=lambda item: (item.created_at, item.import_id))
@@ -2276,6 +2247,49 @@ class FirestoreOrganizationGraphRepository:
             draft,
             acknowledged_codes=acknowledged_codes,
         )
+
+    def _import_state(
+        self,
+        payload: dict[str, Any],
+        draft: ImportDraft,
+    ) -> ImportReceipt | None:
+        status = payload.get("status")
+        if type(status) is not str:
+            raise ImportUnavailable()
+        if status == "draft":
+            if payload.get("receipt") is not None:
+                raise ImportUnavailable()
+            return None
+        if status != "committed":
+            raise ImportUnavailable()
+        raw_receipt = payload.get("receipt")
+        raw_codes = (
+            raw_receipt.get("acknowledged_codes")
+            if isinstance(raw_receipt, dict)
+            else None
+        )
+        if not isinstance(raw_codes, (list, tuple)) or any(
+            type(code) is not str for code in raw_codes
+        ):
+            raise ImportUnavailable()
+        receipt = None
+        try:
+            parsed = ImportReceipt.model_validate_json(to_json(raw_receipt), strict=True)
+            receipt = exact_canonical_model(parsed, ImportReceipt)
+        except (
+            PydanticSerializationError,
+            TypeError,
+            ValueError,
+            ValidationError,
+        ):
+            pass
+        if receipt is None or not self._receipt_matches_draft(
+            receipt,
+            draft,
+            acknowledged_codes=receipt.acknowledged_codes,
+        ):
+            raise ImportUnavailable() from None
+        return receipt
 
     def _membership_change_transaction(
         self,

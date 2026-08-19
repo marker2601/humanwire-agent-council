@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from pydantic_core import to_json
 
 from humanwire.decisionos_models import DecisionOSContext
+from humanwire.organization_canonical import exact_canonical_equal, exact_canonical_model
 from humanwire.organization_graph import validate_organization_graph
 from humanwire.organization_models import (
     AuthorityAssignment,
@@ -680,8 +681,19 @@ class OrganizationImportService:
         context: DecisionOSContext,
         import_id: str,
     ) -> tuple[ImportDraft, ImportReconciliation, ImportReceipt | None]:
-        draft = self._repository.load_import_draft(context, import_id)
-        receipt = self._repository.load_import_receipt(context, import_id)
+        draft = _canonical_draft_identity(
+            self._repository.load_import_draft(context, import_id)
+        )
+        if draft is None or draft.import_id != import_id:
+            raise OrganizationImportUnavailable() from None
+        raw_receipt = self._repository.load_import_receipt(context, import_id)
+        receipt = (
+            None
+            if raw_receipt is None
+            else exact_canonical_model(raw_receipt, ImportReceipt)
+        )
+        if raw_receipt is not None and receipt is None:
+            raise OrganizationImportUnavailable() from None
         reconciliation = _reconcile(draft)
         if not organization_import_is_bound(
             context,
@@ -703,7 +715,11 @@ class OrganizationImportService:
             if graph_version != 0:
                 raise OrganizationImportUnavailable() from None
             return None
-        draft, receipt = committed
+        raw_draft, raw_receipt = committed
+        draft = _canonical_draft_identity(raw_draft)
+        receipt = exact_canonical_model(raw_receipt, ImportReceipt)
+        if draft is None or receipt is None:
+            raise OrganizationImportUnavailable() from None
         reconciliation = _reconcile(draft)
         if not organization_import_is_bound(
             context,
@@ -844,21 +860,6 @@ def _digest_matches(candidate: object, expected: str) -> bool:
     )
 
 
-def _has_exact_model_shape(value: object) -> bool:
-    if isinstance(value, BaseModel):
-        if (
-            set(value.__dict__) != set(type(value).model_fields)
-            or getattr(value, "__pydantic_extra__", None) not in (None, {})
-        ):
-            return False
-        return all(_has_exact_model_shape(item) for item in value.__dict__.values())
-    if isinstance(value, (list, tuple)):
-        return all(_has_exact_model_shape(item) for item in value)
-    if isinstance(value, dict):
-        return all(_has_exact_model_shape(item) for item in value.values())
-    return True
-
-
 def organization_import_is_bound(
     context: DecisionOSContext,
     import_id: str,
@@ -868,51 +869,80 @@ def organization_import_is_bound(
     *,
     graph_version: int | None = None,
 ) -> bool:
-    if type(draft) is not ImportDraft or type(reconciliation) is not ImportReconciliation:
+    canonical_draft = _canonical_draft_identity(draft)
+    canonical_reconciliation = exact_canonical_model(
+        reconciliation,
+        ImportReconciliation,
+    )
+    if canonical_draft is None or canonical_reconciliation is None:
         return False
     try:
-        if not _has_exact_model_shape(draft) or not _has_exact_model_shape(
-            reconciliation
-        ):
-            return False
-        validated_draft = ImportDraft.model_validate_json(draft.model_dump_json())
-        validated_reconciliation = ImportReconciliation.model_validate_json(
-            reconciliation.model_dump_json()
-        )
-        expected_reconciliation = _reconcile(draft)
+        expected_reconciliation = _reconcile(canonical_draft)
     except Exception:  # noqa: BLE001 - hostile repository/service objects fail closed
         return False
     if (
-        validated_draft != draft
-        or validated_reconciliation != reconciliation
-        or expected_reconciliation != reconciliation
-        or draft.organization_id != context.organization_id
-        or draft.import_id != import_id
-        or reconciliation.organization_id != context.organization_id
-        or reconciliation.import_id != import_id
+        not exact_canonical_equal(
+            expected_reconciliation,
+            canonical_reconciliation,
+            ImportReconciliation,
+        )
+        or any(
+            type(code) is not str
+            for code in (
+                *canonical_reconciliation.blocking_codes,
+                *canonical_reconciliation.acknowledged_codes,
+            )
+        )
+        or canonical_draft.organization_id != context.organization_id
+        or canonical_draft.import_id != import_id
+        or canonical_reconciliation.organization_id != context.organization_id
+        or canonical_reconciliation.import_id != import_id
     ):
         return False
     if receipt is None:
         return graph_version is None
-    if type(receipt) is not ImportReceipt:
-        return False
-    try:
-        if not _has_exact_model_shape(receipt):
-            return False
-        validated_receipt = ImportReceipt.model_validate_json(receipt.model_dump_json())
-    except Exception:  # noqa: BLE001 - hostile repository/service objects fail closed
+    canonical_receipt = exact_canonical_model(receipt, ImportReceipt)
+    if canonical_receipt is None or any(
+        type(code) is not str for code in canonical_receipt.acknowledged_codes
+    ):
         return False
     return (
-        validated_receipt == receipt
-        and receipt.organization_id == context.organization_id
-        and receipt.import_id == import_id
-        and receipt.source_snapshot_id == draft.source_snapshot.snapshot_id
-        and receipt.source_snapshot_digest == draft.source_snapshot.semantic_digest
-        and receipt.graph_version == draft.base_graph_version + 1
-        and (graph_version is None or receipt.graph_version <= graph_version)
-        and receipt.committed_subject_count == len(draft.candidate.subjects)
-        and receipt.acknowledged_codes == reconciliation.acknowledged_codes
+        canonical_receipt.organization_id == context.organization_id
+        and canonical_receipt.import_id == import_id
+        and canonical_receipt.source_snapshot_id
+        == canonical_draft.source_snapshot.snapshot_id
+        and canonical_receipt.source_snapshot_digest
+        == canonical_draft.source_snapshot.semantic_digest
+        and canonical_receipt.graph_version == canonical_draft.base_graph_version + 1
+        and (
+            graph_version is None or canonical_receipt.graph_version <= graph_version
+        )
+        and canonical_receipt.committed_subject_count
+        == len(canonical_draft.candidate.subjects)
+        and canonical_receipt.acknowledged_codes
+        == canonical_reconciliation.acknowledged_codes
     )
+
+
+def _canonical_draft_identity(value: object) -> ImportDraft | None:
+    draft = exact_canonical_model(value, ImportDraft)
+    if draft is None:
+        return None
+    expected_digest = _draft_digest(
+        draft.source_snapshot,
+        draft.candidate,
+        draft.base_graph_version,
+        draft.supersedes_import_id,
+    )
+    expected_import_id = (
+        f"imp_{_deterministic_ulid(draft.organization_id, expected_digest)}"
+    )
+    if not _digest_matches(draft.semantic_digest, expected_digest) or not (
+        type(draft.import_id) is str
+        and secrets.compare_digest(draft.import_id, expected_import_id)
+    ):
+        return None
+    return draft
 
 
 def _canonical_snapshot(snapshot: SourceSnapshot) -> SourceSnapshot:
