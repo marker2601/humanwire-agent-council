@@ -138,8 +138,19 @@ class OrganizationSubject(_OrganizationModel):
         if self.kind is OrganizationSubjectKind.HUMAN:
             if self.specialist_key is not None:
                 raise ValueError("human subjects cannot have a specialist key")
-            if self.lifecycle is not SubjectLifecycle.ACTIVE and self.member_uid is not None:
-                raise ValueError("only active human subjects may bind a member UID")
+            if self.lifecycle is SubjectLifecycle.ACTIVE and self.member_uid is None:
+                raise ValueError("active human subjects must bind a member UID")
+            if (
+                self.lifecycle
+                in {
+                    SubjectLifecycle.DRAFT_IMPORTED,
+                    SubjectLifecycle.DIRECTORY_ONLY,
+                    SubjectLifecycle.INVITED,
+                    SubjectLifecycle.NEEDS_REVIEW,
+                }
+                and self.member_uid is not None
+            ):
+                raise ValueError("this human lifecycle cannot bind a member UID")
             return self
 
         if self.member_uid is not None:
@@ -181,12 +192,9 @@ class OrganizationEdge(_OrganizationModel):
     target_subject_id: str | None = Field(default=None, pattern=_SUBJECT_ID)
     target_unit_id: str | None = Field(default=None, pattern=_UNIT_ID)
     is_primary: bool = False
-    decision_function: AuthorityFunction | None = Field(default=None, strict=False)
 
     @model_validator(mode="after")
     def is_a_typed_non_authority_relation(self) -> Self:
-        if self.decision_function is not None:
-            raise ValueError("organization edges cannot encode decision authority")
         if self.kind is OrganizationEdgeKind.MEMBER_OF:
             if self.target_unit_id is None or self.target_subject_id is not None:
                 raise ValueError("membership edges must target exactly one unit")
@@ -257,17 +265,22 @@ class SourceRecord(_OrganizationModel):
     source_identity: str = Field(pattern=_SOURCE_IDENTITY)
     fields: tuple[tuple[str, str], ...] = Field(min_length=1)
 
-    @model_validator(mode="after")
-    def has_unique_canonical_field_names(self) -> Self:
-        field_names = tuple(field_name for field_name, _ in self.fields)
+    @field_validator("fields")
+    @classmethod
+    def has_unique_canonical_field_names(
+        cls,
+        fields: tuple[tuple[str, str], ...],
+    ) -> tuple[tuple[str, str], ...]:
+        field_names = tuple(field_name for field_name, _ in fields)
         _unique(field_names, "source record field names")
-        for field_name, value in self.fields:
+        normalized_fields: list[tuple[str, str]] = []
+        for field_name, value in fields:
             if re.fullmatch(_FIELD_NAME, field_name) is None:
                 raise ValueError("source record field name is invalid")
             if not value or len(value) > 120:
                 raise ValueError("source record field value is invalid")
-            _safe_display_text(value)
-        return self
+            normalized_fields.append((field_name, _safe_display_text(value)))
+        return tuple(normalized_fields)
 
 
 class SourceSnapshot(_OrganizationModel):
@@ -413,10 +426,26 @@ class ImportReceipt(_OrganizationModel):
         return self
 
 
+class OrganizationProjectionSubject(_OrganizationModel):
+    """Browser-safe view of a subject without source or Firebase bindings."""
+
+    subject_id: str = Field(pattern=_SUBJECT_ID)
+    kind: OrganizationSubjectKind = Field(strict=False)
+    lifecycle: SubjectLifecycle = Field(strict=False)
+    display_name: str = Field(min_length=1, max_length=120)
+    unit_id: str | None = Field(default=None, pattern=_UNIT_ID)
+    title: str | None = Field(default=None, max_length=120)
+
+    @field_validator("display_name", "title")
+    @classmethod
+    def display_text_is_safe(cls, value: str | None) -> str | None:
+        return None if value is None else _safe_display_text(value)
+
+
 class OrganizationProjection(_OrganizationModel):
     organization_id: str = Field(pattern=_ORGANIZATION_ID)
     graph_version: int = Field(ge=0)
-    subjects: tuple[OrganizationSubject, ...] = ()
+    subjects: tuple[OrganizationProjectionSubject, ...] = ()
     units: tuple[OrganizationUnit, ...] = ()
     edges: tuple[OrganizationEdge, ...] = ()
     authority_assignments: tuple[AuthorityAssignment, ...] = ()
@@ -438,16 +467,8 @@ class OrganizationProjection(_OrganizationModel):
             and self.reconciliation.organization_id != self.organization_id
         ):
             raise ValueError("projection reconciliation is cross-tenant")
-        for subject in self.subjects:
-            if subject.source_identity is not None or subject.member_uid is not None:
-                raise ValueError("projection cannot expose subject identity bindings")
-        OrganizationGraph(
-            organization_id=self.organization_id,
-            version=self.graph_version,
-            subjects=self.subjects,
-            units=self.units,
-            edges=self.edges,
-            authority_assignments=self.authority_assignments,
-            created_at=self.generated_at,
-        )
+        _unique(tuple(subject.subject_id for subject in self.subjects), "subject IDs")
+        for record in (*self.units, *self.edges, *self.authority_assignments):
+            if record.organization_id != self.organization_id:
+                raise ValueError("organization projection contains a cross-tenant record")
         return self
