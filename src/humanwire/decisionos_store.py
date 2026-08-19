@@ -183,6 +183,40 @@ class SecureDecisionOSIdentifiers:
         return secrets.token_urlsafe(32)
 
 
+@dataclass(frozen=True, slots=True)
+class _InMemoryReferenceReplacement:
+    target: object
+    attribute: str
+    prior: object
+    replacement: object
+
+
+@dataclass(frozen=True, slots=True)
+class _InMemoryPreparedMutation:
+    replacements: tuple[_InMemoryReferenceReplacement, ...]
+
+
+def _publish_in_memory_replacements(
+    prepared: _InMemoryPreparedMutation,
+) -> None:
+    """Publish prepared references with an exact unchecked rollback guard."""
+
+    replacements = prepared.replacements
+    if any(
+        getattr(item.target, item.attribute) is not item.prior
+        for item in replacements
+    ):
+        raise MembershipUnavailable()
+    try:
+        for item in replacements:
+            setattr(item.target, item.attribute, item.replacement)
+    except Exception:
+        # Injected setters may reject publication, so compensation must bypass them.
+        for item in replacements:
+            object.__setattr__(item.target, item.attribute, item.prior)
+        raise
+
+
 class DecisionOSRepository(Protocol):
     def load_context(
         self,
@@ -213,7 +247,7 @@ class DecisionOSRepository(Protocol):
         *,
         carried_member_uids: tuple[str, ...],
         removed_member_uids: tuple[str, ...],
-        mutation: Callable[[Any], Callable[[], None] | None],
+        mutation: Callable[[Any], _InMemoryPreparedMutation | None],
     ) -> None:
         raise NotImplementedError
 
@@ -466,7 +500,7 @@ class InMemoryDecisionOSRepository:
         *,
         carried_member_uids: tuple[str, ...],
         removed_member_uids: tuple[str, ...],
-        mutation: Callable[[Any], Callable[[], None] | None],
+        mutation: Callable[[Any], _InMemoryPreparedMutation | None],
     ) -> None:
         """Validate carried bindings and suspend removed members under one lock."""
 
@@ -536,19 +570,33 @@ class InMemoryDecisionOSRepository:
             prior_memberships = self._memberships
             prior_audit = self._audit
             prior_audit_sequence = self._audit_sequence
-            rollback = None
-            try:
-                rollback = mutation(None)
-                self._memberships = replacement_memberships
-                self._audit = replacement_audit
-                self._audit_sequence = next_audit_sequence
-            except Exception:
-                self._memberships = prior_memberships
-                self._audit = prior_audit
-                self._audit_sequence = prior_audit_sequence
-                if rollback is not None:
-                    rollback()
-                raise
+            organization_mutation = mutation(None)
+            if not isinstance(organization_mutation, _InMemoryPreparedMutation):
+                raise MembershipUnavailable()
+            prepared = _InMemoryPreparedMutation(
+                replacements=(
+                    *organization_mutation.replacements,
+                    _InMemoryReferenceReplacement(
+                        self,
+                        "_memberships",
+                        prior_memberships,
+                        replacement_memberships,
+                    ),
+                    _InMemoryReferenceReplacement(
+                        self,
+                        "_audit",
+                        prior_audit,
+                        replacement_audit,
+                    ),
+                    _InMemoryReferenceReplacement(
+                        self,
+                        "_audit_sequence",
+                        prior_audit_sequence,
+                        next_audit_sequence,
+                    ),
+                )
+            )
+            _publish_in_memory_replacements(prepared)
 
     def load_workspace(
         self,
@@ -1037,7 +1085,7 @@ class FirestoreDecisionOSRepository:
         *,
         carried_member_uids: tuple[str, ...],
         removed_member_uids: tuple[str, ...],
-        mutation: Callable[[Any], Callable[[], None] | None],
+        mutation: Callable[[Any], _InMemoryPreparedMutation | None],
     ) -> None:
         """Apply a membership-only graph change in one DecisionOS transaction."""
 

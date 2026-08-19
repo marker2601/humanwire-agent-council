@@ -9,6 +9,7 @@ import pytest
 from humanwire.decisionos_models import (
     DecisionOSPrincipal,
     DecisionOSRole,
+    MembershipStatus,
 )
 from humanwire.decisionos_store import (
     DecisionOSAuthorizationDenied,
@@ -858,6 +859,142 @@ def test_graph_audit_container_failure_rolls_back_both_repositories_and_retry(
             and event.target_uid == member_context.principal.uid
         )
     ) == 1
+
+
+def test_persistent_decisionos_audit_assignment_failure_restores_exact_state_and_retry(
+    setup_repositories,
+    monkeypatch,
+) -> None:
+    repository, decisionos, owner_context = setup_repositories
+    member_context = _commit_and_bind(
+        repository,
+        decisionos,
+        owner_context,
+        uid="firebase-alice-01",
+    )
+    removal = repository.save_import_draft(
+        owner_context,
+        import_draft(
+            import_id=IMPORT_B,
+            digest=DIGEST_B,
+            base_version=2,
+            include_person=False,
+        ),
+    )
+    graph_before = repository.load_graph(owner_context)
+    graph_bytes_before = graph_before.model_dump_json()
+    org_audit_before = repository.list_audit(owner_context)
+    member_audit_before = decisionos.list_audit(owner_context)
+    state_references_before = (
+        repository._graphs,
+        repository._current_versions,
+        repository._imports,
+        repository._audit,
+        decisionos._memberships,
+        decisionos._audit,
+    )
+    state_before = (
+        dict(repository._graphs),
+        dict(repository._current_versions),
+        {
+            key: (saved.draft, saved.receipt)
+            for key, saved in repository._imports.items()
+        },
+        {key: tuple(events) for key, events in repository._audit.items()},
+        dict(decisionos._memberships),
+        {key: tuple(events) for key, events in decisionos._audit.items()},
+        decisionos._audit_sequence,
+    )
+    original_setattr = InMemoryDecisionOSRepository.__setattr__
+    audit_assignments = []
+
+    def fail_persistently_on_audit_assignment(instance, name, value):
+        if instance is decisionos and name == "_audit":
+            audit_assignments.append(value)
+            raise RuntimeError(PRIVATE_VALUE)
+        original_setattr(instance, name, value)
+
+    with monkeypatch.context() as injection:
+        injection.setattr(
+            InMemoryDecisionOSRepository,
+            "__setattr__",
+            fail_persistently_on_audit_assignment,
+        )
+        with pytest.raises(ImportUnavailable) as captured:
+            repository.commit_graph(
+                owner_context,
+                draft_id=removal.import_id,
+                reviewed_digest=removal.semantic_digest,
+            )
+
+        assert len(audit_assignments) == 1
+        assert audit_assignments[0] is not state_references_before[5]
+        assert PRIVATE_VALUE not in exception_graph_text(captured.value)
+        assert all(
+            actual is expected
+            for actual, expected in zip(
+                (
+                    repository._graphs,
+                    repository._current_versions,
+                    repository._imports,
+                    repository._audit,
+                    decisionos._memberships,
+                    decisionos._audit,
+                ),
+                state_references_before,
+                strict=True,
+            )
+        )
+        assert (
+            dict(repository._graphs),
+            dict(repository._current_versions),
+            {
+                key: (saved.draft, saved.receipt)
+                for key, saved in repository._imports.items()
+            },
+            {key: tuple(events) for key, events in repository._audit.items()},
+            dict(decisionos._memberships),
+            {key: tuple(events) for key, events in decisionos._audit.items()},
+            decisionos._audit_sequence,
+        ) == state_before
+        assert repository.load_graph(owner_context).model_dump_json() == graph_bytes_before
+        assert repository.list_audit(owner_context) == org_audit_before
+        assert decisionos.list_audit(owner_context) == member_audit_before
+        assert decisionos.load_context(member_context.principal, ORG_A) == member_context
+
+    receipt = repository.commit_graph(
+        owner_context,
+        draft_id=removal.import_id,
+        reviewed_digest=removal.semantic_digest,
+    )
+
+    assert receipt.graph_version == graph_before.version + 1
+    assert repository.load_graph(owner_context).version == receipt.graph_version
+    assert len(repository._graphs) == len(state_before[0]) + 1
+    assert repository._current_versions[ORG_A] == receipt.graph_version
+    assert repository._imports[(ORG_A, IMPORT_B)].receipt == receipt
+    assert sum(saved.receipt is not None for saved in repository._imports.values()) == (
+        sum(saved_receipt is not None for _draft, saved_receipt in state_before[2].values()) + 1
+    )
+    org_audit_after = repository.list_audit(owner_context)
+    assert org_audit_after[:-1] == org_audit_before
+    assert org_audit_after[-1].receipt == receipt
+    assert len(org_audit_after) == len(org_audit_before) + 1
+    changed_memberships = {
+        key
+        for key, membership in decisionos._memberships.items()
+        if state_before[4].get(key) != membership
+    }
+    assert changed_memberships == {(ORG_A, member_context.principal.uid)}
+    assert (
+        decisionos._memberships[(ORG_A, member_context.principal.uid)].status
+        is MembershipStatus.SUSPENDED
+    )
+    member_audit_after = decisionos.list_audit(owner_context)
+    assert member_audit_after[:-1] == member_audit_before
+    assert member_audit_after[-1].event_name == "member_suspended"
+    assert member_audit_after[-1].target_uid == member_context.principal.uid
+    assert len(member_audit_after) == len(member_audit_before) + 1
 
 
 def test_removal_serializes_membership_version_until_no_fail_publish(

@@ -30,6 +30,8 @@ from humanwire.decisionos_store import (
     LastOwnerRequired,
     MembershipUnavailable,
     OrganizationUnavailable,
+    _InMemoryPreparedMutation,
+    _InMemoryReferenceReplacement,
     require_permission,
 )
 from humanwire.organization_graph import validate_organization_graph
@@ -511,17 +513,20 @@ class InMemoryOrganizationGraphRepository:
                 self._imports,
                 self._audit,
             )
+            publication = _InMemoryPreparedMutation(
+                replacements=tuple(
+                    _InMemoryReferenceReplacement(self, attribute, prior, replacement)
+                    for attribute, prior, replacement in zip(
+                        ("_graphs", "_current_versions", "_imports", "_audit"),
+                        prior_state,
+                        prepared,
+                        strict=True,
+                    )
+                )
+            )
 
-            def persist(_transaction) -> Callable[[], None]:
-                def rollback() -> None:
-                    self._graphs, self._current_versions, self._imports, self._audit = prior_state
-
-                try:
-                    self._graphs, self._current_versions, self._imports, self._audit = prepared
-                except Exception:
-                    rollback()
-                    raise
-                return rollback
+            def persist(_transaction) -> _InMemoryPreparedMutation:
+                return publication
 
             membership_invalid = False
             provider_failed = False
