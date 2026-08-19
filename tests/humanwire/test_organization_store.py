@@ -266,6 +266,51 @@ def test_stale_draft_conflicts_and_duplicate_commit_returns_same_receipt(
         )
 
 
+def test_commit_persists_exact_acknowledgements_and_retry_must_match(
+    setup_repositories,
+) -> None:
+    repository, _decisionos, owner_context = setup_repositories
+    draft = repository.save_import_draft(owner_context, import_draft())
+
+    receipt = repository.commit_graph(
+        owner_context,
+        draft_id=draft.import_id,
+        reviewed_digest=draft.semantic_digest,
+        acknowledged_codes=("leaderless_team",),
+    )
+
+    assert receipt.acknowledged_codes == ("leaderless_team",)
+    assert repository.commit_graph(
+        owner_context,
+        draft_id=draft.import_id,
+        reviewed_digest=draft.semantic_digest,
+        acknowledged_codes=("leaderless_team",),
+    ) == receipt
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        repository.commit_graph(
+            owner_context,
+            draft_id=draft.import_id,
+            reviewed_digest=draft.semantic_digest,
+            acknowledged_codes=(),
+        )
+
+
+def test_invalid_acknowledgement_shape_is_fixed_safe(setup_repositories) -> None:
+    repository, _decisionos, owner_context = setup_repositories
+    draft = repository.save_import_draft(owner_context, import_draft())
+
+    with pytest.raises(ImportUnavailable, match="^import_unavailable$") as captured:
+        repository.commit_graph(
+            owner_context,
+            draft_id=draft.import_id,
+            reviewed_digest=draft.semantic_digest,
+            acknowledged_codes=(["PRIVATE-ACKNOWLEDGEMENT"],),  # type: ignore[arg-type,list-item]
+        )
+
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
 def test_concurrent_duplicate_commit_is_one_idempotent_result(setup_repositories) -> None:
     repository, _decisionos, owner_context = setup_repositories
     draft = repository.save_import_draft(owner_context, import_draft())

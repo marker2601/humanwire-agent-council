@@ -184,6 +184,7 @@ class OrganizationGraphRepository(Protocol):
         *,
         draft_id: str,
         reviewed_digest: str,
+        acknowledged_codes: tuple[str, ...] = (),
     ) -> ImportReceipt: ...
 
     def load_graph(self, context: DecisionOSContext) -> OrganizationGraph: ...
@@ -242,6 +243,7 @@ def _receipt_for(
     graph_version: int,
     actor_uid: str,
     committed_subject_count: int,
+    acknowledged_codes: tuple[str, ...],
     committed_at: datetime,
 ) -> ImportReceipt:
     return ImportReceipt(
@@ -252,6 +254,7 @@ def _receipt_for(
         source_snapshot_digest=draft.source_snapshot.semantic_digest,
         graph_version=graph_version,
         committed_subject_count=committed_subject_count,
+        acknowledged_codes=acknowledged_codes,
         committed_at=committed_at,
         committed_by_uid=actor_uid,
     )
@@ -451,13 +454,17 @@ class InMemoryOrganizationGraphRepository:
         *,
         draft_id: str,
         reviewed_digest: str,
+        acknowledged_codes: tuple[str, ...] = (),
     ) -> ImportReceipt:
         with self._lock:
+            acknowledged_codes = _canonical_acknowledgements(acknowledged_codes)
             current = self._manage(context)
             saved = self._imports.get((current.organization_id, draft_id))
             if saved is None or not _digest_matches(reviewed_digest, saved.draft.semantic_digest):
                 raise ImportUnavailable()
             if saved.receipt is not None:
+                if saved.receipt.acknowledged_codes != acknowledged_codes:
+                    raise ImportUnavailable()
                 return saved.receipt
             prior = self._graph(current.organization_id)
             if saved.draft.base_graph_version != prior.version:
@@ -474,6 +481,7 @@ class InMemoryOrganizationGraphRepository:
                 graph_version=graph.version,
                 actor_uid=current.principal.uid,
                 committed_subject_count=len(saved.draft.candidate.subjects),
+                acknowledged_codes=acknowledged_codes,
                 committed_at=now,
             )
             event = _commit_event(current, prior.version, receipt, now)
@@ -645,6 +653,21 @@ def _digest_matches(candidate: str, expected: str) -> bool:
         and re.fullmatch(_SHA256, candidate) is not None
         and secrets.compare_digest(candidate, expected)
     )
+
+
+def _canonical_acknowledgements(value: object) -> tuple[str, ...]:
+    if (
+        type(value) is not tuple
+        or any(
+            type(code) is not str
+            or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code) is None
+            for code in value
+        )
+        or len(set(value)) != len(value)
+        or value != tuple(sorted(value))
+    ):
+        raise ImportUnavailable() from None
+    return value
 
 
 def _commit_event(
@@ -1055,9 +1078,11 @@ class FirestoreOrganizationGraphRepository:
         *,
         draft_id: str,
         reviewed_digest: str,
+        acknowledged_codes: tuple[str, ...] = (),
     ) -> ImportReceipt:
         from google.cloud import firestore
 
+        acknowledged_codes = _canonical_acknowledgements(acknowledged_codes)
         draft_ref = self._import_ref(context.organization_id, draft_id)
         organization_ref = self._organization_ref(context.organization_id)
         state_ref = self._state_ref(context.organization_id)
@@ -1096,7 +1121,11 @@ class FirestoreOrganizationGraphRepository:
                     ValidationError,
                 ):
                     pass
-                if receipt is None or not self._receipt_matches_draft(receipt, draft):
+                if receipt is None or not self._receipt_matches_draft(
+                    receipt,
+                    draft,
+                    acknowledged_codes=acknowledged_codes,
+                ):
                     raise ImportUnavailable() from None
                 return receipt
             if payload.get("status") != "draft":
@@ -1141,6 +1170,7 @@ class FirestoreOrganizationGraphRepository:
                 graph_version=graph.version,
                 actor_uid=current.principal.uid,
                 committed_subject_count=len(draft.candidate.subjects),
+                acknowledged_codes=acknowledged_codes,
                 committed_at=now,
             )
             event = _commit_event(current, current_version, receipt, now)
@@ -1625,7 +1655,13 @@ class FirestoreOrganizationGraphRepository:
             )
         )
 
-    def _receipt_matches_draft(self, receipt: ImportReceipt, draft: ImportDraft) -> bool:
+    def _receipt_matches_draft(
+        self,
+        receipt: ImportReceipt,
+        draft: ImportDraft,
+        *,
+        acknowledged_codes: tuple[str, ...],
+    ) -> bool:
         expected_id = f"rcp_{_deterministic_ulid(draft.organization_id, draft.import_id)}"
         return (
             receipt.receipt_id == expected_id
@@ -1635,6 +1671,7 @@ class FirestoreOrganizationGraphRepository:
             and receipt.source_snapshot_digest == draft.source_snapshot.semantic_digest
             and receipt.graph_version == draft.base_graph_version + 1
             and receipt.committed_subject_count == len(draft.candidate.subjects)
+            and receipt.acknowledged_codes == acknowledged_codes
         )
 
     def _membership_change_transaction(

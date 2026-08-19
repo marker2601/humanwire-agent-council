@@ -655,6 +655,38 @@ def test_firestore_rejects_receipt_count_even_with_valid_outer_digest(
     assert client.data == before
 
 
+def test_firestore_persists_acknowledgements_and_rejects_corrupt_retry(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    receipt = repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+        acknowledged_codes=("leaderless_team",),
+    )
+    assert receipt.acknowledged_codes == ("leaderless_team",)
+
+    import_path = (COLLECTION, ORG, "imports", saved.import_id)
+    payload = client.data[import_path]
+    payload["receipt"]["acknowledged_codes"] = ()
+    payload["payload_digest"] = independent_digest(
+        {key: payload[key] for key in payload if key != "payload_digest"}
+    )
+    before = deepcopy(client.data)
+
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        repository.commit_graph(
+            context,
+            draft_id=saved.import_id,
+            reviewed_digest=saved.semantic_digest,
+            acknowledged_codes=("leaderless_team",),
+        )
+
+    assert client.data == before
+
+
 def test_firestore_rejects_state_version_digest_mismatch_before_advancing(
     fake_firestore,
 ) -> None:

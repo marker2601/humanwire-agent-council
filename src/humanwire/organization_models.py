@@ -417,8 +417,18 @@ class ImportReceipt(_OrganizationModel):
     source_snapshot_digest: str = Field(pattern=_SHA256)
     graph_version: int = Field(ge=1)
     committed_subject_count: int = Field(ge=0)
+    acknowledged_codes: tuple[str, ...] = ()
     committed_at: datetime
     committed_by_uid: str = Field(pattern=_FIREBASE_UID)
+
+    @field_validator("acknowledged_codes")
+    @classmethod
+    def acknowledgements_are_canonical(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(value)) != len(value) or value != tuple(sorted(value)):
+            raise ValueError("acknowledged codes must be sorted and unique")
+        if any(re.fullmatch(_FIELD_NAME, code) is None for code in value):
+            raise ValueError("acknowledged code is invalid")
+        return value
 
     @model_validator(mode="after")
     def committed_at_is_aware(self) -> Self:

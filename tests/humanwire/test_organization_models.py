@@ -494,6 +494,18 @@ def test_nested_import_records_reject_cross_tenant_and_duplicate_tuples() -> Non
         )
 
 
+def test_import_receipt_defaults_to_no_acknowledgements_and_requires_canonical_codes() -> None:
+    assert import_receipt().acknowledged_codes == ()
+    assert import_receipt(
+        acknowledged_codes=("leaderless_team", "unassigned_subject"),
+    ).acknowledged_codes == ("leaderless_team", "unassigned_subject")
+
+    with pytest.raises(ValidationError):
+        import_receipt(acknowledged_codes=("unassigned_subject", "leaderless_team"))
+    with pytest.raises(ValidationError):
+        import_receipt(acknowledged_codes=("leaderless_team", "leaderless_team"))
+
+
 @pytest.mark.parametrize(
     "changes",
     [
