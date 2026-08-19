@@ -1,0 +1,12 @@
+[
+  {
+    "title": "Chief Architect",
+    "source_identity": "person:ada",
+    "display_name": "Ada Lovelace"
+  },
+  {
+    "display_name": "Grace Hopper",
+    "title": "Engineering Lead",
+    "source_identity": "person:grace"
+  }
+]
