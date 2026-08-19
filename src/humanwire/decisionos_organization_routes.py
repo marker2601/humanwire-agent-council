@@ -904,16 +904,21 @@ def create_organization_router(
                 return _fixed_error(400, "invitation_unavailable")
             except (TypeError, ValueError, ValidationError):
                 return _fixed_error(400, "invalid_request")
+            canonical_receipt = exact_canonical_model(receipt, BulkInvitationReceipt)
             if (
-                type(receipt) is not BulkInvitationReceipt
-                or receipt.organization_id != context.organization_id
-                or receipt.organization_id != organization_id
-                or receipt.requested_subject_ids != bulk_request.subject_ids
+                canonical_receipt is None
+                or canonical_receipt.organization_id != context.organization_id
+                or canonical_receipt.organization_id != organization_id
+                or canonical_receipt.requested_subject_ids != bulk_request.subject_ids
+                or tuple(
+                    item.subject_id for item in canonical_receipt.invitations
+                )
+                != bulk_request.subject_ids
             ):
                 return _fixed_error(400, "invitation_unavailable")
             return JSONResponse(
                 status_code=201,
-                content=receipt.model_dump(mode="json"),
+                content=BaseModel.model_dump(canonical_receipt, mode="json"),
             )
 
         @router.post("/api/subject-invitations/accept")
@@ -931,14 +936,18 @@ def create_organization_router(
                 )
             except Exception:  # noqa: BLE001 - every token failure is non-enumerating
                 return _fixed_error(400, "invitation_unavailable")
-            if type(accepted) is not ActivatedOrganizationMembership:
+            canonical_accepted = exact_canonical_model(
+                accepted,
+                ActivatedOrganizationMembership,
+            )
+            if canonical_accepted is None:
                 return _fixed_error(400, "invitation_unavailable")
             return JSONResponse(
                 content={
                     "status": "active",
-                    "organization_id": accepted.organization_id,
-                    "subject_id": accepted.subject_id,
-                    "role": accepted.role.value,
+                    "organization_id": canonical_accepted.organization_id,
+                    "subject_id": canonical_accepted.subject_id,
+                    "role": object.__getattribute__(canonical_accepted.role, "_value_"),
                 }
             )
     return router

@@ -33,6 +33,7 @@ _SUBJECT_ID = r"^sub_[0-9A-HJKMNP-TV-Z]{26}$"
 _DELIVERY_ROUTE_ID = r"^[a-z][a-z0-9_]{0,63}$"
 _AUDIT_ID = r"^audit_[0-9]{8,20}$"
 _MAX_INVITATION_LIFETIME = timedelta(days=30)
+_MAX_TRANSACTION_WRITES = 450
 
 
 class DecisionOSStoreError(RuntimeError):
@@ -134,6 +135,7 @@ class InvitationGrant(_StoreModel):
 class SubjectInvitationDeliveryState(StrEnum):
     NOT_DELIVERED = "not_delivered"
     DELIVERY_PENDING = "delivery_pending"
+    DELIVERY_SENDING = "delivery_sending"
     DELIVERED = "delivered"
     DELIVERY_FAILED = "delivery_failed"
 
@@ -227,6 +229,13 @@ class _InMemoryPreparedMutation:
     replacements: tuple[_InMemoryReferenceReplacement, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _FirestorePreparedMutation:
+    write_count: int
+    publish: Callable[[], None]
+    result: Any = None
+
+
 def _publish_in_memory_replacements(
     prepared: _InMemoryPreparedMutation,
 ) -> None:
@@ -290,8 +299,15 @@ class DecisionOSRepository(Protocol):
         role: DecisionOSRole,
         expires_in: timedelta,
         delivery_route_id: str | None,
-        mutation: Callable[[Any, DecisionOSContext, tuple[SubjectInvitationGrant, ...]], Any],
+        mutation: Callable[[Any, DecisionOSContext], Any],
     ) -> tuple[SubjectInvitationGrant, ...]:
+        raise NotImplementedError
+
+    def begin_subject_invitation_delivery(
+        self,
+        context: DecisionOSContext,
+        grant: SubjectInvitationGrant,
+    ) -> SubjectInvitationGrant:
         raise NotImplementedError
 
     def record_subject_invitation_delivery(
@@ -335,6 +351,15 @@ class _SubjectInvitationRecord:
     delivery_route_id: str | None
     retry_sequence: int
     retry_of_invitation_id: str | None = None
+    status: Literal["active", "accepted", "revoked"] = "active"
+
+
+@dataclass(frozen=True, slots=True)
+class _InvitationTokenIndexRecord:
+    invitation_kind: Literal["generic", "organization_subject"]
+    invitation_id: str
+    organization_id: str
+    subject_id: str | None
     status: Literal["active", "accepted", "revoked"] = "active"
 
 
@@ -446,6 +471,7 @@ class InMemoryDecisionOSRepository:
         self._invitations: dict[str, _InvitationRecord] = {}
         self._subject_invitations: dict[str, _SubjectInvitationRecord] = {}
         self._active_subject_invitations: dict[tuple[str, str], str] = {}
+        self._invitation_token_index: dict[str, _InvitationTokenIndexRecord] = {}
         self._audit: dict[str, list[DecisionOSAuditEvent]] = {}
         self._audit_sequence = 0
 
@@ -514,6 +540,95 @@ class InMemoryDecisionOSRepository:
                 raise OrganizationUnavailable()
             return DecisionOSContext(principal=principal, membership=membership)
 
+    def _subject_invitation_relation(
+        self,
+        organization_id: str,
+        subject_id: str,
+    ) -> _SubjectInvitationRecord | None:
+        active_id = self._active_subject_invitations.get((organization_id, subject_id))
+        related = tuple(
+            record
+            for record in self._subject_invitations.values()
+            if type(record) is _SubjectInvitationRecord
+            and type(record.organization_id) is str
+            and record.organization_id == organization_id
+            and type(record.subject_id) is str
+            and record.subject_id == subject_id
+        )
+        if any(
+            type(record.status) is not str
+            or record.status not in {"active", "accepted", "revoked"}
+            for record in related
+        ):
+            raise InvitationUnavailable()
+        matching = tuple(record for record in related if record.status == "active")
+        if active_id is None and not matching:
+            return None
+        if type(active_id) is not str or len(matching) != 1:
+            raise InvitationUnavailable()
+        record = matching[0]
+        index = self._invitation_token_index.get(record.token_digest)
+        if (
+            type(record) is not _SubjectInvitationRecord
+            or record.invitation_id != active_id
+            or type(record.invitation_id) is not str
+            or re.fullmatch(_INVITATION_ID, record.invitation_id) is None
+            or type(record.organization_id) is not str
+            or re.fullmatch(_ORGANIZATION_ID, record.organization_id) is None
+            or type(record.subject_id) is not str
+            or re.fullmatch(_SUBJECT_ID, record.subject_id) is None
+            or type(record.role) is not DecisionOSRole
+            or record.role in {DecisionOSRole.OWNER, DecisionOSRole.ADMIN}
+            or type(record.expires_at) is not datetime
+            or record.expires_at.tzinfo is None
+            or record.expires_at.utcoffset() is None
+            or type(record.delivery_status) is not SubjectInvitationDeliveryState
+            or (
+                record.delivery_route_id is None
+                and record.delivery_status is not SubjectInvitationDeliveryState.NOT_DELIVERED
+            )
+            or (
+                record.delivery_route_id is not None
+                and (
+                    type(record.delivery_route_id) is not str
+                    or re.fullmatch(_DELIVERY_ROUTE_ID, record.delivery_route_id) is None
+                    or record.delivery_status
+                    is SubjectInvitationDeliveryState.NOT_DELIVERED
+                )
+            )
+            or type(record.retry_sequence) is not int
+            or not 0 <= record.retry_sequence <= 100
+            or (
+                record.retry_of_invitation_id is not None
+                and (
+                    type(record.retry_of_invitation_id) is not str
+                    or re.fullmatch(_INVITATION_ID, record.retry_of_invitation_id) is None
+                )
+            )
+            or type(record.token_digest) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", record.token_digest) is None
+            or type(record.status) is not str
+            or record.status != "active"
+            or type(index) is not _InvitationTokenIndexRecord
+            or type(index.invitation_kind) is not str
+            or index.invitation_kind != "organization_subject"
+            or type(index.invitation_id) is not str
+            or index.invitation_id != record.invitation_id
+            or type(index.organization_id) is not str
+            or index.organization_id != record.organization_id
+            or type(index.subject_id) is not str
+            or index.subject_id != record.subject_id
+            or type(index.status) is not str
+            or index.status != record.status
+            or record.invitation_id in self._invitations
+            or any(
+                hmac_compare(generic.token_digest, record.token_digest)
+                for generic in self._invitations.values()
+            )
+        ):
+            raise InvitationUnavailable()
+        return record
+
     def create_invitation(
         self,
         context: DecisionOSContext,
@@ -530,8 +645,17 @@ class InMemoryDecisionOSRepository:
             invitation_id = self._identifiers.invitation_id()
             token = self._identifiers.invitation_token()
             digest = _token_digest(token)
-            if invitation_id in self._invitations or any(
-                item.token_digest == digest for item in self._invitations.values()
+            if (
+                invitation_id in self._invitations
+                or invitation_id in self._subject_invitations
+                or digest in self._invitation_token_index
+                or any(
+                    item.token_digest == digest for item in self._invitations.values()
+                )
+                or any(
+                    item.token_digest == digest
+                    for item in self._subject_invitations.values()
+                )
             ):
                 raise InvitationUnavailable()
             expires_at = _aware(self._clock()) + expires_in
@@ -541,6 +665,12 @@ class InMemoryDecisionOSRepository:
                 role=role,
                 token_digest=digest,
                 expires_at=expires_at,
+            )
+            self._invitation_token_index[digest] = _InvitationTokenIndexRecord(
+                invitation_kind="generic",
+                invitation_id=invitation_id,
+                organization_id=current.organization_id,
+                subject_id=None,
             )
             self._append_audit(
                 current.organization_id,
@@ -562,16 +692,31 @@ class InMemoryDecisionOSRepository:
     ) -> OrganizationMembership:
         digest = _token_digest(token)
         with self._lock:
-            record = next(
-                (
-                    item
-                    for item in self._invitations.values()
-                    if hmac_compare(item.token_digest, digest)
-                ),
-                None,
+            matches = tuple(
+                item
+                for item in self._invitations.values()
+                if hmac_compare(item.token_digest, digest)
             )
+            subject_matches = tuple(
+                item
+                for item in self._subject_invitations.values()
+                if hmac_compare(item.token_digest, digest)
+            )
+            index = self._invitation_token_index.get(digest)
+            record = matches[0] if len(matches) == 1 else None
             now = _aware(self._clock())
-            if record is None or record.status != "active" or record.expires_at <= now:
+            if (
+                record is None
+                or subject_matches
+                or type(index) is not _InvitationTokenIndexRecord
+                or index.invitation_kind != "generic"
+                or index.invitation_id != record.invitation_id
+                or index.organization_id != record.organization_id
+                or index.subject_id is not None
+                or index.status != record.status
+                or record.status != "active"
+                or record.expires_at <= now
+            ):
                 raise InvitationUnavailable()
             key = (record.organization_id, principal.uid)
             existing = self._memberships.get(key)
@@ -584,6 +729,7 @@ class InMemoryDecisionOSRepository:
                 status=MembershipStatus.ACTIVE,
             )
             record.status = "accepted"
+            self._invitation_token_index[digest] = replace(index, status="accepted")
             self._memberships[key] = membership
             self._append_audit(
                 record.organization_id,
@@ -607,14 +753,18 @@ class InMemoryDecisionOSRepository:
         role: DecisionOSRole,
         expires_in: timedelta,
         delivery_route_id: str | None,
-        mutation: Callable[[Any, DecisionOSContext, tuple[SubjectInvitationGrant, ...]], Any],
+        mutation: Callable[[Any, DecisionOSContext], Any],
     ) -> tuple[SubjectInvitationGrant, ...]:
         _subject_invitation_inputs(subject_ids, role, expires_in, delivery_route_id)
         with self._lock:
             current = self._authorize(context, DecisionOSPermission.MANAGE_MEMBERS)
+            organization_mutation = mutation(None, current)
+            if not isinstance(organization_mutation, _InMemoryPreparedMutation):
+                raise InvitationUnavailable()
             now = _aware(self._clock())
             replacement_records = dict(self._subject_invitations)
             replacement_active = dict(self._active_subject_invitations)
+            replacement_index = dict(self._invitation_token_index)
             grants: list[SubjectInvitationGrant] = []
             created_records: list[_SubjectInvitationRecord] = []
             known_digests = {
@@ -623,11 +773,9 @@ class InMemoryDecisionOSRepository:
 
             for subject_id in subject_ids:
                 key = (current.organization_id, subject_id)
-                existing_id = replacement_active.get(key)
-                existing = (
-                    replacement_records.get(existing_id)
-                    if type(existing_id) is str
-                    else None
+                existing = self._subject_invitation_relation(
+                    current.organization_id,
+                    subject_id,
                 )
                 if existing is not None:
                     if (
@@ -635,7 +783,10 @@ class InMemoryDecisionOSRepository:
                         or existing.organization_id != current.organization_id
                         or existing.subject_id != subject_id
                         or existing.role is not role
-                        or existing.delivery_route_id != delivery_route_id
+                        or (
+                            existing.delivery_route_id is not None
+                            and existing.delivery_route_id != delivery_route_id
+                        )
                     ):
                         raise InvitationUnavailable()
                     if (
@@ -644,12 +795,27 @@ class InMemoryDecisionOSRepository:
                         in {
                             SubjectInvitationDeliveryState.DELIVERED,
                             SubjectInvitationDeliveryState.NOT_DELIVERED,
+                            SubjectInvitationDeliveryState.DELIVERY_PENDING,
+                            SubjectInvitationDeliveryState.DELIVERY_SENDING,
                         }
+                        and existing.delivery_route_id == delivery_route_id
                     ):
                         grants.append(_subject_grant(existing, token=None))
                         continue
-                    replacement_records[existing.invitation_id] = replace(
+                    if (
+                        existing.delivery_route_id is None
+                        and delivery_route_id is not None
+                    ) or existing.expires_at <= now or existing.delivery_status is SubjectInvitationDeliveryState.DELIVERY_FAILED:
+                        pass
+                    else:
+                        raise InvitationUnavailable()
+                    revoked = replace(
                         existing,
+                        status="revoked",
+                    )
+                    replacement_records[existing.invitation_id] = revoked
+                    replacement_index[existing.token_digest] = replace(
+                        replacement_index[existing.token_digest],
                         status="revoked",
                     )
                     replacement_active.pop(key, None)
@@ -661,6 +827,7 @@ class InMemoryDecisionOSRepository:
                     invitation_id in self._invitations
                     or invitation_id in replacement_records
                     or digest in known_digests
+                    or digest in replacement_index
                 ):
                     raise InvitationUnavailable()
                 known_digests.add(digest)
@@ -684,12 +851,15 @@ class InMemoryDecisionOSRepository:
                 )
                 replacement_records[invitation_id] = record
                 replacement_active[key] = invitation_id
+                replacement_index[digest] = _InvitationTokenIndexRecord(
+                    invitation_kind="organization_subject",
+                    invitation_id=invitation_id,
+                    organization_id=current.organization_id,
+                    subject_id=subject_id,
+                )
                 created_records.append(record)
                 grants.append(_subject_grant(record, token=token))
 
-            organization_mutation = mutation(None, current, tuple(grants))
-            if not isinstance(organization_mutation, _InMemoryPreparedMutation):
-                raise InvitationUnavailable()
             next_sequence = self._audit_sequence
             audit_events = list(self._audit.get(current.organization_id, ()))
             for _record in created_records:
@@ -725,6 +895,12 @@ class InMemoryDecisionOSRepository:
                     ),
                     _InMemoryReferenceReplacement(
                         self,
+                        "_invitation_token_index",
+                        self._invitation_token_index,
+                        replacement_index,
+                    ),
+                    _InMemoryReferenceReplacement(
+                        self,
                         "_audit",
                         self._audit,
                         replacement_audit,
@@ -740,6 +916,40 @@ class InMemoryDecisionOSRepository:
             _publish_in_memory_replacements(prepared)
             return tuple(grants)
 
+    def begin_subject_invitation_delivery(
+        self,
+        context: DecisionOSContext,
+        grant: SubjectInvitationGrant,
+    ) -> SubjectInvitationGrant:
+        with self._lock:
+            current = self._authorize(context, DecisionOSPermission.MANAGE_MEMBERS)
+            if type(grant) is not SubjectInvitationGrant or grant.token is None:
+                raise InvitationUnavailable()
+            digest = _token_digest(grant.token.get_secret_value())
+            record = self._subject_invitation_relation(
+                current.organization_id,
+                grant.subject_id,
+            )
+            if (
+                record is None
+                or record.invitation_id != grant.invitation_id
+                or record.role is not grant.role
+                or record.delivery_route_id != grant.delivery_route_id
+                or record.retry_sequence != grant.retry_sequence
+                or record.delivery_status
+                is not SubjectInvitationDeliveryState.DELIVERY_PENDING
+                or not hmac_compare(record.token_digest, digest)
+            ):
+                raise InvitationUnavailable()
+            updated = replace(
+                record,
+                delivery_status=SubjectInvitationDeliveryState.DELIVERY_SENDING,
+            )
+            replacement = dict(self._subject_invitations)
+            replacement[record.invitation_id] = updated
+            self._subject_invitations = replacement
+            return _subject_grant(updated, token=grant.token.get_secret_value())
+
     def record_subject_invitation_delivery(
         self,
         context: DecisionOSContext,
@@ -753,7 +963,10 @@ class InMemoryDecisionOSRepository:
                 raise InvitationUnavailable()
             token = grant.token.get_secret_value() if grant.token is not None else None
             digest = _token_digest(token) if token is not None else None
-            record = self._subject_invitations.get(grant.invitation_id)
+            record = self._subject_invitation_relation(
+                current.organization_id,
+                grant.subject_id,
+            )
             if (
                 record is None
                 or record.status != "active"
@@ -763,7 +976,7 @@ class InMemoryDecisionOSRepository:
                 or record.delivery_route_id != grant.delivery_route_id
                 or record.retry_sequence != grant.retry_sequence
                 or record.delivery_status
-                is not SubjectInvitationDeliveryState.DELIVERY_PENDING
+                is not SubjectInvitationDeliveryState.DELIVERY_SENDING
                 or digest is None
                 or not hmac_compare(record.token_digest, digest)
             ):
@@ -791,17 +1004,32 @@ class InMemoryDecisionOSRepository:
         verified = _verified_principal(principal)
         digest = _token_digest(token)
         with self._lock:
-            matches = [
+            matches = tuple(
                 item
                 for item in self._subject_invitations.values()
                 if hmac_compare(item.token_digest, digest)
-            ]
+            )
+            generic_matches = tuple(
+                item
+                for item in self._invitations.values()
+                if hmac_compare(item.token_digest, digest)
+            )
             now = _aware(self._clock())
-            if len(matches) != 1:
+            if len(matches) != 1 or generic_matches:
                 raise InvitationUnavailable()
-            record = matches[0]
+            candidate = matches[0]
+            record = self._subject_invitation_relation(
+                candidate.organization_id,
+                candidate.subject_id,
+            )
+            index = self._invitation_token_index.get(digest)
             if (
-                record.status != "active"
+                record is None
+                or record.invitation_id != candidate.invitation_id
+                or type(index) is not _InvitationTokenIndexRecord
+                or index.invitation_kind != "organization_subject"
+                or index.invitation_id != record.invitation_id
+                or record.status != "active"
                 or record.delivery_status is not SubjectInvitationDeliveryState.DELIVERED
                 or record.expires_at <= now
                 or record.role in {DecisionOSRole.OWNER, DecisionOSRole.ADMIN}
@@ -834,6 +1062,8 @@ class InMemoryDecisionOSRepository:
             )
             replacement_active = dict(self._active_subject_invitations)
             replacement_active.pop((record.organization_id, record.subject_id), None)
+            replacement_index = dict(self._invitation_token_index)
+            replacement_index[digest] = replace(index, status="accepted")
             replacement_memberships = dict(self._memberships)
             replacement_memberships[(record.organization_id, verified.uid)] = membership
             replacement_audit = {
@@ -875,6 +1105,12 @@ class InMemoryDecisionOSRepository:
                         "_memberships",
                         self._memberships,
                         replacement_memberships,
+                    ),
+                    _InMemoryReferenceReplacement(
+                        self,
+                        "_invitation_token_index",
+                        self._invitation_token_index,
+                        replacement_index,
                     ),
                     _InMemoryReferenceReplacement(
                         self,
@@ -1246,16 +1482,38 @@ def _firestore_subject_invitation(
     if failed or record is None:
         raise InvitationUnavailable() from None
     if (
-        value["schema_version"] != 1
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or type(value["invitation_kind"]) is not str
         or value["invitation_kind"] != "organization_subject"
+        or type(value["role"]) is not str
+        or type(value["delivery_status"]) is not str
         or type(record.invitation_id) is not str
         or re.fullmatch(_INVITATION_ID, record.invitation_id) is None
         or type(record.organization_id) is not str
         or re.fullmatch(_ORGANIZATION_ID, record.organization_id) is None
         or type(record.subject_id) is not str
         or re.fullmatch(_SUBJECT_ID, record.subject_id) is None
+        or type(record.expires_at) is not datetime
+        or record.expires_at.tzinfo is None
+        or record.expires_at.utcoffset() is None
+        or (
+            record.delivery_route_id is not None
+            and (
+                type(record.delivery_route_id) is not str
+                or re.fullmatch(_DELIVERY_ROUTE_ID, record.delivery_route_id) is None
+            )
+        )
         or type(record.retry_sequence) is not int
         or not 0 <= record.retry_sequence <= 100
+        or (
+            record.retry_of_invitation_id is not None
+            and (
+                type(record.retry_of_invitation_id) is not str
+                or re.fullmatch(_INVITATION_ID, record.retry_of_invitation_id) is None
+            )
+        )
+        or type(record.status) is not str
         or record.status not in {"active", "accepted", "revoked"}
         or (record.delivery_route_id is None)
         != (record.delivery_status is SubjectInvitationDeliveryState.NOT_DELIVERED)
@@ -1279,6 +1537,35 @@ def _subject_invitation_payload(record: _SubjectInvitationRecord) -> dict[str, o
         "retry_of_invitation_id": record.retry_of_invitation_id,
         "status": record.status,
     }
+
+
+def _subject_invitation_state_payload(
+    record: _SubjectInvitationRecord,
+) -> dict[str, object]:
+    return {
+        **_subject_invitation_payload(record),
+        "token_digest": record.token_digest,
+    }
+
+
+def _subject_invitation_index_payload(
+    record: _SubjectInvitationRecord,
+) -> dict[str, object]:
+    return {
+        key: value
+        for key, value in _subject_invitation_payload(record).items()
+        if key != "token_digest"
+    }
+
+
+def _exact_stored_mapping(value: object, expected: dict[str, object]) -> bool:
+    if type(value) is not dict or set(value) != set(expected):
+        return False
+    for key, expected_value in expected.items():
+        actual = value[key]
+        if type(actual) is not type(expected_value) or actual != expected_value:
+            return False
+    return True
 
 
 class FirestoreDecisionOSRepository:
@@ -1332,6 +1619,78 @@ class FirestoreDecisionOSRepository:
             .collection("subject_invitation_state")
             .document(subject_id)
         )
+
+    def _subject_invitation_relation(
+        self,
+        transaction,
+        organization_id: str,
+        subject_id: str,
+    ) -> tuple[_SubjectInvitationRecord, Any, Any, Any] | None:
+        state_ref = self._subject_invitation_state_ref(organization_id, subject_id)
+        state_row = state_ref.get(transaction=transaction)
+        if not state_row.exists:
+            return None
+        state = state_row.to_dict()
+        if type(state) is not dict:
+            raise InvitationUnavailable()
+        invitation_id = state.get("invitation_id")
+        digest = state.get("token_digest")
+        if (
+            type(invitation_id) is not str
+            or re.fullmatch(_INVITATION_ID, invitation_id) is None
+            or type(digest) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise InvitationUnavailable()
+        invitation_ref = self._invitation_ref(organization_id, invitation_id)
+        index_ref = self._invitation_index_ref(digest)
+        invitation_row = invitation_ref.get(transaction=transaction)
+        index_row = index_ref.get(transaction=transaction)
+        if not invitation_row.exists or not index_row.exists:
+            raise InvitationUnavailable()
+        record = _firestore_subject_invitation(
+            invitation_row.to_dict(),
+            token_digest=digest,
+        )
+        if (
+            record.organization_id != organization_id
+            or record.subject_id != subject_id
+            or not _exact_stored_mapping(
+                state,
+                _subject_invitation_state_payload(record),
+            )
+            or not _exact_stored_mapping(
+                index_row.to_dict(),
+                _subject_invitation_index_payload(record),
+            )
+        ):
+            raise InvitationUnavailable()
+        return record, invitation_ref, index_ref, state_ref
+
+    def _subject_invitation_relation_for_digest(
+        self,
+        transaction,
+        digest: str,
+    ) -> tuple[_SubjectInvitationRecord, Any, Any, Any]:
+        if type(digest) is not str or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise InvitationUnavailable()
+        index_ref = self._invitation_index_ref(digest)
+        index_row = index_ref.get(transaction=transaction)
+        index = index_row.to_dict() if index_row.exists else None
+        if type(index) is not dict or set(index) != _SUBJECT_INVITATION_FIELDS:
+            raise InvitationUnavailable()
+        organization_id = index.get("organization_id")
+        subject_id = index.get("subject_id")
+        if type(organization_id) is not str or type(subject_id) is not str:
+            raise InvitationUnavailable()
+        relation = self._subject_invitation_relation(
+            transaction,
+            organization_id,
+            subject_id,
+        )
+        if relation is None or relation[0].token_digest != digest:
+            raise InvitationUnavailable()
+        return relation
 
     def create_organization(
         self,
@@ -1568,18 +1927,11 @@ class FirestoreDecisionOSRepository:
         role: DecisionOSRole,
         expires_in: timedelta,
         delivery_route_id: str | None,
-        mutation: Callable[[Any, DecisionOSContext, tuple[SubjectInvitationGrant, ...]], Any],
+        mutation: Callable[[Any, DecisionOSContext], Any],
     ) -> tuple[SubjectInvitationGrant, ...]:
         from google.cloud import firestore
 
         _subject_invitation_inputs(subject_ids, role, expires_in, delivery_route_id)
-        candidates = tuple(
-            (
-                self._identifiers.invitation_id(),
-                self._identifiers.invitation_token(),
-            )
-            for _subject_id in subject_ids
-        )
         now = _aware(self._clock())
 
         @firestore.transactional
@@ -1589,64 +1941,32 @@ class FirestoreDecisionOSRepository:
                 context,
                 DecisionOSPermission.MANAGE_MEMBERS,
             )
+            organization_mutation = mutation(transaction, current)
+            if (
+                type(organization_mutation) is not _FirestorePreparedMutation
+                or type(organization_mutation.write_count) is not int
+                or organization_mutation.write_count < 0
+            ):
+                raise InvitationUnavailable()
             grants: list[SubjectInvitationGrant] = []
             writes: list[tuple[object, object, object, _SubjectInvitationRecord]] = []
             revocations: list[tuple[object, object, _SubjectInvitationRecord]] = []
-            for subject_id, (invitation_id, token) in zip(
-                subject_ids,
-                candidates,
-                strict=True,
-            ):
-                state_ref = self._subject_invitation_state_ref(
+            for subject_id in subject_ids:
+                relation = self._subject_invitation_relation(
+                    transaction,
                     current.organization_id,
                     subject_id,
                 )
-                state_row = state_ref.get(transaction=transaction)
                 existing = None
-                existing_index_ref = None
-                existing_invitation_ref = None
-                if state_row.exists:
-                    state = state_row.to_dict()
-                    expected_state_fields = {
-                        "schema_version",
-                        "organization_id",
-                        "subject_id",
-                        "invitation_id",
-                        "token_digest",
-                        "status",
-                    }
-                    if type(state) is not dict or set(state) != expected_state_fields:
-                        raise InvitationUnavailable()
-                    existing_digest = state.get("token_digest")
-                    existing_id = state.get("invitation_id")
+                if relation is not None:
+                    existing, existing_invitation_ref, existing_index_ref, state_ref = relation
                     if (
-                        state.get("schema_version") != 1
-                        or state.get("organization_id") != current.organization_id
-                        or state.get("subject_id") != subject_id
-                        or type(existing_digest) is not str
-                        or re.fullmatch(r"[0-9a-f]{64}", existing_digest) is None
-                        or type(existing_id) is not str
-                        or re.fullmatch(_INVITATION_ID, existing_id) is None
-                        or state.get("status") != "active"
-                    ):
-                        raise InvitationUnavailable()
-                    existing_invitation_ref = self._invitation_ref(
-                        current.organization_id,
-                        existing_id,
-                    )
-                    existing_row = existing_invitation_ref.get(transaction=transaction)
-                    if not existing_row.exists:
-                        raise InvitationUnavailable()
-                    existing = _firestore_subject_invitation(
-                        existing_row.to_dict(),
-                        token_digest=existing_digest,
-                    )
-                    if (
-                        existing.organization_id != current.organization_id
-                        or existing.subject_id != subject_id
+                        existing.status != "active"
                         or existing.role is not role
-                        or existing.delivery_route_id != delivery_route_id
-                        or existing.status != "active"
+                        or (
+                            existing.delivery_route_id is not None
+                            and existing.delivery_route_id != delivery_route_id
+                        )
                     ):
                         raise InvitationUnavailable()
                     if (
@@ -1655,18 +1975,34 @@ class FirestoreDecisionOSRepository:
                         in {
                             SubjectInvitationDeliveryState.DELIVERED,
                             SubjectInvitationDeliveryState.NOT_DELIVERED,
+                            SubjectInvitationDeliveryState.DELIVERY_PENDING,
+                            SubjectInvitationDeliveryState.DELIVERY_SENDING,
                         }
+                        and existing.delivery_route_id == delivery_route_id
                     ):
                         grants.append(_subject_grant(existing, token=None))
                         continue
-                    existing_index_ref = self._invitation_index_ref(existing_digest)
-                    index_row = existing_index_ref.get(transaction=transaction)
-                    if not index_row.exists:
+                    if not (
+                        (
+                            existing.delivery_route_id is None
+                            and delivery_route_id is not None
+                        )
+                        or existing.expires_at <= now
+                        or existing.delivery_status
+                        is SubjectInvitationDeliveryState.DELIVERY_FAILED
+                    ):
                         raise InvitationUnavailable()
                     revocations.append(
                         (existing_invitation_ref, existing_index_ref, existing)
                     )
+                else:
+                    state_ref = self._subject_invitation_state_ref(
+                        current.organization_id,
+                        subject_id,
+                    )
 
+                invitation_id = self._identifiers.invitation_id()
+                token = self._identifiers.invitation_token()
                 digest = _token_digest(token)
                 invitation_ref = self._invitation_ref(current.organization_id, invitation_id)
                 index_ref = self._invitation_index_ref(digest)
@@ -1695,35 +2031,20 @@ class FirestoreDecisionOSRepository:
                 writes.append((invitation_ref, index_ref, state_ref, record))
                 grants.append(_subject_grant(record, token=token))
 
-            mutation(transaction, current, tuple(grants))
-            if (4 * len(writes)) + (2 * len(revocations)) > 440:
+            decision_write_count = (4 * len(writes)) + (2 * len(revocations))
+            if (
+                organization_mutation.write_count + decision_write_count
+                > _MAX_TRANSACTION_WRITES
+            ):
                 raise InvitationUnavailable()
+            organization_mutation.publish()
             for invitation_ref, index_ref, _existing in revocations:
                 transaction.update(invitation_ref, {"status": "revoked"})
                 transaction.update(index_ref, {"status": "revoked"})
             for invitation_ref, index_ref, state_ref, record in writes:
                 transaction.create(invitation_ref, _subject_invitation_payload(record))
-                transaction.create(
-                    index_ref,
-                    {
-                        "invitation_kind": "organization_subject",
-                        "invitation_id": record.invitation_id,
-                        "organization_id": record.organization_id,
-                        "subject_id": record.subject_id,
-                        "status": "active",
-                    },
-                )
-                transaction.set(
-                    state_ref,
-                    {
-                        "schema_version": 1,
-                        "organization_id": record.organization_id,
-                        "subject_id": record.subject_id,
-                        "invitation_id": record.invitation_id,
-                        "token_digest": record.token_digest,
-                        "status": "active",
-                    },
-                )
+                transaction.create(index_ref, _subject_invitation_index_payload(record))
+                transaction.set(state_ref, _subject_invitation_state_payload(record))
                 self._append_audit_transaction(
                     transaction,
                     current.organization_id,
@@ -1734,6 +2055,54 @@ class FirestoreDecisionOSRepository:
             return tuple(grants)
 
         return create(self._client.transaction())
+
+    def begin_subject_invitation_delivery(
+        self,
+        context: DecisionOSContext,
+        grant: SubjectInvitationGrant,
+    ) -> SubjectInvitationGrant:
+        from google.cloud import firestore
+
+        if type(grant) is not SubjectInvitationGrant or grant.token is None:
+            raise InvitationUnavailable()
+        digest = _token_digest(grant.token.get_secret_value())
+
+        @firestore.transactional
+        def begin(transaction):
+            current = self._authorize_transaction(
+                transaction,
+                context,
+                DecisionOSPermission.MANAGE_MEMBERS,
+            )
+            relation = self._subject_invitation_relation(
+                transaction,
+                current.organization_id,
+                grant.subject_id,
+            )
+            if relation is None:
+                raise InvitationUnavailable()
+            record, invitation_ref, index_ref, state_ref = relation
+            if (
+                record.invitation_id != grant.invitation_id
+                or record.role is not grant.role
+                or record.delivery_route_id != grant.delivery_route_id
+                or record.retry_sequence != grant.retry_sequence
+                or record.delivery_status
+                is not SubjectInvitationDeliveryState.DELIVERY_PENDING
+                or record.status != "active"
+                or not hmac_compare(record.token_digest, digest)
+            ):
+                raise InvitationUnavailable()
+            updated = replace(
+                record,
+                delivery_status=SubjectInvitationDeliveryState.DELIVERY_SENDING,
+            )
+            transaction.set(invitation_ref, _subject_invitation_payload(updated))
+            transaction.set(index_ref, _subject_invitation_index_payload(updated))
+            transaction.set(state_ref, _subject_invitation_state_payload(updated))
+            return _subject_grant(updated, token=grant.token.get_secret_value())
+
+        return begin(self._client.transaction())
 
     def record_subject_invitation_delivery(
         self,
@@ -1751,12 +2120,6 @@ class FirestoreDecisionOSRepository:
         ):
             raise InvitationUnavailable()
         digest = _token_digest(grant.token.get_secret_value())
-        invitation_ref = self._invitation_ref(
-            context.organization_id,
-            grant.invitation_id,
-        )
-        index_ref = self._invitation_index_ref(digest)
-
         @firestore.transactional
         def update(transaction):
             current = self._authorize_transaction(
@@ -1764,31 +2127,24 @@ class FirestoreDecisionOSRepository:
                 context,
                 DecisionOSPermission.MANAGE_MEMBERS,
             )
-            row = invitation_ref.get(transaction=transaction)
-            index = index_ref.get(transaction=transaction)
-            if not row.exists or not index.exists:
-                raise InvitationUnavailable()
-            record = _firestore_subject_invitation(
-                row.to_dict(),
-                token_digest=digest,
+            relation = self._subject_invitation_relation(
+                transaction,
+                current.organization_id,
+                grant.subject_id,
             )
-            index_value = index.to_dict()
+            if relation is None:
+                raise InvitationUnavailable()
+            record, invitation_ref, index_ref, state_ref = relation
             if (
-                record.organization_id != current.organization_id
-                or record.invitation_id != grant.invitation_id
+                record.invitation_id != grant.invitation_id
                 or record.subject_id != grant.subject_id
                 or record.role is not grant.role
                 or record.delivery_route_id != grant.delivery_route_id
                 or record.retry_sequence != grant.retry_sequence
                 or record.status != "active"
                 or record.delivery_status
-                is not SubjectInvitationDeliveryState.DELIVERY_PENDING
-                or type(index_value) is not dict
-                or index_value.get("invitation_kind") != "organization_subject"
-                or index_value.get("invitation_id") != record.invitation_id
-                or index_value.get("organization_id") != record.organization_id
-                or index_value.get("subject_id") != record.subject_id
-                or index_value.get("status") != "active"
+                is not SubjectInvitationDeliveryState.DELIVERY_SENDING
+                or not hmac_compare(record.token_digest, digest)
             ):
                 raise InvitationUnavailable()
             updated = replace(
@@ -1800,6 +2156,8 @@ class FirestoreDecisionOSRepository:
                 ),
             )
             transaction.set(invitation_ref, _subject_invitation_payload(updated))
+            transaction.set(index_ref, _subject_invitation_index_payload(updated))
+            transaction.set(state_ref, _subject_invitation_state_payload(updated))
             return _subject_grant(updated, token=None)
 
         return update(self._client.transaction())
@@ -1820,61 +2178,19 @@ class FirestoreDecisionOSRepository:
 
         @firestore.transactional
         def accept(transaction):
-            index_row = index_ref.get(transaction=transaction)
-            if not index_row.exists:
-                raise InvitationUnavailable()
-            index = index_row.to_dict()
-            if type(index) is not dict or set(index) != {
-                "invitation_kind",
-                "invitation_id",
-                "organization_id",
-                "subject_id",
-                "status",
-            }:
-                raise InvitationUnavailable()
-            organization_id = index.get("organization_id")
-            invitation_id = index.get("invitation_id")
-            subject_id = index.get("subject_id")
-            if (
-                index.get("invitation_kind") != "organization_subject"
-                or index.get("status") != "active"
-                or type(organization_id) is not str
-                or type(invitation_id) is not str
-                or type(subject_id) is not str
-            ):
-                raise InvitationUnavailable()
-            invitation_ref = self._invitation_ref(organization_id, invitation_id)
-            invitation_row = invitation_ref.get(transaction=transaction)
-            if not invitation_row.exists:
-                raise InvitationUnavailable()
-            record = _firestore_subject_invitation(
-                invitation_row.to_dict(),
-                token_digest=digest,
+            record, invitation_ref, relation_index_ref, state_ref = (
+                self._subject_invitation_relation_for_digest(transaction, digest)
             )
-            state_ref = self._subject_invitation_state_ref(
-                organization_id,
-                subject_id,
-            )
-            state_row = state_ref.get(transaction=transaction)
-            state = state_row.to_dict() if state_row.exists else None
-            state_digest = state.get("token_digest") if type(state) is dict else None
+            organization_id = record.organization_id
+            subject_id = record.subject_id
+            if relation_index_ref.path != index_ref.path:
+                raise InvitationUnavailable()
             member_ref = self._member_ref(organization_id, verified.uid)
             if (
-                record.organization_id != organization_id
-                or record.invitation_id != invitation_id
-                or record.subject_id != subject_id
-                or record.status != "active"
+                record.status != "active"
                 or record.delivery_status is not SubjectInvitationDeliveryState.DELIVERED
                 or record.expires_at <= now
                 or record.role in {DecisionOSRole.OWNER, DecisionOSRole.ADMIN}
-                or type(state) is not dict
-                or state.get("schema_version") != 1
-                or state.get("organization_id") != organization_id
-                or state.get("subject_id") != subject_id
-                or state.get("invitation_id") != invitation_id
-                or type(state_digest) is not str
-                or not hmac_compare(state_digest, digest)
-                or state.get("status") != "active"
                 or member_ref.get(transaction=transaction).exists
             ):
                 raise InvitationUnavailable()
@@ -1885,11 +2201,20 @@ class FirestoreDecisionOSRepository:
                 status=MembershipStatus.ACTIVE,
             )
             current = DecisionOSContext(principal=verified, membership=membership)
-            result = mutation(transaction, current, subject_id)
+            organization_mutation = mutation(transaction, current, subject_id)
+            if (
+                type(organization_mutation) is not _FirestorePreparedMutation
+                or type(organization_mutation.write_count) is not int
+                or organization_mutation.write_count < 0
+                or organization_mutation.write_count + 6 > _MAX_TRANSACTION_WRITES
+            ):
+                raise InvitationUnavailable()
+            organization_mutation.publish()
+            accepted_record = replace(record, status="accepted")
             transaction.create(member_ref, membership.model_dump(mode="python"))
-            transaction.update(invitation_ref, {"status": "accepted"})
-            transaction.update(index_ref, {"status": "accepted"})
-            transaction.update(state_ref, {"status": "accepted"})
+            transaction.set(invitation_ref, _subject_invitation_payload(accepted_record))
+            transaction.set(index_ref, _subject_invitation_index_payload(accepted_record))
+            transaction.set(state_ref, _subject_invitation_state_payload(accepted_record))
             for event_name in ("invitation_accepted", "membership_activated"):
                 self._append_audit_transaction(
                     transaction,
@@ -1899,7 +2224,7 @@ class FirestoreDecisionOSRepository:
                     target_uid=verified.uid,
                     occurred_at=now,
                 )
-            return membership, result
+            return membership, organization_mutation.result
 
         return accept(self._client.transaction())
 

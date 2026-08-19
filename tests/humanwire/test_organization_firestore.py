@@ -25,12 +25,15 @@ from humanwire.decisionos_store import (
     InvitationUnavailable,
     LastOwnerRequired,
     OrganizationUnavailable,
+    SubjectInvitationDeliveryState,
 )
 from humanwire.organization_models import (
     AuthorityAssignment,
     AuthorityFunction,
     ImportDraft,
     ImportReceipt,
+    OrganizationEdge,
+    OrganizationEdgeKind,
     OrganizationGraph,
     OrganizationGraphCandidate,
     OrganizationSubject,
@@ -74,6 +77,11 @@ class HostileString(str):
 
     def __hash__(self):
         return hash(self.allowed)
+
+
+class ExplodesIfMaterialized:
+    def __deepcopy__(self, _memo):
+        raise AssertionError("irrelevant future transition was materialized")
 
 
 def actual_document_bytes(reference, data, *, include_name: bool = True) -> int:
@@ -394,6 +402,18 @@ class Identifiers:
 
     def invitation_token(self) -> str:
         return "opaque-invitation-token-123456"
+
+
+class SequenceFirestoreIdentifiers(Identifiers):
+    def __init__(self) -> None:
+        self.sequence = 0
+
+    def invitation_id(self) -> str:
+        self.sequence += 1
+        return f"inv_{self.sequence:026d}"
+
+    def invitation_token(self) -> str:
+        return f"opaque-invitation-token-{self.sequence:06d}"
 
 
 def draft() -> ImportDraft:
@@ -719,9 +739,10 @@ def test_firestore_subject_invitation_accepts_membership_and_binding_atomically(
     assert issued.version == 2
     assert issued.subjects[0].lifecycle is SubjectLifecycle.INVITED
     token = grants[0].token.get_secret_value()
+    sending = decisionos.begin_subject_invitation_delivery(context, grants[0])
     decisionos.record_subject_invitation_delivery(
         context,
-        grants[0],
+        sending,
         delivered=True,
     )
     invitee = DecisionOSPrincipal(
@@ -771,7 +792,8 @@ def test_firestore_subject_acceptance_abort_rolls_back_and_retry_advances_once(
         expires_in=timedelta(days=1),
         delivery_route_id="consented_test_route",
     )[0]
-    decisionos.record_subject_invitation_delivery(context, grant, delivered=True)
+    sending = decisionos.begin_subject_invitation_delivery(context, grant)
+    decisionos.record_subject_invitation_delivery(context, sending, delivered=True)
     token = grant.token.get_secret_value()
     invitee = DecisionOSPrincipal(
         uid="firebase-transaction-retry",
@@ -792,6 +814,85 @@ def test_firestore_subject_acceptance_abort_rolls_back_and_retry_advances_once(
     )
     assert membership.uid == subject.member_uid == invitee.uid
     assert repository.load_graph(context).version == 3
+
+
+def test_firestore_unknown_delivery_survives_restart_without_redelivery_grant(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    decisionos = FirestoreDecisionOSRepository(
+        client,
+        clock=lambda: NOW,
+        identifiers=SequenceFirestoreIdentifiers(),
+        organization_collection=COLLECTION,
+        invitation_index_collection="test_subject_invites",
+    )
+    grant = repository.create_subject_invitations(
+        decisionos,
+        context,
+        subject_ids=(SUBJECT,),
+        role=DecisionOSRole.VIEWER,
+        expires_in=timedelta(days=1),
+        delivery_route_id="consented_test_route",
+    )[0]
+    token = grant.token.get_secret_value()
+    before_pending_retry = client.provider_mutation_attempts
+    pending_retry = repository.create_subject_invitations(
+        decisionos,
+        context,
+        subject_ids=(SUBJECT,),
+        role=DecisionOSRole.VIEWER,
+        expires_in=timedelta(days=1),
+        delivery_route_id="consented_test_route",
+    )[0]
+    assert pending_retry.invitation_id == grant.invitation_id
+    assert pending_retry.token is None
+    assert (
+        pending_retry.delivery_status
+        is SubjectInvitationDeliveryState.DELIVERY_PENDING
+    )
+    assert client.provider_mutation_attempts == before_pending_retry
+    sending = decisionos.begin_subject_invitation_delivery(context, grant)
+    assert sending.delivery_status is SubjectInvitationDeliveryState.DELIVERY_SENDING
+
+    restarted = FirestoreDecisionOSRepository(
+        client,
+        clock=lambda: NOW,
+        identifiers=SequenceFirestoreIdentifiers(),
+        organization_collection=COLLECTION,
+        invitation_index_collection="test_subject_invites",
+    )
+    before_attempts = client.provider_mutation_attempts
+    retry = repository.create_subject_invitations(
+        restarted,
+        context,
+        subject_ids=(SUBJECT,),
+        role=DecisionOSRole.VIEWER,
+        expires_in=timedelta(days=1),
+        delivery_route_id="consented_test_route",
+    )[0]
+
+    assert retry.invitation_id == grant.invitation_id
+    assert retry.token is None
+    assert retry.delivery_status is SubjectInvitationDeliveryState.DELIVERY_SENDING
+    assert repository.load_graph(context).version == 2
+    assert client.provider_mutation_attempts == before_attempts
+    with pytest.raises(InvitationUnavailable, match="invitation_unavailable"):
+        repository.accept_subject_invitation(
+            restarted,
+            DecisionOSPrincipal(
+                uid="firebase-unknown-delivery",
+                email_verified=True,
+                provider_ids=("google.com",),
+            ),
+            token,
+        )
 
 
 def test_firestore_activation_transitions_survive_restart_and_corruption_fails_closed(
@@ -837,6 +938,106 @@ def test_firestore_activation_transitions_survive_restart_and_corruption_fails_c
 
     with pytest.raises(ImportUnavailable, match="import_unavailable"):
         restarted.load_committed_import(context, 2)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "boolean_state_schema",
+        "missing_global_index",
+        "extra_global_index_field",
+        "boolean_invitation_schema",
+        "phantom_delivered_invitation",
+    ],
+)
+def test_firestore_subject_invitation_relation_fails_closed_on_corruption(
+    fake_firestore,
+    corruption,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    decisionos = FirestoreDecisionOSRepository(
+        client,
+        clock=lambda: NOW,
+        identifiers=Identifiers(),
+        organization_collection=COLLECTION,
+        invitation_index_collection="test_subject_invites",
+    )
+    grant = repository.create_subject_invitations(
+        decisionos,
+        context,
+        subject_ids=(SUBJECT,),
+        role=DecisionOSRole.VIEWER,
+        expires_in=timedelta(days=1),
+        delivery_route_id=None,
+    )[0]
+    state_path = (COLLECTION, ORG, "subject_invitation_state", SUBJECT)
+    invitation_path = (COLLECTION, ORG, "invitations", grant.invitation_id)
+    digest = client.data[state_path]["token_digest"]
+    index_path = ("test_subject_invites", digest)
+    if corruption == "boolean_state_schema":
+        client.data[state_path]["schema_version"] = True
+    elif corruption == "missing_global_index":
+        del client.data[index_path]
+    elif corruption == "extra_global_index_field":
+        client.data[index_path]["private"] = PRIVATE
+    elif corruption == "boolean_invitation_schema":
+        client.data[invitation_path]["schema_version"] = True
+    else:
+        client.data[invitation_path]["delivery_status"] = "delivered"
+
+    with pytest.raises(InvitationUnavailable, match="invitation_unavailable"):
+        repository.create_subject_invitations(
+            decisionos,
+            context,
+            subject_ids=(SUBJECT,),
+            role=DecisionOSRole.VIEWER,
+            expires_in=timedelta(days=1),
+            delivery_route_id=None,
+        )
+
+
+def test_firestore_transition_replay_never_materializes_irrelevant_future_docs(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    receipt = repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    decisionos = FirestoreDecisionOSRepository(
+        client,
+        clock=lambda: NOW,
+        identifiers=Identifiers(),
+        organization_collection=COLLECTION,
+        invitation_index_collection="test_subject_invites",
+    )
+    repository.create_subject_invitations(
+        decisionos,
+        context,
+        subject_ids=(SUBJECT,),
+        role=DecisionOSRole.VIEWER,
+        expires_in=timedelta(days=1),
+        delivery_route_id=None,
+    )
+    for version in range(10_000, 11_000):
+        client.data[
+            (
+                COLLECTION,
+                ORG,
+                "organization_activation_transitions",
+                f"{version:020d}",
+            )
+        ] = ExplodesIfMaterialized()
+
+    assert repository.load_committed_import(context, 2) == (saved, receipt)
 
 
 def test_firestore_receipt_rejects_unrelated_valid_v1_graph_with_matching_subjects(
@@ -1882,6 +2083,105 @@ def large_draft() -> ImportDraft:
         semantic_digest=DIGEST,
         created_at=NOW,
     )
+
+
+def large_draft_with_edges() -> ImportDraft:
+    value = large_draft()
+    subjects = value.candidate.subjects
+    edges = tuple(
+        OrganizationEdge(
+            edge_id=f"edge_{_numeric_ulid(index)}",
+            organization_id=ORG,
+            kind=OrganizationEdgeKind.COLLABORATES_WITH,
+            source_subject_id=subjects[index - 1].subject_id,
+            target_subject_id=subjects[index % len(subjects)].subject_id,
+        )
+        for index in range(1, 5_001)
+    )
+    return value.model_copy(
+        update={"candidate": value.candidate.model_copy(update={"edges": edges})}
+    )
+
+
+def first_hundred_draft() -> ImportDraft:
+    value = large_draft()
+    snapshot = value.source_snapshot.model_copy(
+        update={"records": value.source_snapshot.records[:100]}
+    )
+    candidate = value.candidate.model_copy(
+        update={"subjects": value.candidate.subjects[:100]}
+    )
+    return value.model_copy(
+        update={"source_snapshot": snapshot, "candidate": candidate}
+    )
+
+
+def test_firestore_subject_invitation_capacity_fails_before_any_write_attempt(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, large_draft_with_edges())
+    repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    decisionos = FirestoreDecisionOSRepository(
+        client,
+        clock=lambda: NOW,
+        identifiers=SequenceFirestoreIdentifiers(),
+        organization_collection=COLLECTION,
+        invitation_index_collection="test_subject_invites",
+    )
+    subject_ids = tuple(item.subject_id for item in saved.candidate.subjects[:100])
+    before = deepcopy(client.data)
+    before_attempts = client.provider_mutation_attempts
+
+    with pytest.raises(InvitationUnavailable, match="invitation_unavailable"):
+        repository.create_subject_invitations(
+            decisionos,
+            context,
+            subject_ids=subject_ids,
+            role=DecisionOSRole.VIEWER,
+            expires_in=timedelta(days=1),
+            delivery_route_id=None,
+        )
+
+    assert client.data == before
+    assert client.provider_mutation_attempts == before_attempts
+    assert client.transactions[-1].write_count == 0
+
+
+def test_firestore_subject_invitation_fitting_capacity_boundary_succeeds(
+    fake_firestore,
+) -> None:
+    _client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, first_hundred_draft())
+    repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    decisionos = FirestoreDecisionOSRepository(
+        _client,
+        clock=lambda: NOW,
+        identifiers=SequenceFirestoreIdentifiers(),
+        organization_collection=COLLECTION,
+        invitation_index_collection="test_subject_invites",
+    )
+    subject_ids = tuple(item.subject_id for item in saved.candidate.subjects)
+
+    grants = repository.create_subject_invitations(
+        decisionos,
+        context,
+        subject_ids=subject_ids,
+        role=DecisionOSRole.VIEWER,
+        expires_in=timedelta(days=1),
+        delivery_route_id=None,
+    )
+
+    assert len(grants) == 100
+    assert repository.load_graph(context).version == 2
 
 
 def test_firestore_chunks_five_thousand_record_draft_and_graph_within_bounds(

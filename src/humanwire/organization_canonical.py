@@ -64,6 +64,44 @@ def _is_trusted_identity(candidate: type[object], trusted: tuple[type[object], .
     return any(candidate is expected for expected in trusted)
 
 
+def _is_trusted_model_identity(candidate: type[object]) -> bool:
+    if _is_trusted_identity(candidate, _TRUSTED_MODEL_TYPES):
+        return True
+    try:
+        from humanwire.organization_activation import (
+            ActivatedOrganizationMembership,
+            BulkInvitationReceipt,
+            SubjectInvitationReceipt,
+        )
+    except ImportError:
+        return False
+    return any(
+        candidate is expected
+        for expected in (
+            ActivatedOrganizationMembership,
+            BulkInvitationReceipt,
+            SubjectInvitationReceipt,
+        )
+    )
+
+
+def _is_trusted_enum_identity(candidate: type[object]) -> bool:
+    if _is_trusted_identity(candidate, _TRUSTED_ENUM_TYPES):
+        return True
+    try:
+        from humanwire.decisionos_models import (
+            DecisionOSRole,
+            MembershipStatus,
+        )
+        from humanwire.organization_activation import ActivationDeliveryStatus
+    except ImportError:
+        return False
+    return any(
+        candidate is expected
+        for expected in (ActivationDeliveryStatus, DecisionOSRole, MembershipStatus)
+    )
+
+
 def _declared_fields(model_type: type[BaseModel]) -> tuple[str, ...] | None:
     fields = type.__getattribute__(model_type, "__pydantic_fields__")
     if type(fields) is not dict:
@@ -111,7 +149,7 @@ def _preflight_exact_value(
     if value_type is datetime:
         tzinfo = object.__getattribute__(value, "tzinfo")
         return tzinfo is None or type(tzinfo) is timezone or type(tzinfo) is TzInfo
-    if _is_trusted_identity(value_type, _TRUSTED_ENUM_TYPES):
+    if _is_trusted_enum_identity(value_type):
         enum_value = object.__getattribute__(value, "_value_")
         if type(enum_value) is not str:
             return False
@@ -147,7 +185,7 @@ def _preflight_exact_value(
             ):
                 return False
         return True
-    if not _is_trusted_identity(value_type, _TRUSTED_MODEL_TYPES):
+    if not _is_trusted_model_identity(value_type):
         return False
 
     fields = _declared_fields(value_type)
@@ -183,7 +221,7 @@ def _same_exact_value(raw: object, canonical: object) -> bool:
     raw_type = type(raw)
     if raw_type is not type(canonical):
         return False
-    if _is_trusted_identity(raw_type, _TRUSTED_MODEL_TYPES):
+    if _is_trusted_model_identity(raw_type):
         fields = _declared_fields(raw_type)
         if fields is None:
             return False
@@ -222,7 +260,7 @@ def _same_exact_value(raw: object, canonical: object) -> bool:
             ):
                 return False
         return True
-    if _is_trusted_identity(raw_type, _TRUSTED_ENUM_TYPES):
+    if _is_trusted_enum_identity(raw_type):
         return _same_exact_value(
             object.__getattribute__(raw, "_value_"),
             object.__getattribute__(canonical, "_value_"),
@@ -251,7 +289,7 @@ def exact_canonical_model[ModelT: BaseModel](
     """Reconstruct an exact model or return None for any coercion or hidden value."""
 
     if (
-        not _is_trusted_identity(model_type, _TRUSTED_MODEL_TYPES)
+        not _is_trusted_model_identity(model_type)
         or type(value) is not model_type
     ):
         return None

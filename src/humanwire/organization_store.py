@@ -32,6 +32,7 @@ from humanwire.decisionos_store import (
     MembershipUnavailable,
     OrganizationUnavailable,
     SubjectInvitationGrant,
+    _FirestorePreparedMutation,
     _InMemoryPreparedMutation,
     _InMemoryReferenceReplacement,
     _publish_in_memory_replacements,
@@ -64,6 +65,7 @@ _ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _CHUNK_TARGET_BYTES = 350_000
 _MAX_DOCUMENT_BYTES = 450_000
 _MAX_TRANSACTION_WRITES = 450
+_MAX_ACTIVATION_TRANSITIONS = 4096
 _MAX_CHUNK_ITEMS = 200
 _CHUNK_KINDS = (
     "source_records",
@@ -1194,17 +1196,10 @@ class InMemoryOrganizationGraphRepository:
             def validate(
                 _transaction,
                 invitation_context: DecisionOSContext,
-                grants: tuple[SubjectInvitationGrant, ...],
             ) -> _InMemoryPreparedMutation:
                 if (
                     invitation_context.organization_id != current.organization_id
                     or invitation_context.principal.uid != current.principal.uid
-                    or tuple(grant.subject_id for grant in grants) != subject_ids
-                    or any(
-                        grant.organization_id != current.organization_id
-                        or grant.role is not role
-                        for grant in grants
-                    )
                 ):
                     raise InvitationUnavailable()
                 graph = self._graph(current.organization_id)
@@ -1885,33 +1880,25 @@ class FirestoreOrganizationGraphRepository:
         receipt_version: int,
         target_version: int,
     ) -> tuple[_ActivationTransition, ...]:
-        rows = self._organization_ref(organization_id).collection(
-            "organization_activation_transitions"
-        ).stream(transaction=transaction)
+        count = target_version - receipt_version
+        if count < 0 or count > _MAX_ACTIVATION_TRANSITIONS:
+            raise ImportUnavailable()
         relevant: list[_ActivationTransition] = []
-        for row in rows:
+        for version in range(receipt_version + 1, target_version + 1):
+            row = self._activation_transition_ref(organization_id, version).get(
+                transaction=transaction
+            )
+            if not row.exists:
+                raise ImportUnavailable()
             value = row.to_dict()
-            raw_version = value.get("new_graph_version") if type(value) is dict else None
-            id_version = int(row.id) if re.fullmatch(r"[0-9]{20}", row.id) else None
-            if not (
-                (type(raw_version) is int and receipt_version < raw_version <= target_version)
-                or (id_version is not None and receipt_version < id_version <= target_version)
-            ):
-                continue
             transition = _transition_from_storage(value)
             if (
                 transition.organization_id != organization_id
-                or row.id != f"{transition.new_graph_version:020d}"
+                or transition.new_graph_version != version
+                or row.id != f"{version:020d}"
             ):
                 raise ImportUnavailable()
             relevant.append(transition)
-        relevant.sort(key=lambda item: item.new_graph_version)
-        if (
-            len(relevant) != target_version - receipt_version
-            or tuple(item.new_graph_version for item in relevant)
-            != tuple(range(receipt_version + 1, target_version + 1))
-        ):
-            raise ImportUnavailable()
         return tuple(relevant)
 
     def _lineage_ref(self, organization_id: str, source_kind: str):
@@ -2487,16 +2474,10 @@ class FirestoreOrganizationGraphRepository:
         def mutate(
             transaction,
             current: DecisionOSContext,
-            grants: tuple[SubjectInvitationGrant, ...],
-        ) -> None:
+        ) -> _FirestorePreparedMutation:
             if (
                 current.organization_id != context.organization_id
-                or tuple(grant.subject_id for grant in grants) != subject_ids
-                or any(
-                    grant.organization_id != current.organization_id
-                    or grant.role is not role
-                    for grant in grants
-                )
+                or current.principal.uid != context.principal.uid
             ):
                 raise InvitationUnavailable()
             state_row = self._state_ref(current.organization_id).get(
@@ -2530,7 +2511,7 @@ class FirestoreOrganizationGraphRepository:
                 raise InvitationUnavailable()
             lifecycles = {subject.lifecycle for subject in selected if subject is not None}
             if lifecycles == {SubjectLifecycle.INVITED}:
-                return
+                return _FirestorePreparedMutation(write_count=0, publish=lambda: None)
             if lifecycles != {SubjectLifecycle.DIRECTORY_ONLY}:
                 raise InvitationUnavailable()
             now = _aware(self._clock())
@@ -2595,19 +2576,29 @@ class FirestoreOrganizationGraphRepository:
                 storage,
                 graph_storage,
             )
-            _require_write_bound(4 + (2 * len(graph_chunks)) + extra_current_deletes)
-            transaction.create(version_ref, graph_storage)
-            for chunk_id, chunk in graph_chunks.items():
-                transaction.create(version_ref.collection("chunks").document(chunk_id), chunk)
-            self._write_current_graph(
-                transaction,
-                organization_ref,
-                storage,
-                graph_storage,
-                graph_chunks,
+            write_count = 3 + (2 * len(graph_chunks)) + extra_current_deletes
+
+            def publish() -> None:
+                transaction.create(version_ref, graph_storage)
+                for chunk_id, chunk in graph_chunks.items():
+                    transaction.create(
+                        version_ref.collection("chunks").document(chunk_id),
+                        chunk,
+                    )
+                self._write_current_graph(
+                    transaction,
+                    organization_ref,
+                    storage,
+                    graph_storage,
+                    graph_chunks,
+                )
+                transaction.set(self._state_ref(current.organization_id), state_payload)
+                transaction.create(transition_ref, transition_payload)
+
+            return _FirestorePreparedMutation(
+                write_count=write_count,
+                publish=publish,
             )
-            transaction.set(self._state_ref(current.organization_id), state_payload)
-            transaction.create(transition_ref, transition_payload)
 
         return decisionos.create_subject_invitations(
             context,
@@ -2644,7 +2635,7 @@ class FirestoreOrganizationGraphRepository:
         transaction,
         context: DecisionOSContext,
         subject_id: str,
-    ) -> OrganizationSubject:
+    ) -> _FirestorePreparedMutation:
         if re.fullmatch(_SUBJECT_ID, subject_id) is None:
             raise InvitationUnavailable()
         organization_ref = self._organization_ref(context.organization_id)
@@ -2716,7 +2707,10 @@ class FirestoreOrganizationGraphRepository:
             context.organization_id,
             graph.version,
         )
-        if transition_ref.get(transaction=transaction).exists:
+        if (
+            version_ref.get(transaction=transaction).exists
+            or transition_ref.get(transaction=transaction).exists
+        ):
             raise InvitationUnavailable()
         state_payload = {
             "schema_version": 1,
@@ -2742,21 +2736,33 @@ class FirestoreOrganizationGraphRepository:
             prior_storage,
             graph_storage,
         )
-        _require_write_bound(10 + (2 * len(graph_chunks)) + extra_current_deletes)
-        transaction.create(version_ref, graph_storage)
-        for chunk_id, chunk in graph_chunks.items():
-            transaction.create(version_ref.collection("chunks").document(chunk_id), chunk)
-        self._write_current_graph(
-            transaction,
-            organization_ref,
-            prior_storage,
-            graph_storage,
-            graph_chunks,
+        event_payload = event.model_dump(mode="python")
+        transition_payload = transition.model_dump(mode="python")
+        write_count = 4 + (2 * len(graph_chunks)) + extra_current_deletes
+
+        def publish() -> None:
+            transaction.create(version_ref, graph_storage)
+            for chunk_id, chunk in graph_chunks.items():
+                transaction.create(
+                    version_ref.collection("chunks").document(chunk_id),
+                    chunk,
+                )
+            self._write_current_graph(
+                transaction,
+                organization_ref,
+                prior_storage,
+                graph_storage,
+                graph_chunks,
+            )
+            transaction.set(state_ref, state_payload)
+            transaction.create(event_ref, event_payload)
+            transaction.create(transition_ref, transition_payload)
+
+        return _FirestorePreparedMutation(
+            write_count=write_count,
+            publish=publish,
+            result=bound,
         )
-        transaction.set(state_ref, state_payload)
-        transaction.create(event_ref, event.model_dump(mode="python"))
-        transaction.create(transition_ref, transition.model_dump(mode="python"))
-        return bound
 
     @_firestore_error_barrier(OrganizationUnavailable)
     def bind_member(

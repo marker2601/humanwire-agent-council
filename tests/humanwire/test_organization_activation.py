@@ -27,6 +27,7 @@ from humanwire.decisionos_store import (
     OrganizationUnavailable,
 )
 from humanwire.organization_activation import (
+    ActivatedOrganizationMembership,
     ActivationDeliveryStatus,
     ActivationService,
     BulkInvitationRequest,
@@ -101,6 +102,31 @@ class RecordingTransport:
         self.deliveries.append(grant)
         if grant.subject_id in self.fail_subject_ids:
             raise RuntimeError(f"private transport failure for {PRIVATE_EMAIL}")
+
+
+class MissingRouteTransport:
+    def deliver(self, grant) -> None:
+        raise AssertionError(f"must not deliver {grant.invitation_id}")
+
+
+class AlternateTransport(RecordingTransport):
+    route_id = "other_consented_route"
+
+
+class PrivateString(str):
+    pass
+
+
+class FixedActivationService:
+    def __init__(self, *, receipt=None, accepted=None) -> None:
+        self.receipt = receipt
+        self.accepted = accepted
+
+    def create_invitations(self, _context, _request):
+        return self.receipt
+
+    def accept(self, _principal, _token):
+        return self.accepted
 
 
 class FakeAuthenticator:
@@ -235,6 +261,43 @@ def _exception_graph_text(error: BaseException) -> str:
     return " ".join(rendered)
 
 
+def _exception_reaches_secret(error: BaseException, secret: str) -> bool:
+    pending: list[object] = [error]
+    seen: set[int] = set()
+    budget = 20_000
+    while pending and budget:
+        budget -= 1
+        value = pending.pop()
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        if type(value) is str:
+            if value == secret:
+                return True
+            continue
+        if value is None or type(value) in {int, float, bool, bytes, type}:
+            continue
+        if isinstance(value, BaseException):
+            pending.extend(value.args)
+            pending.extend((value.__cause__, value.__context__, value.__traceback__))
+        if type(value).__name__ == "traceback":
+            if value.tb_frame.f_code.co_filename != __file__:
+                pending.extend(value.tb_frame.f_locals.values())
+            pending.append(value.tb_next)
+            continue
+        if type(value) is dict:
+            pending.extend(value.keys())
+            pending.extend(value.values())
+            continue
+        if type(value) in {tuple, list, set, frozenset}:
+            pending.extend(value)
+            continue
+        state = getattr(value, "__dict__", None)
+        if type(state) is dict:
+            pending.append(state)
+    return False
+
+
 def test_bulk_invite_only_targets_explicit_committed_human_subject_ids(
     activation_setup,
 ) -> None:
@@ -276,6 +339,120 @@ def test_no_configured_transport_has_no_delivery_side_effect(activation_setup) -
     assert receipt.pending_count == 1
 
 
+def test_non_null_transport_requires_an_exact_server_route_id(activation_setup) -> None:
+    with pytest.raises(ValueError, match="invitation transport route is invalid"):
+        _service(activation_setup, MissingRouteTransport())
+
+
+def test_route_less_invitation_can_be_reissued_once_for_a_configured_route(
+    activation_setup,
+) -> None:
+    first = _service(activation_setup).create_invitations(
+        activation_setup[3],
+        _request(ALICE),
+    )
+    issued_version = activation_setup[2].load_graph(activation_setup[3]).version
+    transport = RecordingTransport()
+
+    recovered = _service(activation_setup, transport).create_invitations(
+        activation_setup[3],
+        _request(ALICE),
+    )
+
+    assert recovered.invitations[0].invitation_id != first.invitations[0].invitation_id
+    assert recovered.invitations[0].status is ActivationDeliveryStatus.DELIVERED
+    assert len(transport.deliveries) == 1
+    assert activation_setup[2].load_graph(activation_setup[3]).version == issued_version
+
+
+def test_non_null_delivery_route_mismatch_remains_fail_closed(activation_setup) -> None:
+    first_transport = RecordingTransport()
+    _service(activation_setup, first_transport).create_invitations(
+        activation_setup[3],
+        _request(ALICE),
+    )
+    alternate = AlternateTransport()
+
+    with pytest.raises(InvitationUnavailable, match="invitation_unavailable"):
+        _service(activation_setup, alternate).create_invitations(
+            activation_setup[3],
+            _request(ALICE),
+        )
+
+    assert alternate.deliveries == []
+
+
+def test_ineligible_subject_is_rejected_before_any_token_is_generated(
+    activation_setup,
+) -> None:
+    identifiers = activation_setup[1]._identifiers
+    before = identifiers.invitation_sequence
+
+    with pytest.raises(InvitationUnavailable, match="invitation_unavailable"):
+        _service(activation_setup).create_invitations(
+            activation_setup[3],
+            _request(AI),
+        )
+
+    assert identifiers.invitation_sequence == before
+
+
+def test_subject_invitation_retry_fails_closed_when_subject_state_is_missing(
+    activation_setup,
+) -> None:
+    service = _service(activation_setup)
+    service.create_invitations(activation_setup[3], _request(ALICE))
+    activation_setup[1]._active_subject_invitations.pop((ORG_A, ALICE))
+
+    with pytest.raises(InvitationUnavailable, match="invitation_unavailable"):
+        service.create_invitations(activation_setup[3], _request(ALICE))
+
+
+def test_legacy_and_subject_invitations_share_id_and_digest_namespace(
+    activation_setup,
+) -> None:
+    _service(activation_setup).create_invitations(
+        activation_setup[3],
+        _request(ALICE),
+    )
+    activation_setup[1]._identifiers.invitation_sequence = 0
+
+    with pytest.raises(InvitationUnavailable, match="invitation_unavailable"):
+        activation_setup[1].create_invitation(
+            activation_setup[3],
+            role=DecisionOSRole.VIEWER,
+            expires_in=timedelta(days=1),
+        )
+
+
+def test_legacy_acceptance_rejects_ambiguous_cross_kind_token_digest(
+    activation_setup,
+) -> None:
+    decisionos = activation_setup[1]
+    generic = decisionos.create_invitation(
+        activation_setup[3],
+        role=DecisionOSRole.VIEWER,
+        expires_in=timedelta(days=1),
+    )
+    _service(activation_setup).create_invitations(
+        activation_setup[3],
+        _request(ALICE),
+    )
+    subject_invitation_id = decisionos._active_subject_invitations[(ORG_A, ALICE)]
+    subject_record = decisionos._subject_invitations[subject_invitation_id]
+    object.__setattr__(
+        subject_record,
+        "token_digest",
+        hashlib.sha256(generic.token.get_secret_value().encode()).hexdigest(),
+    )
+
+    with pytest.raises(InvitationUnavailable, match="invitation_unavailable"):
+        decisionos.accept_invitation(
+            principal("firebase-ambiguous-token"),
+            generic.token.get_secret_value(),
+        )
+
+
 def test_consented_transport_receives_one_opaque_grant_per_explicit_subject(
     activation_setup,
 ) -> None:
@@ -296,7 +473,7 @@ def test_consented_transport_receives_one_opaque_grant_per_explicit_subject(
     )
 
 
-def test_partial_delivery_is_truthful_and_failed_subject_retry_is_idempotent(
+def test_delivery_exception_is_durable_unknown_and_never_auto_redelivered(
     activation_setup,
 ) -> None:
     transport = RecordingTransport(fail_subject_ids={BOB})
@@ -307,26 +484,25 @@ def test_partial_delivery_is_truthful_and_failed_subject_retry_is_idempotent(
 
     assert [item.status for item in first.invitations] == [
         ActivationDeliveryStatus.DELIVERED,
-        ActivationDeliveryStatus.DELIVERY_FAILED,
+        ActivationDeliveryStatus.DELIVERY_UNKNOWN,
     ]
     assert (first.delivered_count, first.pending_count) == (1, 1)
 
     transport.fail_subject_ids.clear()
     second = service.create_invitations(activation_setup[3], _request(ALICE, BOB))
 
-    assert len(transport.deliveries) == 3
-    assert transport.deliveries[-1].subject_id == BOB
-    assert second.delivered_count == 2
-    assert second.pending_count == 0
+    assert len(transport.deliveries) == 2
+    assert second.delivered_count == 1
+    assert second.pending_count == 1
     assert second.invitations[0].invitation_id == first.invitations[0].invitation_id
-    assert second.invitations[1].invitation_id != first.invitations[1].invitation_id
+    assert second.invitations[1].invitation_id == first.invitations[1].invitation_id
     assert activation_setup[2].load_graph(activation_setup[3]).version == issued_version
     with pytest.raises(InvitationUnavailable, match="invitation_unavailable"):
         service.accept(principal("firebase-bob-old-token"), first_bob_token)
 
     third = service.create_invitations(activation_setup[3], _request(ALICE, BOB))
     assert third == second
-    assert len(transport.deliveries) == 3
+    assert len(transport.deliveries) == 2
 
 
 @pytest.mark.parametrize("subject_id", [AI, EXTERNAL, REVIEW, SUSPENDED])
@@ -567,6 +743,62 @@ def test_graph_failure_rolls_back_membership_token_and_graph_before_safe_retry(
     assert service.accept(invitee, token).subject_id == ALICE
 
 
+def test_token_is_not_reachable_from_create_persistence_failure_traceback(
+    activation_setup,
+    monkeypatch,
+) -> None:
+    transport = RecordingTransport()
+    service = _service(activation_setup, transport)
+
+    def fail_persistence(*_args, **_kwargs):
+        raise RuntimeError("private delivery persistence failure")
+
+    monkeypatch.setattr(
+        activation_setup[1],
+        "record_subject_invitation_delivery",
+        fail_persistence,
+    )
+    with pytest.raises(InvitationUnavailable, match="invitation_unavailable") as caught:
+        service.create_invitations(activation_setup[3], _request(ALICE))
+
+    token = transport.deliveries[0].token.get_secret_value()
+    assert not _exception_reaches_secret(caught.value, token)
+
+
+def test_raw_token_is_not_reachable_from_invalid_replay_or_provider_tracebacks(
+    activation_setup,
+    monkeypatch,
+) -> None:
+    invalid = "opaque-invalid-invitation-token-000001"
+    service = _service(activation_setup)
+    with pytest.raises(InvitationUnavailable, match="invitation_unavailable") as caught:
+        service.accept(principal("firebase-invalid-token"), invalid)
+    assert not _exception_reaches_secret(caught.value, invalid)
+
+    transport = RecordingTransport()
+    service = _service(activation_setup, transport)
+    service.create_invitations(activation_setup[3], _request(ALICE))
+    token = transport.deliveries[0].token.get_secret_value()
+    service.accept(principal("firebase-first-accept"), token)
+    with pytest.raises(InvitationUnavailable, match="invitation_unavailable") as replay:
+        service.accept(principal("firebase-replay"), token)
+    assert not _exception_reaches_secret(replay.value, token)
+
+    provider_token = "opaque-provider-failure-token-000001"
+
+    def fail_provider(*_args, **_kwargs):
+        raise RuntimeError(provider_token)
+
+    monkeypatch.setattr(
+        activation_setup[2],
+        "accept_subject_invitation",
+        fail_provider,
+    )
+    with pytest.raises(InvitationUnavailable, match="invitation_unavailable") as provider:
+        service.accept(principal("firebase-provider-failure"), provider_token)
+    assert not _exception_reaches_secret(provider.value, provider_token)
+
+
 def test_tokens_digests_and_email_never_appear_in_receipts_repr_or_fixed_errors(
     activation_setup,
 ) -> None:
@@ -732,6 +964,73 @@ def test_subject_invitation_routes_return_only_the_frozen_safe_contract(
         "role": "contributor",
     }
     assert "firebase-route-invitee" not in accepted.text
+
+
+def test_subject_invitation_create_route_rejects_shadow_serializer_without_leak(
+    activation_setup,
+) -> None:
+    receipt = _service(activation_setup).create_invitations(
+        activation_setup[3],
+        _request(ALICE),
+    )
+    hostile = receipt.model_copy(
+        update={
+            "model_dump": lambda **_kwargs: {
+                "organization_id": ORG_A,
+                "private": PRIVATE_EMAIL,
+            }
+        }
+    )
+    client = _route_client(
+        activation_setup,
+        FixedActivationService(receipt=hostile),
+        session="session-owner",
+    )
+
+    response = client.post(
+        f"/api/organizations/{ORG_A}/subject-invitations",
+        headers=_route_headers(client),
+        json={"subject_ids": [ALICE], "role": "contributor"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "invitation_unavailable"}
+    assert PRIVATE_EMAIL not in response.text
+
+
+@pytest.mark.parametrize("corruption", ["scalar_subclass", "private_extra"])
+def test_subject_invitation_accept_route_deep_canonicalizes_result(
+    activation_setup,
+    corruption,
+) -> None:
+    accepted = ActivatedOrganizationMembership(
+        organization_id=ORG_A,
+        subject_id=ALICE,
+        uid="firebase-hostile-result",
+        role=DecisionOSRole.CONTRIBUTOR,
+        status=MembershipStatus.ACTIVE,
+    )
+    if corruption == "scalar_subclass":
+        accepted = accepted.model_copy(
+            update={"organization_id": PrivateString(PRIVATE_EMAIL)}
+        )
+    else:
+        accepted = accepted.model_copy(update={"private": PRIVATE_EMAIL})
+    client = _route_client(
+        activation_setup,
+        FixedActivationService(accepted=accepted),
+        session="session-invitee",
+    )
+
+    response = client.post(
+        "/api/subject-invitations/accept",
+        headers=_route_headers(client),
+        json={"invitation_token": "opaque-route-token-000001"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "invitation_unavailable"}
+    assert PRIVATE_EMAIL not in response.text
 
 
 @pytest.mark.parametrize(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta
 from enum import StrEnum
-from typing import Protocol, Self
+from typing import Literal, Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -37,8 +37,10 @@ class _ActivationModel(BaseModel):
 
 class ActivationDeliveryStatus(StrEnum):
     NOT_DELIVERED = "not_delivered"
+    DELIVERY_PENDING = "delivery_pending"
     DELIVERED = "delivered"
     DELIVERY_FAILED = "delivery_failed"
+    DELIVERY_UNKNOWN = "delivery_unknown"
 
 
 class BulkInvitationRequest(_ActivationModel):
@@ -117,7 +119,134 @@ _PUBLIC_STATUS = {
     SubjectInvitationDeliveryState.NOT_DELIVERED: ActivationDeliveryStatus.NOT_DELIVERED,
     SubjectInvitationDeliveryState.DELIVERED: ActivationDeliveryStatus.DELIVERED,
     SubjectInvitationDeliveryState.DELIVERY_FAILED: ActivationDeliveryStatus.DELIVERY_FAILED,
+    SubjectInvitationDeliveryState.DELIVERY_PENDING: ActivationDeliveryStatus.DELIVERY_PENDING,
+    SubjectInvitationDeliveryState.DELIVERY_SENDING: ActivationDeliveryStatus.DELIVERY_UNKNOWN,
 }
+
+_FailureMarker = Literal["authorization_denied", "invitation_unavailable"]
+
+
+def _without_token(grant: SubjectInvitationGrant) -> SubjectInvitationGrant:
+    return SubjectInvitationGrant(
+        invitation_id=grant.invitation_id,
+        organization_id=grant.organization_id,
+        subject_id=grant.subject_id,
+        role=grant.role,
+        expires_at=grant.expires_at,
+        delivery_status=grant.delivery_status,
+        delivery_route_id=grant.delivery_route_id,
+        retry_sequence=grant.retry_sequence,
+        token=None,
+    )
+
+
+def _create_invitations_internal(
+    graph: OrganizationGraphRepository,
+    decisionos: DecisionOSRepository,
+    transport: SubjectInvitationTransport | None,
+    delivery_route_id: str | None,
+    context: DecisionOSContext,
+    request: BulkInvitationRequest,
+) -> BulkInvitationReceipt | _FailureMarker:
+    """Contain every token-bearing frame and return only token-free outcomes."""
+
+    grants = None
+    grant = None
+    started = None
+    try:
+        grants = graph.create_subject_invitations(
+            decisionos,
+            context,
+            subject_ids=request.subject_ids,
+            role=request.role,
+            expires_in=timedelta(seconds=request.expires_in_seconds),
+            delivery_route_id=delivery_route_id,
+        )
+        if type(grants) is not tuple:
+            return "invitation_unavailable"
+        finalized: list[SubjectInvitationGrant] = []
+        for grant in grants:
+            if type(grant) is not SubjectInvitationGrant:
+                return "invitation_unavailable"
+            if grant.token is None or transport is None:
+                finalized.append(_without_token(grant))
+                continue
+            started = decisionos.begin_subject_invitation_delivery(context, grant)
+            if type(started) is not SubjectInvitationGrant or started.token is None:
+                return "invitation_unavailable"
+            try:
+                transport.deliver(started)
+            except Exception:  # noqa: BLE001 - sending is durably unknown
+                finalized.append(_without_token(started))
+                continue
+            updated = decisionos.record_subject_invitation_delivery(
+                context,
+                started,
+                delivered=True,
+            )
+            if type(updated) is not SubjectInvitationGrant or updated.token is not None:
+                return "invitation_unavailable"
+            finalized.append(updated)
+        invitations = tuple(
+            SubjectInvitationReceipt(
+                invitation_id=item.invitation_id,
+                subject_id=item.subject_id,
+                status=_PUBLIC_STATUS[item.delivery_status],
+                expires_at=item.expires_at,
+            )
+            for item in finalized
+        )
+        delivered_count = sum(
+            item.status is ActivationDeliveryStatus.DELIVERED for item in invitations
+        )
+        return BulkInvitationReceipt(
+            organization_id=context.organization_id,
+            requested_subject_ids=request.subject_ids,
+            invitations=invitations,
+            created_count=len(invitations),
+            delivered_count=delivered_count,
+            pending_count=len(invitations) - delivered_count,
+        )
+    except DecisionOSAuthorizationDenied:
+        return "authorization_denied"
+    except Exception:  # noqa: BLE001 - every private seam failure is sealed here
+        return "invitation_unavailable"
+    finally:
+        grant = None
+        started = None
+        grants = None
+
+
+def _accept_invitation_internal(
+    graph: OrganizationGraphRepository,
+    decisionos: DecisionOSRepository,
+    principal: DecisionOSPrincipal,
+    raw_token: str,
+) -> ActivatedOrganizationMembership | _FailureMarker:
+    """Contain the raw bearer and provider objects below the public traceback."""
+
+    accepted = None
+    membership = None
+    subject = None
+    try:
+        accepted = graph.accept_subject_invitation(decisionos, principal, raw_token)
+        if type(accepted) is not tuple or len(accepted) != 2:
+            return "invitation_unavailable"
+        membership, subject = accepted
+        return ActivatedOrganizationMembership(
+            organization_id=membership.organization_id,
+            subject_id=subject.subject_id,
+            uid=membership.uid,
+            role=membership.role,
+            status=membership.status,
+        )
+    except Exception:  # noqa: BLE001 - all token failures are non-enumerating
+        return "invitation_unavailable"
+    finally:
+        raw_token = ""
+        accepted = None
+        membership = None
+        subject = None
 
 
 class ActivationService:
@@ -130,10 +259,16 @@ class ActivationService:
         graph_repository: OrganizationGraphRepository,
         transport: SubjectInvitationTransport | None = None,
     ) -> None:
-        route_id = None if transport is None else getattr(transport, "route_id", None)
-        if route_id is not None and (
-            type(route_id) is not str
-            or re.fullmatch(_DELIVERY_ROUTE_ID, route_id) is None
+        try:
+            route_id = (
+                None
+                if transport is None
+                else object.__getattribute__(transport, "route_id")
+            )
+        except Exception:  # noqa: BLE001 - hostile descriptors are not trusted
+            raise ValueError("invitation transport route is invalid") from None
+        if transport is not None and (
+            type(route_id) is not str or re.fullmatch(_DELIVERY_ROUTE_ID, route_id) is None
         ):
             raise ValueError("invitation transport route is invalid")
         self._decisionos = decisionos_repository
@@ -151,111 +286,38 @@ class ActivationService:
     ) -> BulkInvitationReceipt:
         if type(context) is not DecisionOSContext or type(request) is not BulkInvitationRequest:
             raise InvitationUnavailable()
-        failed = False
-        grants = None
-        try:
-            grants = self._graph.create_subject_invitations(
-                self._decisionos,
-                context,
-                subject_ids=request.subject_ids,
-                role=request.role,
-                expires_in=timedelta(seconds=request.expires_in_seconds),
-                delivery_route_id=self._delivery_route_id,
-            )
-        except (DecisionOSAuthorizationDenied, InvitationUnavailable):
-            raise
-        except Exception:  # noqa: BLE001 - hostile seam details are sealed
-            failed = True
-        if failed or type(grants) is not tuple:
+        outcome = _create_invitations_internal(
+            self._graph,
+            self._decisionos,
+            self._transport,
+            self._delivery_route_id,
+            context,
+            request,
+        )
+        if outcome == "authorization_denied":
+            del self
+            raise DecisionOSAuthorizationDenied() from None
+        if outcome == "invitation_unavailable":
+            del self
             raise InvitationUnavailable() from None
-        finalized: list[SubjectInvitationGrant] = []
-        for grant in grants:
-            if grant.token is None or self._transport is None:
-                finalized.append(grant)
-                continue
-            delivered = False
-            try:
-                self._transport.deliver(grant)
-                delivered = True
-            except Exception:  # noqa: BLE001 - provider details never cross the boundary
-                delivered = False
-            delivery_update_failed = False
-            updated = None
-            try:
-                updated = self._decisionos.record_subject_invitation_delivery(
-                    context,
-                    grant,
-                    delivered=delivered,
-                )
-            except (DecisionOSAuthorizationDenied, InvitationUnavailable):
-                raise
-            except Exception:  # noqa: BLE001 - provider/storage details are sealed
-                delivery_update_failed = True
-            if delivery_update_failed or updated is None:
-                raise InvitationUnavailable() from None
-            finalized.append(updated)
-        receipt_failed = False
-        receipt = None
-        try:
-            invitations = tuple(
-                SubjectInvitationReceipt(
-                    invitation_id=grant.invitation_id,
-                    subject_id=grant.subject_id,
-                    status=_PUBLIC_STATUS[grant.delivery_status],
-                    expires_at=grant.expires_at,
-                )
-                for grant in finalized
-            )
-            delivered_count = sum(
-                item.status is ActivationDeliveryStatus.DELIVERED for item in invitations
-            )
-            receipt = BulkInvitationReceipt(
-                organization_id=context.organization_id,
-                requested_subject_ids=request.subject_ids,
-                invitations=invitations,
-                created_count=len(invitations),
-                delivered_count=delivered_count,
-                pending_count=len(invitations) - delivered_count,
-            )
-        except Exception:  # noqa: BLE001 - hostile seam values are fixed-safe
-            receipt_failed = True
-        if receipt_failed or receipt is None:
-            raise InvitationUnavailable() from None
-        return receipt
+        return outcome
 
     def accept(
         self,
         principal: DecisionOSPrincipal,
         token: str,
     ) -> ActivatedOrganizationMembership:
-        failed = False
-        accepted = None
-        try:
-            accepted = self._graph.accept_subject_invitation(
-                self._decisionos,
-                principal,
-                token,
-            )
-        except Exception:  # noqa: BLE001 - every token failure is non-enumerating
-            failed = True
-        if failed or accepted is None:
+        outcome = _accept_invitation_internal(
+            self._graph,
+            self._decisionos,
+            principal,
+            token,
+        )
+        token = ""
+        if outcome == "invitation_unavailable":
+            del self
             raise InvitationUnavailable() from None
-        membership, subject = accepted
-        result_failed = False
-        result = None
-        try:
-            result = ActivatedOrganizationMembership(
-                organization_id=membership.organization_id,
-                subject_id=subject.subject_id,
-                uid=membership.uid,
-                role=membership.role,
-                status=membership.status,
-            )
-        except Exception:  # noqa: BLE001 - hostile seam values are fixed-safe
-            result_failed = True
-        if result_failed or result is None:
-            raise InvitationUnavailable() from None
-        return result
+        return outcome
 
 
 __all__ = [
