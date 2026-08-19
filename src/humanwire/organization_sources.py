@@ -37,10 +37,47 @@ _MAX_COMPRESSION_RATIO = 100
 _MAX_PDF_OBJECTS = 20_000
 _MAX_XLSX_COLUMNS = 256
 _MAX_XML_BYTES = 10 * 1024 * 1024
+_MAX_XML_NODES = 500_000
+_MAX_XML_DEPTH = 64
+_MAX_XML_TEXT_CHARS = 10 * 1024 * 1024
 _CONTENT_TYPES_NAMESPACE = "http://schemas.openxmlformats.org/package/2006/content-types"
 _RELATIONSHIPS_NAMESPACE = "http://schemas.openxmlformats.org/package/2006/relationships"
 _WORKSHEET_NAMESPACE = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_DRAWING_NAMESPACE = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_CORE_PROPERTIES_NAMESPACE = (
+    "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+)
+_EXTENDED_PROPERTIES_NAMESPACE = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"
+)
 _CELL_REFERENCE = re.compile(r"^([A-Z]{1,3})([1-9][0-9]{0,6})$")
+_XML_ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+_XML_DECLARATION = re.compile(
+    r"<\?xml\s+version=(['\"])1\.0\1"
+    r"(?:\s+encoding=(['\"])UTF-8\2)?"
+    r"(?:\s+standalone=(['\"])(?:yes|no)\3)?\s*\?>",
+    re.IGNORECASE,
+)
+_WORKSHEET_ELEMENTS = frozenset(
+    {
+        "c",
+        "dimension",
+        "is",
+        "outlinePr",
+        "pageMargins",
+        "pageSetUpPr",
+        "row",
+        "selection",
+        "sheetData",
+        "sheetFormatPr",
+        "sheetPr",
+        "sheetView",
+        "sheetViews",
+        "t",
+        "v",
+        "worksheet",
+    }
+)
 _ORGANIZATION_ID = re.compile(r"^org_[0-9A-HJKMNP-TV-Z]{26}$")
 _FIELD_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _FORMULA_PREFIXES = ("=", "+", "-", "@")
@@ -120,6 +157,10 @@ class OrganizationSourceRejected(RuntimeError):
 
     def __init__(self, code: str = "source_invalid") -> None:
         super().__init__(code if code in _ERROR_CODES else "source_invalid")
+
+
+class _PdfTextLimitReached(BaseException):
+    """Abort provider extraction before it can materialize excess text."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -384,17 +425,98 @@ def _allowed_xlsx_member(name: str) -> bool:
     return _xlsx_part_content_type(name) is not None
 
 
-def _safe_xml_root(content: bytes, expected_tag: str) -> ElementTree.Element | None:
-    if (
-        len(content) > _MAX_XML_BYTES
-        or b"<!doctype" in content.lower()
-        or b"<!entity" in content.lower()
-    ):
+def _hardened_xml_bytes(
+    content: bytes,
+    expected_tag: str,
+    *,
+    maximum_nodes: int = _MAX_XML_NODES,
+) -> bytes | None:
+    if len(content) > _MAX_XML_BYTES or content.startswith((b"\xff\xfe", b"\xfe\xff")):
         return None
-    root = ElementTree.fromstring(content)
-    if root.tag != expected_tag:
+    try:
+        decoded = content.decode("utf-8-sig")
+    except UnicodeDecodeError:
         return None
-    return root
+    if "\ufeff" in decoded:
+        return None
+    declaration = _XML_DECLARATION.match(decoded)
+    if decoded.startswith("<?xml"):
+        if declaration is None:
+            return None
+    elif "<?xml" in decoded:
+        return None
+    normalized = unicodedata.normalize("NFC", decoded)
+    lowered = normalized.casefold()
+    if "<!doctype" in lowered or "<!entity" in lowered:
+        return None
+    normalized_bytes = normalized.encode("utf-8")
+    depth = 0
+    nodes = 0
+    text_characters = 0
+    root_seen = False
+    try:
+        for event, element in ElementTree.iterparse(
+            BytesIO(normalized_bytes),
+            events=("start", "end"),
+        ):
+            if event == "start":
+                nodes += 1
+                depth += 1
+                if nodes > maximum_nodes or depth > _MAX_XML_DEPTH:
+                    return None
+                if not root_seen:
+                    root_seen = True
+                    if element.tag != expected_tag:
+                        return None
+            else:
+                text_characters += len(element.text or "") + len(element.tail or "")
+                if text_characters > _MAX_XML_TEXT_CHARS:
+                    return None
+                depth -= 1
+                element.clear()
+    except ElementTree.ParseError:
+        return None
+    if not root_seen or depth != 0:
+        return None
+    return normalized_bytes
+
+
+def _safe_xml_root(
+    content: bytes,
+    expected_tag: str,
+    *,
+    maximum_nodes: int = _MAX_XML_NODES,
+) -> ElementTree.Element | None:
+    normalized = _hardened_xml_bytes(
+        content,
+        expected_tag,
+        maximum_nodes=maximum_nodes,
+    )
+    return None if normalized is None else ElementTree.fromstring(normalized)
+
+
+def _xlsx_xml_root(name: str) -> str | None:
+    if name == "[Content_Types].xml":
+        return f"{{{_CONTENT_TYPES_NAMESPACE}}}Types"
+    if name.endswith(".rels"):
+        return f"{{{_RELATIONSHIPS_NAMESPACE}}}Relationships"
+    if name == "docProps/app.xml":
+        return f"{{{_EXTENDED_PROPERTIES_NAMESPACE}}}Properties"
+    if name == "docProps/core.xml":
+        return f"{{{_CORE_PROPERTIES_NAMESPACE}}}coreProperties"
+    if name == "xl/workbook.xml":
+        return f"{{{_WORKSHEET_NAMESPACE}}}workbook"
+    if name == "xl/styles.xml":
+        return f"{{{_WORKSHEET_NAMESPACE}}}styleSheet"
+    if name == "xl/sharedStrings.xml":
+        return f"{{{_WORKSHEET_NAMESPACE}}}sst"
+    if name == "xl/calcChain.xml":
+        return f"{{{_WORKSHEET_NAMESPACE}}}calcChain"
+    if re.fullmatch(r"xl/worksheets/sheet[1-9][0-9]*\.xml", name):
+        return f"{{{_WORKSHEET_NAMESPACE}}}worksheet"
+    if re.fullmatch(r"xl/theme/theme[1-9][0-9]*\.xml", name):
+        return f"{{{_DRAWING_NAMESPACE}}}theme"
+    return None
 
 
 def _content_types_are_safe(content: bytes, names: set[str]) -> bool:
@@ -509,7 +631,7 @@ def _safe_relationship_targets(
         identifier = relationship.attrib["Id"]
         relationship_type = relationship.attrib["Type"]
         if (
-            not identifier
+            _XML_ID.fullmatch(identifier) is None
             or len(identifier) > 120
             or identifier in identifiers
             or relationship_type not in _SAFE_RELATIONSHIP_TYPES
@@ -545,11 +667,13 @@ def _worksheet_bounds(
     content: bytes,
     limits: OrganizationSourceLimits,
 ) -> tuple[int, int, int, int, int] | None:
-    if (
-        len(content) > _MAX_XML_BYTES
-        or b"<!doctype" in content.lower()
-        or b"<!entity" in content.lower()
-    ):
+    maximum_nodes = (limits.max_records + 1) * (_MAX_XLSX_COLUMNS + 2) + 4_096
+    normalized = _hardened_xml_bytes(
+        content,
+        f"{{{_WORKSHEET_NAMESPACE}}}worksheet",
+        maximum_nodes=maximum_nodes,
+    )
+    if normalized is None:
         return None
     dimension: tuple[int, int, int, int] | None = None
     active_row: int | None = None
@@ -559,13 +683,21 @@ def _worksheet_bounds(
     rows: list[tuple[int, int, int, int]] = []
     node_count = 0
     cell_count = 0
-    maximum_nodes = (limits.max_records + 1) * (_MAX_XLSX_COLUMNS + 2) + 4_096
     root_seen = False
-    for event, element in ElementTree.iterparse(BytesIO(content), events=("start", "end")):
+    for event, element in ElementTree.iterparse(BytesIO(normalized), events=("start", "end")):
         if event == "start":
             node_count += 1
             if node_count > maximum_nodes:
                 raise _reject("source_too_large")
+            if not isinstance(element.tag, str):
+                return None
+            local_name = element.tag.rsplit("}", 1)[-1]
+            if local_name == "f":
+                return None
+            if element.tag != f"{{{_WORKSHEET_NAMESPACE}}}{local_name}":
+                return None
+            if local_name not in _WORKSHEET_ELEMENTS:
+                return None
             if not root_seen:
                 root_seen = True
                 if element.tag != f"{{{_WORKSHEET_NAMESPACE}}}worksheet":
@@ -587,8 +719,6 @@ def _worksheet_bounds(
                 if max_row - min_row + 1 > limits.max_records + 1:
                     raise _reject("source_too_large")
                 dimension = (min_row, max_row, min_column, max_column)
-            elif element.tag == f"{{{_WORKSHEET_NAMESPACE}}}f":
-                return None
             elif element.tag == f"{{{_WORKSHEET_NAMESPACE}}}row":
                 if active_row is not None or set(element.attrib) - {"r", "spans"}:
                     return None
@@ -697,14 +827,31 @@ def _inspect_xlsx_archive(
             }
             if not required.issubset(names):
                 return None
-            if not _content_types_are_safe(archive.read("[Content_Types].xml"), names):
+            xml_parts: dict[str, bytes] = {}
+            worksheet_nodes = (limits.max_records + 1) * (_MAX_XLSX_COLUMNS + 2) + 4_096
+            for name in names:
+                expected_root = _xlsx_xml_root(name)
+                if expected_root is None:
+                    return None
+                maximum_nodes = (
+                    worksheet_nodes if name.startswith("xl/worksheets/") else _MAX_XML_NODES
+                )
+                normalized = _hardened_xml_bytes(
+                    archive.read(name),
+                    expected_root,
+                    maximum_nodes=maximum_nodes,
+                )
+                if normalized is None:
+                    return None
+                xml_parts[name] = normalized
+            if not _content_types_are_safe(xml_parts["[Content_Types].xml"], names):
                 return None
 
             edges: dict[str, tuple[str, ...]] = {}
             for name in names:
                 if not name.endswith(".rels"):
                     continue
-                relationship = _safe_relationship_targets(name, archive.read(name), names)
+                relationship = _safe_relationship_targets(name, xml_parts[name], names)
                 if relationship is None:
                     return None
                 source, targets = relationship
@@ -732,7 +879,7 @@ def _inspect_xlsx_archive(
             for name in sorted(names):
                 if not re.fullmatch(r"xl/worksheets/sheet[1-9][0-9]*\.xml", name):
                     continue
-                sheet_bounds = _worksheet_bounds(archive.read(name), limits)
+                sheet_bounds = _worksheet_bounds(xml_parts[name], limits)
                 if sheet_bounds is None:
                     return None
                 bounds[name] = sheet_bounds
@@ -843,12 +990,16 @@ def _pdf_has_forbidden_objects(root: Any, limits: OrganizationSourceLimits) -> b
     visited = 0
     while pending:
         current = pending.pop()
+        visited += 1
+        if visited > _MAX_PDF_OBJECTS:
+            return True
         if isinstance(current, IndirectObject):
             key = (current.idnum, current.generation)
             if key in seen_indirect:
                 continue
             seen_indirect.add(key)
-            current = current.get_object()
+            pending.append(current.get_object())
+            continue
         if isinstance(current, (str, bytes)):
             if _pdf_value_is_unsafe(current, limits):
                 return True
@@ -858,31 +1009,67 @@ def _pdf_has_forbidden_objects(root: Any, limits: OrganizationSourceLimits) -> b
             if direct_id in seen_direct:
                 continue
             seen_direct.add(direct_id)
-            visited += 1
-            if visited > _MAX_PDF_OBJECTS:
-                return True
         if isinstance(current, Mapping):
             if any(str(key) in _FORBIDDEN_PDF_KEYS for key in current):
                 return True
-            pending.extend(current.values())
+            for key, value in current.items():
+                pending.extend((key, value))
         elif isinstance(current, (list, tuple, ArrayObject)):
             pending.extend(current)
     return False
 
 
 def _pdf_content_streams(page: Any) -> tuple[StreamObject, ...] | None:
-    if "/Contents" not in page:
-        return ()
-    pending: list[Any] = [page.raw_get("/Contents")]
+    pending: list[tuple[str, Any]] = []
+    if "/Contents" in page:
+        pending.append(("contents", page.raw_get("/Contents")))
+    if "/Resources" in page:
+        pending.append(("resources", page.raw_get("/Resources")))
     streams: list[StreamObject] = []
+    seen_indirect: set[tuple[int, int]] = set()
+    seen_direct: set[int] = set()
+    traversed = 0
     while pending:
-        current = pending.pop()
+        kind, current = pending.pop()
+        traversed += 1
+        if traversed > _MAX_PDF_OBJECTS:
+            return None
         if isinstance(current, IndirectObject):
-            current = current.get_object()
-        if isinstance(current, StreamObject):
+            key = (current.idnum, current.generation)
+            if key in seen_indirect:
+                return None
+            seen_indirect.add(key)
+            pending.append((kind, current.get_object()))
+            continue
+        if isinstance(current, (DictionaryObject, ArrayObject)):
+            direct_id = id(current)
+            if direct_id in seen_direct:
+                return None
+            seen_direct.add(direct_id)
+        if kind == "contents":
+            if isinstance(current, StreamObject):
+                streams.append(current)
+            elif isinstance(current, ArrayObject):
+                pending.extend(("contents", item) for item in reversed(current))
+            else:
+                return None
+        elif kind == "resources":
+            if not isinstance(current, DictionaryObject):
+                return None
+            if "/XObject" in current:
+                pending.append(("xobjects", current.raw_get("/XObject")))
+        elif kind == "xobjects":
+            if not isinstance(current, DictionaryObject):
+                return None
+            pending.extend(("xobject", current.raw_get(key)) for key in current)
+        elif kind == "xobject":
+            if not isinstance(current, StreamObject):
+                return None
+            if str(current.get("/Subtype", "")) != "/Form":
+                continue
             streams.append(current)
-        elif isinstance(current, ArrayObject):
-            pending.extend(reversed(current))
+            if "/Resources" in current:
+                pending.append(("resources", current.raw_get("/Resources")))
         else:
             return None
     return tuple(streams)
@@ -991,10 +1178,22 @@ def _parse_pdf(content: bytes, limits: OrganizationSourceLimits) -> tuple[Source
     _preflight_pdf_content(reader, limits)
 
     records: list[SourceRecord] = []
+    provider_text = 0
     normalized_text = 0
     maximum_text = limits.max_records * limits.max_cell_chars
+
+    def count_provider_text(text: str, *_args: Any) -> None:
+        nonlocal provider_text
+        normalized = re.sub(r"\s+", " ", unicodedata.normalize("NFC", text)).strip()
+        provider_text += len(normalized)
+        if provider_text > maximum_text:
+            raise _PdfTextLimitReached
+
     for page_number, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
+        try:
+            text = page.extract_text(visitor_text=count_provider_text) or ""
+        except _PdfTextLimitReached:
+            raise _reject("source_too_large") from None
         fragment_number = 0
         for line in StringIO(text):
             safe_line = re.sub(r"\s+", " ", unicodedata.normalize("NFC", line)).strip()

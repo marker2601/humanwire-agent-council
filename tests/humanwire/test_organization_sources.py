@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import stat
+import subprocess
+import sys
 from io import BytesIO
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
@@ -10,7 +12,15 @@ from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 import pytest
 from openpyxl import Workbook
 from pypdf import PdfWriter
-from pypdf.generic import ArrayObject, DecodedStreamObject, DictionaryObject, NameObject
+from pypdf._page import PageObject
+from pypdf.generic import (
+    ArrayObject,
+    DecodedStreamObject,
+    DictionaryObject,
+    NameObject,
+    NumberObject,
+    TextStringObject,
+)
 
 from humanwire import organization_sources
 from humanwire.organization_models import SourceRecord
@@ -127,6 +137,20 @@ def relationship_xml(*, target: str, relationship_id: str = "rId999") -> bytes:
     return relationships.replace(b"</Relationships>", addition + b"</Relationships>")
 
 
+def utf16_entity_content_types() -> bytes:
+    source = (FIXTURES / "sample.xlsx").read_bytes()
+    with ZipFile(BytesIO(source)) as archive:
+        content_types = archive.read("[Content_Types].xml").decode()
+    hostile = content_types.replace(
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
+        '<?xml version="1.0" encoding="UTF-16"?>'
+        '<!DOCTYPE Types [<!ENTITY extension "xml">]>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
+        1,
+    ).replace('Extension="xml"', 'Extension="&extension;"', 1)
+    return hostile.encode("utf-16")
+
+
 def multi_sheet_xlsx() -> bytes:
     workbook = Workbook()
     first = workbook.active
@@ -187,6 +211,54 @@ def pdf_with_form() -> bytes:
     writer.add_blank_page(width=72, height=72)
     form = DictionaryObject({NameObject("/Fields"): ArrayObject()})
     writer._root_object[NameObject("/AcroForm")] = writer._add_object(form)
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
+def pdf_with_cyclic_contents() -> bytes:
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=72, height=72)
+    contents = ArrayObject()
+    contents_reference = writer._add_object(contents)
+    contents.append(contents_reference)
+    page[NameObject("/Contents")] = contents_reference
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
+def pdf_with_nested_form(decoded_size: int) -> bytes:
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=72, height=72)
+
+    form = DecodedStreamObject()
+    form.set_data(b" " * decoded_size)
+    form[NameObject("/Type")] = NameObject("/XObject")
+    form[NameObject("/Subtype")] = NameObject("/Form")
+    form[NameObject("/BBox")] = ArrayObject(
+        [NumberObject(0), NumberObject(0), NumberObject(72), NumberObject(72)]
+    )
+    form[NameObject("/Resources")] = DictionaryObject()
+    form_reference = writer._add_object(form.flate_encode())
+    page[NameObject("/Resources")] = DictionaryObject(
+        {NameObject("/XObject"): DictionaryObject({NameObject("/Fm1"): form_reference})}
+    )
+
+    content = DecodedStreamObject()
+    content.set_data(b"q /Fm1 Do Q")
+    page[NameObject("/Contents")] = writer._add_object(content)
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
+def pdf_with_many_safe_strings(count: int) -> bytes:
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer._root_object[NameObject("/SafeValues")] = ArrayObject(
+        TextStringObject("safe") for _ in range(count)
+    )
     output = BytesIO()
     writer.write(output)
     return output.getvalue()
@@ -355,6 +427,37 @@ def test_xlsx_formula_outside_declared_dimension_is_rejected() -> None:
         parse_organization_source(source_request("sample.xlsx", content=hostile))
 
 
+@pytest.mark.parametrize(
+    "formula_xml",
+    [
+        b'<evil:f xmlns:evil="urn:evil">1+1</evil:f>',
+        b'<f t="shared" si="0">1+1</f>',
+        b'<f t="array" ref="A2:A2">1+1</f>',
+        b'<f t="dataTable" ref="A2:A2">1+1</f>',
+    ],
+)
+def test_xlsx_rejects_formula_local_name_in_every_namespace_and_form(
+    formula_xml: bytes,
+) -> None:
+    hostile = rewrite_sheet_xml(
+        b"<is><t>person:ada</t></is>",
+        b"<is><t>person:ada</t></is>" + formula_xml,
+    )
+
+    with pytest.raises(OrganizationSourceRejected, match="^source_unsafe$"):
+        parse_organization_source(source_request("sample.xlsx", content=hostile))
+
+
+def test_xlsx_rejects_foreign_worksheet_namespace_elements() -> None:
+    hostile = rewrite_sheet_xml(
+        b"<is><t>person:ada</t></is>",
+        b'<is><t>person:ada</t></is><evil:payload xmlns:evil="urn:evil">safe</evil:payload>',
+    )
+
+    with pytest.raises(OrganizationSourceRejected, match="^source_unsafe$"):
+        parse_organization_source(source_request("sample.xlsx", content=hostile))
+
+
 @pytest.mark.parametrize("dimension", [b"A1:XFD1048576", b"A1:IW3"])
 def test_xlsx_unsafe_dimensions_are_rejected_before_openpyxl(
     dimension: bytes,
@@ -474,6 +577,28 @@ def test_xlsx_rejects_ambiguous_members_and_malformed_package_graph(hostile: byt
         parse_organization_source(source_request("sample.xlsx", content=hostile))
 
 
+def test_xlsx_rejects_utf16_entity_content_types() -> None:
+    hostile = rewrite_xlsx(replacements={"[Content_Types].xml": utf16_entity_content_types()})
+
+    with pytest.raises(OrganizationSourceRejected, match="^source_unsafe$"):
+        parse_organization_source(source_request("sample.xlsx", content=hostile))
+
+
+@pytest.mark.parametrize("relationship_id", ["1invalid", "bad id", "bad:id"])
+def test_xlsx_rejects_non_xml_relationship_ids(relationship_id: str) -> None:
+    hostile = rewrite_xlsx(
+        replacements={
+            "xl/_rels/workbook.xml.rels": relationship_xml(
+                target="worksheets/sheet1.xml",
+                relationship_id=relationship_id,
+            )
+        }
+    )
+
+    with pytest.raises(OrganizationSourceRejected, match="^source_unsafe$"):
+        parse_organization_source(source_request("sample.xlsx", content=hostile))
+
+
 @pytest.mark.parametrize(
     "content",
     [
@@ -496,6 +621,74 @@ def test_pdf_rejects_cumulative_decoded_content_over_input_ceiling() -> None:
         parse_organization_source(source_request("sample.pdf", content=hostile))
 
 
+def test_pdf_rejects_cyclic_contents_without_unbounded_traversal(tmp_path: Path) -> None:
+    source = tmp_path / "cyclic.pdf"
+    source.write_bytes(pdf_with_cyclic_contents())
+    probe = """
+import sys
+from pathlib import Path
+from humanwire.organization_sources import (
+    OrganizationSourceRejected,
+    ParseOrganizationSourceRequest,
+    parse_organization_source,
+)
+content = Path(sys.argv[1]).read_bytes()
+request = ParseOrganizationSourceRequest(
+    content=content,
+    filename="cyclic.pdf",
+    content_type="application/pdf",
+    organization_id="org_01J00000000000000000000000",
+)
+try:
+    parse_organization_source(request)
+except OrganizationSourceRejected as error:
+    raise SystemExit(0 if str(error) == "source_unsafe" else 2)
+raise SystemExit(3)
+"""
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", probe, str(source)],
+            check=False,
+            timeout=2,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("cyclic PDF contents did not terminate within the traversal bound")
+
+    assert completed.returncode == 0
+
+
+def test_pdf_counts_nested_form_streams_against_decoded_budget() -> None:
+    hostile = pdf_with_nested_form(10 * 1024 * 1024 + 1)
+    assert len(hostile) < 10 * 1024 * 1024
+
+    with pytest.raises(OrganizationSourceRejected, match="^source_too_large$"):
+        parse_organization_source(source_request("sample.pdf", content=hostile))
+
+
+def test_pdf_provider_text_budget_aborts_during_chunk_extraction(monkeypatch) -> None:
+    emitted = 0
+
+    def emit_many_chunks(self, *args, visitor_text=None, **kwargs):
+        nonlocal emitted
+        for _ in range(100):
+            emitted += 1
+            if visitor_text is not None:
+                visitor_text("x" * 121, None, None, None, 12)
+        return "x" * 12_100
+
+    monkeypatch.setattr(PageObject, "extract_text", emit_many_chunks)
+
+    with pytest.raises(OrganizationSourceRejected, match="^source_too_large$"):
+        parse_organization_source(
+            source_request(
+                "sample.pdf",
+                limits=OrganizationSourceLimits(max_records=1),
+            )
+        )
+
+    assert emitted == 1
+
+
 @pytest.mark.parametrize(
     "private_value",
     [
@@ -514,6 +707,13 @@ def test_pdf_rejects_unsafe_reachable_metadata_values(private_value: str) -> Non
 def test_pdf_rejects_unsupported_form_surface() -> None:
     with pytest.raises(OrganizationSourceRejected, match="^source_unsafe$"):
         parse_organization_source(source_request("sample.pdf", content=pdf_with_form()))
+
+
+def test_pdf_object_budget_counts_safe_scalar_values() -> None:
+    hostile = pdf_with_many_safe_strings(20_001)
+
+    with pytest.raises(OrganizationSourceRejected, match="^source_unsafe$"):
+        parse_organization_source(source_request("sample.pdf", content=hostile))
 
 
 @pytest.mark.parametrize(
