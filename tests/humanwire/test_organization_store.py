@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from threading import Event
 
 import pytest
 
@@ -147,6 +148,23 @@ def make_member(decisionos, owner_context, *, uid: str, role: DecisionOSRole):
     if role is not DecisionOSRole.VIEWER:
         decisionos.update_member_role(owner_context, uid, role)
     return decisionos.load_context(invitee, owner_context.organization_id)
+
+
+def exception_graph_text(error: BaseException) -> str:
+    pending = [error]
+    seen = set()
+    rendered = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        rendered.extend((str(current), repr(current), repr(current.args)))
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return " ".join(rendered)
 
 
 def test_commit_requires_exact_reviewed_digest(setup_repositories) -> None:
@@ -652,6 +670,181 @@ def test_commit_rejects_candidate_introduced_active_member_binding(
             draft_id=saved.import_id,
             reviewed_digest=saved.semantic_digest,
         )
+
+
+def test_commit_accepts_active_ai_specialist_without_membership(
+    setup_repositories,
+) -> None:
+    repository, _decisionos, owner_context = setup_repositories
+    original = import_draft()
+    specialist = OrganizationSubject(
+        subject_id=SUBJECT_A,
+        organization_id=ORG_A,
+        kind=OrganizationSubjectKind.AI_SPECIALIST,
+        lifecycle=SubjectLifecycle.ACTIVE,
+        display_name="Finance specialist",
+        source_identity="directory/alice",
+        specialist_key="finance",
+    )
+    candidate = original.candidate.model_copy(update={"subjects": (specialist,)})
+    saved = repository.save_import_draft(
+        owner_context,
+        original.model_copy(update={"candidate": candidate}),
+    )
+
+    receipt = repository.commit_graph(
+        owner_context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+
+    committed = repository.load_graph(owner_context).subjects[0]
+    assert receipt.committed_subject_count == 1
+    assert committed.kind is OrganizationSubjectKind.AI_SPECIALIST
+    assert committed.lifecycle is SubjectLifecycle.ACTIVE
+    assert committed.member_uid is None
+
+
+@pytest.mark.parametrize(
+    "update",
+    (
+        {"member_uid": "firebase-hostile-ai"},
+        {"lifecycle": SubjectLifecycle.DIRECTORY_ONLY},
+    ),
+)
+def test_import_rejects_hostile_ai_membership_or_lifecycle(
+    setup_repositories,
+    update,
+) -> None:
+    repository, _decisionos, owner_context = setup_repositories
+    original = import_draft()
+    specialist = OrganizationSubject(
+        subject_id=SUBJECT_A,
+        organization_id=ORG_A,
+        kind=OrganizationSubjectKind.AI_SPECIALIST,
+        lifecycle=SubjectLifecycle.ACTIVE,
+        display_name="Finance specialist",
+        source_identity="directory/alice",
+        specialist_key="finance",
+    ).model_copy(update=update)
+    forged = original.model_copy(
+        update={"candidate": original.candidate.model_copy(update={"subjects": (specialist,)})}
+    )
+
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        repository.save_import_draft(owner_context, forged)
+
+
+def test_removal_clock_failure_rolls_back_graph_membership_and_retry(
+    setup_repositories,
+) -> None:
+    repository, decisionos, owner_context = setup_repositories
+    member_context = _commit_and_bind(
+        repository,
+        decisionos,
+        owner_context,
+        uid="firebase-alice-01",
+    )
+    removal = repository.save_import_draft(
+        owner_context,
+        import_draft(
+            import_id=IMPORT_B,
+            digest=DIGEST_B,
+            base_version=2,
+            include_person=False,
+        ),
+    )
+    graph_before = repository.load_graph(owner_context)
+    org_audit_before = repository.list_audit(owner_context)
+    member_audit_before = decisionos.list_audit(owner_context)
+
+    def failing_clock() -> datetime:
+        raise RuntimeError(PRIVATE_VALUE)
+
+    decisionos._clock = failing_clock
+    with pytest.raises(ImportUnavailable) as captured:
+        repository.commit_graph(
+            owner_context,
+            draft_id=removal.import_id,
+            reviewed_digest=removal.semantic_digest,
+        )
+
+    assert PRIVATE_VALUE not in exception_graph_text(captured.value)
+    assert repository.load_graph(owner_context) == graph_before
+    assert repository.list_audit(owner_context) == org_audit_before
+    assert decisionos.list_audit(owner_context) == member_audit_before
+    assert decisionos.load_context(member_context.principal, ORG_A) == member_context
+
+    decisionos._clock = lambda: NOW
+    receipt = repository.commit_graph(
+        owner_context,
+        draft_id=removal.import_id,
+        reviewed_digest=removal.semantic_digest,
+    )
+
+    assert receipt.graph_version == 3
+    assert repository.load_graph(owner_context).version == 3
+    assert len(repository.list_audit(owner_context)) == len(org_audit_before) + 1
+    suspended = tuple(
+        event
+        for event in decisionos.list_audit(owner_context)
+        if event.event_name == "member_suspended"
+        and event.target_uid == member_context.principal.uid
+    )
+    assert len(suspended) == 1
+
+
+def test_removal_serializes_membership_version_until_no_fail_publish(
+    setup_repositories,
+) -> None:
+    repository, decisionos, owner_context = setup_repositories
+    member_context = _commit_and_bind(
+        repository,
+        decisionos,
+        owner_context,
+        uid="firebase-alice-01",
+    )
+    removal = repository.save_import_draft(
+        owner_context,
+        import_draft(
+            import_id=IMPORT_B,
+            digest=DIGEST_B,
+            base_version=2,
+            include_person=False,
+        ),
+    )
+    clock_entered = Event()
+    release_clock = Event()
+
+    def blocking_clock() -> datetime:
+        clock_entered.set()
+        assert release_clock.wait(timeout=5)
+        return NOW
+
+    decisionos._clock = blocking_clock
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        removal_future = executor.submit(
+            repository.commit_graph,
+            owner_context,
+            draft_id=removal.import_id,
+            reviewed_digest=removal.semantic_digest,
+        )
+        assert clock_entered.wait(timeout=5)
+        role_future = executor.submit(
+            decisionos.update_member_role,
+            owner_context,
+            member_context.principal.uid,
+            DecisionOSRole.CONTRIBUTOR,
+        )
+        assert not role_future.done()
+        release_clock.set()
+        receipt = removal_future.result(timeout=5)
+        with pytest.raises(MembershipUnavailable):
+            role_future.result(timeout=5)
+
+    assert receipt.graph_version == 3
+    with pytest.raises(OrganizationUnavailable):
+        decisionos.load_context(member_context.principal, ORG_A)
 
 
 def test_commit_carries_only_a_fresh_active_trusted_binding(setup_repositories) -> None:

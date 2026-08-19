@@ -273,7 +273,10 @@ def _committed_graph(
     carried_member_uids: set[str] = set()
     removed_member_uids: set[str] = set()
     for candidate in draft.candidate.subjects:
-        if candidate.lifecycle is SubjectLifecycle.ACTIVE or candidate.member_uid is not None:
+        if candidate.member_uid is not None or (
+            candidate.kind is OrganizationSubjectKind.HUMAN
+            and candidate.lifecycle is SubjectLifecycle.ACTIVE
+        ):
             raise OrganizationGraphInvalid()
         if candidate.source_identity is not None:
             present_sources.add(candidate.source_identity)
@@ -472,6 +475,7 @@ class InMemoryOrganizationGraphRepository:
                 committed_at=now,
             )
             event = _commit_event(current, prior.version, receipt, now)
+
             def persist(_transaction) -> None:
                 self._graphs[(current.organization_id, graph.version)] = graph
                 self._current_versions[current.organization_id] = graph.version
@@ -479,6 +483,7 @@ class InMemoryOrganizationGraphRepository:
                 self._audit.setdefault(current.organization_id, []).append(event)
 
             membership_invalid = False
+            provider_failed = False
             try:
                 self._decisionos.apply_organization_graph_membership_change(
                     current,
@@ -488,8 +493,14 @@ class InMemoryOrganizationGraphRepository:
                 )
             except MembershipUnavailable:
                 membership_invalid = True
+            except DecisionOSStoreError:
+                raise
+            except Exception:  # noqa: BLE001 - injected/provider failures are sealed
+                provider_failed = True
             if membership_invalid:
                 raise OrganizationGraphInvalid() from None
+            if provider_failed:
+                raise ImportUnavailable() from None
             return receipt
 
     def load_graph(self, context: DecisionOSContext) -> OrganizationGraph:
@@ -683,6 +694,26 @@ def _payload_digest(value: Any) -> str:
     return hashlib.sha256(to_json(value)).hexdigest()
 
 
+def _firestore_document_bytes(value: dict[str, Any]) -> int:
+    failed = False
+    size = 0
+    try:
+        from google.cloud.firestore_v1 import _helpers
+        from google.cloud.firestore_v1.types import Document
+
+        size = Document(fields=_helpers.encode_dict(value))._pb.ByteSize()
+    except Exception:  # noqa: BLE001 - serializer failures are fixed-safe
+        failed = True
+    if failed:
+        raise ImportUnavailable() from None
+    return size
+
+
+def _require_document_bound(value: dict[str, Any]) -> None:
+    if _firestore_document_bytes(value) > _MAX_DOCUMENT_BYTES:
+        raise ImportUnavailable()
+
+
 def _bounded_chunks(
     *,
     organization_id: str,
@@ -739,8 +770,7 @@ def _chunk_document(
         "digest": _payload_digest(items),
         "items": tuple(items),
     }
-    if len(to_json(document)) > _MAX_DOCUMENT_BYTES:
-        raise ImportUnavailable()
+    _require_document_bound(document)
     return document
 
 
@@ -778,8 +808,7 @@ def _chunked_draft(draft: ImportDraft) -> tuple[dict[str, Any], dict[str, dict[s
     storage["payload_digest"] = _payload_digest(
         {key: storage[key] for key in storage if key != "payload_digest"}
     )
-    if len(to_json(storage)) > _MAX_DOCUMENT_BYTES:
-        raise ImportUnavailable()
+    _require_document_bound(storage)
     return storage, chunks
 
 
@@ -808,8 +837,7 @@ def _chunked_graph(graph: OrganizationGraph) -> tuple[dict[str, Any], dict[str, 
     storage["payload_digest"] = _payload_digest(
         {key: storage[key] for key in storage if key != "payload_digest"}
     )
-    if len(to_json(storage)) > _MAX_DOCUMENT_BYTES:
-        raise ImportUnavailable()
+    _require_document_bound(storage)
     return storage, chunks
 
 
@@ -1039,6 +1067,8 @@ class FirestoreOrganizationGraphRepository:
                 prior_row,
                 transaction=transaction,
             )
+            if current_version and prior_storage["payload_digest"] != _state["payload_digest"]:
+                raise ImportUnavailable()
             if draft.base_graph_version != current_version:
                 raise GraphVersionConflict()
             now = _aware(self._clock())
@@ -1457,7 +1487,10 @@ class FirestoreOrganizationGraphRepository:
                 }:
                     raise ImportUnavailable()
                 expected_id = f"{kind}_{expected_index:05d}"
-                if descriptor.get("chunk_id") != expected_id:
+                if (
+                    descriptor.get("chunk_id") != expected_id
+                    or descriptor.get("index") != expected_index
+                ):
                     raise ImportUnavailable()
                 row = owner_ref.collection("chunks").document(expected_id).get(
                     transaction=transaction
@@ -1477,7 +1510,7 @@ class FirestoreOrganizationGraphRepository:
                     or not isinstance(chunk.get("items"), (list, tuple))
                     or len(chunk["items"]) != chunk["count"]
                     or _payload_digest(chunk["items"]) != chunk["digest"]
-                    or len(to_json(chunk)) > _MAX_DOCUMENT_BYTES
+                    or _firestore_document_bytes(chunk) > _MAX_DOCUMENT_BYTES
                 ):
                     raise ImportUnavailable()
                 items.extend(chunk["items"])
@@ -1528,6 +1561,7 @@ class FirestoreOrganizationGraphRepository:
             and receipt.source_snapshot_id == draft.source_snapshot.snapshot_id
             and receipt.source_snapshot_digest == draft.source_snapshot.semantic_digest
             and receipt.graph_version == draft.base_graph_version + 1
+            and receipt.committed_subject_count == len(draft.candidate.subjects)
         )
 
     def _membership_change_transaction(

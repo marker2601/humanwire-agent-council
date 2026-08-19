@@ -3,9 +3,12 @@ from __future__ import annotations
 import os
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from uuid import uuid4
 
 import pytest
+from google.cloud.firestore_v1 import _helpers as firestore_helpers
+from google.cloud.firestore_v1.types import Document as FirestoreDocument
 from pydantic_core import to_json
 
 from humanwire.decisionos_models import (
@@ -50,6 +53,14 @@ OWNER = DecisionOSPrincipal(
 )
 
 
+def actual_document_bytes(data) -> int:
+    return FirestoreDocument(fields=firestore_helpers.encode_dict(data))._pb.ByteSize()
+
+
+def independent_digest(data) -> str:
+    return sha256(to_json(data)).hexdigest()
+
+
 class FakeSnapshot:
     def __init__(self, reference, data):
         self.reference = reference
@@ -78,12 +89,11 @@ class FakeQuery:
         return self
 
     def stream(self, transaction=None):
-        del transaction
         if self.client.failure is not None:
             raise RuntimeError(self.client.failure)
         rows = []
         for path in sorted(self.paths):
-            data = self.client.data.get(path)
+            data = transaction._get(path) if transaction is not None else self.client.data.get(path)
             if data is None:
                 continue
             if all(data.get(field) == value for field, value in self.filters):
@@ -126,19 +136,30 @@ class FakeDocument:
         return FakeCollection(self.client, (*self.path, name))
 
     def get(self, transaction=None):
-        del transaction
         if self.client.failure is not None:
             raise RuntimeError(self.client.failure)
-        return FakeSnapshot(self, self.client.data.get(self.path))
+        data = (
+            transaction._get(self.path)
+            if transaction is not None
+            else self.client.data.get(self.path)
+        )
+        return FakeSnapshot(self, data)
 
 
 class FakeTransaction:
     def __init__(self, client):
         self.client = client
         self.write_count = 0
+        self.staged = {}
+
+    def _get(self, path):
+        if path in self.staged:
+            return deepcopy(self.staged[path])
+        return deepcopy(self.client.data.get(path))
 
     def _write(self, reference, data):
-        encoded_size = len(to_json(data))
+        self.client.provider_mutation_attempts += 1
+        encoded_size = actual_document_bytes(data)
         if encoded_size > self.client.max_document_bytes:
             raise AssertionError(f"document exceeds bound: {encoded_size}")
         self.write_count += 1
@@ -148,10 +169,10 @@ class FakeTransaction:
             self.client.max_observed_document_bytes,
             encoded_size,
         )
-        self.client.data[reference.path] = deepcopy(data)
+        self.staged[reference.path] = deepcopy(data)
 
     def create(self, reference, data):
-        if reference.path in self.client.data:
+        if self._get(reference.path) is not None:
             raise RuntimeError("document already exists")
         self._write(reference, data)
 
@@ -159,15 +180,31 @@ class FakeTransaction:
         self._write(reference, data)
 
     def update(self, reference, data):
-        current = deepcopy(self.client.data.get(reference.path, {}))
+        current = self._get(reference.path) or {}
         current.update(deepcopy(data))
         self._write(reference, current)
 
     def delete(self, reference):
+        self.client.provider_mutation_attempts += 1
         self.write_count += 1
         if self.write_count > self.client.max_transaction_writes:
             raise AssertionError(f"transaction exceeds write bound: {self.write_count}")
-        self.client.data.pop(reference.path, None)
+        self.staged[reference.path] = None
+
+    def commit(self):
+        if self.client.abort_next_transaction:
+            self.client.abort_next_transaction = False
+            self.staged.clear()
+            raise RuntimeError(PRIVATE)
+        for path, data in self.staged.items():
+            if data is None:
+                self.client.data.pop(path, None)
+            else:
+                self.client.data[path] = deepcopy(data)
+        self.staged.clear()
+
+    def rollback(self):
+        self.staged.clear()
 
 
 class FakeClient:
@@ -177,6 +214,8 @@ class FakeClient:
         self.max_document_bytes = 450_000
         self.max_transaction_writes = 450
         self.max_observed_document_bytes = 0
+        self.provider_mutation_attempts = 0
+        self.abort_next_transaction = False
         self.transactions = []
 
     def collection(self, name):
@@ -198,7 +237,19 @@ class FakeClient:
 def fake_firestore(monkeypatch):
     from google.cloud import firestore
 
-    monkeypatch.setattr(firestore, "transactional", lambda function: function)
+    def transactional(function):
+        def invoke(transaction):
+            try:
+                result = function(transaction)
+                transaction.commit()
+                return result
+            except Exception:
+                transaction.rollback()
+                raise
+
+        return invoke
+
+    monkeypatch.setattr(firestore, "transactional", transactional)
     client = FakeClient()
     client.data[(COLLECTION, ORG)] = DecisionOrganization(
         organization_id=ORG,
@@ -389,7 +440,7 @@ def large_draft() -> ImportDraft:
             record_id=f"rec_{_numeric_ulid(index)}",
             source_ordinal=index,
             source_identity=f"directory/person-{index}",
-            fields=(("name", f"Person {index}"),),
+            fields=(("name", f"Person {index} Ω"),),
         )
         for index in range(1, 5_001)
     )
@@ -447,6 +498,137 @@ def test_firestore_chunks_five_thousand_record_draft_and_graph_within_bounds(
         transaction.write_count <= client.max_transaction_writes
         for transaction in client.transactions
     )
+
+
+def test_firestore_preflights_actual_protobuf_size_before_provider_mutation(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    original = draft()
+    adversarial_record = original.source_snapshot.records[0].model_copy(
+        update={"fields": tuple((f"f{index}", "x") for index in range(22_000))}
+    )
+    adversarial = original.model_copy(
+        update={
+            "source_snapshot": original.source_snapshot.model_copy(
+                update={"records": (adversarial_record,)}
+            )
+        }
+    )
+    client.provider_mutation_attempts = 0
+
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        repository.save_import_draft(context, adversarial)
+
+    assert client.provider_mutation_attempts == 0
+    assert not any(path[-1] == adversarial.import_id for path in client.data)
+
+
+def test_firestore_rejects_manifest_descriptor_index_even_with_valid_outer_digest(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    import_path = (COLLECTION, ORG, "imports", saved.import_id)
+    payload = client.data[import_path]
+    payload["manifest"]["source_records"][0]["index"] = 999
+    payload["payload_digest"] = independent_digest(
+        {key: payload[key] for key in payload if key != "payload_digest"}
+    )
+    before = deepcopy(client.data)
+
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        repository.load_import_draft(context, saved.import_id)
+
+    assert client.data == before
+
+
+def test_firestore_rejects_receipt_count_even_with_valid_outer_digest(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    import_path = (COLLECTION, ORG, "imports", saved.import_id)
+    payload = client.data[import_path]
+    payload["receipt"]["committed_subject_count"] = 999
+    payload["payload_digest"] = independent_digest(
+        {key: payload[key] for key in payload if key != "payload_digest"}
+    )
+    before = deepcopy(client.data)
+
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        repository.commit_graph(
+            context,
+            draft_id=saved.import_id,
+            reviewed_digest=saved.semantic_digest,
+        )
+
+    assert client.data == before
+
+
+def test_firestore_rejects_state_version_digest_mismatch_before_advancing(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    first = repository.save_import_draft(context, draft())
+    repository.commit_graph(
+        context,
+        draft_id=first.import_id,
+        reviewed_digest=first.semantic_digest,
+    )
+    second_source = first.source_snapshot.model_copy(update={"semantic_digest": "2" * 64})
+    second = first.model_copy(
+        update={
+            "import_id": "imp_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            "source_snapshot": second_source,
+            "base_graph_version": 1,
+            "semantic_digest": "2" * 64,
+        }
+    )
+    saved_second = repository.save_import_draft(context, second)
+    state_path = (COLLECTION, ORG, "organization_graph", "state")
+    client.data[state_path]["payload_digest"] = "3" * 64
+    before = deepcopy(client.data)
+
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        repository.commit_graph(
+            context,
+            draft_id=saved_second.import_id,
+            reviewed_digest=saved_second.semantic_digest,
+        )
+
+    assert client.data == before
+
+
+def test_firestore_transaction_abort_rolls_back_and_retries_from_precommit(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    before = deepcopy(client.data)
+    client.abort_next_transaction = True
+
+    with pytest.raises(ImportUnavailable) as captured:
+        repository.commit_graph(
+            context,
+            draft_id=saved.import_id,
+            reviewed_digest=saved.semantic_digest,
+        )
+
+    assert PRIVATE not in exception_graph_text(captured.value)
+    assert client.data == before
+    receipt = repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    assert receipt.graph_version == 1
+    assert repository.load_graph(context).version == 1
 
 
 def test_firestore_rejects_cross_bound_membership_document(fake_firestore) -> None:

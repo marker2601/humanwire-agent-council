@@ -497,16 +497,36 @@ class InMemoryDecisionOSRepository:
                 for (organization_id, uid), membership in self._memberships.items()
             ):
                 raise LastOwnerRequired()
-            mutation(None)
+            next_audit_sequence = self._audit_sequence
+            audit_events = []
+            updated_memberships = []
+            membership_snapshot = {}
             for member in active_removed:
-                updated = member.model_copy(update={"status": MembershipStatus.SUSPENDED})
-                self._memberships[(current.organization_id, member.uid)] = updated
-                self._append_audit(
-                    current.organization_id,
-                    "member_suspended",
-                    current.principal.uid,
-                    target_uid=member.uid,
+                key = (current.organization_id, member.uid)
+                membership_snapshot[key] = member
+                updated_memberships.append(
+                    (key, member.model_copy(update={"status": MembershipStatus.SUSPENDED}))
                 )
+                next_audit_sequence += 1
+                audit_events.append(
+                    DecisionOSAuditEvent(
+                        audit_id=f"audit_{next_audit_sequence:08d}",
+                        organization_id=current.organization_id,
+                        event_name="member_suspended",
+                        actor_uid=current.principal.uid,
+                        target_uid=member.uid,
+                        occurred_at=_aware(self._clock()),
+                    )
+                )
+            if any(
+                self._memberships.get(key) != value for key, value in membership_snapshot.items()
+            ):
+                raise MembershipUnavailable()
+            mutation(None)
+            for key, updated in updated_memberships:
+                self._memberships[key] = updated
+            self._audit_sequence = next_audit_sequence
+            self._audit.setdefault(current.organization_id, []).extend(audit_events)
 
     def load_workspace(
         self,
