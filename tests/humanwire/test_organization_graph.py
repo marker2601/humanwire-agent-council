@@ -395,3 +395,56 @@ def test_project_team_graph_includes_subjects_linked_by_membership_edges() -> No
 
     assert tuple(item.subject_id for item in projection.subjects) == (AVERY,)
     assert projection.edges == (membership,)
+
+
+def test_projecting_a_child_team_rebases_its_root_parent() -> None:
+    source = graph(
+        subjects=(subject(BLAIR, unit_id=PLATFORM),),
+        units=(unit(), unit(PLATFORM, parent_unit_id=PRODUCT)),
+    )
+
+    projection = project_team_graph(source, PLATFORM)
+
+    assert validate_organization_graph(source).committable is True
+    assert validate_organization_graph(projection).committable is True
+    assert projection.units[0].parent_unit_id is None
+    assert source.units[1].parent_unit_id == PRODUCT
+
+
+def test_projecting_an_external_member_normalizes_the_subject_unit() -> None:
+    membership = OrganizationEdge(
+        edge_id="edge_01K00000000000000000000000",
+        organization_id=ORG,
+        kind=OrganizationEdgeKind.MEMBER_OF,
+        source_subject_id=AVERY,
+        target_unit_id=PLATFORM,
+    )
+    source = graph(
+        subjects=(subject(unit_id=PRODUCT),),
+        units=(unit(), unit(PLATFORM, parent_unit_id=PRODUCT)),
+        edges=(membership,),
+    )
+
+    projection = project_team_graph(source, PLATFORM)
+
+    assert validate_organization_graph(source).committable is True
+    assert validate_organization_graph(projection).committable is True
+    assert projection.subjects[0].unit_id == PLATFORM
+    assert source.subjects[0].unit_id == PRODUCT
+
+
+def test_projecting_an_external_leader_normalizes_the_subject_unit() -> None:
+    source = graph(
+        subjects=(subject(unit_id=PRODUCT),),
+        units=(
+            unit(),
+            unit(PLATFORM, parent_unit_id=PRODUCT, leader_subject_id=AVERY),
+        ),
+    )
+
+    projection = project_team_graph(source, PLATFORM)
+
+    assert validate_organization_graph(source).committable is True
+    assert validate_organization_graph(projection).committable is True
+    assert projection.subjects[0].unit_id == PLATFORM
+    assert source.subjects[0].unit_id == PRODUCT

@@ -119,10 +119,22 @@ def project_team_graph(graph: OrganizationGraph, team_id: str) -> OrganizationGr
             key=lambda item: item.subject_id,
         )
     )
+    subjects = tuple(
+        subject
+        if subject.unit_id in team_unit_ids
+        else subject.model_copy(update={"unit_id": team_id})
+        for subject in subjects
+    )
     subject_ids = {subject.subject_id for subject in subjects}
     units = tuple(
         sorted(
-            (unit for unit in graph.units if unit.unit_id in team_unit_ids),
+            (
+                unit
+                if unit.unit_id != team_id
+                else unit.model_copy(update={"parent_unit_id": None})
+                for unit in graph.units
+                if unit.unit_id in team_unit_ids
+            ),
             key=lambda item: item.unit_id,
         )
     )
