@@ -505,6 +505,57 @@ def test_delivery_exception_is_durable_unknown_and_never_auto_redelivered(
     assert len(transport.deliveries) == 2
 
 
+def test_unknown_delivery_remains_token_free_and_never_resends_after_expiry(
+    activation_setup,
+) -> None:
+    clock, decisionos, graph, owner_context = activation_setup
+    transport = RecordingTransport(fail_subject_ids={ALICE})
+    request = BulkInvitationRequest(
+        subject_ids=(ALICE,),
+        role=DecisionOSRole.CONTRIBUTOR,
+        expires_in_seconds=60,
+    )
+    first = _service(activation_setup, transport).create_invitations(
+        owner_context,
+        request,
+    )
+    token = transport.deliveries[0].token.get_secret_value()
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    invitation_id = first.invitations[0].invitation_id
+    issued_version = graph.load_graph(owner_context).version
+    records_before = dict(decisionos._subject_invitations)
+    active_before = dict(decisionos._active_subject_invitations)
+    index_before = dict(decisionos._invitation_token_index)
+    audit_before = {
+        organization_id: tuple(events)
+        for organization_id, events in decisionos._audit.items()
+    }
+    identifier_sequence = decisionos._identifiers.invitation_sequence
+
+    clock.advance(timedelta(seconds=61))
+    transport.fail_subject_ids.clear()
+    restarted = _service(activation_setup, transport)
+    retried = restarted.create_invitations(owner_context, request)
+
+    assert retried.invitations[0].invitation_id == invitation_id
+    assert retried.invitations[0].status is ActivationDeliveryStatus.DELIVERY_UNKNOWN
+    assert (retried.delivered_count, retried.pending_count) == (0, 1)
+    assert len(transport.deliveries) == 1
+    assert decisionos._identifiers.invitation_sequence == identifier_sequence
+    assert decisionos._subject_invitations == records_before
+    assert decisionos._active_subject_invitations == active_before
+    assert decisionos._invitation_token_index == index_before
+    assert {
+        organization_id: tuple(events)
+        for organization_id, events in decisionos._audit.items()
+    } == audit_before
+    assert graph.load_graph(owner_context).version == issued_version
+    rendered = f"{retried!r} {retried.model_dump_json()}"
+    assert token not in rendered
+    assert digest not in rendered
+    assert PRIVATE_EMAIL not in rendered
+
+
 def test_pre_provider_failure_reissues_pending_grant_without_token_traceback(
     activation_setup,
     monkeypatch,

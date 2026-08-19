@@ -800,12 +800,17 @@ class InMemoryDecisionOSRepository:
                     ):
                         raise InvitationUnavailable()
                     if (
+                        existing.delivery_status
+                        is SubjectInvitationDeliveryState.DELIVERY_SENDING
+                    ):
+                        grants.append(_subject_grant(existing, token=None))
+                        continue
+                    if (
                         existing.expires_at > now
                         and existing.delivery_status
                         in {
                             SubjectInvitationDeliveryState.DELIVERED,
                             SubjectInvitationDeliveryState.NOT_DELIVERED,
-                            SubjectInvitationDeliveryState.DELIVERY_SENDING,
                         }
                         and existing.delivery_route_id == delivery_route_id
                     ):
@@ -1463,6 +1468,31 @@ _SUBJECT_INVITATION_FIELDS = frozenset(
     }
 )
 
+_GENERIC_INVITATION_FIELDS = frozenset(
+    {
+        "invitation_kind",
+        "invitation_id",
+        "organization_id",
+        "role",
+        "expires_at",
+        "status",
+    }
+)
+_LEGACY_GENERIC_INVITATION_FIELDS = _GENERIC_INVITATION_FIELDS - {
+    "invitation_kind"
+}
+_GENERIC_INVITATION_INDEX_FIELDS = frozenset(
+    {
+        "invitation_kind",
+        "invitation_id",
+        "organization_id",
+        "status",
+    }
+)
+_LEGACY_GENERIC_INVITATION_INDEX_FIELDS = _GENERIC_INVITATION_INDEX_FIELDS - {
+    "invitation_kind"
+}
+
 
 def _has_exact_builtin_keys(
     value: object,
@@ -1474,6 +1504,96 @@ def _has_exact_builtin_keys(
     return all(type(key) is str for key in keys) and frozenset(keys) == frozenset(
         expected
     )
+
+
+def _firestore_generic_invitation(
+    value: object,
+    *,
+    token_digest: str,
+) -> tuple[_InvitationRecord, bool]:
+    is_legacy = _has_exact_builtin_keys(
+        value,
+        _LEGACY_GENERIC_INVITATION_FIELDS,
+    )
+    if not is_legacy and not _has_exact_builtin_keys(
+        value,
+        _GENERIC_INVITATION_FIELDS,
+    ):
+        raise InvitationUnavailable()
+    if not is_legacy and (
+        type(value["invitation_kind"]) is not str
+        or value["invitation_kind"] != "generic"
+    ):
+        raise InvitationUnavailable()
+    failed = False
+    record = None
+    try:
+        record = _InvitationRecord(
+            invitation_id=value["invitation_id"],
+            organization_id=value["organization_id"],
+            role=DecisionOSRole(value["role"]),
+            token_digest=token_digest,
+            expires_at=_aware(value["expires_at"]),
+            status=value["status"],
+        )
+    except Exception:  # noqa: BLE001 - stored corruption details are sealed
+        failed = True
+    if failed or record is None:
+        raise InvitationUnavailable() from None
+    if (
+        type(value["invitation_id"]) is not str
+        or re.fullmatch(_INVITATION_ID, record.invitation_id) is None
+        or type(value["organization_id"]) is not str
+        or re.fullmatch(_ORGANIZATION_ID, record.organization_id) is None
+        or type(value["role"]) is not str
+        or record.role in {DecisionOSRole.OWNER, DecisionOSRole.ADMIN}
+        or type(value["expires_at"]) is not datetime
+        or value["expires_at"].tzinfo is None
+        or value["expires_at"].utcoffset() is None
+        or type(value["status"]) is not str
+        or record.status != "active"
+    ):
+        raise InvitationUnavailable()
+    return record, is_legacy
+
+
+def _firestore_generic_invitation_index(
+    value: object,
+) -> tuple[_InvitationTokenIndexRecord, bool]:
+    is_legacy = _has_exact_builtin_keys(
+        value,
+        _LEGACY_GENERIC_INVITATION_INDEX_FIELDS,
+    )
+    if not is_legacy and not _has_exact_builtin_keys(
+        value,
+        _GENERIC_INVITATION_INDEX_FIELDS,
+    ):
+        raise InvitationUnavailable()
+    if not is_legacy and (
+        type(value["invitation_kind"]) is not str
+        or value["invitation_kind"] != "generic"
+    ):
+        raise InvitationUnavailable()
+    try:
+        index = _InvitationTokenIndexRecord(
+            invitation_kind="generic",
+            invitation_id=value["invitation_id"],
+            organization_id=value["organization_id"],
+            subject_id=None,
+            status=value["status"],
+        )
+    except Exception:  # noqa: BLE001 - stored corruption details are sealed
+        raise InvitationUnavailable() from None
+    if (
+        type(value["invitation_id"]) is not str
+        or re.fullmatch(_INVITATION_ID, index.invitation_id) is None
+        or type(value["organization_id"]) is not str
+        or re.fullmatch(_ORGANIZATION_ID, index.organization_id) is None
+        or type(value["status"]) is not str
+        or index.status != "active"
+    ):
+        raise InvitationUnavailable()
+    return index, is_legacy
 
 
 def _firestore_subject_invitation(
@@ -1716,6 +1836,52 @@ class FirestoreDecisionOSRepository:
             raise InvitationUnavailable()
         return relation
 
+    def _generic_invitation_relation(
+        self,
+        transaction,
+        digest: str,
+        *,
+        now: datetime,
+    ) -> tuple[_InvitationRecord, Any, Any]:
+        from google.cloud.firestore_v1.base_query import FieldFilter
+
+        index_ref = self._invitation_index_ref(digest)
+        index_row = index_ref.get(transaction=transaction)
+        if not index_row.exists:
+            raise InvitationUnavailable()
+        index, legacy_index = _firestore_generic_invitation_index(
+            index_row.to_dict()
+        )
+        invitation_ref = self._invitation_ref(
+            index.organization_id,
+            index.invitation_id,
+        )
+        invitation_row = invitation_ref.get(transaction=transaction)
+        if not invitation_row.exists:
+            raise InvitationUnavailable()
+        invitation, legacy_invitation = _firestore_generic_invitation(
+            invitation_row.to_dict(),
+            token_digest=digest,
+        )
+        if (
+            legacy_index is not legacy_invitation
+            or invitation.invitation_id != index.invitation_id
+            or invitation.organization_id != index.organization_id
+            or invitation.status != index.status
+            or invitation.expires_at <= now
+        ):
+            raise InvitationUnavailable()
+        subject_relations = (
+            self._organization_ref(index.organization_id)
+            .collection("subject_invitation_state")
+            .where(filter=FieldFilter("token_digest", "==", digest))
+            .limit(1)
+            .stream(transaction=transaction)
+        )
+        if any(True for _row in subject_relations):
+            raise InvitationUnavailable()
+        return invitation, invitation_ref, index_ref
+
     def create_organization(
         self,
         principal: DecisionOSPrincipal,
@@ -1837,6 +2003,7 @@ class FirestoreDecisionOSRepository:
             transaction.create(
                 invitation_ref,
                 {
+                    "invitation_kind": "generic",
                     "invitation_id": invitation_id,
                     "organization_id": current.organization_id,
                     "role": role.value,
@@ -1847,6 +2014,7 @@ class FirestoreDecisionOSRepository:
             transaction.create(
                 index_ref,
                 {
+                    "invitation_kind": "generic",
                     "invitation_id": invitation_id,
                     "organization_id": current.organization_id,
                     "status": "active",
@@ -1877,37 +2045,18 @@ class FirestoreDecisionOSRepository:
         from google.cloud import firestore
 
         digest = _token_digest(token)
-        index_ref = self._invitation_index_ref(digest)
         now = _aware(self._clock())
 
         @firestore.transactional
         def accept(transaction):
-            index_row = index_ref.get(transaction=transaction)
-            if not index_row.exists:
-                raise InvitationUnavailable()
-            index = index_row.to_dict()
-            if (
-                index.get("status") != "active"
-                or index.get("invitation_kind") is not None
-            ):
-                raise InvitationUnavailable()
-            organization_id = index.get("organization_id")
-            invitation_id = index.get("invitation_id")
-            if type(organization_id) is not str or type(invitation_id) is not str:
-                raise InvitationUnavailable()
-            invitation_ref = self._invitation_ref(organization_id, invitation_id)
-            invitation_row = invitation_ref.get(transaction=transaction)
-            if not invitation_row.exists:
-                raise InvitationUnavailable()
-            invitation = invitation_row.to_dict()
-            expires_at = invitation.get("expires_at")
-            if (
-                invitation.get("status") != "active"
-                or invitation.get("invitation_kind") is not None
-                or not isinstance(expires_at, datetime)
-                or _aware(expires_at) <= now
-            ):
-                raise InvitationUnavailable()
+            invitation, invitation_ref, loaded_index_ref = (
+                self._generic_invitation_relation(
+                    transaction,
+                    digest,
+                    now=now,
+                )
+            )
+            organization_id = invitation.organization_id
             member_ref = self._member_ref(organization_id, principal.uid)
             existing = member_ref.get(transaction=transaction)
             if existing.exists:
@@ -1917,12 +2066,12 @@ class FirestoreDecisionOSRepository:
             membership = OrganizationMembership(
                 organization_id=organization_id,
                 uid=principal.uid,
-                role=invitation.get("role"),
+                role=invitation.role,
                 status=MembershipStatus.ACTIVE,
             )
             transaction.set(member_ref, membership.model_dump(mode="python"))
             transaction.update(invitation_ref, {"status": "accepted"})
-            transaction.update(index_ref, {"status": "accepted"})
+            transaction.update(loaded_index_ref, {"status": "accepted"})
             self._append_audit_transaction(
                 transaction,
                 organization_id,
@@ -2000,12 +2149,17 @@ class FirestoreDecisionOSRepository:
                     ):
                         raise InvitationUnavailable()
                     if (
+                        existing.delivery_status
+                        is SubjectInvitationDeliveryState.DELIVERY_SENDING
+                    ):
+                        grants.append(_subject_grant(existing, token=None))
+                        continue
+                    if (
                         existing.expires_at > now
                         and existing.delivery_status
                         in {
                             SubjectInvitationDeliveryState.DELIVERED,
                             SubjectInvitationDeliveryState.NOT_DELIVERED,
-                            SubjectInvitationDeliveryState.DELIVERY_SENDING,
                         }
                         and existing.delivery_route_id == delivery_route_id
                     ):

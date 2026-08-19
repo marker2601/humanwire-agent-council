@@ -933,6 +933,209 @@ def test_firestore_pending_delivery_reissues_but_sending_survives_restart(
         )
 
 
+def test_firestore_sending_survives_restart_and_expiry_without_any_write(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    current_time = [NOW]
+    identifiers = SequenceFirestoreIdentifiers()
+    decisionos = FirestoreDecisionOSRepository(
+        client,
+        clock=lambda: current_time[0],
+        identifiers=identifiers,
+        organization_collection=COLLECTION,
+        invitation_index_collection="test_subject_invites",
+    )
+    pending = repository.create_subject_invitations(
+        decisionos,
+        context,
+        subject_ids=(SUBJECT,),
+        role=DecisionOSRole.VIEWER,
+        expires_in=timedelta(seconds=60),
+        delivery_route_id="consented_test_route",
+    )[0]
+    sending = decisionos.begin_subject_invitation_delivery(context, pending)
+    token = pending.token.get_secret_value()
+    digest = sha256(token.encode()).hexdigest()
+    current_time[0] += timedelta(seconds=61)
+    before = deepcopy(client.data)
+    attempts_before = client.provider_mutation_attempts
+    sequence_before = identifiers.sequence
+    issued_version = repository.load_graph(context).version
+
+    restarted = FirestoreDecisionOSRepository(
+        client,
+        clock=lambda: current_time[0],
+        identifiers=identifiers,
+        organization_collection=COLLECTION,
+        invitation_index_collection="test_subject_invites",
+    )
+    retried = repository.create_subject_invitations(
+        restarted,
+        context,
+        subject_ids=(SUBJECT,),
+        role=DecisionOSRole.VIEWER,
+        expires_in=timedelta(seconds=60),
+        delivery_route_id="consented_test_route",
+    )[0]
+
+    assert retried.invitation_id == sending.invitation_id
+    assert retried.token is None
+    assert retried.delivery_status is SubjectInvitationDeliveryState.DELIVERY_SENDING
+    assert identifiers.sequence == sequence_before
+    assert client.provider_mutation_attempts == attempts_before
+    assert client.data == before
+    assert repository.load_graph(context).version == issued_version
+    assert token not in repr(retried)
+    assert digest not in repr(retried)
+
+
+@pytest.mark.parametrize("disguise_as_exact_legacy", [False, True])
+def test_firestore_generic_acceptance_rejects_subject_invitation_with_removed_kind(
+    fake_firestore,
+    disguise_as_exact_legacy,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    decisionos = FirestoreDecisionOSRepository(
+        client,
+        clock=lambda: NOW,
+        identifiers=SequenceFirestoreIdentifiers(),
+        organization_collection=COLLECTION,
+        invitation_index_collection="test_subject_invites",
+    )
+    grant = repository.create_subject_invitations(
+        decisionos,
+        context,
+        subject_ids=(SUBJECT,),
+        role=DecisionOSRole.VIEWER,
+        expires_in=timedelta(days=1),
+        delivery_route_id=None,
+    )[0]
+    token = grant.token.get_secret_value()
+    digest = sha256(token.encode()).hexdigest()
+    invitation_path = (COLLECTION, ORG, "invitations", grant.invitation_id)
+    index_path = ("test_subject_invites", digest)
+    client.data[invitation_path].pop("invitation_kind")
+    client.data[index_path].pop("invitation_kind")
+    if disguise_as_exact_legacy:
+        invitation = client.data[invitation_path]
+        client.data[invitation_path] = {
+            key: invitation[key]
+            for key in (
+                "invitation_id",
+                "organization_id",
+                "role",
+                "expires_at",
+                "status",
+            )
+        }
+        index = client.data[index_path]
+        client.data[index_path] = {
+            key: index[key]
+            for key in ("invitation_id", "organization_id", "status")
+        }
+    before = deepcopy(client.data)
+    invitee = DecisionOSPrincipal(
+        uid="firebase-corrupt-cross-kind",
+        email_verified=True,
+        provider_ids=("google.com",),
+    )
+
+    restarted = FirestoreDecisionOSRepository(
+        client,
+        clock=lambda: NOW,
+        organization_collection=COLLECTION,
+        invitation_index_collection="test_subject_invites",
+    )
+    with pytest.raises(InvitationUnavailable, match="invitation_unavailable"):
+        restarted.accept_invitation(invitee, token)
+
+    assert client.data == before
+    assert (COLLECTION, ORG, "members", invitee.uid) not in client.data
+    graph = repository.load_graph(context)
+    assert graph.version == 2
+    assert graph.subjects[0].lifecycle is SubjectLifecycle.INVITED
+    assert graph.subjects[0].member_uid is None
+
+
+def test_firestore_generic_invitation_supports_exact_new_and_historical_schemas(
+    fake_firestore,
+) -> None:
+    client, _repository, context = fake_firestore
+    identifiers = SequenceFirestoreIdentifiers()
+    decisionos = FirestoreDecisionOSRepository(
+        client,
+        clock=lambda: NOW,
+        identifiers=identifiers,
+        organization_collection=COLLECTION,
+        invitation_index_collection="test_subject_invites",
+    )
+    current = decisionos.create_invitation(
+        context,
+        role=DecisionOSRole.VIEWER,
+        expires_in=timedelta(days=1),
+    )
+    current_digest = sha256(current.token.get_secret_value().encode()).hexdigest()
+    current_invitation_path = (
+        COLLECTION,
+        ORG,
+        "invitations",
+        current.invitation_id,
+    )
+    current_index_path = ("test_subject_invites", current_digest)
+    assert client.data[current_invitation_path]["invitation_kind"] == "generic"
+    assert client.data[current_index_path]["invitation_kind"] == "generic"
+    current_invitee = DecisionOSPrincipal(
+        uid="firebase-current-generic",
+        email_verified=True,
+        provider_ids=("google.com",),
+    )
+    assert decisionos.accept_invitation(
+        current_invitee,
+        current.token.get_secret_value(),
+    ).uid == current_invitee.uid
+
+    historical = decisionos.create_invitation(
+        context,
+        role=DecisionOSRole.CONTRIBUTOR,
+        expires_in=timedelta(days=1),
+    )
+    historical_digest = sha256(
+        historical.token.get_secret_value().encode()
+    ).hexdigest()
+    historical_invitation_path = (
+        COLLECTION,
+        ORG,
+        "invitations",
+        historical.invitation_id,
+    )
+    historical_index_path = ("test_subject_invites", historical_digest)
+    client.data[historical_invitation_path].pop("invitation_kind")
+    client.data[historical_index_path].pop("invitation_kind")
+    historical_invitee = DecisionOSPrincipal(
+        uid="firebase-historical-generic",
+        email_verified=True,
+        provider_ids=("google.com",),
+    )
+
+    assert decisionos.accept_invitation(
+        historical_invitee,
+        historical.token.get_secret_value(),
+    ).uid == historical_invitee.uid
+
+
 def test_firestore_activation_transitions_survive_restart_and_corruption_fails_closed(
     fake_firestore,
 ) -> None:
