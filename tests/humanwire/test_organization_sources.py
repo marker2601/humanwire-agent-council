@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import stat
 from io import BytesIO
 from pathlib import Path
-from zipfile import ZIP_DEFLATED, ZipFile
+from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 import pytest
 from openpyxl import Workbook
 from pypdf import PdfWriter
+from pypdf.generic import ArrayObject, DecodedStreamObject, DictionaryObject, NameObject
 
 from humanwire import organization_sources
 from humanwire.organization_models import SourceRecord
@@ -86,12 +88,56 @@ def xlsx_with_formula(formula: str) -> ParseOrganizationSourceRequest:
 
 
 def xlsx_with_member(name: str, content: bytes) -> bytes:
+    return rewrite_xlsx(additions=((name, content),))
+
+
+def rewrite_xlsx(
+    *,
+    replacements: dict[str, bytes] | None = None,
+    additions: tuple[tuple[str | ZipInfo, bytes], ...] = (),
+) -> bytes:
     source = (FIXTURES / "sample.xlsx").read_bytes()
     output = BytesIO()
     with ZipFile(BytesIO(source)) as archive, ZipFile(output, "w", ZIP_DEFLATED) as target:
         for info in archive.infolist():
-            target.writestr(info, archive.read(info.filename))
-        target.writestr(name, content)
+            value = (replacements or {}).get(info.filename, archive.read(info.filename))
+            target.writestr(info, value)
+        for name, content in additions:
+            target.writestr(name, content)
+    return output.getvalue()
+
+
+def rewrite_sheet_xml(old: bytes, new: bytes) -> bytes:
+    source = (FIXTURES / "sample.xlsx").read_bytes()
+    with ZipFile(BytesIO(source)) as archive:
+        sheet = archive.read("xl/worksheets/sheet1.xml")
+    assert old in sheet
+    return rewrite_xlsx(replacements={"xl/worksheets/sheet1.xml": sheet.replace(old, new, 1)})
+
+
+def relationship_xml(*, target: str, relationship_id: str = "rId999") -> bytes:
+    source = (FIXTURES / "sample.xlsx").read_bytes()
+    with ZipFile(BytesIO(source)) as archive:
+        relationships = archive.read("xl/_rels/workbook.xml.rels")
+    addition = (
+        f'<Relationship Id="{relationship_id}" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        f'Target="{target}"/>'
+    ).encode()
+    return relationships.replace(b"</Relationships>", addition + b"</Relationships>")
+
+
+def multi_sheet_xlsx() -> bytes:
+    workbook = Workbook()
+    first = workbook.active
+    first.title = "First"
+    first.append(("source_identity", "display_name"))
+    first.append(("person:one", "Person One"))
+    second = workbook.create_sheet("Second")
+    second.append(("source_identity", "display_name"))
+    second.append(("person:two", "Person Two"))
+    output = BytesIO()
+    workbook.save(output)
     return output.getvalue()
 
 
@@ -116,6 +162,36 @@ def pdf_bytes(
     return output.getvalue()
 
 
+def pdf_with_decoded_content(size: int) -> bytes:
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=72, height=72)
+    stream = DecodedStreamObject()
+    stream.set_data(b" " * size)
+    page[NameObject("/Contents")] = writer._add_object(stream.flate_encode())
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
+def pdf_with_metadata(title: str) -> bytes:
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.add_metadata({"/Title": title})
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
+def pdf_with_form() -> bytes:
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    form = DictionaryObject({NameObject("/Fields"): ArrayObject()})
+    writer._root_object[NameObject("/AcroForm")] = writer._add_object(form)
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
 def exception_graph_text(error: BaseException) -> str:
     pending = [error]
     seen: set[int] = set()
@@ -131,6 +207,24 @@ def exception_graph_text(error: BaseException) -> str:
         if current.__context__ is not None:
             pending.append(current.__context__)
     return " ".join(rendered)
+
+
+def private_graph_text(value: object, seen: set[int] | None = None) -> str:
+    visited = set() if seen is None else seen
+    if id(value) in visited:
+        return ""
+    visited.add(id(value))
+    if isinstance(value, bytes):
+        return repr(value)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return " ".join(
+            private_graph_text(item, visited) for pair in value.items() for item in pair
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return " ".join(private_graph_text(item, visited) for item in value)
+    return repr(value)
 
 
 @pytest.mark.parametrize("fixture", ["sample.csv", "sample.json", "sample.xlsx"])
@@ -250,6 +344,48 @@ def test_xlsx_formula_is_rejected() -> None:
         parse_organization_source(xlsx_with_formula('=HYPERLINK("https://internal")'))
 
 
+def test_xlsx_formula_outside_declared_dimension_is_rejected() -> None:
+    hostile = rewrite_sheet_xml(
+        b"</sheetData>",
+        b'<row r="100"><c r="D100"><f>HYPERLINK(&quot;https://internal&quot;)</f>'
+        b"<v>1</v></c></row></sheetData>",
+    )
+
+    with pytest.raises(OrganizationSourceRejected, match="^source_unsafe$"):
+        parse_organization_source(source_request("sample.xlsx", content=hostile))
+
+
+@pytest.mark.parametrize("dimension", [b"A1:XFD1048576", b"A1:IW3"])
+def test_xlsx_unsafe_dimensions_are_rejected_before_openpyxl(
+    dimension: bytes,
+    monkeypatch,
+) -> None:
+    hostile = rewrite_sheet_xml(b"A1:C3", dimension)
+    provider_called = False
+
+    def fail_if_called(*_args, **_kwargs):
+        nonlocal provider_called
+        provider_called = True
+        raise AssertionError("unsafe worksheet reached openpyxl")
+
+    monkeypatch.setattr(organization_sources.openpyxl, "load_workbook", fail_if_called)
+
+    with pytest.raises(OrganizationSourceRejected, match="^source_unsafe$"):
+        parse_organization_source(source_request("sample.xlsx", content=hostile))
+
+    assert not provider_called
+
+
+def test_xlsx_legitimate_multi_sheet_records_keep_global_ordinals() -> None:
+    snapshot = parse_organization_source(source_request("sample.xlsx", content=multi_sheet_xlsx()))
+
+    assert [record.source_ordinal for record in snapshot.records] == [1, 2]
+    assert [record.source_identity for record in snapshot.records] == [
+        "person:one",
+        "person:two",
+    ]
+
+
 @pytest.mark.parametrize(
     ("member", "content"),
     [
@@ -295,6 +431,49 @@ def test_xlsx_rejects_zip_bombs() -> None:
         parse_organization_source(source_request("sample.xlsx", content=hostile))
 
 
+def unsafe_xlsx_archives() -> tuple[bytes, ...]:
+    symlink = ZipInfo("xl/symlink.xml")
+    symlink.create_system = 3
+    symlink.external_attr = (stat.S_IFLNK | 0o777) << 16
+    malformed_relationships = (
+        b'<NotRelationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>'
+    )
+    entity_relationships = (
+        b'<!DOCTYPE Relationships [<!ENTITY private "missing.xml">]>'
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/'
+        b'package/2006/relationships"></Relationships>'
+    )
+    wrong_content_types = (
+        b'<Types xmlns="https://private.invalid/content-types">'
+        b'<Default Extension="xml" ContentType="application/xml"/></Types>'
+    )
+    return (
+        rewrite_xlsx(additions=(("XL/WORKBOOK.XML", b"collision"),)),
+        rewrite_xlsx(additions=((symlink, b"../workbook.xml"),)),
+        rewrite_xlsx(additions=(("customXml/item1.xml", b"<private/>"),)),
+        rewrite_xlsx(additions=(("xl/oleObject1.bin", b"private"),)),
+        rewrite_xlsx(additions=(("custom/_rels/empty.rels", malformed_relationships),)),
+        rewrite_xlsx(additions=(("custom/_rels/entity.rels", entity_relationships),)),
+        rewrite_xlsx(
+            replacements={
+                "xl/_rels/workbook.xml.rels": relationship_xml(target="%2e%2e/%2e%2e/private.xml")
+            }
+        ),
+        rewrite_xlsx(
+            replacements={
+                "xl/_rels/workbook.xml.rels": relationship_xml(target="worksheets/missing.xml")
+            }
+        ),
+        rewrite_xlsx(replacements={"[Content_Types].xml": wrong_content_types}),
+    )
+
+
+@pytest.mark.parametrize("hostile", unsafe_xlsx_archives())
+def test_xlsx_rejects_ambiguous_members_and_malformed_package_graph(hostile: bytes) -> None:
+    with pytest.raises(OrganizationSourceRejected, match="^source_unsafe$"):
+        parse_organization_source(source_request("sample.xlsx", content=hostile))
+
+
 @pytest.mark.parametrize(
     "content",
     [
@@ -307,6 +486,34 @@ def test_xlsx_rejects_zip_bombs() -> None:
 def test_pdf_rejects_over_page_encrypted_embedded_and_active_files(content: bytes) -> None:
     with pytest.raises(OrganizationSourceRejected, match="^source_unsafe$"):
         parse_organization_source(source_request("sample.pdf", content=content))
+
+
+def test_pdf_rejects_cumulative_decoded_content_over_input_ceiling() -> None:
+    hostile = pdf_with_decoded_content(10 * 1024 * 1024 + 1)
+    assert len(hostile) < 10 * 1024 * 1024
+
+    with pytest.raises(OrganizationSourceRejected, match="^source_too_large$"):
+        parse_organization_source(source_request("sample.pdf", content=hostile))
+
+
+@pytest.mark.parametrize(
+    "private_value",
+    [
+        "password=PRIVATE-PDF-METADATA",
+        r"C:\Users\private\organization.pdf",
+        "powershell Invoke-Expression private-command",
+    ],
+)
+def test_pdf_rejects_unsafe_reachable_metadata_values(private_value: str) -> None:
+    with pytest.raises(OrganizationSourceRejected, match="^source_unsafe$"):
+        parse_organization_source(
+            source_request("sample.pdf", content=pdf_with_metadata(private_value))
+        )
+
+
+def test_pdf_rejects_unsupported_form_surface() -> None:
+    with pytest.raises(OrganizationSourceRejected, match="^source_unsafe$"):
+        parse_organization_source(source_request("sample.pdf", content=pdf_with_form()))
 
 
 @pytest.mark.parametrize(
@@ -351,6 +558,27 @@ def test_fixed_errors_do_not_retain_filename_path_or_parsed_values() -> None:
     }
     assert private_filename not in rendered
     assert private_value not in rendered
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+def test_fixed_errors_clear_parser_traceback_locals() -> None:
+    sentinel = "PRIVATE-TRACEBACK-LOCAL-SENTINEL"
+    request = source_request(
+        "sample.csv",
+        content=f"source_identity,display_name\nperson:one,password={sentinel}\n".encode(),
+    )
+
+    with pytest.raises(OrganizationSourceRejected, match="^source_unsafe$") as captured:
+        parse_organization_source(request)
+
+    traceback = captured.value.__traceback__
+    rendered: list[str] = []
+    while traceback is not None:
+        if Path(traceback.tb_frame.f_code.co_filename).name == "organization_sources.py":
+            rendered.append(private_graph_text(traceback.tb_frame.f_locals))
+        traceback = traceback.tb_next
+    assert sentinel not in " ".join(rendered)
     assert captured.value.__cause__ is None
     assert captured.value.__context__ is None
 
