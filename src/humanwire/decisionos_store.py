@@ -200,6 +200,13 @@ class DecisionOSRepository(Protocol):
     ) -> DecisionWorkspace:
         raise NotImplementedError
 
+    def authorize_context(
+        self,
+        context: DecisionOSContext,
+        permission: DecisionOSPermission,
+    ) -> DecisionOSContext:
+        raise NotImplementedError
+
 
 @dataclass
 class _InvitationRecord:
@@ -432,6 +439,16 @@ class InMemoryDecisionOSRepository:
                 current.principal.uid,
             )
             return workspace
+
+    def authorize_context(
+        self,
+        context: DecisionOSContext,
+        permission: DecisionOSPermission,
+    ) -> DecisionOSContext:
+        """Reload membership before granting another repository authority."""
+
+        with self._lock:
+            return self._authorize(context, permission)
 
     def load_workspace(
         self,
@@ -902,6 +919,17 @@ class FirestoreDecisionOSRepository:
             return workspace
 
         return create(self._client.transaction())
+
+    def authorize_context(
+        self,
+        context: DecisionOSContext,
+        permission: DecisionOSPermission,
+    ) -> DecisionOSContext:
+        """Reload membership before granting another repository authority."""
+
+        current = self.load_context(context.principal, context.organization_id)
+        require_permission(current, permission)
+        return current
 
     def load_workspace(
         self,
