@@ -1697,6 +1697,7 @@ class FirestoreOrganizationGraphRepository:
         if (
             set(payload) != _LINEAGE_STORAGE_FIELDS
             or not self._storage_digest_valid(payload)
+            or type(payload.get("schema_version")) is not int
             or payload.get("schema_version") != 1
             or payload.get("organization_id") != organization_id
             or payload.get("source_kind") != source_kind
@@ -1733,7 +1734,10 @@ class FirestoreOrganizationGraphRepository:
                 or snapshot_payload.get("source_kind") != source_kind
             ):
                 continue
-            if payload.get("schema_version") != 1:
+            if (
+                type(payload.get("schema_version")) is not int
+                or payload.get("schema_version") != 1
+            ):
                 raise ImportUnavailable()
             draft = self._draft_from_row(
                 row,
@@ -1776,10 +1780,11 @@ class FirestoreOrganizationGraphRepository:
     ) -> ImportDraft:
         draft = None
         try:
+            schema_version = payload.get("schema_version")
             expected_fields = {
                 1: _DRAFT_V1_STORAGE_FIELDS,
                 2: _DRAFT_V2_STORAGE_FIELDS,
-            }.get(payload.get("schema_version"))
+            }.get(schema_version) if type(schema_version) is int else None
             if (
                 expected_fields is None
                 or set(payload) != expected_fields
@@ -1898,6 +1903,7 @@ class FirestoreOrganizationGraphRepository:
                 chunk = row.to_dict()
                 if (
                     set(chunk) != _CHUNK_STORAGE_FIELDS
+                    or type(chunk.get("schema_version")) is not int
                     or chunk.get("schema_version") != 1
                     or chunk.get("organization_id") != organization_id
                     or chunk.get("owner_id") != owner_id

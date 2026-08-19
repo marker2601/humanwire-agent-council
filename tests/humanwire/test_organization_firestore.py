@@ -630,6 +630,53 @@ def test_firestore_rejects_mixed_draft_schema_shapes(
         repository.load_import_draft(context, saved.import_id)
 
 
+@pytest.mark.parametrize("invalid_schema", [True, 1.0, "1", 9])
+def test_firestore_draft_schema_requires_exact_builtin_integer(
+    fake_firestore,
+    invalid_schema,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    import_path = (COLLECTION, ORG, "imports", saved.import_id)
+    payload = client.data[import_path]
+    payload.pop("supersedes_import_id")
+    payload["schema_version"] = invalid_schema
+    payload["payload_digest"] = independent_digest(
+        {key: payload[key] for key in payload if key != "payload_digest"}
+    )
+
+    with pytest.raises(ImportUnavailable, match="^import_unavailable$"):
+        repository.load_import_draft(context, saved.import_id)
+
+
+@pytest.mark.parametrize("invalid_schema", [True, 1.0, "1", 9])
+def test_firestore_legacy_lineage_scan_rejects_nonexact_schema(
+    fake_firestore,
+    invalid_schema,
+) -> None:
+    client, repository, context = fake_firestore
+    first = repository.save_import_draft(context, draft())
+    downgrade_to_legacy_v1(client, first.import_id)
+    import_path = (COLLECTION, ORG, "imports", first.import_id)
+    payload = client.data[import_path]
+    payload["schema_version"] = invalid_schema
+    payload["payload_digest"] = independent_digest(
+        {key: payload[key] for key in payload if key != "payload_digest"}
+    )
+    correction = next_draft(
+        first,
+        import_id="imp_01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        digest="3" * 64,
+        supersedes_import_id=first.import_id,
+    )
+    before = deepcopy(client.data)
+
+    with pytest.raises(ImportUnavailable, match="^import_unavailable$"):
+        repository.save_import_draft(context, correction)
+
+    assert client.data == before
+
+
 def test_firestore_exact_committed_retry_precedes_newer_lineage(fake_firestore) -> None:
     _client, repository, context = fake_firestore
     first = repository.save_import_draft(context, draft())

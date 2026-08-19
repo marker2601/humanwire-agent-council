@@ -211,7 +211,7 @@ class OrganizationMapperWorkerSpec(BaseModel):
                 separators=(",", ":"),
                 sort_keys=True,
             )
-        except (TypeError, ValueError):
+        except (RecursionError, TypeError, ValueError):
             raise ValueError("mapper config is invalid") from None
         if (
             len(value.encode("utf-8")) > _MAX_MAPPER_CONFIG_BYTES
@@ -562,7 +562,7 @@ def _mapper_worker_spec(mapper: OrganizationMapper) -> OrganizationMapperWorkerS
                 "config_json": config_json,
             }
         )
-    except (TypeError, ValueError, ValidationError):
+    except (RecursionError, TypeError, ValueError, ValidationError):
         return None
 
 
@@ -859,6 +859,29 @@ def _validated_candidate(
         subject.source_identity in ambiguous_source_identities
         and subject.lifecycle is not SubjectLifecycle.NEEDS_REVIEW
         for subject in validated.subjects
+    ):
+        return None
+    units_by_id = {unit.unit_id: unit for unit in validated.units}
+    poisoned_unit_ids = {
+        unit.unit_id
+        for unit in validated.units
+        if unit.name in diagnostics.structurally_ambiguous_units
+    }
+    poisoned_unit_ids.update(
+        subject.unit_id
+        for subject in validated.subjects
+        if subject.unit_id is not None
+        and subject.source_identity in records
+        and _fields(records[subject.source_identity or ""]).get("unit_name")
+        in diagnostics.structurally_ambiguous_units
+    )
+    if any(
+        unit_id in units_by_id
+        and (
+            units_by_id[unit_id].parent_unit_id is not None
+            or units_by_id[unit_id].leader_subject_id is not None
+        )
+        for unit_id in poisoned_unit_ids
     ):
         return None
     for edge in validated.edges:

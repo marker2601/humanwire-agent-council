@@ -197,6 +197,29 @@ def exception_graph_text(error: BaseException) -> str:
     return " ".join(rendered)
 
 
+def exception_graph_with_traceback_locals(error: BaseException | None) -> str:
+    if error is None:
+        return ""
+    pending = [error]
+    seen = set()
+    rendered = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        rendered.extend((str(current), repr(current), repr(current.args)))
+        traceback = current.__traceback__
+        while traceback is not None:
+            rendered.extend(repr(value) for value in traceback.tb_frame.f_locals.values())
+            traceback = traceback.tb_next
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return " ".join(rendered)
+
+
 def test_draft_reconciles_every_source_row(service_setup) -> None:
     service, _repository, _decisionos, admin_context = service_setup
     draft = service.create_draft(admin_context, complete_snapshot())
@@ -836,6 +859,23 @@ class WorkerProbeMapper:
             return HugeSerializedCandidate.model_construct(**candidate.__dict__)
         if self.mode == "truncated":
             return TruncatedSerializedCandidate.model_construct(**candidate.__dict__)
+        if self.mode == "restore_structural_controls":
+            platform = next(unit for unit in candidate.units if unit.name == "Platform")
+            engineering = next(unit for unit in candidate.units if unit.name == "Engineering")
+            leader = next(
+                subject for subject in candidate.subjects if subject.unit_id == platform.unit_id
+            )
+            restored = platform.model_copy(
+                update={
+                    "leader_subject_id": leader.subject_id,
+                    "parent_unit_id": engineering.unit_id,
+                }
+            )
+            units = tuple(
+                restored if unit.unit_id == platform.unit_id else unit
+                for unit in candidate.units
+            )
+            return candidate.model_copy(update={"units": units})
         first = candidate.subjects[0].model_copy(update={"display_name": "Worker Output"})
         return candidate.model_copy(update={"subjects": (first, *candidate.subjects[1:])})
 
@@ -1022,6 +1062,47 @@ def test_mapper_spec_extraction_ignores_poisoned_instance_methods(service_setup)
     }
 
 
+def test_deep_mutated_mapper_config_falls_back_without_private_trace(
+    service_setup,
+) -> None:
+    _service, repository, _decisionos, context = service_setup
+    private_sentinel = "private-deep-mapper-config-sentinel"
+    deep_config = (
+        '{"private_sentinel":"'
+        + private_sentinel
+        + '","value":'
+        + ("[" * 4_000)
+        + "0"
+        + ("]" * 4_000)
+        + "}"
+    )
+    assert len(deep_config.encode("utf-8")) < 16_384
+    mapper = worker_spec_mapper("valid")
+    mapper._humanwire_mapper_spec.__dict__["config_json"] = deep_config
+    service = OrganizationImportService(
+        repository=repository,
+        mapper=mapper,
+        mapper_timeout_seconds=0.2,
+        clock=lambda: NOW,
+    )
+    before_processes = {process.pid for process in multiprocessing.active_children()}
+    captured = None
+    draft = None
+
+    started = time.perf_counter()
+    try:
+        draft = service.create_draft(context, complete_snapshot())
+    except BaseException as error:  # noqa: BLE001 - privacy probe inspects any escape
+        captured = error
+    elapsed = time.perf_counter() - started
+
+    assert private_sentinel not in exception_graph_with_traceback_locals(captured)
+    assert captured is None
+    assert elapsed < 1
+    assert draft is not None and len(draft.candidate.subjects) == 4
+    assert {process.pid for process in multiprocessing.active_children()} <= before_processes
+
+
 def test_spec_built_mapper_deadline_leaves_no_child_or_thread(service_setup) -> None:
     _service, repository, _decisionos, context = service_setup
     before_processes = {process.pid for process in multiprocessing.active_children()}
@@ -1074,6 +1155,29 @@ def test_mapper_worker_rejects_bounded_or_truncated_packet(service_setup, mode) 
     assert "Worker Output" not in {
         subject.display_name for subject in draft.candidate.subjects
     }
+
+
+@pytest.mark.parametrize("reorder", [False, True])
+def test_central_validation_rejects_restored_controls_for_poisoned_unit(
+    service_setup,
+    reorder,
+) -> None:
+    _service, repository, _decisionos, context = service_setup
+    service = OrganizationImportService(
+        repository=repository,
+        mapper=worker_spec_mapper("restore_structural_controls"),
+        mapper_timeout_seconds=2,
+        clock=lambda: NOW,
+    )
+
+    draft = service.create_draft(
+        context,
+        malformed_unit_control_snapshot(reorder=reorder),
+    )
+    platform = next(unit for unit in draft.candidate.units if unit.name == "Platform")
+
+    assert platform.parent_unit_id is None
+    assert platform.leader_subject_id is None
 
 
 @pytest.mark.parametrize("mapper", [EmptyMapper(), PartialMapper()])
