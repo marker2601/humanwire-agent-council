@@ -683,7 +683,7 @@ class OrganizationImportService:
         draft = self._repository.load_import_draft(context, import_id)
         receipt = self._repository.load_import_receipt(context, import_id)
         reconciliation = _reconcile(draft)
-        if not _loaded_import_is_bound(
+        if not organization_import_is_bound(
             context,
             import_id,
             draft,
@@ -705,7 +705,7 @@ class OrganizationImportService:
             return None
         draft, receipt = committed
         reconciliation = _reconcile(draft)
-        if not _loaded_import_is_bound(
+        if not organization_import_is_bound(
             context,
             draft.import_id,
             draft,
@@ -844,7 +844,22 @@ def _digest_matches(candidate: object, expected: str) -> bool:
     )
 
 
-def _loaded_import_is_bound(
+def _has_exact_model_shape(value: object) -> bool:
+    if isinstance(value, BaseModel):
+        if (
+            set(value.__dict__) != set(type(value).model_fields)
+            or getattr(value, "__pydantic_extra__", None) not in (None, {})
+        ):
+            return False
+        return all(_has_exact_model_shape(item) for item in value.__dict__.values())
+    if isinstance(value, (list, tuple)):
+        return all(_has_exact_model_shape(item) for item in value)
+    if isinstance(value, dict):
+        return all(_has_exact_model_shape(item) for item in value.values())
+    return True
+
+
+def organization_import_is_bound(
     context: DecisionOSContext,
     import_id: str,
     draft: ImportDraft,
@@ -853,9 +868,24 @@ def _loaded_import_is_bound(
     *,
     graph_version: int | None = None,
 ) -> bool:
+    if type(draft) is not ImportDraft or type(reconciliation) is not ImportReconciliation:
+        return False
+    try:
+        if not _has_exact_model_shape(draft) or not _has_exact_model_shape(
+            reconciliation
+        ):
+            return False
+        validated_draft = ImportDraft.model_validate_json(draft.model_dump_json())
+        validated_reconciliation = ImportReconciliation.model_validate_json(
+            reconciliation.model_dump_json()
+        )
+        expected_reconciliation = _reconcile(draft)
+    except Exception:  # noqa: BLE001 - hostile repository/service objects fail closed
+        return False
     if (
-        type(draft) is not ImportDraft
-        or type(reconciliation) is not ImportReconciliation
+        validated_draft != draft
+        or validated_reconciliation != reconciliation
+        or expected_reconciliation != reconciliation
         or draft.organization_id != context.organization_id
         or draft.import_id != import_id
         or reconciliation.organization_id != context.organization_id
@@ -864,14 +894,22 @@ def _loaded_import_is_bound(
         return False
     if receipt is None:
         return graph_version is None
+    if type(receipt) is not ImportReceipt:
+        return False
+    try:
+        if not _has_exact_model_shape(receipt):
+            return False
+        validated_receipt = ImportReceipt.model_validate_json(receipt.model_dump_json())
+    except Exception:  # noqa: BLE001 - hostile repository/service objects fail closed
+        return False
     return (
-        type(receipt) is ImportReceipt
+        validated_receipt == receipt
         and receipt.organization_id == context.organization_id
         and receipt.import_id == import_id
         and receipt.source_snapshot_id == draft.source_snapshot.snapshot_id
         and receipt.source_snapshot_digest == draft.source_snapshot.semantic_digest
         and receipt.graph_version == draft.base_graph_version + 1
-        and (graph_version is None or receipt.graph_version == graph_version)
+        and (graph_version is None or receipt.graph_version <= graph_version)
         and receipt.committed_subject_count == len(draft.candidate.subjects)
         and receipt.acknowledged_codes == reconciliation.acknowledged_codes
     )

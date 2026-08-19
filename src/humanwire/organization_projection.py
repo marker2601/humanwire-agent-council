@@ -115,11 +115,7 @@ def _assignment(assignment: AuthorityAssignment) -> AuthorityAssignment:
 def _reconciliation(value: ImportReconciliation | None) -> ImportReconciliation | None:
     if value is None:
         return None
-    if type(value) is not ImportReconciliation:
-        raise TypeError("import reconciliation is invalid")
-    if not {*value.blocking_codes, *value.acknowledged_codes}.issubset(
-        _CANONICAL_DIAGNOSTIC_CODES
-    ):
+    if not organization_reconciliation_is_safe(value):
         raise ValueError("import reconciliation diagnostic is invalid")
     return ImportReconciliation(
         import_id=value.import_id,
@@ -131,6 +127,25 @@ def _reconciliation(value: ImportReconciliation | None) -> ImportReconciliation 
         blocking_codes=tuple(value.blocking_codes),
         acknowledged_codes=tuple(value.acknowledged_codes),
     )
+
+
+def organization_reconciliation_is_safe(value: object) -> bool:
+    """Return whether a reconciliation is canonical, finite, and round-trippable."""
+
+    if (
+        type(value) is not ImportReconciliation
+        or set(value.__dict__) != set(ImportReconciliation.model_fields)
+        or getattr(value, "__pydantic_extra__", None) not in (None, {})
+    ):
+        return False
+    try:
+        validated = ImportReconciliation.model_validate_json(value.model_dump_json())
+    except Exception:  # noqa: BLE001 - hostile seam output must fail closed
+        return False
+    return validated == value and {
+        *value.blocking_codes,
+        *value.acknowledged_codes,
+    }.issubset(_CANONICAL_DIAGNOSTIC_CODES)
 
 
 def _build_organization_projection(
@@ -195,4 +210,5 @@ def _raise_projection_unavailable() -> None:
 __all__ = [
     "OrganizationProjectionUnavailable",
     "build_organization_projection",
+    "organization_reconciliation_is_safe",
 ]

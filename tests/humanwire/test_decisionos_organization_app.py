@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, ClassVar
 
 import anyio
 import pytest
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
+from humanwire import decisionos_organization_routes
 from humanwire.decisionos_app import DecisionOSDependencies, create_decisionos_app
 from humanwire.decisionos_auth import (
     AppCheckUnavailable,
@@ -55,6 +57,10 @@ IMPORT = "imp_01ARZ3NDEKTSV4RRFFQ69G5FAV"
 IMPORT_B = "imp_01ARZ3NDEKTSV4RRFFQ69G5FAW"
 COMPLETE_CSV = b"""source_identity,display_name,kind,title,unit_name,unit_leader
 directory/ada,Ada Lovelace,human,Chief Executive,Executive,true
+"""
+TWO_SUBJECT_CSV = b"""source_identity,display_name,kind,title,unit_name,unit_leader
+directory/ada,Ada Lovelace,human,Chief Executive,Executive,true
+directory/grace,Grace Hopper,human,Engineering Lead,Engineering,true
 """
 PRIVATE_CSV = b"source_identity,display_name,email\nprivate/alice,Alice,alice@example.invalid\n"
 MUTATION_HEADERS = {
@@ -912,6 +918,84 @@ def test_underdeclared_org_stream_rejects_before_reading_large_tail(
     assert received == 1
 
 
+def test_bounded_body_uses_one_bytearray_for_two_hundred_thousand_fragments() -> None:
+    fragment_count = 200_000
+
+    class FragmentedRequest:
+        scope: ClassVar = {
+            "headers": ((b"content-length", str(fragment_count).encode()),)
+        }
+
+        async def stream(self):
+            for _ in range(fragment_count):
+                yield b"x"
+
+    result = anyio.run(
+        decisionos_organization_routes._bounded_body,
+        FragmentedRequest(),
+        fragment_count,
+    )
+    implementation = inspect.getsource(decisionos_organization_routes._bounded_body)
+
+    assert result == b"x" * fragment_count
+    assert "bytearray()" in implementation
+    assert "list[bytes]" not in implementation
+    assert 'b"".join' not in implementation
+
+
+def test_bounded_body_seals_transport_disconnect() -> None:
+    class DisconnectingRequest:
+        scope: ClassVar = {"headers": ((b"content-length", b"2"),)}
+
+        async def stream(self):
+            yield b"{"
+            raise RuntimeError("PRIVATE-DISCONNECT-SENTINEL")
+
+    result = anyio.run(
+        decisionos_organization_routes._bounded_body,
+        DisconnectingRequest(),
+        10,
+    )
+
+    assert result is None
+
+
+def test_sub_cap_recursive_json_is_fixed_invalid_request_without_private_trace(bundle) -> None:
+    client = _client(bundle, "owner")
+    recursive = b"[" * 1_200 + b'"PRIVATE-RECURSION-SENTINEL"' + b"]" * 1_200
+
+    response = client.post(
+        f"/api/organizations/{ORG_A}/imports/{IMPORT}/commit",
+        headers={**_authorized_headers(client), "Content-Type": "application/json"},
+        content=recursive,
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid_request"}
+    assert "PRIVATE-RECURSION-SENTINEL" not in response.text
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_json_body_seals_decoder_recursion_before_route_dispatch() -> None:
+    recursive = b"[" * 3_000 + b'"PRIVATE-RECURSION-SENTINEL"' + b"]" * 3_000
+
+    class RecursiveRequest:
+        scope: ClassVar = {
+            "headers": ((b"content-length", str(len(recursive)).encode()),)
+        }
+
+        async def stream(self):
+            yield recursive
+
+    result = anyio.run(
+        decisionos_organization_routes._json_body,
+        RecursiveRequest(),
+        decisionos_organization_routes._CommitBody,
+    )
+
+    assert result is None
+
+
 def test_missing_membership_and_viewer_writes_fail_before_source_parse(bundle) -> None:
     calls: list[str] = []
 
@@ -967,18 +1051,17 @@ def test_import_detail_rebinds_exact_path_and_reconciliation_ids(bundle, monkeyp
     client = _client(bundle, "owner")
     uploaded = _upload(client).json()
     import_id = uploaded["import_id"]
-    draft = bundle.graph_repository.load_import_draft(bundle.owner_context, import_id)
-    reconciliation = bundle.import_service.reconcile(bundle.owner_context, import_id)
-    monkeypatch.setattr(
-        bundle.graph_repository,
-        "load_import_draft",
-        lambda _context, _import_id: draft.model_copy(update={"import_id": IMPORT_B}),
+    draft, reconciliation, receipt = bundle.import_service.load_import(
+        bundle.owner_context,
+        import_id,
     )
     monkeypatch.setattr(
         bundle.import_service,
-        "reconcile",
-        lambda _context, _import_id: reconciliation.model_copy(
-            update={"import_id": IMPORT_B}
+        "load_import",
+        lambda _context, _import_id: (
+            draft.model_copy(update={"import_id": IMPORT_B}),
+            reconciliation.model_copy(update={"import_id": IMPORT_B}),
+            receipt,
         ),
     )
 
@@ -992,15 +1075,17 @@ def test_import_detail_rebinds_exact_path_and_reconciliation_ids(bundle, monkeyp
 def test_import_detail_rejects_cross_tenant_reconciliation(bundle, monkeypatch) -> None:
     client = _client(bundle, "owner")
     uploaded = _upload(client).json()
-    reconciliation = bundle.import_service.reconcile(
+    draft, reconciliation, receipt = bundle.import_service.load_import(
         bundle.owner_context,
         uploaded["import_id"],
     )
     monkeypatch.setattr(
         bundle.import_service,
-        "reconcile",
-        lambda _context, _import_id: reconciliation.model_copy(
-            update={"organization_id": ORG_B}
+        "load_import",
+        lambda _context, _import_id: (
+            draft,
+            reconciliation.model_copy(update={"organization_id": ORG_B}),
+            receipt,
         ),
     )
 
@@ -1010,6 +1095,68 @@ def test_import_detail_rejects_cross_tenant_reconciliation(bundle, monkeypatch) 
 
     assert response.status_code == 404
     assert response.json() == {"error": "organization_not_found"}
+
+
+def test_import_detail_uses_one_authoritative_service_load(bundle, monkeypatch) -> None:
+    client = _client(bundle, "owner")
+    uploaded = _upload(client).json()
+    loaded = bundle.import_service.load_import(
+        bundle.owner_context,
+        uploaded["import_id"],
+    )
+    monkeypatch.setattr(bundle.import_service, "load_import", lambda *_args: loaded)
+
+    def forbidden_split_read(*_args, **_kwargs):
+        raise AssertionError("route split the authoritative import load")
+
+    monkeypatch.setattr(
+        bundle.graph_repository,
+        "load_import_draft",
+        forbidden_split_read,
+    )
+    monkeypatch.setattr(
+        bundle.graph_repository,
+        "load_import_receipt",
+        forbidden_split_read,
+    )
+    monkeypatch.setattr(bundle.import_service, "reconcile", forbidden_split_read)
+
+    response = client.get(
+        f"/api/organizations/{ORG_A}/imports/{uploaded['import_id']}"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["import_id"] == uploaded["import_id"]
+
+
+def test_import_detail_rejects_private_noncanonical_service_diagnostic(
+    bundle,
+    monkeypatch,
+) -> None:
+    client = _client(bundle, "owner")
+    uploaded = _upload(client).json()
+    draft, reconciliation, receipt = bundle.import_service.load_import(
+        bundle.owner_context,
+        uploaded["import_id"],
+    )
+    private = "provider_private_alice_email"
+    monkeypatch.setattr(
+        bundle.import_service,
+        "load_import",
+        lambda *_args: (
+            draft,
+            reconciliation.model_copy(update={"blocking_codes": (private,)}),
+            receipt,
+        ),
+    )
+
+    response = client.get(
+        f"/api/organizations/{ORG_A}/imports/{uploaded['import_id']}"
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "organization_not_found"}
+    assert private not in response.text
 
 
 def test_upload_rebinds_cross_tenant_draft_before_serialization(bundle, monkeypatch) -> None:
@@ -1084,6 +1231,55 @@ def test_commit_rebinds_receipt_to_path_and_tenant_before_serialization(
     assert "private-firebase-owner" not in response.text
 
 
+def test_commit_post_mutation_reload_uses_one_authoritative_service_load(
+    bundle,
+    monkeypatch,
+) -> None:
+    client = _client(bundle, "owner")
+    uploaded = _upload(client).json()
+    original_commit = bundle.import_service.commit
+    original_load = bundle.import_service.load_import
+    loaded: dict[str, object] = {}
+
+    def forbidden_split_read(*_args, **_kwargs):
+        raise AssertionError("route split the post-mutation import reload")
+
+    def commit_then_block_split_reads(context, request):
+        receipt = original_commit(context, request)
+        loaded["value"] = original_load(context, request.import_id)
+        monkeypatch.setattr(
+            bundle.graph_repository,
+            "load_import_draft",
+            forbidden_split_read,
+        )
+        monkeypatch.setattr(
+            bundle.graph_repository,
+            "load_import_receipt",
+            forbidden_split_read,
+        )
+        monkeypatch.setattr(bundle.import_service, "reconcile", forbidden_split_read)
+        return receipt
+
+    monkeypatch.setattr(bundle.import_service, "commit", commit_then_block_split_reads)
+    monkeypatch.setattr(
+        bundle.import_service,
+        "load_import",
+        lambda *_args: loaded["value"],
+    )
+
+    response = client.post(
+        f"/api/organizations/{ORG_A}/imports/{uploaded['import_id']}/commit",
+        headers=_authorized_headers(client),
+        json={
+            "reviewed_digest": uploaded["reviewed_digest"],
+            "acknowledged_codes": uploaded["acknowledged_codes"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "committed"
+
+
 def test_correction_rebinds_new_draft_and_exact_superseded_import(
     bundle,
     monkeypatch,
@@ -1129,6 +1325,60 @@ def test_correction_rebinds_new_draft_and_exact_superseded_import(
 
     assert response.status_code == 404
     assert response.json() == {"error": "organization_not_found"}
+
+
+def test_correction_post_mutation_reload_uses_one_authoritative_service_load(
+    bundle,
+    monkeypatch,
+) -> None:
+    client = _client(bundle, "owner")
+    uploaded = _upload(
+        client,
+        content=b"source_identity,title\nrow/one,Founder\n",
+    ).json()
+    original_apply = bundle.import_service.apply_correction
+    original_load = bundle.import_service.load_import
+    loaded: dict[str, object] = {}
+
+    def apply_then_block_split_reads(context, request):
+        draft = original_apply(context, request)
+        loaded["value"] = original_load(context, draft.import_id)
+
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("route split the post-correction import reload")
+
+        monkeypatch.setattr(bundle.import_service, "reconcile", forbidden)
+        return draft
+
+    monkeypatch.setattr(
+        bundle.import_service,
+        "apply_correction",
+        apply_then_block_split_reads,
+    )
+    monkeypatch.setattr(
+        bundle.import_service,
+        "load_import",
+        lambda *_args: loaded["value"],
+    )
+
+    response = client.post(
+        f"/api/organizations/{ORG_A}/imports/{uploaded['import_id']}/corrections",
+        headers=_authorized_headers(client),
+        json={
+            "reviewed_digest": uploaded["reviewed_digest"],
+            "kind": "correct_record",
+            "source_record_ids": [uploaded["source_record_ids"][0]],
+            "replacement_fields": [
+                ["display_name", "Ada Lovelace"],
+                ["kind", "human"],
+                ["unit_leader", "true"],
+                ["unit_name", "Executive"],
+            ],
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["supersedes_import_id"] == uploaded["import_id"]
 
 
 def test_viewer_reads_graph_but_unsigned_user_is_rejected(bundle) -> None:
@@ -1417,6 +1667,130 @@ def test_projection_route_rebinds_version_and_exact_graph_ids(
     assert response.json() == {"error": "organization_not_found"}
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ["subject", "unit", "edge", "authority", "private_extra"],
+)
+def test_projection_route_deep_binds_every_allowlisted_graph_field(
+    bundle,
+    monkeypatch,
+    mutation,
+) -> None:
+    graph = OrganizationGraph(
+        organization_id=ORG_A,
+        version=0,
+        subjects=(
+            OrganizationSubject(
+                subject_id=SUBJECT,
+                organization_id=ORG_A,
+                kind=OrganizationSubjectKind.HUMAN,
+                lifecycle=SubjectLifecycle.DIRECTORY_ONLY,
+                display_name="Alice Example",
+                source_identity="private/provider/alice",
+                unit_id=UNIT,
+                title="Engineering Lead",
+            ),
+        ),
+        units=(
+            OrganizationUnit(
+                unit_id=UNIT,
+                organization_id=ORG_A,
+                name="Engineering",
+                leader_subject_id=SUBJECT,
+            ),
+        ),
+        edges=(
+            OrganizationEdge(
+                edge_id=EDGE,
+                organization_id=ORG_A,
+                kind=OrganizationEdgeKind.MEMBER_OF,
+                source_subject_id=SUBJECT,
+                target_unit_id=UNIT,
+            ),
+        ),
+        authority_assignments=(
+            AuthorityAssignment(
+                assignment_id=ASSIGNMENT,
+                organization_id=ORG_A,
+                subject_id=SUBJECT,
+                decision_type="launch_decision",
+                function=AuthorityFunction.DECISION_OWNER,
+                effective_from=NOW,
+            ),
+        ),
+        created_at=NOW,
+    )
+    private = "PRIVATE-NESTED-PROJECTION"
+
+    def hostile_builder(value, reconciliation):
+        projected = build_organization_projection(value, reconciliation)
+        if mutation == "subject":
+            return projected.model_copy(
+                update={
+                    "subjects": (
+                        projected.subjects[0].model_copy(update={"display_name": private}),
+                    )
+                }
+            )
+        if mutation == "unit":
+            return projected.model_copy(
+                update={
+                    "units": (
+                        projected.units[0].model_copy(update={"name": private}),
+                    )
+                }
+            )
+        if mutation == "edge":
+            return projected.model_copy(
+                update={
+                    "edges": (
+                        projected.edges[0].model_copy(
+                            update={"organization_id": ORG_B}
+                        ),
+                    )
+                }
+            )
+        if mutation == "private_extra":
+            return projected.model_copy(
+                update={
+                    "subjects": (
+                        projected.subjects[0].model_copy(
+                            update={"private_connector_identity": private}
+                        ),
+                    )
+                }
+            )
+        return projected.model_copy(
+            update={
+                "authority_assignments": (
+                    projected.authority_assignments[0].model_copy(
+                        update={"organization_id": ORG_B}
+                    ),
+                )
+            }
+        )
+
+    monkeypatch.setattr(bundle.graph_repository, "load_graph", lambda _context: graph)
+    dependencies = _replacement_dependencies(
+        bundle,
+        organization_projection_builder=hostile_builder,
+    )
+    guarded = OrganizationAppBundle(
+        dependencies=dependencies,
+        decisionos=bundle.decisionos,
+        graph_repository=bundle.graph_repository,
+        import_service=bundle.import_service,
+        owner_context=bundle.owner_context,
+    )
+    viewer = _client(guarded, "viewer")
+
+    response = viewer.get(f"/api/organizations/{ORG_A}/organization-graph")
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "organization_not_found"}
+    assert private not in response.text
+
+
 def test_projection_routes_use_exact_committed_review_not_newer_pending_import(bundle) -> None:
     owner = _client(bundle, "owner")
     committed_draft = _upload(owner).json()
@@ -1445,6 +1819,59 @@ def test_projection_routes_use_exact_committed_review_not_newer_pending_import(b
         assert reconciliation["import_id"] != pending["import_id"]
         assert reconciliation["organization_id"] == ORG_A
         assert reconciliation["source_count"] == committed_draft["source_count"]
+
+
+def test_projection_route_carries_review_across_bind_versions_then_uses_new_receipt(
+    bundle,
+) -> None:
+    owner = _client(bundle, "owner")
+    first = _upload(owner, content=TWO_SUBJECT_CSV).json()
+    first_receipt = owner.post(
+        f"/api/organizations/{ORG_A}/imports/{first['import_id']}/commit",
+        headers=_authorized_headers(owner),
+        json={
+            "reviewed_digest": first["reviewed_digest"],
+            "acknowledged_codes": first["acknowledged_codes"],
+        },
+    ).json()
+    subjects = bundle.graph_repository.load_graph(bundle.owner_context).subjects
+    bundle.graph_repository.bind_member(
+        bundle.owner_context,
+        subject_id=subjects[0].subject_id,
+        member_uid="firebase-admin-01",
+    )
+    bundle.graph_repository.bind_member(
+        bundle.owner_context,
+        subject_id=subjects[1].subject_id,
+        member_uid="firebase-viewer-01",
+    )
+    viewer = _client(bundle, "viewer")
+
+    carried = viewer.get(f"/api/organizations/{ORG_A}/organization-graph")
+
+    assert carried.status_code == 200
+    assert carried.json()["graph_version"] == 3
+    assert carried.json()["reconciliation"]["import_id"] == first["import_id"]
+    assert first_receipt["graph_version"] == 1
+    assert {item["lifecycle"] for item in carried.json()["subjects"]} == {"active"}
+
+    second = _upload(
+        owner,
+        content=TWO_SUBJECT_CSV.replace(b"Engineering Lead", b"Engineering Director"),
+    ).json()
+    second_receipt = owner.post(
+        f"/api/organizations/{ORG_A}/imports/{second['import_id']}/commit",
+        headers=_authorized_headers(owner),
+        json={
+            "reviewed_digest": second["reviewed_digest"],
+            "acknowledged_codes": second["acknowledged_codes"],
+        },
+    )
+    assert second_receipt.status_code == 200
+    latest = viewer.get(f"/api/organizations/{ORG_A}/organization-graph")
+    assert latest.status_code == 200
+    assert latest.json()["graph_version"] == 4
+    assert latest.json()["reconciliation"]["import_id"] == second["import_id"]
 
 
 def test_private_route_failure_is_fixed_and_keeps_security_headers(bundle) -> None:

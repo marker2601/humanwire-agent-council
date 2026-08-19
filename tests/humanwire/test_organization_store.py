@@ -23,6 +23,7 @@ from humanwire.organization_models import (
     OrganizationGraphCandidate,
     OrganizationSubject,
     OrganizationSubjectKind,
+    OrganizationUnit,
     SourceRecord,
     SourceSnapshot,
     SubjectLifecycle,
@@ -123,6 +124,32 @@ def import_draft(
     )
 
 
+def two_subject_draft() -> ImportDraft:
+    first = import_draft()
+    second_record = SourceRecord(
+        record_id="rec_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        source_ordinal=2,
+        source_identity="directory/bob",
+        fields=(("email", "bob@example.invalid"),),
+    )
+    second_subject = OrganizationSubject(
+        subject_id=SUBJECT_B,
+        organization_id=ORG_A,
+        kind=OrganizationSubjectKind.HUMAN,
+        lifecycle=SubjectLifecycle.DRAFT_IMPORTED,
+        display_name="Bob Example",
+        source_identity="directory/bob",
+    )
+    return first.model_copy(
+        update={
+            "source_snapshot": first.source_snapshot.model_copy(
+                update={"records": (*first.source_snapshot.records, second_record)}
+            ),
+            "candidate": first.candidate.model_copy(
+                update={"subjects": (*first.candidate.subjects, second_subject)}
+            ),
+        }
+    )
 @pytest.fixture
 def setup_repositories():
     decisionos = InMemoryDecisionOSRepository(
@@ -295,6 +322,146 @@ def test_graph_version_read_ignores_pending_latest_and_fails_on_corrupt_receipt(
     with pytest.raises(ImportUnavailable, match="import_unavailable") as captured:
         repository.load_committed_import(owner_context, receipt.graph_version)
     assert PRIVATE_VALUE not in exception_graph_text(captured.value)
+
+
+def test_committed_import_carries_across_two_exact_member_binding_versions(
+    setup_repositories,
+) -> None:
+    repository, decisionos, owner_context = setup_repositories
+    first_member = make_member(
+        decisionos,
+        owner_context,
+        uid="firebase-viewer-01",
+        role=DecisionOSRole.VIEWER,
+    )
+    second_member = make_member(
+        decisionos,
+        owner_context,
+        uid="firebase-viewer-02",
+        role=DecisionOSRole.VIEWER,
+    )
+    draft = repository.save_import_draft(owner_context, two_subject_draft())
+    receipt = repository.commit_graph(
+        owner_context,
+        draft_id=draft.import_id,
+        reviewed_digest=draft.semantic_digest,
+    )
+    repository.bind_member(
+        owner_context,
+        subject_id=SUBJECT_A,
+        member_uid=first_member.principal.uid,
+    )
+    repository.bind_member(
+        owner_context,
+        subject_id=SUBJECT_B,
+        member_uid=second_member.principal.uid,
+    )
+
+    assert repository.load_committed_import(owner_context, 2) == (draft, receipt)
+    assert repository.load_committed_import(owner_context, 3) == (draft, receipt)
+
+
+def test_newer_committed_import_supersedes_prior_receipt_predecessor(
+    setup_repositories,
+) -> None:
+    repository, decisionos, owner_context = setup_repositories
+    member = make_member(
+        decisionos,
+        owner_context,
+        uid="firebase-viewer-01",
+        role=DecisionOSRole.VIEWER,
+    )
+    first = repository.save_import_draft(owner_context, import_draft())
+    repository.commit_graph(
+        owner_context,
+        draft_id=first.import_id,
+        reviewed_digest=first.semantic_digest,
+    )
+    repository.bind_member(
+        owner_context,
+        subject_id=SUBJECT_A,
+        member_uid=member.principal.uid,
+    )
+    second = repository.save_import_draft(
+        owner_context,
+        import_draft(import_id=IMPORT_B, digest=DIGEST_B, base_version=2),
+    )
+    second_receipt = repository.commit_graph(
+        owner_context,
+        draft_id=second.import_id,
+        reviewed_digest=second.semantic_digest,
+    )
+
+    assert second_receipt.graph_version == 3
+    assert repository.load_committed_import(owner_context, 3) == (
+        second,
+        second_receipt,
+    )
+
+
+@pytest.mark.parametrize("corruption", ["subject", "lifecycle", "structure", "delta"])
+def test_committed_import_predecessor_rejects_non_binding_graph_delta(
+    setup_repositories,
+    corruption,
+) -> None:
+    repository, decisionos, owner_context = setup_repositories
+    member = make_member(
+        decisionos,
+        owner_context,
+        uid="firebase-viewer-01",
+        role=DecisionOSRole.VIEWER,
+    )
+    draft = repository.save_import_draft(owner_context, import_draft())
+    repository.commit_graph(
+        owner_context,
+        draft_id=draft.import_id,
+        reviewed_digest=draft.semantic_digest,
+    )
+    repository.bind_member(
+        owner_context,
+        subject_id=SUBJECT_A,
+        member_uid=member.principal.uid,
+    )
+    target = repository._graphs[(ORG_A, 2)]
+    if corruption == "subject":
+        target = target.model_copy(
+            update={
+                "subjects": (
+                    target.subjects[0].model_copy(update={"title": "PRIVATE-CHANGED"}),
+                )
+            }
+        )
+    elif corruption == "lifecycle":
+        prior = repository._graphs[(ORG_A, 1)]
+        target = prior.model_copy(
+            update={
+                "version": 2,
+                "subjects": (
+                    prior.subjects[0].model_copy(
+                        update={"lifecycle": SubjectLifecycle.SUSPENDED}
+                    ),
+                ),
+            }
+        )
+    elif corruption == "structure":
+        target = target.model_copy(
+            update={
+                "units": (
+                    OrganizationUnit(
+                        unit_id="unit_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                        organization_id=ORG_A,
+                        name="PRIVATE-UNIT",
+                    ),
+                )
+            }
+        )
+    else:
+        target = target.model_copy(update={"version": 3})
+        repository._graphs[(ORG_A, 3)] = target
+
+    repository._graphs[(ORG_A, target.version)] = target
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        repository.load_committed_import(owner_context, target.version)
 
 
 def test_stale_draft_conflicts_and_duplicate_commit_returns_same_receipt(

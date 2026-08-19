@@ -26,6 +26,7 @@ from humanwire.organization_import import (
     OrganizationImportService,
     OrganizationImportStale,
     OrganizationImportUnavailable,
+    organization_import_is_bound,
 )
 from humanwire.organization_models import (
     CommitImportRequest,
@@ -36,7 +37,10 @@ from humanwire.organization_models import (
     OrganizationProjection,
     SourceSnapshot,
 )
-from humanwire.organization_projection import OrganizationProjectionUnavailable
+from humanwire.organization_projection import (
+    OrganizationProjectionUnavailable,
+    organization_reconciliation_is_safe,
+)
 from humanwire.organization_sources import (
     OrganizationSourceRejected,
     ParseOrganizationSourceRequest,
@@ -201,7 +205,7 @@ async def _bounded_body(request: Request, maximum_bytes: int) -> bytes | None:
     declared = int(length_text)
     if not 1 <= declared <= maximum_bytes:
         return None
-    chunks: list[bytes] = []
+    raw = bytearray()
     received = 0
     try:
         async for chunk in request.stream():
@@ -209,12 +213,12 @@ async def _bounded_body(request: Request, maximum_bytes: int) -> bytes | None:
             if received > declared or received > maximum_bytes:
                 return None
             if chunk:
-                chunks.append(chunk)
+                raw.extend(chunk)
     except Exception:  # noqa: BLE001 - transport failures are fixed and content-free
         return None
     if received != declared:
         return None
-    return b"".join(chunks)
+    return bytes(raw)
 
 
 def _rejecting_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -246,8 +250,37 @@ async def _json_body(
         if not isinstance(decoded, dict):
             return None
         return model_type.model_validate(decoded)
-    except (UnicodeError, ValueError, TypeError, ValidationError):
+    except (RecursionError, UnicodeError, ValueError, TypeError, ValidationError):
         return None
+
+
+def _strict_roundtrip(value: object, model_type: type[BaseModel]) -> bool:
+    if type(value) is not model_type:
+        return False
+    try:
+        return _has_exact_model_shape(value) and (
+            model_type.model_validate_json(value.model_dump_json()) == value
+        )
+    except Exception:  # noqa: BLE001 - hostile dependency output fails closed
+        return False
+
+
+def _has_exact_model_shape(value: object) -> bool:
+    if isinstance(value, BaseModel):
+        if (
+            set(value.__dict__) != set(type(value).model_fields)
+            or getattr(value, "__pydantic_extra__", None) not in (None, {})
+        ):
+            return False
+        return all(_has_exact_model_shape(item) for item in value.__dict__.values())
+    if isinstance(value, (list, tuple)):
+        return all(_has_exact_model_shape(item) for item in value)
+    if isinstance(value, dict):
+        return all(
+            _has_exact_model_shape(key) and _has_exact_model_shape(item)
+            for key, item in value.items()
+        )
+    return True
 
 
 def _draft_is_bound(
@@ -259,7 +292,18 @@ def _draft_is_bound(
     import_id: str | None = None,
     supersedes_import_id: str | None = None,
 ) -> bool:
-    if type(draft) is not ImportDraft or type(reconciliation) is not ImportReconciliation:
+    if (
+        type(draft) is not ImportDraft
+        or type(reconciliation) is not ImportReconciliation
+        or not organization_import_is_bound(
+            context,
+            draft.import_id,
+            draft,
+            reconciliation,
+            None,
+        )
+        or not organization_reconciliation_is_safe(reconciliation)
+    ):
         return False
     expected_import_id = draft.import_id if import_id is None else import_id
     return (
@@ -288,18 +332,25 @@ def _receipt_is_bound(
     reconciliation: ImportReconciliation | None = None,
     graph_version: int | None = None,
 ) -> bool:
-    if type(receipt) is not ImportReceipt:
+    if not _strict_roundtrip(receipt, ImportReceipt):
         return False
     if (
         context.organization_id != organization_id
         or receipt.organization_id != organization_id
         or receipt.import_id != import_id
-        or (graph_version is not None and receipt.graph_version != graph_version)
+        or (graph_version is not None and receipt.graph_version > graph_version)
     ):
         return False
     if draft is None or reconciliation is None:
         return True
-    return (
+    return organization_import_is_bound(
+        context,
+        import_id,
+        draft,
+        reconciliation,
+        receipt,
+        graph_version=graph_version,
+    ) and (
         draft.organization_id == organization_id
         and draft.import_id == import_id
         and receipt.source_snapshot_id == draft.source_snapshot.snapshot_id
@@ -317,8 +368,38 @@ def _projection_is_bound(
     reconciliation: ImportReconciliation | None,
     projected: object,
 ) -> bool:
-    if type(projected) is not OrganizationProjection:
+    if (
+        not _strict_roundtrip(graph, OrganizationGraph)
+        or not _strict_roundtrip(projected, OrganizationProjection)
+        or (
+            reconciliation is not None
+            and not organization_reconciliation_is_safe(reconciliation)
+        )
+    ):
         return False
+    projected_subjects = {item.subject_id: item for item in projected.subjects}
+    graph_subjects = {item.subject_id: item for item in graph.subjects}
+    expected_subjects = {
+        subject_id: {
+            "subject_id": item.subject_id,
+            "kind": item.kind,
+            "lifecycle": item.lifecycle,
+            "display_name": item.display_name,
+            "unit_id": item.unit_id,
+            "title": item.title,
+        }
+        for subject_id, item in graph_subjects.items()
+    }
+    projected_units = {item.unit_id: item for item in projected.units}
+    graph_units = {item.unit_id: item for item in graph.units}
+    projected_edges = {item.edge_id: item for item in projected.edges}
+    graph_edges = {item.edge_id: item for item in graph.edges}
+    projected_assignments = {
+        item.assignment_id: item for item in projected.authority_assignments
+    }
+    graph_assignments = {
+        item.assignment_id: item for item in graph.authority_assignments
+    }
     return (
         context.organization_id == organization_id
         and graph.organization_id == organization_id
@@ -327,14 +408,14 @@ def _projection_is_bound(
         and projected.source_kind is None
         and projected.synchronized_at == graph.created_at
         and projected.reconciliation == reconciliation
-        and {item.subject_id for item in projected.subjects}
-        == {item.subject_id for item in graph.subjects}
-        and {item.unit_id for item in projected.units}
-        == {item.unit_id for item in graph.units}
-        and {item.edge_id for item in projected.edges}
-        == {item.edge_id for item in graph.edges}
-        and {item.assignment_id for item in projected.authority_assignments}
-        == {item.assignment_id for item in graph.authority_assignments}
+        and {
+            subject_id: item.model_dump(mode="python")
+            for subject_id, item in projected_subjects.items()
+        }
+        == expected_subjects
+        and projected_units == graph_units
+        and projected_edges == graph_edges
+        and projected_assignments == graph_assignments
     )
 
 
@@ -431,8 +512,16 @@ def create_organization_router(
                 or context.organization_id != organization_id
             ):
                 return _fixed_error(404, "organization_not_found")
-            draft = dependencies.import_service.create_draft(context, snapshot)
-            reconciliation = dependencies.import_service.reconcile(context, draft.import_id)
+            created = dependencies.import_service.create_draft(context, snapshot)
+            if (
+                type(created) is not ImportDraft
+                or created.organization_id != organization_id
+            ):
+                return _fixed_error(404, "organization_not_found")
+            draft, reconciliation, receipt = dependencies.import_service.load_import(
+                context,
+                created.import_id,
+            )
         except OrganizationSourceRejected as error:
             code = str(error)
             status = 413 if code == "source_too_large" else 415 if code == "source_unsupported" else 400
@@ -447,7 +536,11 @@ def create_organization_router(
             ValidationError,
         ) as error:
             return _import_error(error)
-        if not _draft_is_bound(context, organization_id, draft, reconciliation):
+        if (
+            receipt is not None
+            or draft != created
+            or not _draft_is_bound(context, organization_id, draft, reconciliation)
+        ):
             return _fixed_error(404, "organization_not_found")
         return JSONResponse(status_code=201, content=_draft_payload(draft, reconciliation))
 
@@ -460,9 +553,10 @@ def create_organization_router(
         if isinstance(context, Response):
             return context
         try:
-            draft = dependencies.graph_repository.load_import_draft(context, import_id)
-            reconciliation = dependencies.import_service.reconcile(context, import_id)
-            receipt = dependencies.graph_repository.load_import_receipt(context, import_id)
+            draft, reconciliation, receipt = dependencies.import_service.load_import(
+                context,
+                import_id,
+            )
         except (
             DecisionOSAuthorizationDenied,
             ImportUnavailable,
@@ -512,8 +606,16 @@ def create_organization_router(
                 source_record_ids=tuple(body.source_record_ids),
                 replacement_fields=tuple(tuple(item) for item in body.replacement_fields),
             )
-            draft = dependencies.import_service.apply_correction(context, correction)
-            reconciliation = dependencies.import_service.reconcile(context, draft.import_id)
+            corrected = dependencies.import_service.apply_correction(context, correction)
+            if (
+                type(corrected) is not ImportDraft
+                or corrected.organization_id != organization_id
+            ):
+                return _fixed_error(404, "organization_not_found")
+            draft, reconciliation, receipt = dependencies.import_service.load_import(
+                context,
+                corrected.import_id,
+            )
         except (
             DecisionOSAuthorizationDenied,
             ImportUnavailable,
@@ -530,7 +632,7 @@ def create_organization_router(
             draft,
             reconciliation,
             supersedes_import_id=import_id,
-        ):
+        ) or receipt is not None or draft != corrected:
             return _fixed_error(404, "organization_not_found")
         return JSONResponse(status_code=201, content=_draft_payload(draft, reconciliation))
 
@@ -562,9 +664,7 @@ def create_organization_router(
                 receipt,
             ):
                 return _fixed_error(404, "organization_not_found")
-            draft = dependencies.graph_repository.load_import_draft(context, import_id)
-            reconciliation = dependencies.import_service.reconcile(context, import_id)
-            stored_receipt = dependencies.graph_repository.load_import_receipt(
+            draft, reconciliation, stored_receipt = dependencies.import_service.load_import(
                 context,
                 import_id,
             )

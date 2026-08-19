@@ -42,6 +42,7 @@ from humanwire.organization_store import (
 
 ORG = "org_01ARZ3NDEKTSV4RRFFQ69G5FAV"
 SUBJECT = "sub_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+SUBJECT_B = "sub_01ARZ3NDEKTSV4RRFFQ69G5FAW"
 NOW = datetime(2026, 8, 18, 15, 0, tzinfo=UTC)
 DIGEST = "1" * 64
 PRIVATE = "private-provider-sentinel@example.invalid"
@@ -87,20 +88,40 @@ class FakeSnapshot:
 
 
 class FakeQuery:
-    def __init__(self, client, paths, filters=()):
+    def __init__(self, client, paths, filters=(), ordering=None, limit_count=None):
         self.client = client
         self.paths = tuple(paths)
         self.filters = tuple(filters)
+        self.ordering = ordering
+        self.limit_count = limit_count
 
     def where(self, *, filter):
         return FakeQuery(
             self.client,
             self.paths,
-            (*self.filters, (filter.field_path, filter.value)),
+            (*self.filters, (filter.field_path, filter.op_string, filter.value)),
+            self.ordering,
+            self.limit_count,
         )
 
-    def order_by(self, _field):
-        return self
+    def order_by(self, field, direction=None):
+        return FakeQuery(
+            self.client,
+            self.paths,
+            self.filters,
+            (field, direction),
+            self.limit_count,
+        )
+
+    def limit(self, count):
+        self.client.query_limits.append(count)
+        return FakeQuery(
+            self.client,
+            self.paths,
+            self.filters,
+            self.ordering,
+            count,
+        )
 
     def stream(self, transaction=None):
         if self.client.failure is not None:
@@ -110,9 +131,28 @@ class FakeQuery:
             data = transaction._get(path) if transaction is not None else self.client.data.get(path)
             if data is None:
                 continue
-            if all(self._field(data, field) == value for field, value in self.filters):
+            if all(
+                self._matches(self._field(data, field), operator, value)
+                for field, operator, value in self.filters
+            ):
                 rows.append(FakeSnapshot(FakeDocument(self.client, path), data))
+        if self.ordering is not None:
+            field, direction = self.ordering
+            rows.sort(
+                key=lambda row: self._field(row.to_dict(), field),
+                reverse=str(direction).casefold().endswith("descending"),
+            )
+        if self.limit_count is not None:
+            rows = rows[: self.limit_count]
         return tuple(rows)
+
+    @staticmethod
+    def _matches(actual, operator, expected):
+        if operator == "==":
+            return actual == expected
+        if operator == "<=":
+            return actual is not None and actual <= expected
+        raise AssertionError(f"unsupported fake query operator: {operator}")
 
     @staticmethod
     def _field(data, field):
@@ -245,6 +285,7 @@ class FakeClient:
         self.provider_mutation_attempts = 0
         self.abort_next_transaction = False
         self.transactions = []
+        self.query_limits = []
 
     def collection(self, name):
         if self.failure is not None:
@@ -371,6 +412,42 @@ def draft() -> ImportDraft:
         base_graph_version=0,
         semantic_digest=DIGEST,
         created_at=NOW,
+    )
+
+
+def two_subject_draft() -> ImportDraft:
+    first = draft()
+    return first.model_copy(
+        update={
+            "source_snapshot": first.source_snapshot.model_copy(
+                update={
+                    "records": (
+                        *first.source_snapshot.records,
+                        SourceRecord(
+                            record_id="rec_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+                            source_ordinal=2,
+                            source_identity="directory/bob",
+                            fields=(("email", "bob@example.invalid"),),
+                        ),
+                    )
+                }
+            ),
+            "candidate": first.candidate.model_copy(
+                update={
+                    "subjects": (
+                        *first.candidate.subjects,
+                        OrganizationSubject(
+                            subject_id=SUBJECT_B,
+                            organization_id=ORG,
+                            kind=OrganizationSubjectKind.HUMAN,
+                            lifecycle=SubjectLifecycle.DRAFT_IMPORTED,
+                            display_name="Bob Example",
+                            source_identity="directory/bob",
+                        ),
+                    )
+                }
+            ),
+        }
     )
 
 
@@ -508,6 +585,170 @@ def test_firestore_reads_exact_receipt_and_committed_graph_version(fake_firestor
     )
     with pytest.raises(ImportUnavailable, match="import_unavailable"):
         repository.load_committed_import(context, receipt.graph_version + 1)
+
+
+def test_firestore_committed_import_carries_across_two_member_binding_versions(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    second_uid = "firebase-viewer-02"
+    client.data[(COLLECTION, ORG, "members", second_uid)] = OrganizationMembership(
+        organization_id=ORG,
+        uid=second_uid,
+        role=DecisionOSRole.VIEWER,
+        status=MembershipStatus.ACTIVE,
+    ).model_dump(mode="python")
+    saved = repository.save_import_draft(context, two_subject_draft())
+    receipt = repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    repository.bind_member(context, subject_id=SUBJECT, member_uid=OWNER.uid)
+    repository.bind_member(context, subject_id=SUBJECT_B, member_uid=second_uid)
+
+    assert repository.load_committed_import(context, 2) == (saved, receipt)
+    assert repository.load_committed_import(context, 3) == (saved, receipt)
+    assert client.query_limits[-2:] == [2, 2]
+
+
+def test_firestore_newer_committed_import_supersedes_prior_receipt_predecessor(
+    fake_firestore,
+) -> None:
+    _client, repository, context = fake_firestore
+    first = repository.save_import_draft(context, draft())
+    repository.commit_graph(
+        context,
+        draft_id=first.import_id,
+        reviewed_digest=first.semantic_digest,
+    )
+    repository.bind_member(context, subject_id=SUBJECT, member_uid=OWNER.uid)
+    second = repository.save_import_draft(
+        context,
+        next_draft(
+            first.model_copy(update={"base_graph_version": 2}),
+            supersedes_import_id=first.import_id,
+        ),
+    )
+    second_receipt = repository.commit_graph(
+        context,
+        draft_id=second.import_id,
+        reviewed_digest=second.semantic_digest,
+    )
+
+    assert second_receipt.graph_version == 3
+    assert repository.load_committed_import(context, 3) == (second, second_receipt)
+
+
+@pytest.mark.parametrize("corruption", ["subject", "lifecycle", "structure", "delta"])
+def test_firestore_predecessor_rejects_non_binding_graph_delta(
+    fake_firestore,
+    monkeypatch,
+    corruption,
+) -> None:
+    _client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    repository.bind_member(context, subject_id=SUBJECT, member_uid=OWNER.uid)
+    receipt_graph, receipt_storage = repository._graph_from_row(
+        ORG,
+        1,
+        repository._version_ref(ORG, 1).get(),
+    )
+    target_graph, target_storage = repository._graph_from_row(
+        ORG,
+        2,
+        repository._version_ref(ORG, 2).get(),
+    )
+    target_version = 2
+    if corruption == "subject":
+        target_graph = target_graph.model_copy(
+            update={
+                "subjects": (
+                    target_graph.subjects[0].model_copy(
+                        update={"title": "PRIVATE-CHANGED"}
+                    ),
+                )
+            }
+        )
+    elif corruption == "lifecycle":
+        target_graph = target_graph.model_copy(
+            update={
+                "subjects": (
+                    target_graph.subjects[0].model_copy(
+                        update={"lifecycle": SubjectLifecycle.SUSPENDED}
+                    ),
+                )
+            }
+        )
+    elif corruption == "structure":
+        target_graph = target_graph.model_copy(
+            update={
+                "units": (
+                    OrganizationUnit(
+                        unit_id="unit_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                        organization_id=ORG,
+                        name="PRIVATE-UNIT",
+                    ),
+                )
+            }
+        )
+    else:
+        target_version = 3
+        target_graph = target_graph.model_copy(update={"version": target_version})
+
+    def corrupted_graph_from_row(
+        organization_id,
+        version,
+        row,
+        *,
+        transaction=None,
+    ):
+        del organization_id, row, transaction
+        if version == 1:
+            return receipt_graph, receipt_storage
+        assert version == target_version
+        return target_graph, target_storage
+
+    monkeypatch.setattr(repository, "_graph_from_row", corrupted_graph_from_row)
+
+    with pytest.raises(ImportUnavailable, match="import_unavailable") as captured:
+        repository.load_committed_import(context, target_version)
+    assert PRIVATE not in exception_graph_text(captured.value)
+
+
+def test_firestore_draft_status_rejects_receipt_even_with_valid_outer_digest(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    receipt = ImportReceipt(
+        receipt_id=f"rcp_{deterministic_ulid(ORG, saved.import_id)}",
+        import_id=saved.import_id,
+        organization_id=ORG,
+        source_snapshot_id=saved.source_snapshot.snapshot_id,
+        source_snapshot_digest=saved.source_snapshot.semantic_digest,
+        graph_version=1,
+        committed_subject_count=len(saved.candidate.subjects),
+        committed_at=NOW,
+        committed_by_uid=OWNER.uid,
+    )
+    import_path = (COLLECTION, ORG, "imports", saved.import_id)
+    client.data[import_path]["receipt"] = receipt.model_dump(mode="python")
+    client.data[import_path]["payload_digest"] = independent_digest(
+        {
+            key: value
+            for key, value in client.data[import_path].items()
+            if key != "payload_digest"
+        }
+    )
+
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        repository.load_import_receipt(context, saved.import_id)
 
 
 def test_firestore_graph_version_read_ignores_pending_and_rejects_corrupt_shape(
