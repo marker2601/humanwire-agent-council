@@ -2403,6 +2403,23 @@ class FirestoreOrganizationGraphRepository:
             current_version, state = self._state_from_row(organization_id, state_row)
             if current_version < canonical_receipt.graph_version:
                 raise ImportUnavailable()
+            base_version = canonical_draft.base_graph_version
+            if base_version == 0:
+                base_graph = OrganizationGraph(
+                    organization_id=organization_id,
+                    version=0,
+                    created_at=canonical_draft.created_at,
+                )
+            else:
+                base_row = self._version_ref(organization_id, base_version).get(
+                    transaction=transaction
+                )
+                base_graph, _base_storage = self._graph_from_row(
+                    organization_id,
+                    base_version,
+                    base_row,
+                    transaction=transaction,
+                )
             version_row = self._version_ref(
                 organization_id,
                 canonical_receipt.graph_version,
@@ -2415,32 +2432,43 @@ class FirestoreOrganizationGraphRepository:
             )
         except OrganizationUnavailable:
             raise ImportUnavailable() from None
+        canonical_base = exact_canonical_model(base_graph, OrganizationGraph)
         canonical_graph = exact_canonical_model(graph, OrganizationGraph)
         if (
-            canonical_graph is None
+            canonical_base is None
+            or canonical_base.organization_id != organization_id
+            or canonical_base.version != canonical_draft.base_graph_version
+            or canonical_receipt.graph_version != canonical_draft.base_graph_version + 1
+            or not validate_organization_graph(canonical_base).committable
+        ):
+            raise ImportUnavailable()
+        expected_graph, _carried_member_uids, _removed_member_uids = _committed_graph(
+            canonical_draft,
+            canonical_base,
+            version=canonical_receipt.graph_version,
+            created_at=canonical_receipt.committed_at,
+        )
+        canonical_expected = exact_canonical_model(expected_graph, OrganizationGraph)
+        if (
+            canonical_expected is None
+            or canonical_graph is None
             or canonical_graph.organization_id != organization_id
             or canonical_graph.version != canonical_receipt.graph_version
+            or not validate_organization_graph(canonical_expected).committable
             or not validate_organization_graph(canonical_graph).committable
             or canonical_receipt.committed_subject_count
             != len(canonical_draft.candidate.subjects)
-            or canonical_receipt.committed_subject_count > len(canonical_graph.subjects)
+            or not exact_canonical_equal(
+                canonical_expected,
+                canonical_graph,
+                OrganizationGraph,
+            )
             or (
                 current_version == canonical_receipt.graph_version
                 and storage["payload_digest"] != state["payload_digest"]
             )
         ):
             raise ImportUnavailable()
-        graph_subjects = {
-            subject.subject_id: subject for subject in canonical_graph.subjects
-        }
-        for candidate in canonical_draft.candidate.subjects:
-            committed = graph_subjects.get(candidate.subject_id)
-            if committed is None or to_json(
-                candidate.model_dump(exclude={"lifecycle", "member_uid"})
-            ) != to_json(
-                committed.model_dump(exclude={"lifecycle", "member_uid"})
-            ):
-                raise ImportUnavailable()
         return canonical_graph
 
     def _import_state(

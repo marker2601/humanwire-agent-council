@@ -99,6 +99,85 @@ class EqualitySpoofDict(dict):
         return True
 
 
+class SideEffectList(list):
+    def __init__(self, values, calls: list[str]) -> None:
+        list.__init__(self, values)
+        self.calls = calls
+
+    def __len__(self):
+        self.calls.append("len")
+        return list.__len__(self)
+
+    def __iter__(self):
+        self.calls.append("iter")
+        return list.__iter__(self)
+
+    def __repr__(self):
+        self.calls.append("repr")
+        return list.__repr__(self)
+
+    def __eq__(self, other):
+        self.calls.append("eq")
+        return list.__eq__(self, other)
+
+    def __hash__(self):
+        self.calls.append("hash")
+        return 1
+
+
+class SideEffectString(str):
+    def __new__(cls, value: str, calls: list[str]):
+        instance = str.__new__(cls, value)
+        instance.calls = calls
+        return instance
+
+    def __len__(self):
+        self.calls.append("len")
+        return str.__len__(self)
+
+    def __iter__(self):
+        self.calls.append("iter")
+        return iter(str.__str__(self))
+
+    def __repr__(self):
+        self.calls.append("repr")
+        return str.__repr__(self)
+
+    def __eq__(self, other):
+        self.calls.append("eq")
+        return str.__eq__(self, other)
+
+    def __hash__(self):
+        self.calls.append("hash")
+        return str.__hash__(self)
+
+
+class SideEffectDict(dict):
+    def __init__(self, values, calls: list[str]) -> None:
+        dict.__init__(self, values)
+        self.calls = calls
+
+    def __len__(self):
+        self.calls.append("len")
+        return dict.__len__(self)
+
+    def __iter__(self):
+        self.calls.append("iter")
+        return dict.__iter__(self)
+
+    def __repr__(self):
+        self.calls.append("repr")
+        return dict.__repr__(self)
+
+    def __eq__(self, other):
+        self.calls.append("eq")
+        return dict.__eq__(self, other)
+
+    def __hash__(self):
+        self.calls.append("hash")
+        return 1
+
+
 def _install_hidden_equality_spoof(model, mutation) -> EqualitySpoofDict:
     state = EqualitySpoofDict(mutation)
     object.__setattr__(model, "__pydantic_private__", state)
@@ -1257,6 +1336,64 @@ def test_exact_canonical_model_rejects_hidden_equality_spoof_without_calling_it(
 
     assert exact_canonical_model(graph, OrganizationGraph) is None
     assert state.calls == 0
+
+
+@pytest.mark.parametrize("hostile_kind", ["list", "string", "dict"])
+def test_exact_canonical_preflight_rejects_subclasses_without_dispatching_hooks(
+    hostile_kind,
+) -> None:
+    graph = OrganizationGraph(organization_id=ORG_A, version=0, created_at=NOW)
+    calls: list[str] = []
+    hostile = {
+        "list": lambda: SideEffectList([1], calls),
+        "string": lambda: SideEffectString("1", calls),
+        "dict": lambda: SideEffectDict({"private": 1}, calls),
+    }[hostile_kind]()
+    dict.__setitem__(object.__getattribute__(graph, "__dict__"), "version", hostile)
+
+    assert exact_canonical_model(graph, OrganizationGraph) is None
+    assert calls == []
+
+
+def test_import_detail_rejects_self_deleting_serializer_hook_without_calling_it(
+    bundle,
+    monkeypatch,
+) -> None:
+    client = _client(bundle, "owner")
+    uploaded = _upload(client).json()
+    draft, reconciliation, receipt = bundle.import_service.load_import(
+        bundle.owner_context,
+        uploaded["import_id"],
+    )
+    private = "private_payload"
+    calls: list[str] = []
+
+    def model_dump_json_hook(*args, **kwargs):
+        calls.append("model_dump_json")
+        reconciliation_values = object.__getattribute__(reconciliation, "__dict__")
+        dict.__delitem__(reconciliation_values, "model_dump_json")
+        snapshot_values = object.__getattribute__(draft.source_snapshot, "__dict__")
+        dict.__setitem__(snapshot_values, "source_kind", private)
+        return ImportReconciliation.model_dump_json(reconciliation, *args, **kwargs)
+
+    dict.__setitem__(
+        object.__getattribute__(reconciliation, "__dict__"),
+        "model_dump_json",
+        model_dump_json_hook,
+    )
+    monkeypatch.setattr(
+        bundle.import_service,
+        "load_import",
+        lambda _context, _import_id: (draft, reconciliation, receipt),
+    )
+
+    response = client.get(f"/api/organizations/{ORG_A}/imports/{draft.import_id}")
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "organization_not_found"}
+    assert private not in response.text
+    assert calls == []
+    assert draft.source_snapshot.source_kind == "csv"
 
 
 def test_import_detail_never_serializes_draft_mutated_by_hidden_equality(

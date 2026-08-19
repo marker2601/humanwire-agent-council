@@ -11,6 +11,7 @@ from google.cloud.firestore_v1 import _helpers as firestore_helpers
 from google.cloud.firestore_v1.types import Document as FirestoreDocument
 from pydantic_core import to_json
 
+from humanwire import organization_store
 from humanwire.decisionos_models import (
     DecisionOrganization,
     DecisionOSContext,
@@ -29,6 +30,7 @@ from humanwire.organization_models import (
     AuthorityFunction,
     ImportDraft,
     ImportReceipt,
+    OrganizationGraph,
     OrganizationGraphCandidate,
     OrganizationSubject,
     OrganizationSubjectKind,
@@ -530,6 +532,59 @@ def inject_phantom_committed_receipt(client: FakeClient, saved: ImportDraft) -> 
     return receipt
 
 
+def inject_committed_receipt(
+    client: FakeClient,
+    saved: ImportDraft,
+    *,
+    graph_version: int,
+) -> ImportReceipt:
+    receipt = ImportReceipt(
+        receipt_id=f"rcp_{deterministic_ulid(ORG, saved.import_id)}",
+        import_id=saved.import_id,
+        organization_id=ORG,
+        source_snapshot_id=saved.source_snapshot.snapshot_id,
+        source_snapshot_digest=saved.source_snapshot.semantic_digest,
+        graph_version=graph_version,
+        committed_subject_count=len(saved.candidate.subjects),
+        committed_at=NOW,
+        committed_by_uid=OWNER.uid,
+    )
+    import_path = (COLLECTION, ORG, "imports", saved.import_id)
+    client.data[import_path].update(
+        {
+            "status": "committed",
+            "receipt": receipt.model_dump(mode="python"),
+        }
+    )
+    client.data[import_path]["payload_digest"] = independent_digest(
+        {
+            key: value
+            for key, value in client.data[import_path].items()
+            if key != "payload_digest"
+        }
+    )
+    return receipt
+
+
+def replace_stored_graph(
+    client: FakeClient,
+    repository: FirestoreOrganizationGraphRepository,
+    graph: OrganizationGraph,
+) -> None:
+    storage, chunks = organization_store._chunked_graph(graph)
+    version_path = repository._version_ref(ORG, graph.version).path
+    chunk_prefix = (*version_path, "chunks")
+    for path in tuple(client.data):
+        if path[: len(chunk_prefix)] == chunk_prefix:
+            client.data.pop(path)
+    client.data[version_path] = deepcopy(storage)
+    for chunk_id, chunk in chunks.items():
+        client.data[(*chunk_prefix, chunk_id)] = deepcopy(chunk)
+    state_path = repository._state_ref(ORG).path
+    if client.data[state_path]["current_version"] == graph.version:
+        client.data[state_path]["payload_digest"] = storage["payload_digest"]
+
+
 @pytest.mark.parametrize(
     ("operation", "expected_error"),
     (
@@ -632,6 +687,117 @@ def test_firestore_reads_exact_receipt_and_committed_graph_version(fake_firestor
     )
     with pytest.raises(ImportUnavailable, match="import_unavailable"):
         repository.load_committed_import(context, receipt.graph_version + 1)
+
+
+def test_firestore_receipt_rejects_unrelated_valid_v1_graph_with_matching_subjects(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    graph = repository.load_graph(context)
+    forged = graph.model_copy(
+        update={
+            "units": (
+                OrganizationUnit(
+                    unit_id="unit_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    organization_id=ORG,
+                    name="Unrelated Valid Unit",
+                ),
+            )
+        }
+    )
+    replace_stored_graph(client, repository, forged)
+    before = deepcopy(client.data)
+    client.provider_mutation_attempts = 0
+
+    with pytest.raises(ImportUnavailable, match="^import_unavailable$"):
+        repository.load_import_receipt(context, saved.import_id)
+
+    assert client.data == before
+    assert client.provider_mutation_attempts == 0
+
+
+def test_firestore_receipt_rejects_bind_derived_v2_graph_for_different_draft(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    first = repository.save_import_draft(context, draft())
+    repository.commit_graph(
+        context,
+        draft_id=first.import_id,
+        reviewed_digest=first.semantic_digest,
+    )
+    second = repository.save_import_draft(
+        context,
+        next_draft(
+            first.model_copy(update={"base_graph_version": 1}),
+            supersedes_import_id=first.import_id,
+        ),
+    )
+    repository.bind_member(context, subject_id=SUBJECT, member_uid=OWNER.uid)
+    inject_committed_receipt(client, second, graph_version=2)
+    before = deepcopy(client.data)
+    client.provider_mutation_attempts = 0
+
+    with pytest.raises(ImportUnavailable, match="^import_unavailable$"):
+        repository.load_import_receipt(context, second.import_id)
+
+    assert client.data == before
+    assert client.provider_mutation_attempts == 0
+
+
+def test_firestore_receipt_provenance_reads_base_and_commit_in_one_transaction(
+    fake_firestore,
+    monkeypatch,
+) -> None:
+    _client, repository, context = fake_firestore
+    first = repository.save_import_draft(context, draft())
+    repository.commit_graph(
+        context,
+        draft_id=first.import_id,
+        reviewed_digest=first.semantic_digest,
+    )
+    second = repository.save_import_draft(
+        context,
+        next_draft(
+            first.model_copy(update={"base_graph_version": 1}),
+            supersedes_import_id=first.import_id,
+        ),
+    )
+    receipt = repository.commit_graph(
+        context,
+        draft_id=second.import_id,
+        reviewed_digest=second.semantic_digest,
+    )
+    original_graph_from_row = repository._graph_from_row
+    graph_reads = []
+
+    def recording_graph_from_row(
+        organization_id,
+        version,
+        row,
+        *,
+        transaction=None,
+    ):
+        graph_reads.append((version, transaction))
+        return original_graph_from_row(
+            organization_id,
+            version,
+            row,
+            transaction=transaction,
+        )
+
+    monkeypatch.setattr(repository, "_graph_from_row", recording_graph_from_row)
+
+    assert repository.load_import_receipt(context, second.import_id) == receipt
+    assert tuple(version for version, _transaction in graph_reads) == (1, 2)
+    assert graph_reads[0][1] is not None
+    assert graph_reads[0][1] is graph_reads[1][1]
 
 
 @pytest.mark.parametrize(
