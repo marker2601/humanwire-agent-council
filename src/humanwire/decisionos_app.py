@@ -33,6 +33,12 @@ from humanwire.decisionos_models import (
     DecisionOSRole,
     WorkspacePlaybook,
 )
+from humanwire.decisionos_organization_routes import (
+    OrganizationProjectionBuilder,
+    OrganizationRouteDependencies,
+    OrganizationSourceParser,
+    create_organization_router,
+)
 from humanwire.decisionos_store import (
     DecisionOSAuthorizationDenied,
     DecisionOSRepository,
@@ -40,8 +46,11 @@ from humanwire.decisionos_store import (
     OrganizationUnavailable,
     WorkspaceUnavailable,
 )
+from humanwire.organization_import import OrganizationImportService
+from humanwire.organization_store import OrganizationGraphRepository
 
 _MAX_BODY_BYTES = 8192
+_MAX_UPLOAD_BODY_BYTES = 10 * 1024 * 1024 + 4096
 _PACKAGE_DIR = Path(__file__).resolve().parent
 _SESSION_COOKIE = "__session"
 _CSRF_COOKIE = "__Host-humanwire-csrf"
@@ -67,6 +76,43 @@ _MUTATION_PATHS = (
     re.compile(r"^/api/invitations/accept$"),
     re.compile(rf"^/api/organizations/{_ORGANIZATION_ID}/invitations$"),
     re.compile(rf"^/api/organizations/{_ORGANIZATION_ID}/workspaces$"),
+)
+_ORGANIZATION_ROUTE_PROFILES = (
+    (
+        re.compile(r"^/api/organizations/[^/]+/imports$"),
+        frozenset({"POST"}),
+        "multipart",
+    ),
+    (
+        re.compile(r"^/api/organizations/[^/]+/imports/[^/]+$"),
+        frozenset({"GET", "HEAD"}),
+        "read",
+    ),
+    (
+        re.compile(r"^/api/organizations/[^/]+/imports/[^/]+/corrections$"),
+        frozenset({"POST"}),
+        "json",
+    ),
+    (
+        re.compile(r"^/api/organizations/[^/]+/imports/[^/]+/commit$"),
+        frozenset({"POST"}),
+        "json",
+    ),
+    (
+        re.compile(r"^/api/organizations/[^/]+/organization-graph$"),
+        frozenset({"GET", "HEAD"}),
+        "read",
+    ),
+    (
+        re.compile(r"^/api/organizations/[^/]+/authority-map$"),
+        frozenset({"GET", "HEAD"}),
+        "read",
+    ),
+)
+_ORGANIZATION_ROUTE_FAMILY = re.compile(
+    r"^/api/organizations/[^/]+/(?:"
+    r"imports(?:/[^/]+(?:/(?:corrections|commit))?)?"
+    r"|organization-graph|authority-map)/?$"
 )
 _SAFE_HEADERS = {
     "Cache-Control": "no-store",
@@ -125,6 +171,11 @@ class DecisionOSDependencies:
     firebase_public_config: Mapping[str, object] = field(default_factory=dict)
     app_check_enforced: bool = True
     app_check_observer: Callable[[bool], None] = _ignore_app_check_observation
+    organization_features_enabled: bool = False
+    organization_source_parser: OrganizationSourceParser | None = None
+    organization_import_service: OrganizationImportService | None = None
+    organization_graph_repository: OrganizationGraphRepository | None = None
+    organization_projection_builder: OrganizationProjectionBuilder | None = None
 
     def __post_init__(self) -> None:
         if not self.allowed_hosts:
@@ -138,6 +189,17 @@ class DecisionOSDependencies:
                 raise ValueError("DecisionOS allowed host is invalid")
         config = _validated_public_config(self.firebase_public_config)
         object.__setattr__(self, "firebase_public_config", MappingProxyType(config))
+        organization_dependencies = (
+            self.organization_source_parser,
+            self.organization_import_service,
+            self.organization_graph_repository,
+            self.organization_projection_builder,
+        )
+        if type(self.organization_features_enabled) is not bool or (
+            self.organization_features_enabled
+            and any(item is None for item in organization_dependencies)
+        ):
+            raise ValueError("DecisionOS organization dependencies are incomplete")
 
 
 def _public_value(value: object) -> bool:
@@ -270,6 +332,28 @@ def _is_exact_mutation(request: Request) -> bool:
     )
 
 
+def _organization_route_profile(
+    request: Request,
+) -> tuple[frozenset[str], str] | str | None:
+    path = request.scope.get("path")
+    raw_path = request.scope.get("raw_path")
+    if not isinstance(path, str) or not isinstance(raw_path, bytes):
+        return None
+    for pattern, methods, media_kind in _ORGANIZATION_ROUTE_PROFILES:
+        if pattern.fullmatch(path) is None:
+            continue
+        try:
+            exact_raw = path.encode("ascii")
+        except UnicodeEncodeError:
+            return "invalid"
+        if raw_path != exact_raw or request.scope.get("query_string"):
+            return "invalid"
+        return methods, media_kind
+    if _ORGANIZATION_ROUTE_FAMILY.fullmatch(path) is not None:
+        return "invalid"
+    return None
+
+
 def _session_cookie(request: Request) -> str | None:
     if len(_raw_headers(request, b"cookie")) != 1:
         return None
@@ -345,27 +429,44 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
     @app.middleware("http")
     async def protected_boundary(request: Request, call_next):
         try:
+            organization_profile = (
+                _organization_route_profile(request)
+                if dependencies.organization_features_enabled
+                else None
+            )
             hosts = _raw_headers(request, b"host")
             host = _ascii_header(hosts)
             if host is None or host.casefold() not in dependencies.allowed_hosts:
                 response = _fixed_error(400, "invalid_host")
             elif len(_raw_headers(request, b"cookie")) > 1:
                 response = _fixed_error(400, "invalid_request")
-            elif request.method not in {"GET", "HEAD", "POST"} or (
-                request.method == "POST" and not _is_exact_mutation(request)
+            elif organization_profile == "invalid" or (
+                isinstance(organization_profile, tuple)
+                and request.method not in organization_profile[0]
+            ) or request.method not in {"GET", "HEAD", "POST"} or (
+                request.method == "POST"
+                and not _is_exact_mutation(request)
+                and not isinstance(organization_profile, tuple)
             ):
                 response = _fixed_error(405, "method_not_allowed")
             elif request.method == "POST":
                 lengths = _raw_headers(request, b"content-length")
                 length_text = _ascii_header(lengths)
+                upload = (
+                    isinstance(organization_profile, tuple)
+                    and organization_profile[1] == "multipart"
+                )
+                maximum_body_bytes = (
+                    _MAX_UPLOAD_BODY_BYTES if upload else _MAX_BODY_BYTES
+                )
                 if (
                     length_text is None
                     or not length_text.isdecimal()
-                    or len(length_text) > 4
+                    or len(length_text) > len(str(maximum_body_bytes))
                     or int(length_text) < 1
                 ):
                     response = _fixed_error(400, "invalid_request")
-                elif int(length_text) > _MAX_BODY_BYTES:
+                elif int(length_text) > maximum_body_bytes:
                     response = _fixed_error(413, "request_too_large")
                 elif _raw_headers(request, b"transfer-encoding") or _raw_headers(
                     request,
@@ -374,8 +475,13 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
                     response = _fixed_error(400, "invalid_request")
                 else:
                     content_type = _ascii_header(_raw_headers(request, b"content-type"))
-                    if content_type is None or content_type.split(";", 1)[0].strip().casefold() != (
-                        "application/json"
+                    expected_content_type = (
+                        "multipart/form-data" if upload else "application/json"
+                    )
+                    if (
+                        content_type is None
+                        or content_type.split(";", 1)[0].strip().casefold()
+                        != expected_content_type
                     ):
                         response = _fixed_error(415, "unsupported_media_type")
                     else:
@@ -643,5 +749,27 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
         except WorkspaceUnavailable:
             return _fixed_error(404, "workspace_not_found")
         return JSONResponse(content=workspace.model_dump(mode="json"))
+
+    if dependencies.organization_features_enabled:
+        assert dependencies.organization_source_parser is not None
+        assert dependencies.organization_import_service is not None
+        assert dependencies.organization_graph_repository is not None
+        assert dependencies.organization_projection_builder is not None
+        app.include_router(
+            create_organization_router(
+                OrganizationRouteDependencies(
+                    decisionos_repository=dependencies.repository,
+                    source_parser=dependencies.organization_source_parser,
+                    import_service=dependencies.organization_import_service,
+                    graph_repository=dependencies.organization_graph_repository,
+                    projection_builder=dependencies.organization_projection_builder,
+                    principal_loader=lambda request: _principal(
+                        request,
+                        dependencies.authenticator,
+                    ),
+                    body_loader=_body,
+                )
+            )
+        )
 
     return app

@@ -78,6 +78,7 @@ def test_production_settings_bind_only_explicit_decisionos_environment(monkeypat
         {"decisionos.example.com", "humanwire-startup.firebaseapp.com"}
     )
     assert settings.app_check_enforced is False
+    assert settings.organization_features_enabled is False
     assert settings.firebase_public_config == {
         "firebase": {
             "apiKey": "public-web-key",
@@ -88,6 +89,26 @@ def test_production_settings_bind_only_explicit_decisionos_environment(monkeypat
         },
         "appCheckSiteKey": "recaptcha-site-key",
     }
+
+
+def test_organization_feature_setting_is_explicit_and_disabled_by_default(monkeypatch) -> None:
+    values = {
+        "PROJECT_ID": "humanwire-startup",
+        "ALLOWED_HOSTS": "decisionos.example.com",
+        "FIREBASE_API_KEY": "public-web-key",
+        "FIREBASE_APP_ID": "1:123:web:abc",
+        "FIREBASE_AUTH_DOMAIN": "humanwire-startup.firebaseapp.com",
+        "APP_CHECK_SITE_KEY": "recaptcha-site-key",
+    }
+    for suffix, value in values.items():
+        monkeypatch.setenv(f"HUMANWIRE_DECISIONOS_{suffix}", value)
+
+    disabled = decisionos_web.DecisionOSSettings()
+    monkeypatch.setenv("HUMANWIRE_DECISIONOS_ORGANIZATION_FEATURES_ENABLED", "true")
+    enabled = decisionos_web.DecisionOSSettings()
+
+    assert disabled.organization_features_enabled is False
+    assert enabled.organization_features_enabled is True
 
 
 def test_container_keeps_existing_roles_and_installs_decisionos_runtime() -> None:

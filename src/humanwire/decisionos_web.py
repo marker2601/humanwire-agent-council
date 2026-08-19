@@ -49,6 +49,7 @@ class DecisionOSSettings(BaseSettings):
     firebase_messaging_sender_id: str | None = Field(default=None, max_length=64)
     app_check_site_key: SecretStr
     app_check_enforced: bool = False
+    organization_features_enabled: bool = False
 
     @field_validator(
         "firestore_database",
@@ -190,15 +191,34 @@ def build_dependencies(
         app=firebase_app,
         database_id=settings.firestore_database,
     )
+    decisionos_repository = FirestoreDecisionOSRepository(firestore_client)
+    organization_dependencies: dict[str, object] = {}
+    if settings.organization_features_enabled:
+        from humanwire.organization_import import OrganizationImportService
+        from humanwire.organization_projection import build_organization_projection
+        from humanwire.organization_sources import parse_organization_source
+        from humanwire.organization_store import FirestoreOrganizationGraphRepository
+
+        organization_repository = FirestoreOrganizationGraphRepository(firestore_client)
+        organization_dependencies = {
+            "organization_source_parser": parse_organization_source,
+            "organization_import_service": OrganizationImportService(
+                repository=organization_repository,
+            ),
+            "organization_graph_repository": organization_repository,
+            "organization_projection_builder": build_organization_projection,
+        }
     return DecisionOSDependencies(
         authenticator=FirebaseSessionAuthenticator(_FirebaseAuthAdapter(firebase_app)),
         app_check=FirebaseAppCheckVerifier(_FirebaseAppCheckAdapter(firebase_app)),
-        repository=FirestoreDecisionOSRepository(firestore_client),
+        repository=decisionos_repository,
         allowed_hosts=settings.allowed_host_set,
         csrf_token_factory=lambda: secrets.token_urlsafe(32),
         firebase_public_config=settings.firebase_public_config,
         app_check_enforced=settings.app_check_enforced,
         app_check_observer=_observe_app_check,
+        organization_features_enabled=settings.organization_features_enabled,
+        **organization_dependencies,
     )
 
 
