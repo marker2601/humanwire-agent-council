@@ -22,6 +22,7 @@ from humanwire.decisionos_models import (
 )
 from humanwire.decisionos_store import (
     FirestoreDecisionOSRepository,
+    InvitationUnavailable,
     LastOwnerRequired,
     OrganizationUnavailable,
 )
@@ -687,6 +688,155 @@ def test_firestore_reads_exact_receipt_and_committed_graph_version(fake_firestor
     )
     with pytest.raises(ImportUnavailable, match="import_unavailable"):
         repository.load_committed_import(context, receipt.graph_version + 1)
+
+
+def test_firestore_subject_invitation_accepts_membership_and_binding_atomically(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    decisionos = FirestoreDecisionOSRepository(
+        client,
+        clock=lambda: NOW,
+        identifiers=Identifiers(),
+        organization_collection=COLLECTION,
+        invitation_index_collection="test_subject_invites",
+    )
+    grants = repository.create_subject_invitations(
+        decisionos,
+        context,
+        subject_ids=(SUBJECT,),
+        role=DecisionOSRole.CONTRIBUTOR,
+        expires_in=timedelta(days=1),
+        delivery_route_id="consented_test_route",
+    )
+    issued = repository.load_graph(context)
+    assert issued.version == 2
+    assert issued.subjects[0].lifecycle is SubjectLifecycle.INVITED
+    token = grants[0].token.get_secret_value()
+    decisionos.record_subject_invitation_delivery(
+        context,
+        grants[0],
+        delivered=True,
+    )
+    invitee = DecisionOSPrincipal(
+        uid="firebase-subject-invitee",
+        email_verified=True,
+        provider_ids=("google.com",),
+    )
+
+    membership, subject = repository.accept_subject_invitation(
+        decisionos,
+        invitee,
+        token,
+    )
+
+    assert membership.uid == invitee.uid
+    assert subject.member_uid == invitee.uid
+    assert repository.load_graph(context).version == 3
+    assert repository.load_committed_import(context, 3) == (saved, repository.load_import_receipt(context, saved.import_id))
+    assert decisionos.load_context(invitee, ORG).membership.role is DecisionOSRole.CONTRIBUTOR
+    assert token not in repr(client.data)
+    with pytest.raises(InvitationUnavailable, match="invitation_unavailable"):
+        repository.accept_subject_invitation(decisionos, invitee, token)
+
+
+def test_firestore_subject_acceptance_abort_rolls_back_and_retry_advances_once(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    decisionos = FirestoreDecisionOSRepository(
+        client,
+        clock=lambda: NOW,
+        identifiers=Identifiers(),
+        organization_collection=COLLECTION,
+        invitation_index_collection="test_subject_invites",
+    )
+    grant = repository.create_subject_invitations(
+        decisionos,
+        context,
+        subject_ids=(SUBJECT,),
+        role=DecisionOSRole.VIEWER,
+        expires_in=timedelta(days=1),
+        delivery_route_id="consented_test_route",
+    )[0]
+    decisionos.record_subject_invitation_delivery(context, grant, delivered=True)
+    token = grant.token.get_secret_value()
+    invitee = DecisionOSPrincipal(
+        uid="firebase-transaction-retry",
+        email_verified=True,
+        provider_ids=("google.com",),
+    )
+    before = deepcopy(client.data)
+    client.abort_next_transaction = True
+
+    with pytest.raises(InvitationUnavailable, match="invitation_unavailable"):
+        repository.accept_subject_invitation(decisionos, invitee, token)
+
+    assert client.data == before
+    membership, subject = repository.accept_subject_invitation(
+        decisionos,
+        invitee,
+        token,
+    )
+    assert membership.uid == subject.member_uid == invitee.uid
+    assert repository.load_graph(context).version == 3
+
+
+def test_firestore_activation_transitions_survive_restart_and_corruption_fails_closed(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    receipt = repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    decisionos = FirestoreDecisionOSRepository(
+        client,
+        clock=lambda: NOW,
+        identifiers=Identifiers(),
+        organization_collection=COLLECTION,
+        invitation_index_collection="test_subject_invites",
+    )
+    repository.create_subject_invitations(
+        decisionos,
+        context,
+        subject_ids=(SUBJECT,),
+        role=DecisionOSRole.VIEWER,
+        expires_in=timedelta(days=1),
+        delivery_route_id=None,
+    )
+    restarted = FirestoreOrganizationGraphRepository(
+        client,
+        clock=lambda: NOW,
+        organization_collection=COLLECTION,
+        audit_collection=AUDIT,
+    )
+
+    assert restarted.load_committed_import(context, 2) == (saved, receipt)
+    transition_path = (
+        COLLECTION,
+        ORG,
+        "organization_activation_transitions",
+        "00000000000000000002",
+    )
+    client.data[transition_path]["subject_ids"] = [SUBJECT_B]
+
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        restarted.load_committed_import(context, 2)
 
 
 def test_firestore_receipt_rejects_unrelated_valid_v1_graph_with_matching_subjects(

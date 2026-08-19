@@ -8,7 +8,7 @@ import secrets
 import threading
 from collections import Counter
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from functools import wraps
 from typing import Any, Literal, Protocol, Self
 
@@ -27,9 +27,11 @@ from humanwire.decisionos_store import (
     DecisionOSPermission,
     DecisionOSRepository,
     DecisionOSStoreError,
+    InvitationUnavailable,
     LastOwnerRequired,
     MembershipUnavailable,
     OrganizationUnavailable,
+    SubjectInvitationGrant,
     _InMemoryPreparedMutation,
     _InMemoryReferenceReplacement,
     _publish_in_memory_replacements,
@@ -57,6 +59,7 @@ _ULID = r"[0-9A-HJKMNP-TV-Z]{26}"
 _IMPORT_ID = rf"^imp_{_ULID}$"
 _SUBJECT_ID = rf"^sub_{_ULID}$"
 _SHA256 = r"^[0-9a-f]{64}$"
+_FIREBASE_UID = r"^[A-Za-z0-9._:-]{1,128}$"
 _ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _CHUNK_TARGET_BYTES = 350_000
 _MAX_DOCUMENT_BYTES = 450_000
@@ -196,6 +199,133 @@ class OrganizationGraphAuditEvent(BaseModel):
         return self
 
 
+class _ActivationTransition(BaseModel):
+    """Private, digest-bound provenance for post-import activation graph versions."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    organization_id: str
+    kind: Literal["invitations_created", "invitation_accepted"]
+    subject_ids: tuple[str, ...]
+    prior_graph_version: int
+    new_graph_version: int
+    member_uid: str | None = None
+    occurred_at: datetime
+    payload_digest: str
+
+    @model_validator(mode="after")
+    def is_exact_activation_provenance(self) -> Self:
+        if (
+            re.fullmatch(rf"^org_{_ULID}$", self.organization_id) is None
+            or type(self.prior_graph_version) is not int
+            or self.prior_graph_version < 1
+            or type(self.new_graph_version) is not int
+            or self.new_graph_version != self.prior_graph_version + 1
+            or type(self.subject_ids) is not tuple
+            or not self.subject_ids
+            or len(self.subject_ids) != len(set(self.subject_ids))
+            or any(
+                type(subject_id) is not str
+                or re.fullmatch(_SUBJECT_ID, subject_id) is None
+                for subject_id in self.subject_ids
+            )
+            or self.occurred_at.tzinfo is None
+            or self.occurred_at.utcoffset() is None
+        ):
+            raise ValueError("activation transition is invalid")
+        if self.kind == "invitations_created":
+            if self.member_uid is not None:
+                raise ValueError("invitation issue transition cannot contain a UID")
+        elif (
+            len(self.subject_ids) != 1
+            or type(self.member_uid) is not str
+            or re.fullmatch(_FIREBASE_UID, self.member_uid) is None
+        ):
+            raise ValueError("invitation acceptance transition is invalid")
+        expected = hashlib.sha256(
+            to_json(self.model_dump(mode="python", exclude={"payload_digest"}))
+        ).hexdigest()
+        if (
+            type(self.payload_digest) is not str
+            or re.fullmatch(_SHA256, self.payload_digest) is None
+            or not secrets.compare_digest(self.payload_digest, expected)
+        ):
+            raise ValueError("activation transition digest is invalid")
+        return self
+
+
+def _activation_transition(
+    *,
+    organization_id: str,
+    kind: Literal["invitations_created", "invitation_accepted"],
+    subject_ids: tuple[str, ...],
+    prior_graph_version: int,
+    member_uid: str | None,
+    occurred_at: datetime,
+) -> _ActivationTransition:
+    payload = {
+        "organization_id": organization_id,
+        "kind": kind,
+        "subject_ids": subject_ids,
+        "prior_graph_version": prior_graph_version,
+        "new_graph_version": prior_graph_version + 1,
+        "member_uid": member_uid,
+        "occurred_at": occurred_at,
+    }
+    return _ActivationTransition(
+        **payload,
+        payload_digest=hashlib.sha256(to_json(payload)).hexdigest(),
+    )
+
+
+def _canonical_activation_transition(value: object) -> _ActivationTransition | None:
+    if type(value) is not _ActivationTransition:
+        return None
+    canonical = None
+    failed = False
+    try:
+        fields = tuple(_ActivationTransition.model_fields)
+        values = object.__getattribute__(value, "__dict__")
+        extra = object.__getattribute__(value, "__pydantic_extra__")
+        private = object.__getattribute__(value, "__pydantic_private__")
+        if (
+            type(values) is not dict
+            or tuple(values) != fields
+            or extra not in (None, {})
+            or private not in (None, {})
+        ):
+            return None
+        raw_json = BaseModel.model_dump_json(value, warnings="error")
+        canonical = BaseModel.model_validate_json.__func__(
+            _ActivationTransition,
+            raw_json,
+            strict=True,
+        )
+        if not isinstance(canonical, _ActivationTransition):
+            return None
+        canonical_json = BaseModel.model_dump_json(canonical, warnings="error")
+        if not secrets.compare_digest(raw_json, canonical_json):
+            return None
+    except Exception:  # noqa: BLE001 - hostile private records fail closed
+        failed = True
+    if failed:
+        return None
+    return canonical
+
+
+def _transition_from_storage(value: object) -> _ActivationTransition:
+    parsed = None
+    failed = False
+    try:
+        parsed = _ActivationTransition.model_validate_json(to_json(value), strict=True)
+    except Exception:  # noqa: BLE001 - stored corruption details are sealed
+        failed = True
+    canonical = None if parsed is None else _canonical_activation_transition(parsed)
+    if failed or canonical is None:
+        raise ImportUnavailable() from None
+    return canonical
+
+
 class OrganizationGraphRepository(Protocol):
     def save_import_draft(
         self,
@@ -253,6 +383,24 @@ class OrganizationGraphRepository(Protocol):
         subject_id: str,
         member_uid: str,
     ) -> OrganizationSubject: ...
+
+    def create_subject_invitations(
+        self,
+        decisionos: DecisionOSRepository,
+        context: DecisionOSContext,
+        *,
+        subject_ids: tuple[str, ...],
+        role: DecisionOSRole,
+        expires_in: timedelta,
+        delivery_route_id: str | None,
+    ) -> tuple[SubjectInvitationGrant, ...]: ...
+
+    def accept_subject_invitation(
+        self,
+        decisionos: DecisionOSRepository,
+        principal: DecisionOSPrincipal,
+        token: str,
+    ) -> tuple[OrganizationMembership, OrganizationSubject]: ...
 
 
 class _SavedImport:
@@ -465,6 +613,99 @@ def _graphs_differ_only_by_member_bindings(
     return target_version - receipt_version == newly_bound
 
 
+def _replays_activation_transition_chain(
+    receipt_graph: OrganizationGraph,
+    target_graph: OrganizationGraph,
+    transitions: tuple[_ActivationTransition, ...],
+    *,
+    receipt_version: int,
+    target_version: int,
+) -> bool:
+    """Replay only contiguous, canonical activation transitions to the exact target."""
+
+    current = exact_canonical_model(receipt_graph, OrganizationGraph)
+    canonical_target = exact_canonical_model(target_graph, OrganizationGraph)
+    if (
+        current is None
+        or canonical_target is None
+        or type(transitions) is not tuple
+        or current.organization_id != canonical_target.organization_id
+        or current.version != receipt_version
+        or canonical_target.version != target_version
+        or receipt_version > target_version
+        or len(transitions) != target_version - receipt_version
+        or not validate_organization_graph(current).committable
+        or not validate_organization_graph(canonical_target).committable
+    ):
+        return False
+    for expected_version, candidate in enumerate(
+        transitions,
+        start=receipt_version + 1,
+    ):
+        transition = _canonical_activation_transition(candidate)
+        if (
+            transition is None
+            or transition.organization_id != current.organization_id
+            or transition.prior_graph_version != current.version
+            or transition.new_graph_version != expected_version
+        ):
+            return False
+        by_id = {subject.subject_id: subject for subject in current.subjects}
+        if len(by_id) != len(current.subjects):
+            return False
+        replacements: dict[str, OrganizationSubject] = {}
+        if transition.kind == "invitations_created":
+            for subject_id in transition.subject_ids:
+                subject = by_id.get(subject_id)
+                if (
+                    subject is None
+                    or subject.kind is not OrganizationSubjectKind.HUMAN
+                    or subject.lifecycle is not SubjectLifecycle.DIRECTORY_ONLY
+                    or subject.member_uid is not None
+                ):
+                    return False
+                replacements[subject_id] = _validated_subject(
+                    subject,
+                    {"lifecycle": SubjectLifecycle.INVITED},
+                )
+        else:
+            subject_id = transition.subject_ids[0]
+            subject = by_id.get(subject_id)
+            member_uid = transition.member_uid
+            if (
+                subject is None
+                or subject.kind is not OrganizationSubjectKind.HUMAN
+                or subject.lifecycle
+                not in {SubjectLifecycle.DIRECTORY_ONLY, SubjectLifecycle.INVITED}
+                or subject.member_uid is not None
+                or type(member_uid) is not str
+                or any(item.member_uid == member_uid for item in current.subjects)
+            ):
+                return False
+            replacements[subject_id] = _validated_subject(
+                subject,
+                {
+                    "lifecycle": SubjectLifecycle.ACTIVE,
+                    "member_uid": member_uid,
+                },
+            )
+        current = OrganizationGraph(
+            organization_id=current.organization_id,
+            version=transition.new_graph_version,
+            subjects=tuple(
+                replacements.get(subject.subject_id, subject)
+                for subject in current.subjects
+            ),
+            units=current.units,
+            edges=current.edges,
+            authority_assignments=current.authority_assignments,
+            created_at=transition.occurred_at,
+        )
+        if not validate_organization_graph(current).committable:
+            return False
+    return exact_canonical_equal(current, canonical_target, OrganizationGraph)
+
+
 def _committed_graph(
     draft: ImportDraft,
     prior: OrganizationGraph,
@@ -599,6 +840,9 @@ class InMemoryOrganizationGraphRepository:
         self._imports: dict[tuple[str, str], _SavedImport] = {}
         self._latest_imports: dict[tuple[str, str], str] = {}
         self._audit: dict[str, list[OrganizationGraphAuditEvent]] = {}
+        self._activation_transitions: dict[
+            tuple[str, int], _ActivationTransition
+        ] = {}
 
     def __repr__(self) -> str:
         return "InMemoryOrganizationGraphRepository()"
@@ -755,9 +999,19 @@ class InMemoryOrganizationGraphRepository:
             receipt_graph = self._graphs.get(
                 (current.organization_id, receipt.graph_version)
             )
-            if receipt_graph is None or not _graphs_differ_only_by_member_bindings(
+            transitions: list[_ActivationTransition] = []
+            for version in range(receipt.graph_version + 1, graph_version + 1):
+                transition = self._activation_transitions.get(
+                    (current.organization_id, version)
+                )
+                canonical = _canonical_activation_transition(transition)
+                if canonical is None:
+                    raise ImportUnavailable()
+                transitions.append(canonical)
+            if receipt_graph is None or not _replays_activation_transition_chain(
                 receipt_graph,
                 target_graph,
+                tuple(transitions),
                 receipt_version=receipt.graph_version,
                 target_version=graph_version,
             ):
@@ -924,6 +1178,269 @@ class InMemoryOrganizationGraphRepository:
             current = self._read(context)
             return self._graph(current.organization_id)
 
+    def create_subject_invitations(
+        self,
+        decisionos: DecisionOSRepository,
+        context: DecisionOSContext,
+        *,
+        subject_ids: tuple[str, ...],
+        role: DecisionOSRole,
+        expires_in: timedelta,
+        delivery_route_id: str | None,
+    ) -> tuple[SubjectInvitationGrant, ...]:
+        with self._lock:
+            current = self._manage(context)
+
+            def validate(
+                _transaction,
+                invitation_context: DecisionOSContext,
+                grants: tuple[SubjectInvitationGrant, ...],
+            ) -> _InMemoryPreparedMutation:
+                if (
+                    invitation_context.organization_id != current.organization_id
+                    or invitation_context.principal.uid != current.principal.uid
+                    or tuple(grant.subject_id for grant in grants) != subject_ids
+                    or any(
+                        grant.organization_id != current.organization_id
+                        or grant.role is not role
+                        for grant in grants
+                    )
+                ):
+                    raise InvitationUnavailable()
+                graph = self._graph(current.organization_id)
+                by_id = {subject.subject_id: subject for subject in graph.subjects}
+                selected = tuple(by_id.get(subject_id) for subject_id in subject_ids)
+                if (
+                    len(by_id) != len(graph.subjects)
+                    or any(
+                        subject is None
+                        or subject.kind is not OrganizationSubjectKind.HUMAN
+                        or subject.member_uid is not None
+                        for subject in selected
+                    )
+                ):
+                    raise InvitationUnavailable()
+                lifecycles = {subject.lifecycle for subject in selected if subject is not None}
+                if lifecycles == {SubjectLifecycle.INVITED}:
+                    return _InMemoryPreparedMutation(replacements=())
+                if lifecycles != {SubjectLifecycle.DIRECTORY_ONLY}:
+                    raise InvitationUnavailable()
+                now = _aware(self._clock())
+                invited_by_id = {
+                    subject.subject_id: _validated_subject(
+                        subject,
+                        {"lifecycle": SubjectLifecycle.INVITED},
+                    )
+                    for subject in selected
+                    if subject is not None
+                }
+                invited_graph = OrganizationGraph(
+                    organization_id=graph.organization_id,
+                    version=graph.version + 1,
+                    subjects=tuple(
+                        invited_by_id.get(subject.subject_id, subject)
+                        for subject in graph.subjects
+                    ),
+                    units=graph.units,
+                    edges=graph.edges,
+                    authority_assignments=graph.authority_assignments,
+                    created_at=now,
+                )
+                transition = _activation_transition(
+                    organization_id=current.organization_id,
+                    kind="invitations_created",
+                    subject_ids=subject_ids,
+                    prior_graph_version=graph.version,
+                    member_uid=None,
+                    occurred_at=now,
+                )
+                replacement_graphs = dict(self._graphs)
+                replacement_graphs[(current.organization_id, invited_graph.version)] = (
+                    invited_graph
+                )
+                replacement_versions = dict(self._current_versions)
+                replacement_versions[current.organization_id] = invited_graph.version
+                replacement_transitions = dict(self._activation_transitions)
+                transition_key = (current.organization_id, invited_graph.version)
+                if transition_key in replacement_transitions:
+                    raise InvitationUnavailable()
+                replacement_transitions[transition_key] = transition
+                return _InMemoryPreparedMutation(
+                    replacements=(
+                        _InMemoryReferenceReplacement(
+                            self,
+                            "_graphs",
+                            self._graphs,
+                            replacement_graphs,
+                        ),
+                        _InMemoryReferenceReplacement(
+                            self,
+                            "_current_versions",
+                            self._current_versions,
+                            replacement_versions,
+                        ),
+                        _InMemoryReferenceReplacement(
+                            self,
+                            "_activation_transitions",
+                            self._activation_transitions,
+                            replacement_transitions,
+                        ),
+                    )
+                )
+
+            failed = False
+            grants = None
+            try:
+                grants = decisionos.create_subject_invitations(
+                    current,
+                    subject_ids=subject_ids,
+                    role=role,
+                    expires_in=expires_in,
+                    delivery_route_id=delivery_route_id,
+                    mutation=validate,
+                )
+            except (DecisionOSStoreError, InvitationUnavailable):
+                raise
+            except Exception:  # noqa: BLE001 - injected/provider details are sealed
+                failed = True
+            if failed or grants is None:
+                raise InvitationUnavailable() from None
+            return grants
+
+    def accept_subject_invitation(
+        self,
+        decisionos: DecisionOSRepository,
+        principal: DecisionOSPrincipal,
+        token: str,
+    ) -> tuple[OrganizationMembership, OrganizationSubject]:
+        with self._lock:
+            failed = False
+            accepted = None
+            try:
+                accepted = decisionos.accept_subject_invitation(
+                    principal,
+                    token,
+                    mutation=self._prepare_subject_invitation_acceptance,
+                )
+            except InvitationUnavailable:
+                raise
+            except Exception:  # noqa: BLE001 - invitation failures are non-enumerating
+                failed = True
+            if failed or accepted is None:
+                raise InvitationUnavailable() from None
+            membership, subject = accepted
+            if (
+                type(membership) is not OrganizationMembership
+                or type(subject) is not OrganizationSubject
+                or membership.organization_id != subject.organization_id
+                or membership.uid != subject.member_uid
+            ):
+                raise InvitationUnavailable()
+            return membership, subject
+
+    def _prepare_subject_invitation_acceptance(
+        self,
+        transaction,
+        context: DecisionOSContext,
+        subject_id: str,
+    ) -> tuple[_InMemoryPreparedMutation, OrganizationSubject]:
+        if transaction is not None or type(subject_id) is not str:
+            raise InvitationUnavailable()
+        prior = self._graph(context.organization_id)
+        subject = next(
+            (item for item in prior.subjects if item.subject_id == subject_id),
+            None,
+        )
+        if (
+            subject is None
+            or subject.kind is not OrganizationSubjectKind.HUMAN
+            or subject.lifecycle is not SubjectLifecycle.INVITED
+            or subject.member_uid is not None
+            or any(item.member_uid == context.principal.uid for item in prior.subjects)
+        ):
+            raise InvitationUnavailable()
+        bound = _validated_subject(
+            subject,
+            {
+                "member_uid": context.principal.uid,
+                "lifecycle": SubjectLifecycle.ACTIVE,
+            },
+        )
+        target_subjects = tuple(
+            bound if item.subject_id == subject_id else item for item in prior.subjects
+        )
+        if not _member_binding_is_allowed(
+            subject,
+            bound,
+            target_subjects=target_subjects,
+        ):
+            raise InvitationUnavailable()
+        now = _aware(self._clock())
+        graph = OrganizationGraph(
+            organization_id=prior.organization_id,
+            version=prior.version + 1,
+            subjects=target_subjects,
+            units=prior.units,
+            edges=prior.edges,
+            authority_assignments=prior.authority_assignments,
+            created_at=now,
+        )
+        event = _binding_event(context, prior.version, bound, now)
+        transition = _activation_transition(
+            organization_id=context.organization_id,
+            kind="invitation_accepted",
+            subject_ids=(subject_id,),
+            prior_graph_version=prior.version,
+            member_uid=context.principal.uid,
+            occurred_at=now,
+        )
+        replacement_graphs = dict(self._graphs)
+        replacement_graphs[(context.organization_id, graph.version)] = graph
+        replacement_versions = dict(self._current_versions)
+        replacement_versions[context.organization_id] = graph.version
+        replacement_audit = {
+            organization_id: list(events)
+            for organization_id, events in self._audit.items()
+        }
+        replacement_audit[context.organization_id] = [
+            *replacement_audit.get(context.organization_id, ()),
+            event,
+        ]
+        replacement_transitions = dict(self._activation_transitions)
+        transition_key = (context.organization_id, graph.version)
+        if transition_key in replacement_transitions:
+            raise InvitationUnavailable()
+        replacement_transitions[transition_key] = transition
+        prepared = _InMemoryPreparedMutation(
+            replacements=(
+                _InMemoryReferenceReplacement(
+                    self,
+                    "_graphs",
+                    self._graphs,
+                    replacement_graphs,
+                ),
+                _InMemoryReferenceReplacement(
+                    self,
+                    "_current_versions",
+                    self._current_versions,
+                    replacement_versions,
+                ),
+                _InMemoryReferenceReplacement(
+                    self,
+                    "_audit",
+                    self._audit,
+                    replacement_audit,
+                ),
+                _InMemoryReferenceReplacement(
+                    self,
+                    "_activation_transitions",
+                    self._activation_transitions,
+                    replacement_transitions,
+                ),
+            )
+        )
+        return prepared, bound
+
     def bind_member(
         self,
         context: DecisionOSContext,
@@ -979,9 +1496,21 @@ class InMemoryOrganizationGraphRepository:
                 created_at=now,
             )
             event = _binding_event(current, prior.version, bound, now)
+            transition = _activation_transition(
+                organization_id=current.organization_id,
+                kind="invitation_accepted",
+                subject_ids=(subject_id,),
+                prior_graph_version=prior.version,
+                member_uid=member_uid,
+                occurred_at=now,
+            )
+            transition_key = (current.organization_id, graph.version)
+            if transition_key in self._activation_transitions:
+                raise OrganizationUnavailable()
             self._graphs[(current.organization_id, graph.version)] = graph
             self._current_versions[current.organization_id] = graph.version
             self._audit.setdefault(current.organization_id, []).append(event)
+            self._activation_transitions[transition_key] = transition
             return bound
 
     def list_audit(
@@ -1339,6 +1868,52 @@ class FirestoreOrganizationGraphRepository:
             .document("state")
         )
 
+    def _activation_transition_ref(self, organization_id: str, version: int):
+        if type(version) is not int or version < 1:
+            raise ImportUnavailable()
+        return (
+            self._organization_ref(organization_id)
+            .collection("organization_activation_transitions")
+            .document(f"{version:020d}")
+        )
+
+    def _activation_transition_chain(
+        self,
+        transaction,
+        organization_id: str,
+        *,
+        receipt_version: int,
+        target_version: int,
+    ) -> tuple[_ActivationTransition, ...]:
+        rows = self._organization_ref(organization_id).collection(
+            "organization_activation_transitions"
+        ).stream(transaction=transaction)
+        relevant: list[_ActivationTransition] = []
+        for row in rows:
+            value = row.to_dict()
+            raw_version = value.get("new_graph_version") if type(value) is dict else None
+            id_version = int(row.id) if re.fullmatch(r"[0-9]{20}", row.id) else None
+            if not (
+                (type(raw_version) is int and receipt_version < raw_version <= target_version)
+                or (id_version is not None and receipt_version < id_version <= target_version)
+            ):
+                continue
+            transition = _transition_from_storage(value)
+            if (
+                transition.organization_id != organization_id
+                or row.id != f"{transition.new_graph_version:020d}"
+            ):
+                raise ImportUnavailable()
+            relevant.append(transition)
+        relevant.sort(key=lambda item: item.new_graph_version)
+        if (
+            len(relevant) != target_version - receipt_version
+            or tuple(item.new_graph_version for item in relevant)
+            != tuple(range(receipt_version + 1, target_version + 1))
+        ):
+            raise ImportUnavailable()
+        return tuple(relevant)
+
     def _lineage_ref(self, organization_id: str, source_kind: str):
         if re.fullmatch(r"^[a-z][a-z0-9_]{0,31}$", source_kind) is None:
             raise ImportUnavailable()
@@ -1590,9 +2165,16 @@ class FirestoreOrganizationGraphRepository:
                 )
             except OrganizationUnavailable:
                 raise ImportUnavailable() from None
-            if not _graphs_differ_only_by_member_bindings(
+            transitions = self._activation_transition_chain(
+                transaction,
+                current.organization_id,
+                receipt_version=receipt.graph_version,
+                target_version=graph_version,
+            )
+            if not _replays_activation_transition_chain(
                 receipt_graph,
                 target_graph,
+                transitions,
                 receipt_version=receipt.graph_version,
                 target_version=graph_version,
             ):
@@ -1891,6 +2473,291 @@ class FirestoreOrganizationGraphRepository:
             raise OrganizationUnavailable()
         return graph
 
+    @_firestore_error_barrier(InvitationUnavailable)
+    def create_subject_invitations(
+        self,
+        decisionos: DecisionOSRepository,
+        context: DecisionOSContext,
+        *,
+        subject_ids: tuple[str, ...],
+        role: DecisionOSRole,
+        expires_in: timedelta,
+        delivery_route_id: str | None,
+    ) -> tuple[SubjectInvitationGrant, ...]:
+        def mutate(
+            transaction,
+            current: DecisionOSContext,
+            grants: tuple[SubjectInvitationGrant, ...],
+        ) -> None:
+            if (
+                current.organization_id != context.organization_id
+                or tuple(grant.subject_id for grant in grants) != subject_ids
+                or any(
+                    grant.organization_id != current.organization_id
+                    or grant.role is not role
+                    for grant in grants
+                )
+            ):
+                raise InvitationUnavailable()
+            state_row = self._state_ref(current.organization_id).get(
+                transaction=transaction
+            )
+            version, state = self._state_from_row(current.organization_id, state_row)
+            if version == 0:
+                raise InvitationUnavailable()
+            graph_row = self._version_ref(current.organization_id, version).get(
+                transaction=transaction
+            )
+            graph, storage = self._graph_from_row(
+                current.organization_id,
+                version,
+                graph_row,
+                transaction=transaction,
+            )
+            if storage["payload_digest"] != state["payload_digest"]:
+                raise InvitationUnavailable()
+            by_id = {subject.subject_id: subject for subject in graph.subjects}
+            selected = tuple(by_id.get(subject_id) for subject_id in subject_ids)
+            if (
+                len(by_id) != len(graph.subjects)
+                or any(
+                    subject is None
+                    or subject.kind is not OrganizationSubjectKind.HUMAN
+                    or subject.member_uid is not None
+                    for subject in selected
+                )
+            ):
+                raise InvitationUnavailable()
+            lifecycles = {subject.lifecycle for subject in selected if subject is not None}
+            if lifecycles == {SubjectLifecycle.INVITED}:
+                return
+            if lifecycles != {SubjectLifecycle.DIRECTORY_ONLY}:
+                raise InvitationUnavailable()
+            now = _aware(self._clock())
+            invited_by_id = {
+                subject.subject_id: _validated_subject(
+                    subject,
+                    {"lifecycle": SubjectLifecycle.INVITED},
+                )
+                for subject in selected
+                if subject is not None
+            }
+            invited_graph = OrganizationGraph(
+                organization_id=graph.organization_id,
+                version=version + 1,
+                subjects=tuple(
+                    invited_by_id.get(subject.subject_id, subject)
+                    for subject in graph.subjects
+                ),
+                units=graph.units,
+                edges=graph.edges,
+                authority_assignments=graph.authority_assignments,
+                created_at=now,
+            )
+            transition = _activation_transition(
+                organization_id=current.organization_id,
+                kind="invitations_created",
+                subject_ids=subject_ids,
+                prior_graph_version=version,
+                member_uid=None,
+                occurred_at=now,
+            )
+            organization_ref = self._organization_ref(current.organization_id)
+            version_ref = self._version_ref(current.organization_id, invited_graph.version)
+            transition_ref = self._activation_transition_ref(
+                current.organization_id,
+                invited_graph.version,
+            )
+            if (
+                version_ref.get(transaction=transaction).exists
+                or transition_ref.get(transaction=transaction).exists
+            ):
+                raise InvitationUnavailable()
+            graph_storage, graph_chunks = _chunked_graph(invited_graph)
+            state_payload = {
+                "schema_version": 1,
+                "organization_id": current.organization_id,
+                "current_version": invited_graph.version,
+                "current_version_id": f"{invited_graph.version:020d}",
+                "payload_digest": graph_storage["payload_digest"],
+                "updated_at": now,
+            }
+            transition_payload = transition.model_dump(mode="python")
+            self._preflight_graph_documents(
+                version_ref,
+                organization_ref,
+                graph_storage,
+                graph_chunks,
+            )
+            _require_document_bound(self._state_ref(current.organization_id), state_payload)
+            _require_document_bound(transition_ref, transition_payload)
+            extra_current_deletes = self._extra_current_chunk_count(
+                storage,
+                graph_storage,
+            )
+            _require_write_bound(4 + (2 * len(graph_chunks)) + extra_current_deletes)
+            transaction.create(version_ref, graph_storage)
+            for chunk_id, chunk in graph_chunks.items():
+                transaction.create(version_ref.collection("chunks").document(chunk_id), chunk)
+            self._write_current_graph(
+                transaction,
+                organization_ref,
+                storage,
+                graph_storage,
+                graph_chunks,
+            )
+            transaction.set(self._state_ref(current.organization_id), state_payload)
+            transaction.create(transition_ref, transition_payload)
+
+        return decisionos.create_subject_invitations(
+            context,
+            subject_ids=subject_ids,
+            role=role,
+            expires_in=expires_in,
+            delivery_route_id=delivery_route_id,
+            mutation=mutate,
+        )
+
+    @_firestore_error_barrier(InvitationUnavailable)
+    def accept_subject_invitation(
+        self,
+        decisionos: DecisionOSRepository,
+        principal: DecisionOSPrincipal,
+        token: str,
+    ) -> tuple[OrganizationMembership, OrganizationSubject]:
+        membership, subject = decisionos.accept_subject_invitation(
+            principal,
+            token,
+            mutation=self._prepare_subject_invitation_acceptance,
+        )
+        if (
+            type(membership) is not OrganizationMembership
+            or type(subject) is not OrganizationSubject
+            or membership.organization_id != subject.organization_id
+            or membership.uid != subject.member_uid
+        ):
+            raise InvitationUnavailable()
+        return membership, subject
+
+    def _prepare_subject_invitation_acceptance(
+        self,
+        transaction,
+        context: DecisionOSContext,
+        subject_id: str,
+    ) -> OrganizationSubject:
+        if re.fullmatch(_SUBJECT_ID, subject_id) is None:
+            raise InvitationUnavailable()
+        organization_ref = self._organization_ref(context.organization_id)
+        state_ref = self._state_ref(context.organization_id)
+        state_row = state_ref.get(transaction=transaction)
+        version, state = self._state_from_row(context.organization_id, state_row)
+        if version == 0:
+            raise InvitationUnavailable()
+        prior_ref = self._version_ref(context.organization_id, version)
+        prior_row = prior_ref.get(transaction=transaction)
+        prior, prior_storage = self._graph_from_row(
+            context.organization_id,
+            version,
+            prior_row,
+            transaction=transaction,
+        )
+        if prior_storage["payload_digest"] != state["payload_digest"]:
+            raise InvitationUnavailable()
+        subject = next(
+            (item for item in prior.subjects if item.subject_id == subject_id),
+            None,
+        )
+        if (
+            subject is None
+            or subject.kind is not OrganizationSubjectKind.HUMAN
+            or subject.lifecycle is not SubjectLifecycle.INVITED
+            or subject.member_uid is not None
+            or any(item.member_uid == context.principal.uid for item in prior.subjects)
+        ):
+            raise InvitationUnavailable()
+        bound = _validated_subject(
+            subject,
+            {
+                "member_uid": context.principal.uid,
+                "lifecycle": SubjectLifecycle.ACTIVE,
+            },
+        )
+        target_subjects = tuple(
+            bound if item.subject_id == subject_id else item for item in prior.subjects
+        )
+        if not _member_binding_is_allowed(
+            subject,
+            bound,
+            target_subjects=target_subjects,
+        ):
+            raise InvitationUnavailable()
+        now = _aware(self._clock())
+        graph = OrganizationGraph(
+            organization_id=prior.organization_id,
+            version=version + 1,
+            subjects=target_subjects,
+            units=prior.units,
+            edges=prior.edges,
+            authority_assignments=prior.authority_assignments,
+            created_at=now,
+        )
+        event = _binding_event(context, version, bound, now)
+        transition = _activation_transition(
+            organization_id=context.organization_id,
+            kind="invitation_accepted",
+            subject_ids=(subject_id,),
+            prior_graph_version=version,
+            member_uid=context.principal.uid,
+            occurred_at=now,
+        )
+        graph_storage, graph_chunks = _chunked_graph(graph)
+        version_ref = self._version_ref(context.organization_id, graph.version)
+        transition_ref = self._activation_transition_ref(
+            context.organization_id,
+            graph.version,
+        )
+        if transition_ref.get(transaction=transaction).exists:
+            raise InvitationUnavailable()
+        state_payload = {
+            "schema_version": 1,
+            "organization_id": context.organization_id,
+            "current_version": graph.version,
+            "current_version_id": f"{graph.version:020d}",
+            "payload_digest": graph_storage["payload_digest"],
+            "updated_at": now,
+        }
+        event_ref = self._client.collection(self._audit_collection).document(
+            event.event_id
+        )
+        self._preflight_graph_documents(
+            version_ref,
+            organization_ref,
+            graph_storage,
+            graph_chunks,
+        )
+        _require_document_bound(state_ref, state_payload)
+        _require_document_bound(event_ref, event.model_dump(mode="python"))
+        _require_document_bound(transition_ref, transition.model_dump(mode="python"))
+        extra_current_deletes = self._extra_current_chunk_count(
+            prior_storage,
+            graph_storage,
+        )
+        _require_write_bound(10 + (2 * len(graph_chunks)) + extra_current_deletes)
+        transaction.create(version_ref, graph_storage)
+        for chunk_id, chunk in graph_chunks.items():
+            transaction.create(version_ref.collection("chunks").document(chunk_id), chunk)
+        self._write_current_graph(
+            transaction,
+            organization_ref,
+            prior_storage,
+            graph_storage,
+            graph_chunks,
+        )
+        transaction.set(state_ref, state_payload)
+        transaction.create(event_ref, event.model_dump(mode="python"))
+        transaction.create(transition_ref, transition.model_dump(mode="python"))
+        return bound
+
     @_firestore_error_barrier(OrganizationUnavailable)
     def bind_member(
         self,
@@ -1979,8 +2846,22 @@ class FirestoreOrganizationGraphRepository:
                 created_at=now,
             )
             event = _binding_event(current, version, bound, now)
+            transition = _activation_transition(
+                organization_id=current.organization_id,
+                kind="invitation_accepted",
+                subject_ids=(subject_id,),
+                prior_graph_version=version,
+                member_uid=member_uid,
+                occurred_at=now,
+            )
             graph_storage, graph_chunks = _chunked_graph(graph)
             version_ref = self._version_ref(current.organization_id, graph.version)
+            transition_ref = self._activation_transition_ref(
+                current.organization_id,
+                graph.version,
+            )
+            if transition_ref.get(transaction=transaction).exists:
+                raise OrganizationUnavailable()
             state_payload = {
                 "schema_version": 1,
                 "organization_id": current.organization_id,
@@ -1998,6 +2879,7 @@ class FirestoreOrganizationGraphRepository:
             )
             _require_document_bound(state_ref, state_payload)
             _require_document_bound(event_ref, event.model_dump(mode="python"))
+            _require_document_bound(transition_ref, transition.model_dump(mode="python"))
             extra_current_deletes = self._extra_current_chunk_count(
                 prior_storage,
                 graph_storage,
@@ -2021,6 +2903,7 @@ class FirestoreOrganizationGraphRepository:
                 event_ref,
                 event.model_dump(mode="python"),
             )
+            transaction.create(transition_ref, transition.model_dump(mode="python"))
             return bound
 
         return bind(self._client.transaction())

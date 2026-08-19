@@ -12,12 +12,23 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from humanwire.decisionos_models import DecisionOSContext, DecisionOSPrincipal
+from humanwire.decisionos_models import (
+    DecisionOSContext,
+    DecisionOSPrincipal,
+    DecisionOSRole,
+)
 from humanwire.decisionos_store import (
     DecisionOSAuthorizationDenied,
     DecisionOSPermission,
     DecisionOSRepository,
+    InvitationUnavailable,
     OrganizationUnavailable,
+)
+from humanwire.organization_activation import (
+    ActivatedOrganizationMembership,
+    ActivationService,
+    BulkInvitationReceipt,
+    BulkInvitationRequest,
 )
 from humanwire.organization_canonical import (
     exact_canonical_equal,
@@ -83,6 +94,7 @@ class OrganizationRouteDependencies:
     graph_repository: OrganizationGraphRepository
     projection_builder: OrganizationProjectionBuilder
     principal_loader: Callable[[Request], DecisionOSPrincipal | None]
+    activation_service: ActivationService | None = None
 
 
 class _RouteBody(BaseModel):
@@ -99,6 +111,16 @@ class _CorrectionBody(_RouteBody):
 class _CommitBody(_RouteBody):
     reviewed_digest: str
     acknowledged_codes: list[str] = Field(default_factory=list)
+
+
+class _SubjectInvitationsBody(_RouteBody):
+    subject_ids: list[str] = Field(min_length=1, max_length=100)
+    role: DecisionOSRole = Field(strict=False)
+    expires_in_seconds: int = Field(default=604800, ge=60, le=2592000)
+
+
+class _SubjectInvitationAcceptanceBody(_RouteBody):
+    invitation_token: str = Field(min_length=1, max_length=512)
 
 
 def _fixed_error(status_code: int, code: str) -> JSONResponse:
@@ -849,6 +871,76 @@ def create_organization_router(
         projection,
         methods=["GET", "HEAD"],
     )
+    if dependencies.activation_service is not None:
+
+        @router.post(
+            "/api/organizations/{organization_id}/subject-invitations",
+        )
+        async def create_subject_invitations(
+            organization_id: str,
+            request: Request,
+        ) -> Response:
+            context = _context(request, organization_id, dependencies, manage=True)
+            if isinstance(context, Response):
+                return context
+            body = await _json_body(request, _SubjectInvitationsBody)
+            if not isinstance(body, _SubjectInvitationsBody):
+                return _fixed_error(400, "invalid_request")
+            try:
+                bulk_request = BulkInvitationRequest(
+                    subject_ids=tuple(body.subject_ids),
+                    role=body.role,
+                    expires_in_seconds=body.expires_in_seconds,
+                )
+                receipt = dependencies.activation_service.create_invitations(
+                    context,
+                    bulk_request,
+                )
+            except DecisionOSAuthorizationDenied:
+                return _fixed_error(403, "authorization_denied")
+            except OrganizationUnavailable:
+                return _fixed_error(404, "organization_not_found")
+            except InvitationUnavailable:
+                return _fixed_error(400, "invitation_unavailable")
+            except (TypeError, ValueError, ValidationError):
+                return _fixed_error(400, "invalid_request")
+            if (
+                type(receipt) is not BulkInvitationReceipt
+                or receipt.organization_id != context.organization_id
+                or receipt.organization_id != organization_id
+                or receipt.requested_subject_ids != bulk_request.subject_ids
+            ):
+                return _fixed_error(400, "invitation_unavailable")
+            return JSONResponse(
+                status_code=201,
+                content=receipt.model_dump(mode="json"),
+            )
+
+        @router.post("/api/subject-invitations/accept")
+        async def accept_subject_invitation(request: Request) -> Response:
+            principal = dependencies.principal_loader(request)
+            if principal is None:
+                return _fixed_error(401, "authentication_required")
+            body = await _json_body(request, _SubjectInvitationAcceptanceBody)
+            if not isinstance(body, _SubjectInvitationAcceptanceBody):
+                return _fixed_error(400, "invalid_request")
+            try:
+                accepted = dependencies.activation_service.accept(
+                    principal,
+                    body.invitation_token,
+                )
+            except Exception:  # noqa: BLE001 - every token failure is non-enumerating
+                return _fixed_error(400, "invitation_unavailable")
+            if type(accepted) is not ActivatedOrganizationMembership:
+                return _fixed_error(400, "invitation_unavailable")
+            return JSONResponse(
+                content={
+                    "status": "active",
+                    "organization_id": accepted.organization_id,
+                    "subject_id": accepted.subject_id,
+                    "role": accepted.role.value,
+                }
+            )
     return router
 
 

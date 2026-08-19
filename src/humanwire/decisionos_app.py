@@ -46,6 +46,7 @@ if TYPE_CHECKING:
         OrganizationProjectionBuilder,
         OrganizationSourceParser,
     )
+    from humanwire.organization_activation import ActivationService
     from humanwire.organization_import import OrganizationImportService
     from humanwire.organization_store import OrganizationGraphRepository
 
@@ -79,6 +80,16 @@ _MUTATION_PATHS = (
 )
 _ORGANIZATION_ROUTE_PROFILES = (
     (
+        re.compile(r"^/api/subject-invitations/accept$"),
+        frozenset({"POST"}),
+        "json",
+    ),
+    (
+        re.compile(r"^/api/organizations/[^/]+/subject-invitations$"),
+        frozenset({"POST"}),
+        "json",
+    ),
+    (
         re.compile(r"^/api/organizations/[^/]+/imports$"),
         frozenset({"POST"}),
         "multipart",
@@ -110,9 +121,10 @@ _ORGANIZATION_ROUTE_PROFILES = (
     ),
 )
 _ORGANIZATION_ROUTE_FAMILY = re.compile(
-    r"^/api/organizations/[^/]+/(?:"
+    r"^(?:/api/subject-invitations/accept"
+    r"|/api/organizations/[^/]+/(?:"
     r"imports(?:/[^/]+(?:/(?:corrections|commit))?)?"
-    r"|organization-graph|authority-map)/?$"
+    r"|organization-graph|authority-map|subject-invitations))/?$"
 )
 _SAFE_HEADERS = {
     "Cache-Control": "no-store",
@@ -176,6 +188,7 @@ class DecisionOSDependencies:
     organization_import_service: OrganizationImportService | None = None
     organization_graph_repository: OrganizationGraphRepository | None = None
     organization_projection_builder: OrganizationProjectionBuilder | None = None
+    organization_activation_service: ActivationService | None = None
 
     def __post_init__(self) -> None:
         if not self.allowed_hosts:
@@ -771,6 +784,7 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
                     import_service=dependencies.organization_import_service,
                     graph_repository=dependencies.organization_graph_repository,
                     projection_builder=dependencies.organization_projection_builder,
+                    activation_service=dependencies.organization_activation_service,
                     principal_loader=lambda request: _principal(
                         request,
                         dependencies.authenticator,
