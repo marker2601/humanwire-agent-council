@@ -32,6 +32,7 @@ from humanwire.decisionos_store import (
     OrganizationUnavailable,
     _InMemoryPreparedMutation,
     _InMemoryReferenceReplacement,
+    _publish_in_memory_replacements,
     require_permission,
 )
 from humanwire.organization_graph import validate_organization_graph
@@ -65,6 +66,7 @@ _DRAFT_STORAGE_FIELDS = frozenset(
     {
         "schema_version",
         "import_id",
+        "supersedes_import_id",
         "organization_id",
         "source_snapshot",
         "candidate",
@@ -97,6 +99,16 @@ _STATE_STORAGE_FIELDS = frozenset(
         "updated_at",
     }
 )
+_LINEAGE_STORAGE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "organization_id",
+        "source_kind",
+        "latest_import_id",
+        "updated_at",
+        "payload_digest",
+    }
+)
 _CHUNK_STORAGE_FIELDS = frozenset(
     {
         "schema_version",
@@ -118,6 +130,11 @@ class OrganizationStoreError(RuntimeError):
 class ImportUnavailable(OrganizationStoreError):
     def __init__(self) -> None:
         super().__init__("import_unavailable")
+
+
+class ImportLineageConflict(ImportUnavailable):
+    def __init__(self) -> None:
+        OrganizationStoreError.__init__(self, "import_lineage_conflict")
 
 
 class GraphVersionConflict(ImportUnavailable):
@@ -196,6 +213,12 @@ class OrganizationGraphRepository(Protocol):
     ) -> ImportDraft: ...
 
     def list_imports(self, context: DecisionOSContext) -> tuple[ImportDraft, ...]: ...
+
+    def require_latest_import(
+        self,
+        context: DecisionOSContext,
+        draft_id: str,
+    ) -> None: ...
 
     def reconcile_import(
         self,
@@ -392,6 +415,7 @@ class InMemoryOrganizationGraphRepository:
         self._current_versions: dict[str, int] = {}
         self._graphs: dict[tuple[str, int], OrganizationGraph] = {}
         self._imports: dict[tuple[str, str], _SavedImport] = {}
+        self._latest_imports: dict[tuple[str, str], str] = {}
         self._audit: dict[str, list[OrganizationGraphAuditEvent]] = {}
 
     def __repr__(self) -> str:
@@ -415,9 +439,43 @@ class InMemoryOrganizationGraphRepository:
             if draft.organization_id != current.organization_id:
                 raise ImportUnavailable()
             key = (current.organization_id, draft.import_id)
+            lineage_key = (current.organization_id, draft.source_snapshot.source_kind)
+            latest_import_id = self._latest_imports.get(lineage_key)
+            if (
+                draft.supersedes_import_id is not None
+                and draft.supersedes_import_id != latest_import_id
+            ):
+                raise ImportLineageConflict()
             if key in self._imports:
                 raise ImportUnavailable()
-            self._imports[key] = _SavedImport(draft)
+            replacement_imports = dict(self._imports)
+            replacement_imports[key] = _SavedImport(draft)
+            replacement_latest = dict(self._latest_imports)
+            replacement_latest[lineage_key] = draft.import_id
+            failed = False
+            try:
+                _publish_in_memory_replacements(
+                    _InMemoryPreparedMutation(
+                        replacements=(
+                            _InMemoryReferenceReplacement(
+                                self,
+                                "_imports",
+                                self._imports,
+                                replacement_imports,
+                            ),
+                            _InMemoryReferenceReplacement(
+                                self,
+                                "_latest_imports",
+                                self._latest_imports,
+                                replacement_latest,
+                            ),
+                        )
+                    )
+                )
+            except Exception:  # noqa: BLE001 - publication failures are sealed
+                failed = True
+            if failed:
+                raise ImportUnavailable() from None
             return draft
 
     def load_import_draft(
@@ -440,6 +498,25 @@ class InMemoryOrganizationGraphRepository:
                 for (organization_id, _draft_id), saved in sorted(self._imports.items())
                 if organization_id == current.organization_id
             )
+
+    def require_latest_import(
+        self,
+        context: DecisionOSContext,
+        draft_id: str,
+    ) -> None:
+        with self._lock:
+            current = self._manage(context)
+            saved = self._imports.get((current.organization_id, draft_id))
+            if saved is None:
+                raise ImportUnavailable()
+            if saved.receipt is not None:
+                return
+            lineage_key = (
+                current.organization_id,
+                saved.draft.source_snapshot.source_kind,
+            )
+            if self._latest_imports.get(lineage_key) != draft_id:
+                raise ImportLineageConflict()
 
     def reconcile_import(
         self,
@@ -466,6 +543,12 @@ class InMemoryOrganizationGraphRepository:
                 if saved.receipt.acknowledged_codes != acknowledged_codes:
                     raise ImportUnavailable()
                 return saved.receipt
+            lineage_key = (
+                current.organization_id,
+                saved.draft.source_snapshot.source_kind,
+            )
+            if self._latest_imports.get(lineage_key) != saved.draft.import_id:
+                raise ImportLineageConflict()
             prior = self._graph(current.organization_id)
             if saved.draft.base_graph_version != prior.version:
                 raise GraphVersionConflict()
@@ -958,6 +1041,15 @@ class FirestoreOrganizationGraphRepository:
             .document("state")
         )
 
+    def _lineage_ref(self, organization_id: str, source_kind: str):
+        if re.fullmatch(r"^[a-z][a-z0-9_]{0,31}$", source_kind) is None:
+            raise ImportUnavailable()
+        return (
+            self._organization_ref(organization_id)
+            .collection("organization_import_lineage")
+            .document(source_kind)
+        )
+
     @_firestore_error_barrier(OrganizationUnavailable)
     def load_context(
         self,
@@ -1002,13 +1094,26 @@ class FirestoreOrganizationGraphRepository:
         draft = _validated_draft(draft)
         payload, chunks = _chunked_draft(draft)
         draft_ref = self._import_ref(context.organization_id, draft.import_id)
+        lineage_ref = self._lineage_ref(
+            context.organization_id,
+            draft.source_snapshot.source_kind,
+        )
+        lineage_payload = {
+            "schema_version": 1,
+            "organization_id": draft.organization_id,
+            "source_kind": draft.source_snapshot.source_kind,
+            "latest_import_id": draft.import_id,
+            "updated_at": draft.created_at,
+        }
+        lineage_payload["payload_digest"] = _payload_digest(lineage_payload)
         _require_document_bound(draft_ref, payload)
+        _require_document_bound(lineage_ref, lineage_payload)
         for chunk_id, chunk in chunks.items():
             _require_document_bound(
                 draft_ref.collection("chunks").document(chunk_id),
                 chunk,
             )
-        _require_write_bound(1 + len(chunks))
+        _require_write_bound(2 + len(chunks))
 
         @firestore.transactional
         def save(transaction):
@@ -1017,13 +1122,25 @@ class FirestoreOrganizationGraphRepository:
                 context,
                 DecisionOSPermission.MANAGE_MEMBERS,
             )
-            if draft.organization_id != current.organization_id or draft_ref.get(
-                transaction=transaction
-            ).exists:
+            if draft.organization_id != current.organization_id:
+                raise ImportUnavailable()
+            lineage_row = lineage_ref.get(transaction=transaction)
+            latest_import_id = self._lineage_from_row(
+                current.organization_id,
+                draft.source_snapshot.source_kind,
+                lineage_row,
+            )
+            if (
+                draft.supersedes_import_id is not None
+                and draft.supersedes_import_id != latest_import_id
+            ):
+                raise ImportLineageConflict()
+            if draft_ref.get(transaction=transaction).exists:
                 raise ImportUnavailable()
             transaction.create(draft_ref, payload)
             for chunk_id, chunk in chunks.items():
                 transaction.create(draft_ref.collection("chunks").document(chunk_id), chunk)
+            transaction.set(lineage_ref, lineage_payload)
 
         save(self._client.transaction())
         return draft
@@ -1062,6 +1179,55 @@ class FirestoreOrganizationGraphRepository:
                 key=lambda item: item.import_id,
             )
         )
+
+    @_firestore_error_barrier(ImportUnavailable)
+    def require_latest_import(
+        self,
+        context: DecisionOSContext,
+        draft_id: str,
+    ) -> None:
+        current = self._authorize(context, DecisionOSPermission.MANAGE_MEMBERS)
+        draft_ref = self._import_ref(current.organization_id, draft_id)
+        row = draft_ref.get()
+        if not row.exists:
+            raise ImportUnavailable()
+        draft = self._draft_from_row(
+            row,
+            draft_ref,
+            organization_id=current.organization_id,
+        )
+        payload = row.to_dict()
+        if payload.get("status") == "committed":
+            receipt = None
+            try:
+                receipt = ImportReceipt.model_validate_json(to_json(payload["receipt"]))
+            except (
+                KeyError,
+                PydanticSerializationError,
+                TypeError,
+                ValueError,
+                ValidationError,
+            ):
+                pass
+            if receipt is None or not self._receipt_matches_draft(
+                receipt,
+                draft,
+                acknowledged_codes=receipt.acknowledged_codes,
+            ):
+                raise ImportUnavailable()
+            return
+        if payload.get("status") != "draft":
+            raise ImportUnavailable()
+        lineage_row = self._lineage_ref(
+            current.organization_id,
+            draft.source_snapshot.source_kind,
+        ).get()
+        if self._lineage_from_row(
+            current.organization_id,
+            draft.source_snapshot.source_kind,
+            lineage_row,
+        ) != draft.import_id:
+            raise ImportLineageConflict()
 
     @_firestore_error_barrier(ImportUnavailable)
     def reconcile_import(
@@ -1130,6 +1296,16 @@ class FirestoreOrganizationGraphRepository:
                 return receipt
             if payload.get("status") != "draft":
                 raise ImportUnavailable()
+            lineage_row = self._lineage_ref(
+                current.organization_id,
+                draft.source_snapshot.source_kind,
+            ).get(transaction=transaction)
+            if self._lineage_from_row(
+                current.organization_id,
+                draft.source_snapshot.source_kind,
+                lineage_row,
+            ) != draft.import_id:
+                raise ImportLineageConflict()
             state_row = state_ref.get(transaction=transaction)
             current_version, _state = self._state_from_row(
                 current.organization_id,
@@ -1480,6 +1656,26 @@ class FirestoreOrganizationGraphRepository:
         if draft.organization_id != organization_id or draft.import_id != draft_ref.id:
             raise ImportUnavailable()
         return draft
+
+    def _lineage_from_row(
+        self,
+        organization_id: str,
+        source_kind: str,
+        row,
+    ) -> str | None:
+        if not row.exists:
+            return None
+        payload = row.to_dict()
+        if (
+            set(payload) != _LINEAGE_STORAGE_FIELDS
+            or not self._storage_digest_valid(payload)
+            or payload.get("schema_version") != 1
+            or payload.get("organization_id") != organization_id
+            or payload.get("source_kind") != source_kind
+            or re.fullmatch(_IMPORT_ID, payload.get("latest_import_id", "")) is None
+        ):
+            raise ImportUnavailable()
+        return payload["latest_import_id"]
 
     def _draft_from_payload(
         self,

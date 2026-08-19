@@ -506,6 +506,17 @@ def test_import_receipt_defaults_to_no_acknowledgements_and_requires_canonical_c
         import_receipt(acknowledged_codes=("leaderless_team", "leaderless_team"))
 
 
+def test_import_draft_lineage_is_optional_but_cannot_supersede_itself() -> None:
+    assert import_draft().supersedes_import_id is None
+    prior = "imp_01K00000000000000000000001"
+    assert import_draft(supersedes_import_id=prior).supersedes_import_id == prior
+
+    with pytest.raises(ValidationError):
+        import_draft(
+            supersedes_import_id="imp_01K00000000000000000000000",
+        )
+
+
 @pytest.mark.parametrize(
     "changes",
     [

@@ -350,6 +350,7 @@ class OrganizationGraphCandidate(_OrganizationModel):
 
 class ImportDraft(_OrganizationModel):
     import_id: str = Field(pattern=_IMPORT_ID)
+    supersedes_import_id: str | None = Field(default=None, pattern=_IMPORT_ID)
     organization_id: str = Field(pattern=_ORGANIZATION_ID)
     source_snapshot: SourceSnapshot
     candidate: OrganizationGraphCandidate
@@ -360,6 +361,8 @@ class ImportDraft(_OrganizationModel):
     @model_validator(mode="after")
     def binds_one_snapshot_candidate_and_tenant(self) -> Self:
         _aware(self.created_at, "created_at")
+        if self.supersedes_import_id == self.import_id:
+            raise ValueError("an import cannot supersede itself")
         if self.source_snapshot.organization_id != self.organization_id:
             raise ValueError("import draft snapshot is cross-tenant")
         if self.candidate.organization_id != self.organization_id:

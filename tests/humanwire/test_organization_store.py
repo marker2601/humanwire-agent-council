@@ -29,6 +29,7 @@ from humanwire.organization_models import (
 )
 from humanwire.organization_store import (
     GraphVersionConflict,
+    ImportLineageConflict,
     ImportUnavailable,
     InMemoryOrganizationGraphRepository,
 )
@@ -241,11 +242,6 @@ def test_stale_draft_conflicts_and_duplicate_commit_returns_same_receipt(
 ) -> None:
     repository, _decisionos, owner_context = setup_repositories
     first = repository.save_import_draft(owner_context, import_draft())
-    stale = repository.save_import_draft(
-        owner_context,
-        import_draft(import_id=IMPORT_B, digest=DIGEST_B),
-    )
-
     receipt = repository.commit_graph(
         owner_context,
         draft_id=first.import_id,
@@ -258,12 +254,127 @@ def test_stale_draft_conflicts_and_duplicate_commit_returns_same_receipt(
     )
 
     assert duplicate == receipt
+    stale = repository.save_import_draft(
+        owner_context,
+        import_draft(import_id=IMPORT_B, digest=DIGEST_B),
+    )
     with pytest.raises(GraphVersionConflict, match="graph_version_conflict"):
         repository.commit_graph(
             owner_context,
             draft_id=stale.import_id,
             reviewed_digest=stale.semantic_digest,
         )
+
+
+def test_new_source_draft_durably_supersedes_uncommitted_latest(
+    setup_repositories,
+) -> None:
+    repository, _decisionos, owner_context = setup_repositories
+    first = repository.save_import_draft(owner_context, import_draft())
+    second = repository.save_import_draft(
+        owner_context,
+        import_draft(import_id=IMPORT_B, digest=DIGEST_B),
+    )
+
+    with pytest.raises(ImportUnavailable, match="^import_lineage_conflict$"):
+        repository.commit_graph(
+            owner_context,
+            draft_id=first.import_id,
+            reviewed_digest=first.semantic_digest,
+        )
+    assert repository.commit_graph(
+        owner_context,
+        draft_id=second.import_id,
+        reviewed_digest=second.semantic_digest,
+    ).import_id == second.import_id
+
+
+def test_committed_exact_retry_precedes_newer_source_freshness(
+    setup_repositories,
+) -> None:
+    repository, _decisionos, owner_context = setup_repositories
+    first = repository.save_import_draft(owner_context, import_draft())
+    receipt = repository.commit_graph(
+        owner_context,
+        draft_id=first.import_id,
+        reviewed_digest=first.semantic_digest,
+        acknowledged_codes=("leaderless_team",),
+    )
+    repository.save_import_draft(
+        owner_context,
+        import_draft(import_id=IMPORT_B, digest=DIGEST_B, base_version=1),
+    )
+
+    assert repository.commit_graph(
+        owner_context,
+        draft_id=first.import_id,
+        reviewed_digest=first.semantic_digest,
+        acknowledged_codes=("leaderless_team",),
+    ) == receipt
+    with pytest.raises(ImportUnavailable, match="^import_unavailable$"):
+        repository.commit_graph(
+            owner_context,
+            draft_id=first.import_id,
+            reviewed_digest=first.semantic_digest,
+            acknowledged_codes=(),
+        )
+
+
+def test_correction_must_supersede_exact_durable_latest(setup_repositories) -> None:
+    repository, _decisionos, owner_context = setup_repositories
+    first = repository.save_import_draft(owner_context, import_draft())
+    second = repository.save_import_draft(
+        owner_context,
+        import_draft(import_id=IMPORT_B, digest=DIGEST_B),
+    )
+    stale_correction = import_draft(
+        import_id="imp_01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        digest="3" * 64,
+    ).model_copy(update={"supersedes_import_id": first.import_id})
+
+    with pytest.raises(ImportUnavailable, match="^import_lineage_conflict$"):
+        repository.save_import_draft(owner_context, stale_correction)
+
+    exact_correction = stale_correction.model_copy(
+        update={
+            "import_id": "imp_01ARZ3NDEKTSV4RRFFQ69G5FAY",
+            "supersedes_import_id": second.import_id,
+        }
+    )
+    assert repository.save_import_draft(
+        owner_context,
+        exact_correction,
+    ).supersedes_import_id == second.import_id
+
+
+def test_concurrent_source_saves_publish_one_latest_lineage(setup_repositories) -> None:
+    repository, _decisionos, owner_context = setup_repositories
+    drafts = (
+        import_draft(import_id=IMPORT_A, digest=DIGEST_A),
+        import_draft(import_id=IMPORT_B, digest=DIGEST_B),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        saved = tuple(executor.map(lambda item: repository.save_import_draft(owner_context, item), drafts))
+
+    receipts = []
+    failures = []
+    for draft in saved:
+        try:
+            receipts.append(
+                repository.commit_graph(
+                    owner_context,
+                    draft_id=draft.import_id,
+                    reviewed_digest=draft.semantic_digest,
+                )
+            )
+        except ImportUnavailable as error:
+            failures.append(error)
+
+    assert len(receipts) == 1
+    assert len(failures) == 1
+    assert str(failures[0]) == "import_lineage_conflict"
+    assert repository.load_graph(owner_context).version == 1
 
 
 def test_commit_persists_exact_acknowledgements_and_retry_must_match(
@@ -540,14 +651,14 @@ def test_two_different_concurrent_drafts_serialize_one_winner(setup_repositories
                 draft_id=draft.import_id,
                 reviewed_digest=draft.semantic_digest,
             )
-        except GraphVersionConflict as error:
+        except ImportLineageConflict as error:
             return error
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = tuple(executor.map(commit, drafts))
 
-    assert sum(not isinstance(item, GraphVersionConflict) for item in results) == 1
-    assert sum(isinstance(item, GraphVersionConflict) for item in results) == 1
+    assert sum(not isinstance(item, ImportLineageConflict) for item in results) == 1
+    assert sum(isinstance(item, ImportLineageConflict) for item in results) == 1
     assert repository.load_graph(owner_context).version == 1
 
 

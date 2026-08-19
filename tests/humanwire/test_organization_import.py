@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import inspect
+import multiprocessing
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
@@ -463,6 +467,114 @@ def test_explicit_authority_columns_are_mapped_without_reporting_inference() -> 
     assert candidate.authority_assignments[0].subject_id == ada.subject_id
 
 
+def control_ambiguity_snapshot(*, reorder: bool = False) -> SourceSnapshot:
+    records = (
+        source_record(
+            1,
+            "row/one",
+            (
+                ("authority_function", "approver"),
+                ("display_name", "Ada One"),
+                ("kind", "human"),
+                ("unit_leader", "true"),
+                ("unit_name", "Platform"),
+                ("unit_parent_name", "Product"),
+            ),
+        ),
+        source_record(
+            2,
+            "row/two",
+            (
+                ("display_name", "Ada Two"),
+                ("kind", "human"),
+                ("unit_leader", "true"),
+                ("unit_name", "Platform"),
+                ("unit_parent_name", "Engineering"),
+            ),
+        ),
+        source_record(
+            3,
+            "row/three",
+            (
+                ("display_name", "Ada Three"),
+                ("kind", "human"),
+                ("unit_leader", "yes"),
+                ("unit_name", "Platform"),
+            ),
+        ),
+        source_record(
+            4,
+            "row/four",
+            (
+                ("authority_required", "sometimes"),
+                ("display_name", "Ada Four"),
+                ("kind", "human"),
+                ("unit_name", "Operations"),
+            ),
+        ),
+    )
+    if reorder:
+        records = tuple(
+            record.model_copy(update={"fields": tuple(reversed(record.fields))})
+            for record in reversed(records)
+        )
+    return SourceSnapshot(
+        snapshot_id="snap_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        organization_id=ORG_A,
+        source_kind="csv",
+        captured_at=NOW,
+        records=records,
+        semantic_digest="6" * 64,
+    )
+
+
+def test_control_ambiguity_marks_all_participants_and_selects_no_winner(
+    service_setup,
+) -> None:
+    service, _repository, _decisionos, context = service_setup
+    draft = service.create_draft(context, control_ambiguity_snapshot())
+    reconciliation = service.reconcile(context, draft.import_id)
+
+    assert reconciliation.blocking_codes == (
+        "conflicting_unit_parent",
+        "incomplete_authority",
+        "invalid_control_value",
+        "multiple_unit_leaders",
+        "needs_review",
+    )
+    assert all(
+        subject.lifecycle is SubjectLifecycle.NEEDS_REVIEW
+        for subject in draft.candidate.subjects
+    )
+    platform = next(unit for unit in draft.candidate.units if unit.name == "Platform")
+    assert platform.parent_unit_id is None
+    assert platform.leader_subject_id is None
+
+
+def test_control_ambiguity_is_byte_identical_when_inputs_are_shuffled() -> None:
+    def build(snapshot):
+        decisionos = InMemoryDecisionOSRepository(
+            identifiers=SequenceIdentifiers(), clock=lambda: NOW
+        )
+        owner = principal("firebase-owner-01")
+        organization = decisionos.create_organization(owner, "Northstar Labs")
+        context = decisionos.load_context(owner, organization.organization_id)
+        service = OrganizationImportService(
+            repository=InMemoryOrganizationGraphRepository(
+                decisionos=decisionos, clock=lambda: NOW
+            ),
+            clock=lambda: NOW,
+        )
+        draft = service.create_draft(context, snapshot)
+        return draft, service.reconcile(context, draft.import_id)
+
+    first = build(control_ambiguity_snapshot())
+    second = build(control_ambiguity_snapshot(reorder=True))
+
+    assert first[0].model_dump_json() == second[0].model_dump_json()
+    assert first[1].model_dump_json() == second[1].model_dump_json()
+
+
 def test_stale_source_and_stale_graph_fail_closed(service_setup) -> None:
     service, _repository, _decisionos, context = service_setup
     stale_source = service.create_draft(context, complete_snapshot(digest="1" * 64))
@@ -492,6 +604,56 @@ def test_stale_source_and_stale_graph_fail_closed(service_setup) -> None:
             context,
             CommitImportRequest(import_id=second.import_id, reviewed_digest=second.semantic_digest),
         )
+
+
+def test_two_service_instances_share_durable_source_lineage(service_setup) -> None:
+    first_service, repository, _decisionos, context = service_setup
+    second_service = OrganizationImportService(repository=repository, clock=lambda: NOW)
+    first = first_service.create_draft(context, complete_snapshot(digest="1" * 64))
+    second_service.create_draft(context, complete_snapshot(digest="2" * 64))
+
+    with pytest.raises(OrganizationImportStale, match="organization_import_stale"):
+        first_service.commit(
+            context,
+            CommitImportRequest(
+                import_id=first.import_id,
+                reviewed_digest=first.semantic_digest,
+            ),
+        )
+
+
+def test_old_service_cannot_correct_chain_advanced_by_new_service(service_setup) -> None:
+    first_service, repository, _decisionos, context = service_setup
+    second_service = OrganizationImportService(repository=repository, clock=lambda: NOW)
+    first = first_service.create_draft(context, complete_snapshot(digest="1" * 64))
+    second_service.create_draft(context, complete_snapshot(digest="2" * 64))
+
+    with pytest.raises(OrganizationImportStale, match="organization_import_stale"):
+        first_service.apply_correction(
+            context,
+            ImportCorrectionRequest(
+                import_id=first.import_id,
+                reviewed_digest=first.semantic_digest,
+                kind=ImportCorrectionKind.CORRECT_RECORD,
+                source_record_ids=(first.source_snapshot.records[0].record_id,),
+                replacement_fields=(("display_name", "Ada Corrected"),),
+            ),
+        )
+
+
+def test_exact_committed_retry_survives_newer_source_in_same_service(
+    service_setup,
+) -> None:
+    service, _repository, _decisionos, context = service_setup
+    first = service.create_draft(context, complete_snapshot(digest="1" * 64))
+    request = CommitImportRequest(
+        import_id=first.import_id,
+        reviewed_digest=first.semantic_digest,
+    )
+    receipt = service.commit(context, request)
+    service.create_draft(context, complete_snapshot(digest="2" * 64))
+
+    assert service.commit(context, request) == receipt
 
 
 def test_wrong_tenant_and_permission_fail_closed(service_setup) -> None:
@@ -530,6 +692,62 @@ class PrivateFailureMapper:
         raise RuntimeError(private_value)
 
 
+class SleepingMapper:
+    def map(self, snapshot, current_graph):
+        time.sleep(30)
+        return RuleOrganizationMapper().map(snapshot, current_graph)
+
+
+class NonPicklableMapper:
+    def __init__(self) -> None:
+        self.callback = lambda: None
+
+    def map(self, snapshot, current_graph):
+        return RuleOrganizationMapper().map(snapshot, current_graph)
+
+
+class EmptyMapper:
+    def map(self, snapshot, current_graph):
+        candidate = RuleOrganizationMapper().map(snapshot, current_graph)
+        return candidate.model_copy(
+            update={"subjects": (), "units": (), "edges": (), "authority_assignments": ()}
+        )
+
+
+class PartialMapper:
+    def map(self, snapshot, current_graph):
+        candidate = RuleOrganizationMapper().map(snapshot, current_graph)
+        return candidate.model_copy(
+            update={
+                "subjects": candidate.subjects[:1],
+                "units": (),
+                "edges": (),
+                "authority_assignments": (),
+            }
+        )
+
+
+class ExtraSubjectMapper:
+    def map(self, snapshot, current_graph):
+        candidate = RuleOrganizationMapper().map(snapshot, current_graph)
+        extra = candidate.subjects[0].model_copy(
+            update={
+                "subject_id": "sub_01ARZ3NDEKTSV4RRFFQ69G5FZZ",
+                "source_identity": "not/in/source",
+            }
+        )
+        return candidate.model_copy(update={"subjects": (*candidate.subjects, extra)})
+
+
+class DuplicateSourceMapper:
+    def map(self, snapshot, current_graph):
+        candidate = RuleOrganizationMapper().map(snapshot, current_graph)
+        duplicate = candidate.subjects[0].model_copy(
+            update={"subject_id": "sub_01ARZ3NDEKTSV4RRFFQ69G5FZZ"}
+        )
+        return candidate.model_copy(update={"subjects": (*candidate.subjects, duplicate)})
+
+
 class ExplodingCandidate(OrganizationGraphCandidate):
     def model_dump(self, *args, **kwargs):
         raise RuntimeError("PRIVATE-CANDIDATE-SERIALIZATION")
@@ -561,6 +779,72 @@ def test_mapper_timeout_failure_and_invalid_output_use_rule_fallback_without_lea
     assert "PRIVATE" not in repr(service)
     if isinstance(mapper, TimeoutMapper):
         assert mapper.provider_state == []
+
+
+def test_uncooperative_mapper_has_hard_deadline_and_leaves_no_worker(service_setup) -> None:
+    _service, repository, _decisionos, context = service_setup
+    before_processes = {process.pid for process in multiprocessing.active_children()}
+    before_threads = {thread.ident for thread in threading.enumerate()}
+    service = OrganizationImportService(
+        repository=repository,
+        mapper=SleepingMapper(),
+        mapper_timeout_seconds=0.2,
+        clock=lambda: NOW,
+    )
+
+    started = time.perf_counter()
+    draft = service.create_draft(context, complete_snapshot())
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 2
+    assert len(draft.candidate.subjects) == 4
+    assert {
+        process.pid for process in multiprocessing.active_children()
+    } <= before_processes
+    assert {thread.ident for thread in threading.enumerate()} <= before_threads
+
+
+def test_non_picklable_mapper_configuration_falls_back_fixed_safe(service_setup) -> None:
+    _service, repository, _decisionos, context = service_setup
+    service = OrganizationImportService(
+        repository=repository,
+        mapper=NonPicklableMapper(),
+        mapper_timeout_seconds=0.2,
+        clock=lambda: NOW,
+    )
+
+    draft = service.create_draft(context, complete_snapshot())
+
+    assert len(draft.candidate.subjects) == 4
+
+
+@pytest.mark.parametrize("mapper", [EmptyMapper(), PartialMapper()])
+def test_mapper_must_cover_every_active_row_or_rule_fallback_preserves_all(
+    service_setup,
+    mapper,
+) -> None:
+    _service, repository, _decisionos, context = service_setup
+    service = OrganizationImportService(
+        repository=repository,
+        mapper=mapper,
+        mapper_timeout_seconds=2,
+        clock=lambda: NOW,
+    )
+
+    draft = service.create_draft(context, complete_snapshot())
+    reconciliation = service.reconcile(context, draft.import_id)
+    receipt = service.commit(
+        context,
+        CommitImportRequest(
+            import_id=draft.import_id,
+            reviewed_digest=draft.semantic_digest,
+        ),
+    )
+
+    assert reconciliation.normalized_count == 4
+    assert reconciliation.rejected_count == 0
+    assert receipt.committed_subject_count == 4
+    assert len(repository.load_graph(context).subjects) == 4
 
 
 class CyclicMapper:
@@ -610,23 +894,22 @@ def test_exact_request_retry_and_concurrent_admin_commit_are_idempotent(service_
     assert repository.load_graph(context).version == 1
 
 
-def test_import_commit_never_invokes_invitation_transport(service_setup) -> None:
-    service, _repository, _decisionos, context = service_setup
+def test_import_commit_has_no_reachable_invitation_transport(
+    service_setup,
+    monkeypatch,
+) -> None:
+    service, _repository, decisionos, context = service_setup
 
-    class InvitationSpy:
-        def __init__(self) -> None:
-            self.calls: list[object] = []
+    def fail_invitation(*_args, **_kwargs):
+        raise AssertionError("import reached invitation transport")
 
-        def invite(self, value: object) -> None:
-            self.calls.append(value)
-
-    invitation_spy = InvitationSpy()
+    monkeypatch.setattr(decisionos, "create_invitation", fail_invitation)
+    assert "invitation" not in inspect.signature(OrganizationImportService).parameters
     draft = service.create_draft(context, complete_snapshot())
     service.commit(
         context,
         CommitImportRequest(import_id=draft.import_id, reviewed_digest=draft.semantic_digest),
     )
-    assert invitation_spy.calls == []
 
 
 def test_mapper_exception_trace_and_source_values_do_not_enter_public_errors(
@@ -660,25 +943,21 @@ def test_mapper_exception_trace_and_source_values_do_not_enter_public_errors(
     assert captured.value.__context__ is None
 
 
-def test_external_mapper_candidate_must_cover_only_exact_snapshot_rows(service_setup) -> None:
+@pytest.mark.parametrize("mapper", [ExtraSubjectMapper(), DuplicateSourceMapper()])
+def test_external_mapper_candidate_must_cover_only_exact_snapshot_rows(
+    service_setup,
+    mapper,
+) -> None:
     _service, repository, _decisionos, context = service_setup
-
-    class ExtraSubjectMapper:
-        def map(self, snapshot, current_graph):
-            candidate = RuleOrganizationMapper().map(snapshot, current_graph)
-            extra = candidate.subjects[0].model_copy(
-                update={
-                    "subject_id": "sub_01ARZ3NDEKTSV4RRFFQ69G5FZZ",
-                    "source_identity": "not/in/source",
-                }
-            )
-            return candidate.model_copy(update={"subjects": (*candidate.subjects, extra)})
-
     service = OrganizationImportService(
         repository=repository,
-        mapper=ExtraSubjectMapper(),
+        mapper=mapper,
         clock=lambda: NOW,
     )
     draft = service.create_draft(context, complete_snapshot())
     assert len(draft.candidate.subjects) == 4
-    assert all(subject.source_identity != "not/in/source" for subject in draft.candidate.subjects)
+    source_identities = tuple(
+        subject.source_identity for subject in draft.candidate.subjects
+    )
+    assert "not/in/source" not in source_identities
+    assert len(source_identities) == len(set(source_identities))

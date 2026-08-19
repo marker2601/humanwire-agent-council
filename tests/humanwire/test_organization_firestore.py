@@ -439,6 +439,146 @@ def test_firestore_commit_keeps_strict_decisionos_root_compatible(fake_firestore
     assert decisionos.list_organizations(OWNER)[0].organization_id == ORG
 
 
+def test_firestore_latest_import_lineage_rejects_superseded_commit(fake_firestore) -> None:
+    client, repository, context = fake_firestore
+    first = repository.save_import_draft(context, draft())
+    second = first.model_copy(
+        update={
+            "import_id": "imp_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            "semantic_digest": "2" * 64,
+            "source_snapshot": first.source_snapshot.model_copy(
+                update={"semantic_digest": "2" * 64}
+            ),
+        }
+    )
+    repository.save_import_draft(context, second)
+    lineage_path = (COLLECTION, ORG, "organization_import_lineage", "csv")
+
+    assert client.data[lineage_path]["latest_import_id"] == second.import_id
+    with pytest.raises(ImportUnavailable, match="^import_lineage_conflict$"):
+        repository.commit_graph(
+            context,
+            draft_id=first.import_id,
+            reviewed_digest=first.semantic_digest,
+        )
+
+
+def test_firestore_exact_committed_retry_precedes_newer_lineage(fake_firestore) -> None:
+    _client, repository, context = fake_firestore
+    first = repository.save_import_draft(context, draft())
+    receipt = repository.commit_graph(
+        context,
+        draft_id=first.import_id,
+        reviewed_digest=first.semantic_digest,
+        acknowledged_codes=("leaderless_team",),
+    )
+    second = first.model_copy(
+        update={
+            "import_id": "imp_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            "semantic_digest": "2" * 64,
+            "base_graph_version": 1,
+            "source_snapshot": first.source_snapshot.model_copy(
+                update={"semantic_digest": "2" * 64}
+            ),
+        }
+    )
+    repository.save_import_draft(context, second)
+
+    assert repository.commit_graph(
+        context,
+        draft_id=first.import_id,
+        reviewed_digest=first.semantic_digest,
+        acknowledged_codes=("leaderless_team",),
+    ) == receipt
+    with pytest.raises(ImportUnavailable, match="^import_unavailable$"):
+        repository.commit_graph(
+            context,
+            draft_id=first.import_id,
+            reviewed_digest=first.semantic_digest,
+            acknowledged_codes=(),
+        )
+    with pytest.raises(ImportUnavailable, match="^import_unavailable$"):
+        repository.commit_graph(
+            context,
+            draft_id=first.import_id,
+            reviewed_digest="9" * 64,
+            acknowledged_codes=("leaderless_team",),
+        )
+
+
+def test_firestore_correction_requires_exact_latest_lineage(fake_firestore) -> None:
+    client, repository, context = fake_firestore
+    first = repository.save_import_draft(context, draft())
+    second = first.model_copy(
+        update={
+            "import_id": "imp_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            "semantic_digest": "2" * 64,
+            "source_snapshot": first.source_snapshot.model_copy(
+                update={"semantic_digest": "2" * 64}
+            ),
+        }
+    )
+    repository.save_import_draft(context, second)
+    correction = first.model_copy(
+        update={
+            "import_id": "imp_01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            "semantic_digest": "3" * 64,
+            "supersedes_import_id": first.import_id,
+            "source_snapshot": first.source_snapshot.model_copy(
+                update={"semantic_digest": "3" * 64}
+            ),
+        }
+    )
+    before = deepcopy(client.data)
+
+    with pytest.raises(ImportUnavailable, match="^import_lineage_conflict$"):
+        repository.save_import_draft(context, correction)
+
+    assert client.data == before
+
+
+def test_firestore_lineage_and_draft_save_roll_back_together(fake_firestore) -> None:
+    client, repository, context = fake_firestore
+    first = repository.save_import_draft(context, draft())
+    second = first.model_copy(
+        update={
+            "import_id": "imp_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            "semantic_digest": "2" * 64,
+            "source_snapshot": first.source_snapshot.model_copy(
+                update={"semantic_digest": "2" * 64}
+            ),
+        }
+    )
+    before = deepcopy(client.data)
+    client.abort_next_transaction = True
+
+    with pytest.raises(ImportUnavailable, match="^import_unavailable$"):
+        repository.save_import_draft(context, second)
+
+    assert client.data == before
+
+
+def test_firestore_corrupt_lineage_rejects_commit_without_writes(fake_firestore) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    lineage_path = (COLLECTION, ORG, "organization_import_lineage", "csv")
+    client.data[lineage_path]["latest_import_id"] = (
+        "imp_01ARZ3NDEKTSV4RRFFQ69G5FAW"
+    )
+    before = deepcopy(client.data)
+    client.provider_mutation_attempts = 0
+
+    with pytest.raises(ImportUnavailable, match="^import_unavailable$"):
+        repository.commit_graph(
+            context,
+            draft_id=saved.import_id,
+            reviewed_digest=saved.semantic_digest,
+        )
+
+    assert client.data == before
+    assert client.provider_mutation_attempts == 0
+
+
 def _numeric_ulid(value: int) -> str:
     return f"{value:026d}"
 

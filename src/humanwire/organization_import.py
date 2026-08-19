@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import hashlib
+import multiprocessing
+import pickle
 import re
 import secrets
-import threading
 import unicodedata
 from collections import Counter
 from collections.abc import Callable
+from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from time import monotonic
 from typing import Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -36,7 +40,11 @@ from humanwire.organization_models import (
     SourceSnapshot,
     SubjectLifecycle,
 )
-from humanwire.organization_store import ImportUnavailable, OrganizationGraphRepository
+from humanwire.organization_store import (
+    ImportLineageConflict,
+    ImportUnavailable,
+    OrganizationGraphRepository,
+)
 
 _ULID = r"[0-9A-HJKMNP-TV-Z]{26}"
 _IMPORT_ID = rf"^imp_{_ULID}$"
@@ -165,6 +173,73 @@ def _truthy(value: str | None) -> bool:
     return value == "true"
 
 
+@dataclass(frozen=True, slots=True)
+class _ControlDiagnostics:
+    ambiguous_record_ids: frozenset[str]
+    blocking_codes: tuple[str, ...]
+    conflicting_parent_units: frozenset[str]
+    multiple_leader_units: frozenset[str]
+
+
+def _control_diagnostics(records: tuple[SourceRecord, ...]) -> _ControlDiagnostics:
+    ambiguous: set[str] = set()
+    codes: set[str] = set()
+    records_by_unit: dict[str, list[SourceRecord]] = {}
+    parents_by_unit: dict[str, set[str]] = {}
+    leaders_by_unit: dict[str, list[SourceRecord]] = {}
+    for record in records:
+        fields = _fields(record)
+        unit_name = fields.get("unit_name")
+        if unit_name is not None:
+            records_by_unit.setdefault(unit_name, []).append(record)
+            parent_name = fields.get("unit_parent_name")
+            if parent_name is not None:
+                parents_by_unit.setdefault(unit_name, set()).add(parent_name)
+        elif "unit_parent_name" in fields:
+            ambiguous.add(record.record_id)
+            codes.add("invalid_control_value")
+        for boolean_field in ("authority_required", "unit_leader"):
+            if boolean_field in fields and fields[boolean_field] not in {"false", "true"}:
+                ambiguous.add(record.record_id)
+                codes.add("invalid_control_value")
+        if unit_name is not None and fields.get("unit_leader") == "true":
+            leaders_by_unit.setdefault(unit_name, []).append(record)
+        has_function = "authority_function" in fields
+        has_decision_type = "decision_type" in fields
+        if has_function != has_decision_type:
+            ambiguous.add(record.record_id)
+            codes.add("incomplete_authority")
+        elif has_function:
+            try:
+                AuthorityFunction(fields["authority_function"])
+            except ValueError:
+                ambiguous.add(record.record_id)
+                codes.add("invalid_control_value")
+
+    conflicting_parent_units = frozenset(
+        unit_name
+        for unit_name, parent_names in parents_by_unit.items()
+        if len(parent_names) > 1
+    )
+    multiple_leader_units = frozenset(
+        unit_name
+        for unit_name, leaders in leaders_by_unit.items()
+        if len(leaders) > 1
+    )
+    if conflicting_parent_units:
+        codes.add("conflicting_unit_parent")
+    if multiple_leader_units:
+        codes.add("multiple_unit_leaders")
+    for unit_name in conflicting_parent_units | multiple_leader_units:
+        ambiguous.update(record.record_id for record in records_by_unit[unit_name])
+    return _ControlDiagnostics(
+        ambiguous_record_ids=frozenset(ambiguous),
+        blocking_codes=tuple(sorted(codes)),
+        conflicting_parent_units=conflicting_parent_units,
+        multiple_leader_units=multiple_leader_units,
+    )
+
+
 class RuleOrganizationMapper:
     """Map only source-declared identity, hierarchy, unit, and authority fields."""
 
@@ -176,8 +251,9 @@ class RuleOrganizationMapper:
         del current_graph
         records = tuple(sorted(snapshot.records, key=lambda item: (item.source_ordinal, item.record_id)))
         active_records = tuple(record for record in records if "merged_into" not in _fields(record))
+        diagnostics = _control_diagnostics(active_records)
         unit_names: set[str] = set()
-        parent_by_unit: dict[str, str] = {}
+        declared_parents: dict[str, set[str]] = {}
         for record in active_records:
             fields = _fields(record)
             unit_name = fields.get("unit_name")
@@ -186,7 +262,12 @@ class RuleOrganizationMapper:
                 unit_names.add(unit_name)
                 if parent_name is not None:
                     unit_names.add(parent_name)
-                    parent_by_unit[unit_name] = parent_name
+                    declared_parents.setdefault(unit_name, set()).add(parent_name)
+        parent_by_unit = {
+            unit_name: next(iter(parent_names))
+            for unit_name, parent_names in declared_parents.items()
+            if unit_name not in diagnostics.conflicting_parent_units
+        }
         unit_ids = {
             name: f"unit_{_deterministic_ulid(snapshot.organization_id, 'unit', name)}"
             for name in sorted(unit_names)
@@ -197,7 +278,14 @@ class RuleOrganizationMapper:
         record_by_source = {record.source_identity: record for record in active_records}
         for record in active_records:
             fields = _fields(record)
-            subject = self._subject(snapshot, record, fields, unit_ids, record_by_source)
+            subject = self._subject(
+                snapshot,
+                record,
+                fields,
+                unit_ids,
+                record_by_source,
+                diagnostics,
+            )
             subjects.append(subject)
             subject_by_source[record.source_identity] = subject
 
@@ -217,7 +305,12 @@ class RuleOrganizationMapper:
                 parent_unit_id=(
                     unit_ids[parent_by_unit[name]] if name in parent_by_unit else None
                 ),
-                leader_subject_id=(min(leaders[name]) if leaders.get(name) else None),
+                leader_subject_id=(
+                    min(leaders[name])
+                    if leaders.get(name)
+                    and name not in diagnostics.multiple_leader_units
+                    else None
+                ),
             )
             for name in sorted(unit_names)
         )
@@ -274,8 +367,9 @@ class RuleOrganizationMapper:
         fields: dict[str, str],
         unit_ids: dict[str, str],
         record_by_source: dict[str, SourceRecord],
+        diagnostics: _ControlDiagnostics,
     ) -> OrganizationSubject:
-        ambiguous = False
+        ambiguous = record.record_id in diagnostics.ambiguous_record_ids
         try:
             kind = OrganizationSubjectKind(fields["kind"])
         except (KeyError, ValueError):
@@ -329,6 +423,81 @@ class RuleOrganizationMapper:
             )
 
 
+def _mapper_worker(
+    mapper: OrganizationMapper,
+    snapshot_json: str,
+    graph_json: str,
+    sender,
+) -> None:
+    payload = b""
+    try:
+        snapshot = SourceSnapshot.model_validate_json(snapshot_json)
+        graph = OrganizationGraph.model_validate_json(graph_json)
+        candidate = mapper.map(snapshot, graph)
+        if isinstance(candidate, OrganizationGraphCandidate):
+            payload = candidate.model_dump_json().encode("utf-8")
+    except Exception:  # noqa: BLE001 - child details never cross the boundary
+        payload = b""
+    with suppress(Exception):
+        sender.send_bytes(payload)
+    sender.close()
+
+
+def _run_mapper_with_deadline(
+    mapper: OrganizationMapper,
+    snapshot: SourceSnapshot,
+    current: OrganizationGraph,
+    timeout_seconds: float,
+) -> object:
+    try:
+        pickle.dumps(mapper)
+    except Exception:  # noqa: BLE001 - configuration details are sealed
+        return None
+    process_context = multiprocessing.get_context("spawn")
+    receiver, sender = process_context.Pipe(duplex=False)
+    process = process_context.Process(
+        target=_mapper_worker,
+        args=(
+            mapper,
+            snapshot.model_dump_json(),
+            current.model_dump_json(),
+            sender,
+        ),
+        daemon=True,
+    )
+    started = False
+    payload: bytes | None = None
+    deadline = monotonic() + timeout_seconds
+    try:
+        process.start()
+        started = True
+        sender.close()
+        remaining = max(0.0, deadline - monotonic())
+        if receiver.poll(remaining):
+            payload = receiver.recv_bytes()
+            process.join(max(0.0, deadline - monotonic()))
+    except Exception:  # noqa: BLE001 - spawn/pickle/provider details are sealed
+        payload = None
+    finally:
+        with suppress(Exception):
+            sender.close()
+        if started and process.is_alive():
+            process.terminate()
+            process.join(1)
+        if started and process.is_alive():
+            process.kill()
+            process.join()
+        if started and process.exitcode not in {0, None}:
+            payload = None
+        receiver.close()
+    if not payload:
+        return None
+    try:
+        return OrganizationGraphCandidate.model_validate_json(payload)
+    except Exception:  # noqa: BLE001 - hostile mapper output is sealed
+        return None
+
+
 class OrganizationImportService:
     """Authorize, stage, reconcile, correct, and commit reviewed graph imports."""
 
@@ -337,15 +506,20 @@ class OrganizationImportService:
         *,
         repository: OrganizationGraphRepository,
         mapper: OrganizationMapper | None = None,
+        mapper_timeout_seconds: float = 2.0,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
+        if (
+            isinstance(mapper_timeout_seconds, bool)
+            or not isinstance(mapper_timeout_seconds, (int, float))
+            or not 0 < mapper_timeout_seconds <= 30
+        ):
+            raise ValueError("mapper timeout is invalid")
         self._repository = repository
         self._mapper = RuleOrganizationMapper() if mapper is None else mapper
         self._fallback = RuleOrganizationMapper()
+        self._mapper_timeout_seconds = float(mapper_timeout_seconds)
         self._clock = (lambda: datetime.now(UTC)) if clock is None else clock
-        self._lock = threading.RLock()
-        self._latest_source: dict[tuple[str, str], str] = {}
-        self._superseded: set[tuple[str, str]] = set()
 
     def __repr__(self) -> str:
         return "OrganizationImportService()"
@@ -363,97 +537,92 @@ class OrganizationImportService:
         context: DecisionOSContext,
         snapshot: SourceSnapshot,
     ) -> ImportDraft:
-        with self._lock:
-            self._repository.list_imports(context)
-            if snapshot.organization_id != context.organization_id:
-                raise ImportUnavailable() from None
-            current = self._repository.load_graph(context)
-            canonical = _canonical_snapshot(snapshot)
-            draft = self._draft(canonical, current)
-            saved = self._repository.save_import_draft(context, draft)
-            self._latest_source[(context.organization_id, canonical.source_kind)] = (
-                canonical.semantic_digest
-            )
-            return saved
+        self._repository.list_imports(context)
+        if snapshot.organization_id != context.organization_id:
+            raise ImportUnavailable() from None
+        current = self._repository.load_graph(context)
+        canonical = _canonical_snapshot(snapshot)
+        draft = self._draft(canonical, current)
+        return self._repository.save_import_draft(context, draft)
 
     def reconcile(
         self,
         context: DecisionOSContext,
         import_id: str,
     ) -> ImportReconciliation:
-        with self._lock:
-            draft = self._repository.load_import_draft(context, import_id)
-            return _reconcile(draft)
+        draft = self._repository.load_import_draft(context, import_id)
+        return _reconcile(draft)
 
     def apply_correction(
         self,
         context: DecisionOSContext,
         request: ImportCorrectionRequest,
     ) -> ImportDraft:
-        with self._lock:
-            draft = self._repository.load_import_draft(context, request.import_id)
-            key = (context.organization_id, request.import_id)
-            if key in self._superseded or not _digest_matches(
-                request.reviewed_digest,
-                draft.semantic_digest,
-            ):
-                raise OrganizationImportStale() from None
-            current = self._repository.load_graph(context)
-            if current.version != draft.base_graph_version:
-                raise OrganizationImportStale() from None
-            record_ids = {record.record_id for record in draft.source_snapshot.records}
-            if any(record_id not in record_ids for record_id in request.source_record_ids):
-                raise OrganizationImportUnavailable() from None
-            corrected_snapshot = _corrected_snapshot(draft.source_snapshot, request)
-            corrected = self._draft(corrected_snapshot, current)
-            saved = self._repository.save_import_draft(context, corrected)
-            self._superseded.add(key)
-            self._latest_source[
-                (context.organization_id, corrected_snapshot.source_kind)
-            ] = corrected_snapshot.semantic_digest
-            return saved
+        draft = self._repository.load_import_draft(context, request.import_id)
+        if not _digest_matches(request.reviewed_digest, draft.semantic_digest):
+            raise OrganizationImportStale() from None
+        current = self._repository.load_graph(context)
+        if current.version != draft.base_graph_version:
+            raise OrganizationImportStale() from None
+        record_ids = {record.record_id for record in draft.source_snapshot.records}
+        if any(record_id not in record_ids for record_id in request.source_record_ids):
+            raise OrganizationImportUnavailable() from None
+        corrected_snapshot = _corrected_snapshot(draft.source_snapshot, request)
+        corrected = self._draft(
+            corrected_snapshot,
+            current,
+            supersedes_import_id=draft.import_id,
+        )
+        try:
+            return self._repository.save_import_draft(context, corrected)
+        except ImportLineageConflict:
+            raise OrganizationImportStale() from None
 
     def commit(
         self,
         context: DecisionOSContext,
         request: CommitImportRequest,
     ) -> ImportReceipt:
-        with self._lock:
-            draft = self._repository.load_import_draft(context, request.import_id)
-            if (context.organization_id, request.import_id) in self._superseded:
-                raise OrganizationImportStale() from None
-            latest = self._latest_source.get(
-                (context.organization_id, draft.source_snapshot.source_kind)
-            )
-            if latest is not None and not _digest_matches(
-                latest,
-                draft.source_snapshot.semantic_digest,
-            ):
-                raise OrganizationImportStale() from None
-            if not _digest_matches(request.reviewed_digest, draft.semantic_digest):
-                raise OrganizationImportReviewRequired() from None
-            reconciliation = _reconcile(draft)
-            if reconciliation.blocking_codes or (
-                request.acknowledged_codes != reconciliation.acknowledged_codes
-            ):
-                raise OrganizationImportReviewRequired() from None
+        draft = self._repository.load_import_draft(context, request.import_id)
+        if not _digest_matches(request.reviewed_digest, draft.semantic_digest):
+            raise OrganizationImportReviewRequired() from None
+        try:
+            self._repository.require_latest_import(context, draft.import_id)
+        except ImportLineageConflict:
+            raise OrganizationImportStale() from None
+        reconciliation = _reconcile(draft)
+        if reconciliation.blocking_codes or (
+            request.acknowledged_codes != reconciliation.acknowledged_codes
+        ):
+            raise OrganizationImportReviewRequired() from None
+        try:
             return self._repository.commit_graph(
                 context,
                 draft_id=draft.import_id,
                 reviewed_digest=request.reviewed_digest,
                 acknowledged_codes=request.acknowledged_codes,
             )
+        except ImportLineageConflict:
+            raise OrganizationImportStale() from None
 
     def _draft(
         self,
         snapshot: SourceSnapshot,
         current: OrganizationGraph,
+        *,
+        supersedes_import_id: str | None = None,
     ) -> ImportDraft:
         candidate = self._mapped_candidate(snapshot, current)
         created_at = _aware(self._clock())
-        digest = _draft_digest(snapshot, candidate, current.version)
+        digest = _draft_digest(
+            snapshot,
+            candidate,
+            current.version,
+            supersedes_import_id,
+        )
         return ImportDraft(
             import_id=f"imp_{_deterministic_ulid(snapshot.organization_id, digest)}",
+            supersedes_import_id=supersedes_import_id,
             organization_id=snapshot.organization_id,
             source_snapshot=snapshot,
             candidate=candidate,
@@ -467,12 +636,16 @@ class OrganizationImportService:
         snapshot: SourceSnapshot,
         current: OrganizationGraph,
     ) -> OrganizationGraphCandidate:
-        failed = False
-        candidate: object = None
-        try:
-            candidate = self._mapper.map(snapshot, current)
-        except Exception:  # noqa: BLE001 - mapper/provider details are sealed
-            failed = True
+        if type(self._mapper) is RuleOrganizationMapper:
+            candidate: object = self._mapper.map(snapshot, current)
+        else:
+            candidate = _run_mapper_with_deadline(
+                self._mapper,
+                snapshot,
+                current,
+                self._mapper_timeout_seconds,
+            )
+        failed = candidate is None
         if not failed:
             candidate = _validated_candidate(candidate, snapshot)
             failed = candidate is None
@@ -531,13 +704,35 @@ def _validated_candidate(
         or validated.source_snapshot_id != snapshot.snapshot_id
     ):
         return None
-    records = {record.source_identity: record for record in snapshot.records}
+    active_records = tuple(
+        record for record in snapshot.records if "merged_into" not in _fields(record)
+    )
+    records = {record.source_identity: record for record in active_records}
+    candidate_source_identities = {
+        subject.source_identity
+        for subject in validated.subjects
+        if subject.source_identity is not None
+    }
+    if candidate_source_identities != set(records):
+        return None
     subjects = {
         subject.subject_id: subject
         for subject in validated.subjects
         if subject.source_identity in records
     }
     if len(subjects) != len(validated.subjects):
+        return None
+    diagnostics = _control_diagnostics(active_records)
+    ambiguous_source_identities = {
+        record.source_identity
+        for record in active_records
+        if record.record_id in diagnostics.ambiguous_record_ids
+    }
+    if any(
+        subject.source_identity in ambiguous_source_identities
+        and subject.lifecycle is not SubjectLifecycle.NEEDS_REVIEW
+        for subject in validated.subjects
+    ):
         return None
     for edge in validated.edges:
         if edge.kind is not OrganizationEdgeKind.REPORTS_TO:
@@ -566,6 +761,7 @@ def _draft_digest(
     snapshot: SourceSnapshot,
     candidate: OrganizationGraphCandidate,
     base_version: int,
+    supersedes_import_id: str | None,
 ) -> str:
     return hashlib.sha256(
         to_json(
@@ -573,6 +769,7 @@ def _draft_digest(
                 "base_graph_version": base_version,
                 "candidate": candidate.model_dump(mode="python"),
                 "source_snapshot": snapshot.model_dump(mode="python"),
+                "supersedes_import_id": supersedes_import_id,
             }
         )
     ).hexdigest()
@@ -590,6 +787,12 @@ def _reconcile(draft: ImportDraft) -> ImportReconciliation:
     )
     blocking = set(validate_organization_graph(graph).blocking_codes)
     nonblocking: set[str] = set()
+    active_records = tuple(
+        record
+        for record in draft.source_snapshot.records
+        if "merged_into" not in _fields(record)
+    )
+    blocking.update(_control_diagnostics(active_records).blocking_codes)
     subject_by_source = {
         subject.source_identity: subject
         for subject in draft.candidate.subjects
