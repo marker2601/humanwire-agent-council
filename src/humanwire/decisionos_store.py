@@ -213,7 +213,7 @@ class DecisionOSRepository(Protocol):
         *,
         carried_member_uids: tuple[str, ...],
         removed_member_uids: tuple[str, ...],
-        mutation: Callable[[Any], None],
+        mutation: Callable[[Any], Callable[[], None] | None],
     ) -> None:
         raise NotImplementedError
 
@@ -466,7 +466,7 @@ class InMemoryDecisionOSRepository:
         *,
         carried_member_uids: tuple[str, ...],
         removed_member_uids: tuple[str, ...],
-        mutation: Callable[[Any], None],
+        mutation: Callable[[Any], Callable[[], None] | None],
     ) -> None:
         """Validate carried bindings and suspend removed members under one lock."""
 
@@ -522,11 +522,33 @@ class InMemoryDecisionOSRepository:
                 self._memberships.get(key) != value for key, value in membership_snapshot.items()
             ):
                 raise MembershipUnavailable()
-            mutation(None)
+            replacement_memberships = dict(self._memberships)
             for key, updated in updated_memberships:
-                self._memberships[key] = updated
-            self._audit_sequence = next_audit_sequence
-            self._audit.setdefault(current.organization_id, []).extend(audit_events)
+                replacement_memberships[key] = updated
+            replacement_audit = {
+                organization_id: list(events)
+                for organization_id, events in self._audit.items()
+            }
+            replacement_audit[current.organization_id] = [
+                *replacement_audit.get(current.organization_id, ()),
+                *audit_events,
+            ]
+            prior_memberships = self._memberships
+            prior_audit = self._audit
+            prior_audit_sequence = self._audit_sequence
+            rollback = None
+            try:
+                rollback = mutation(None)
+                self._memberships = replacement_memberships
+                self._audit = replacement_audit
+                self._audit_sequence = next_audit_sequence
+            except Exception:
+                self._memberships = prior_memberships
+                self._audit = prior_audit
+                self._audit_sequence = prior_audit_sequence
+                if rollback is not None:
+                    rollback()
+                raise
 
     def load_workspace(
         self,
@@ -1015,7 +1037,7 @@ class FirestoreDecisionOSRepository:
         *,
         carried_member_uids: tuple[str, ...],
         removed_member_uids: tuple[str, ...],
-        mutation: Callable[[Any], None],
+        mutation: Callable[[Any], Callable[[], None] | None],
     ) -> None:
         """Apply a membership-only graph change in one DecisionOS transaction."""
 

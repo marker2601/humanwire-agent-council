@@ -794,6 +794,72 @@ def test_removal_clock_failure_rolls_back_graph_membership_and_retry(
     assert len(suspended) == 1
 
 
+def test_graph_audit_container_failure_rolls_back_both_repositories_and_retry(
+    setup_repositories,
+) -> None:
+    repository, decisionos, owner_context = setup_repositories
+    member_context = _commit_and_bind(
+        repository,
+        decisionos,
+        owner_context,
+        uid="firebase-alice-01",
+    )
+    removal = repository.save_import_draft(
+        owner_context,
+        import_draft(
+            import_id=IMPORT_B,
+            digest=DIGEST_B,
+            base_version=2,
+            include_person=False,
+        ),
+    )
+    graph_before = repository.load_graph(owner_context)
+    org_audit_before = repository.list_audit(owner_context)
+    member_audit_before = decisionos.list_audit(owner_context)
+
+    class FailingAuditContainer(dict):
+        def items(self):
+            raise RuntimeError(PRIVATE_VALUE)
+
+        def setdefault(self, _key, _default=None):
+            raise RuntimeError(PRIVATE_VALUE)
+
+    repository._audit = FailingAuditContainer(repository._audit)
+    with pytest.raises(ImportUnavailable) as captured:
+        repository.commit_graph(
+            owner_context,
+            draft_id=removal.import_id,
+            reviewed_digest=removal.semantic_digest,
+        )
+
+    assert PRIVATE_VALUE not in exception_graph_text(captured.value)
+    assert repository.load_graph(owner_context) == graph_before
+    assert repository.list_audit(owner_context) == org_audit_before
+    assert decisionos.list_audit(owner_context) == member_audit_before
+    assert decisionos.load_context(member_context.principal, ORG_A) == member_context
+
+    repository._audit = {key: list(value) for key, value in dict(repository._audit).items()}
+    receipt = repository.commit_graph(
+        owner_context,
+        draft_id=removal.import_id,
+        reviewed_digest=removal.semantic_digest,
+    )
+
+    assert receipt.graph_version == 3
+    assert repository.load_graph(owner_context).version == 3
+    assert len(repository.list_audit(owner_context)) == len(org_audit_before) + 1
+    with pytest.raises(OrganizationUnavailable):
+        decisionos.load_context(member_context.principal, ORG_A)
+    assert len(
+        tuple(
+            event
+            for event in decisionos.list_audit(owner_context)
+            if event.event_name == "member_suspended"
+            and event.target_uid == member_context.principal.uid
+        )
+    ) == 1
+
+
 def test_removal_serializes_membership_version_until_no_fail_publish(
     setup_repositories,
 ) -> None:

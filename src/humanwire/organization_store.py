@@ -476,11 +476,52 @@ class InMemoryOrganizationGraphRepository:
             )
             event = _commit_event(current, prior.version, receipt, now)
 
-            def persist(_transaction) -> None:
-                self._graphs[(current.organization_id, graph.version)] = graph
-                self._current_versions[current.organization_id] = graph.version
-                saved.receipt = receipt
-                self._audit.setdefault(current.organization_id, []).append(event)
+            prepared = None
+            preparation_failed = False
+            try:
+                replacement_graphs = dict(self._graphs)
+                replacement_graphs[(current.organization_id, graph.version)] = graph
+                replacement_versions = dict(self._current_versions)
+                replacement_versions[current.organization_id] = graph.version
+                replacement_saved = _SavedImport(saved.draft)
+                replacement_saved.receipt = receipt
+                replacement_imports = dict(self._imports)
+                replacement_imports[(current.organization_id, draft_id)] = replacement_saved
+                replacement_audit = {
+                    organization_id: list(events)
+                    for organization_id, events in self._audit.items()
+                }
+                replacement_audit[current.organization_id] = [
+                    *replacement_audit.get(current.organization_id, ()),
+                    event,
+                ]
+                prepared = (
+                    replacement_graphs,
+                    replacement_versions,
+                    replacement_imports,
+                    replacement_audit,
+                )
+            except Exception:  # noqa: BLE001 - injected container failures are sealed
+                preparation_failed = True
+            if preparation_failed or prepared is None:
+                raise ImportUnavailable() from None
+            prior_state = (
+                self._graphs,
+                self._current_versions,
+                self._imports,
+                self._audit,
+            )
+
+            def persist(_transaction) -> Callable[[], None]:
+                def rollback() -> None:
+                    self._graphs, self._current_versions, self._imports, self._audit = prior_state
+
+                try:
+                    self._graphs, self._current_versions, self._imports, self._audit = prepared
+                except Exception:
+                    rollback()
+                    raise
+                return rollback
 
             membership_invalid = False
             provider_failed = False
@@ -694,14 +735,17 @@ def _payload_digest(value: Any) -> str:
     return hashlib.sha256(to_json(value)).hexdigest()
 
 
-def _firestore_document_bytes(value: dict[str, Any]) -> int:
+def _firestore_document_bytes(reference: Any, value: dict[str, Any]) -> int:
     failed = False
     size = 0
     try:
         from google.cloud.firestore_v1 import _helpers
         from google.cloud.firestore_v1.types import Document
 
-        size = Document(fields=_helpers.encode_dict(value))._pb.ByteSize()
+        name = reference._document_path
+        if type(name) is not str or not name:
+            raise ValueError("document reference has no resource name")
+        size = Document(name=name, fields=_helpers.encode_dict(value))._pb.ByteSize()
     except Exception:  # noqa: BLE001 - serializer failures are fixed-safe
         failed = True
     if failed:
@@ -709,8 +753,8 @@ def _firestore_document_bytes(value: dict[str, Any]) -> int:
     return size
 
 
-def _require_document_bound(value: dict[str, Any]) -> None:
-    if _firestore_document_bytes(value) > _MAX_DOCUMENT_BYTES:
+def _require_document_bound(reference: Any, value: dict[str, Any]) -> None:
+    if _firestore_document_bytes(reference, value) > _MAX_DOCUMENT_BYTES:
         raise ImportUnavailable()
 
 
@@ -770,7 +814,6 @@ def _chunk_document(
         "digest": _payload_digest(items),
         "items": tuple(items),
     }
-    _require_document_bound(document)
     return document
 
 
@@ -808,7 +851,6 @@ def _chunked_draft(draft: ImportDraft) -> tuple[dict[str, Any], dict[str, dict[s
     storage["payload_digest"] = _payload_digest(
         {key: storage[key] for key in storage if key != "payload_digest"}
     )
-    _require_document_bound(storage)
     return storage, chunks
 
 
@@ -837,7 +879,6 @@ def _chunked_graph(graph: OrganizationGraph) -> tuple[dict[str, Any], dict[str, 
     storage["payload_digest"] = _payload_digest(
         {key: storage[key] for key in storage if key != "payload_digest"}
     )
-    _require_document_bound(storage)
     return storage, chunks
 
 
@@ -932,8 +973,14 @@ class FirestoreOrganizationGraphRepository:
             raise ImportUnavailable()
         draft = _validated_draft(draft)
         payload, chunks = _chunked_draft(draft)
-        _require_write_bound(1 + len(chunks))
         draft_ref = self._import_ref(context.organization_id, draft.import_id)
+        _require_document_bound(draft_ref, payload)
+        for chunk_id, chunk in chunks.items():
+            _require_document_bound(
+                draft_ref.collection("chunks").document(chunk_id),
+                chunk,
+            )
+        _require_write_bound(1 + len(chunks))
 
         @firestore.transactional
         def save(transaction):
@@ -1093,30 +1140,7 @@ class FirestoreOrganizationGraphRepository:
             )
             event = _commit_event(current, current_version, receipt, now)
             graph_storage, graph_chunks = _chunked_graph(graph)
-            extra_current_deletes = self._extra_current_chunk_count(
-                prior_storage,
-                graph_storage,
-            )
-            _require_write_bound(
-                4
-                + (2 * len(graph_chunks))
-                + extra_current_deletes
-                + (2 * len(active_removed))
-            )
-            transaction.create(
-                self._version_ref(current.organization_id, graph.version),
-                graph_storage,
-            )
             version_ref = self._version_ref(current.organization_id, graph.version)
-            for chunk_id, chunk in graph_chunks.items():
-                transaction.create(version_ref.collection("chunks").document(chunk_id), chunk)
-            self._write_current_graph(
-                transaction,
-                organization_ref,
-                prior_storage,
-                graph_storage,
-                graph_chunks,
-            )
             committed_payload = dict(payload)
             committed_payload.update(
                 {"status": "committed", "receipt": receipt.model_dump(mode="python")}
@@ -1128,27 +1152,64 @@ class FirestoreOrganizationGraphRepository:
                     if key != "payload_digest"
                 }
             )
-            transaction.set(draft_ref, committed_payload)
-            transaction.set(
-                state_ref,
-                {
-                    "schema_version": 1,
-                    "organization_id": current.organization_id,
-                    "current_version": graph.version,
-                    "current_version_id": f"{graph.version:020d}",
-                    "payload_digest": graph_storage["payload_digest"],
-                    "updated_at": now,
-                },
-            )
-            self._write_membership_suspensions(
-                transaction,
+            state_payload = {
+                "schema_version": 1,
+                "organization_id": current.organization_id,
+                "current_version": graph.version,
+                "current_version_id": f"{graph.version:020d}",
+                "payload_digest": graph_storage["payload_digest"],
+                "updated_at": now,
+            }
+            membership_documents = self._membership_suspension_documents(
                 current,
                 active_removed,
                 graph.version,
                 now,
             )
+            event_ref = self._client.collection(self._audit_collection).document(event.event_id)
+            self._preflight_graph_documents(
+                version_ref,
+                organization_ref,
+                graph_storage,
+                graph_chunks,
+            )
+            _require_document_bound(draft_ref, committed_payload)
+            _require_document_bound(state_ref, state_payload)
+            _require_document_bound(event_ref, event.model_dump(mode="python"))
+            for member_ref, member_payload, audit_ref, audit_payload in membership_documents:
+                _require_document_bound(member_ref, member_payload)
+                _require_document_bound(audit_ref, audit_payload)
+            extra_current_deletes = self._extra_current_chunk_count(
+                prior_storage,
+                graph_storage,
+            )
+            _require_write_bound(
+                4
+                + (2 * len(graph_chunks))
+                + extra_current_deletes
+                + (2 * len(active_removed))
+            )
             transaction.create(
-                self._client.collection(self._audit_collection).document(event.event_id),
+                version_ref,
+                graph_storage,
+            )
+            for chunk_id, chunk in graph_chunks.items():
+                transaction.create(version_ref.collection("chunks").document(chunk_id), chunk)
+            self._write_current_graph(
+                transaction,
+                organization_ref,
+                prior_storage,
+                graph_storage,
+                graph_chunks,
+            )
+            transaction.set(draft_ref, committed_payload)
+            transaction.set(state_ref, state_payload)
+            self._write_membership_suspensions(
+                transaction,
+                membership_documents,
+            )
+            transaction.create(
+                event_ref,
                 event.model_dump(mode="python"),
             )
             return receipt
@@ -1248,16 +1309,33 @@ class FirestoreOrganizationGraphRepository:
             )
             event = _binding_event(current, version, bound, now)
             graph_storage, graph_chunks = _chunked_graph(graph)
+            version_ref = self._version_ref(current.organization_id, graph.version)
+            state_payload = {
+                "schema_version": 1,
+                "organization_id": current.organization_id,
+                "current_version": graph.version,
+                "current_version_id": f"{graph.version:020d}",
+                "payload_digest": graph_storage["payload_digest"],
+                "updated_at": now,
+            }
+            event_ref = self._client.collection(self._audit_collection).document(event.event_id)
+            self._preflight_graph_documents(
+                version_ref,
+                organization_ref,
+                graph_storage,
+                graph_chunks,
+            )
+            _require_document_bound(state_ref, state_payload)
+            _require_document_bound(event_ref, event.model_dump(mode="python"))
             extra_current_deletes = self._extra_current_chunk_count(
                 prior_storage,
                 graph_storage,
             )
             _require_write_bound(3 + (2 * len(graph_chunks)) + extra_current_deletes)
             transaction.create(
-                self._version_ref(current.organization_id, graph.version),
+                version_ref,
                 graph_storage,
             )
-            version_ref = self._version_ref(current.organization_id, graph.version)
             for chunk_id, chunk in graph_chunks.items():
                 transaction.create(version_ref.collection("chunks").document(chunk_id), chunk)
             self._write_current_graph(
@@ -1267,19 +1345,9 @@ class FirestoreOrganizationGraphRepository:
                 graph_storage,
                 graph_chunks,
             )
-            transaction.set(
-                state_ref,
-                {
-                    "schema_version": 1,
-                    "organization_id": current.organization_id,
-                    "current_version": graph.version,
-                    "current_version_id": f"{graph.version:020d}",
-                    "payload_digest": graph_storage["payload_digest"],
-                    "updated_at": now,
-                },
-            )
+            transaction.set(state_ref, state_payload)
             transaction.create(
-                self._client.collection(self._audit_collection).document(event.event_id),
+                event_ref,
                 event.model_dump(mode="python"),
             )
             return bound
@@ -1510,7 +1578,7 @@ class FirestoreOrganizationGraphRepository:
                     or not isinstance(chunk.get("items"), (list, tuple))
                     or len(chunk["items"]) != chunk["count"]
                     or _payload_digest(chunk["items"]) != chunk["digest"]
-                    or _firestore_document_bytes(chunk) > _MAX_DOCUMENT_BYTES
+                    or _firestore_document_bytes(row.reference, chunk) > _MAX_DOCUMENT_BYTES
                 ):
                     raise ImportUnavailable()
                 items.extend(chunk["items"])
@@ -1627,22 +1695,18 @@ class FirestoreOrganizationGraphRepository:
                 raise LastOwnerRequired()
         return tuple(active_removed)
 
-    def _write_membership_suspensions(
+    def _membership_suspension_documents(
         self,
-        transaction,
         context: DecisionOSContext,
         members: tuple[OrganizationMembership, ...],
         graph_version: int,
         occurred_at: datetime,
-    ) -> None:
+    ) -> tuple[tuple[Any, dict[str, Any], Any, dict[str, Any]], ...]:
         organization_ref = self._organization_ref(context.organization_id)
-        for index, member in enumerate(members):
+        documents = []
+        for member in members:
             updated = OrganizationMembership.model_validate(
                 {**member.model_dump(mode="python"), "status": MembershipStatus.SUSPENDED}
-            )
-            transaction.set(
-                organization_ref.collection("members").document(member.uid),
-                updated.model_dump(mode="python"),
             )
             number = int(
                 hashlib.sha256(
@@ -1659,10 +1723,48 @@ class FirestoreOrganizationGraphRepository:
                 target_uid=member.uid,
                 occurred_at=occurred_at,
             )
-            transaction.create(
-                organization_ref.collection("audit").document(audit_id),
-                event.model_dump(mode="python"),
+            documents.append(
+                (
+                    organization_ref.collection("members").document(member.uid),
+                    updated.model_dump(mode="python"),
+                    organization_ref.collection("audit").document(audit_id),
+                    event.model_dump(mode="python"),
+                )
             )
+        return tuple(documents)
+
+    def _write_membership_suspensions(
+        self,
+        transaction,
+        documents: tuple[tuple[Any, dict[str, Any], Any, dict[str, Any]], ...],
+    ) -> None:
+        for member_ref, member_payload, audit_ref, audit_payload in documents:
+            transaction.set(member_ref, member_payload)
+            transaction.create(audit_ref, audit_payload)
+
+    def _preflight_graph_documents(
+        self,
+        version_ref,
+        organization_ref,
+        graph_storage: dict[str, Any],
+        chunks: dict[str, dict[str, Any]],
+    ) -> None:
+        _require_document_bound(version_ref, graph_storage)
+        collections = {
+            "subjects": "org_subjects",
+            "units": "org_units",
+            "edges": "org_edges",
+            "authority_assignments": "authority_policies",
+        }
+        for chunk_id, chunk in chunks.items():
+            _require_document_bound(version_ref.collection("chunks").document(chunk_id), chunk)
+        for kind, collection_name in collections.items():
+            collection = organization_ref.collection(collection_name)
+            for index in range(len(graph_storage["manifest"][kind])):
+                _require_document_bound(
+                    collection.document(f"chunk_{index:05d}"),
+                    chunks[f"{kind}_{index:05d}"],
+                )
 
     def _extra_current_chunk_count(
         self,

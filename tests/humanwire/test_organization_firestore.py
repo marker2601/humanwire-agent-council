@@ -53,8 +53,12 @@ OWNER = DecisionOSPrincipal(
 )
 
 
-def actual_document_bytes(data) -> int:
-    return FirestoreDocument(fields=firestore_helpers.encode_dict(data))._pb.ByteSize()
+def actual_document_bytes(reference, data, *, include_name: bool = True) -> int:
+    name = reference._document_path if include_name else ""
+    return FirestoreDocument(
+        name=name,
+        fields=firestore_helpers.encode_dict(data),
+    )._pb.ByteSize()
 
 
 def independent_digest(data) -> str:
@@ -132,6 +136,11 @@ class FakeDocument:
         self.path = tuple(path)
         self.id = self.path[-1]
 
+    @property
+    def _document_path(self):
+        suffix = "/".join(self.path)
+        return f"projects/test-project/databases/(default)/documents/{suffix}"
+
     def collection(self, name):
         return FakeCollection(self.client, (*self.path, name))
 
@@ -159,7 +168,7 @@ class FakeTransaction:
 
     def _write(self, reference, data):
         self.client.provider_mutation_attempts += 1
-        encoded_size = actual_document_bytes(data)
+        encoded_size = actual_document_bytes(reference, data)
         if encoded_size > self.client.max_document_bytes:
             raise AssertionError(f"document exceeds bound: {encoded_size}")
         self.write_count += 1
@@ -506,7 +515,7 @@ def test_firestore_preflights_actual_protobuf_size_before_provider_mutation(
     client, repository, context = fake_firestore
     original = draft()
     adversarial_record = original.source_snapshot.records[0].model_copy(
-        update={"fields": tuple((f"f{index}", "x") for index in range(22_000))}
+        update={"fields": tuple((f"f{index}", "x") for index in range(21_930))}
     )
     adversarial = original.model_copy(
         update={
@@ -515,6 +524,26 @@ def test_firestore_preflights_actual_protobuf_size_before_provider_mutation(
             )
         }
     )
+    record_payload = adversarial_record.model_dump(mode="python")
+    chunk_payload = {
+        "schema_version": 1,
+        "organization_id": ORG,
+        "owner_id": adversarial.import_id,
+        "kind": "source_records",
+        "index": 0,
+        "count": 1,
+        "digest": independent_digest((record_payload,)),
+        "items": (record_payload,),
+    }
+    chunk_ref = FakeDocument(
+        client,
+        (COLLECTION, ORG, "imports", adversarial.import_id, "chunks", "source_records_00000"),
+    )
+    assert (
+        actual_document_bytes(chunk_ref, chunk_payload, include_name=False)
+        <= client.max_document_bytes
+        < actual_document_bytes(chunk_ref, chunk_payload)
+    )
     client.provider_mutation_attempts = 0
 
     with pytest.raises(ImportUnavailable, match="import_unavailable"):
@@ -522,6 +551,61 @@ def test_firestore_preflights_actual_protobuf_size_before_provider_mutation(
 
     assert client.provider_mutation_attempts == 0
     assert not any(path[-1] == adversarial.import_id for path in client.data)
+
+
+def test_firestore_preflights_oversized_committed_manifest_before_any_write(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    import_path = (COLLECTION, ORG, "imports", saved.import_id)
+    payload = client.data[import_path]
+    descriptors = list(payload["manifest"]["units"])
+    empty_digest = independent_digest(())
+    draft_ref = FakeDocument(client, import_path)
+    index = 0
+
+    def add_empty_unit_descriptor() -> None:
+        nonlocal index
+        descriptor = {
+            "chunk_id": f"units_{index:05d}",
+            "index": index,
+            "count": 0,
+            "digest": empty_digest,
+        }
+        descriptors.append(descriptor)
+        client.data[(*import_path, "chunks", descriptor["chunk_id"])] = {
+            "schema_version": 1,
+            "organization_id": ORG,
+            "owner_id": saved.import_id,
+            "kind": "units",
+            "index": index,
+            "count": 0,
+            "digest": empty_digest,
+            "items": (),
+        }
+        payload["manifest"]["units"] = tuple(descriptors)
+        index += 1
+
+    while actual_document_bytes(draft_ref, payload) < 449_000:
+        for _ in range(100):
+            add_empty_unit_descriptor()
+    while actual_document_bytes(draft_ref, payload) < 449_700:
+        add_empty_unit_descriptor()
+    payload["payload_digest"] = independent_digest(
+        {key: payload[key] for key in payload if key != "payload_digest"}
+    )
+    assert actual_document_bytes(draft_ref, payload) <= client.max_document_bytes
+    client.provider_mutation_attempts = 0
+
+    with pytest.raises(ImportUnavailable, match="import_unavailable"):
+        repository.commit_graph(
+            context,
+            draft_id=saved.import_id,
+            reviewed_digest=saved.semantic_digest,
+        )
+
+    assert client.provider_mutation_attempts == 0
 
 
 def test_firestore_rejects_manifest_descriptor_index_even_with_valid_outer_digest(
