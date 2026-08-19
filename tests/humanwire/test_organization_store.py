@@ -13,6 +13,7 @@ from humanwire.decisionos_store import (
     DecisionOSAuthorizationDenied,
     InMemoryDecisionOSRepository,
     LastOwnerRequired,
+    MembershipUnavailable,
     OrganizationUnavailable,
 )
 from humanwire.organization_models import (
@@ -33,6 +34,7 @@ from humanwire.organization_store import (
 ORG_A = "org_01ARZ3NDEKTSV4RRFFQ69G5FAV"
 ORG_B = "org_01ARZ3NDEKTSV4RRFFQ69G5FAW"
 SUBJECT_A = "sub_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+SUBJECT_B = "sub_01ARZ3NDEKTSV4RRFFQ69G5FAW"
 SNAPSHOT_A = "snap_01ARZ3NDEKTSV4RRFFQ69G5FAV"
 IMPORT_A = "imp_01ARZ3NDEKTSV4RRFFQ69G5FAV"
 IMPORT_B = "imp_01ARZ3NDEKTSV4RRFFQ69G5FAW"
@@ -45,18 +47,7 @@ PRIVATE_VALUE = "private-alice@example.invalid"
 class SequenceIdentifiers:
     def __init__(self) -> None:
         self.organizations = iter((ORG_A, ORG_B))
-        self.invitations = iter(
-            (
-                "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-                "inv_01ARZ3NDEKTSV4RRFFQ69G5FAW",
-            )
-        )
-        self.tokens = iter(
-            (
-                "opaque-invitation-token-123456",
-                "opaque-invitation-token-123457",
-            )
-        )
+        self.invitation_sequence = 0
 
     def organization_id(self) -> str:
         return next(self.organizations)
@@ -65,10 +56,11 @@ class SequenceIdentifiers:
         return "wrk_01ARZ3NDEKTSV4RRFFQ69G5FAV"
 
     def invitation_id(self) -> str:
-        return next(self.invitations)
+        self.invitation_sequence += 1
+        return f"inv_{self.invitation_sequence:026d}"
 
     def invitation_token(self) -> str:
-        return next(self.tokens)
+        return f"opaque-invitation-token-{self.invitation_sequence:06d}"
 
 
 def principal(uid: str) -> DecisionOSPrincipal:
@@ -408,3 +400,351 @@ def test_fixed_failures_do_not_retain_private_source_values_in_exception_graph(
         assert PRIVATE_VALUE not in " ".join(rendered)
     else:
         pytest.fail("duplicate import should fail closed")
+
+
+def test_protocol_draft_load_list_and_reconciliation_are_tenant_bound(
+    setup_repositories,
+) -> None:
+    repository, _decisionos, owner_context = setup_repositories
+    saved = repository.save_import_draft(owner_context, import_draft())
+
+    assert repository.load_import_draft(owner_context, saved.import_id) == saved
+    assert repository.list_imports(owner_context) == (saved,)
+    reconciliation = repository.reconcile_import(owner_context, saved.import_id)
+    assert reconciliation.import_id == saved.import_id
+    assert reconciliation.source_count == 1
+    assert reconciliation.normalized_count == 1
+    assert reconciliation.rejected_count == 0
+    assert reconciliation.committable is True
+
+
+def test_stale_admin_role_cannot_commit_a_saved_draft(setup_repositories) -> None:
+    repository, decisionos, owner_context = setup_repositories
+    admin_context = make_member(
+        decisionos,
+        owner_context,
+        uid="firebase-admin-01",
+        role=DecisionOSRole.ADMIN,
+    )
+    saved = repository.save_import_draft(admin_context, import_draft())
+    decisionos.update_member_role(owner_context, admin_context.principal.uid, DecisionOSRole.VIEWER)
+
+    with pytest.raises(DecisionOSAuthorizationDenied, match="authorization_denied"):
+        repository.commit_graph(
+            admin_context,
+            draft_id=saved.import_id,
+            reviewed_digest=saved.semantic_digest,
+        )
+
+
+def test_other_tenant_cannot_read_graph_audit_or_bind_subject(setup_repositories) -> None:
+    repository, decisionos, owner_context = setup_repositories
+    saved = repository.save_import_draft(owner_context, import_draft())
+    repository.commit_graph(
+        owner_context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    owner_b = principal("firebase-owner-02")
+    org_b = decisionos.create_organization(owner_b, "Other Company")
+    context_b = decisionos.load_context(owner_b, org_b.organization_id)
+
+    assert repository.load_graph(context_b).version == 0
+    assert repository.list_audit(context_b) == ()
+    with pytest.raises(OrganizationUnavailable, match="organization_unavailable"):
+        repository.bind_member(
+            context_b,
+            subject_id=SUBJECT_A,
+            member_uid=context_b.principal.uid,
+        )
+
+
+def test_two_different_concurrent_drafts_serialize_one_winner(setup_repositories) -> None:
+    repository, _decisionos, owner_context = setup_repositories
+    drafts = (
+        repository.save_import_draft(owner_context, import_draft()),
+        repository.save_import_draft(
+            owner_context,
+            import_draft(import_id=IMPORT_B, digest=DIGEST_B),
+        ),
+    )
+
+    def commit(draft):
+        try:
+            return repository.commit_graph(
+                owner_context,
+                draft_id=draft.import_id,
+                reviewed_digest=draft.semantic_digest,
+            )
+        except GraphVersionConflict as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(commit, drafts))
+
+    assert sum(not isinstance(item, GraphVersionConflict) for item in results) == 1
+    assert sum(isinstance(item, GraphVersionConflict) for item in results) == 1
+    assert repository.load_graph(owner_context).version == 1
+
+
+def _commit_and_bind(repository, decisionos, owner_context, *, uid: str):
+    saved = repository.save_import_draft(owner_context, import_draft())
+    repository.commit_graph(
+        owner_context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    member_context = make_member(
+        decisionos,
+        owner_context,
+        uid=uid,
+        role=DecisionOSRole.VIEWER,
+    )
+    repository.bind_member(
+        owner_context,
+        subject_id=SUBJECT_A,
+        member_uid=member_context.principal.uid,
+    )
+    return member_context
+
+
+def test_source_removal_suspends_bound_non_owner_product_membership(
+    setup_repositories,
+) -> None:
+    repository, decisionos, owner_context = setup_repositories
+    member_context = _commit_and_bind(
+        repository,
+        decisionos,
+        owner_context,
+        uid="firebase-alice-01",
+    )
+    removal = repository.save_import_draft(
+        owner_context,
+        import_draft(
+            import_id=IMPORT_B,
+            digest=DIGEST_B,
+            base_version=2,
+            include_person=False,
+        ),
+    )
+
+    repository.commit_graph(
+        owner_context,
+        draft_id=removal.import_id,
+        reviewed_digest=removal.semantic_digest,
+    )
+
+    assert repository.load_graph(owner_context).subjects[0].lifecycle is SubjectLifecycle.SUSPENDED
+    with pytest.raises(OrganizationUnavailable, match="organization_unavailable"):
+        decisionos.load_context(member_context.principal, ORG_A)
+
+
+def test_source_removal_rejects_suspending_last_owner_atomically(setup_repositories) -> None:
+    repository, decisionos, owner_context = setup_repositories
+    saved = repository.save_import_draft(owner_context, import_draft())
+    repository.commit_graph(
+        owner_context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    repository.bind_member(
+        owner_context,
+        subject_id=SUBJECT_A,
+        member_uid=owner_context.principal.uid,
+    )
+    removal = repository.save_import_draft(
+        owner_context,
+        import_draft(
+            import_id=IMPORT_B,
+            digest=DIGEST_B,
+            base_version=2,
+            include_person=False,
+        ),
+    )
+
+    with pytest.raises(LastOwnerRequired, match="last_owner_required"):
+        repository.commit_graph(
+            owner_context,
+            draft_id=removal.import_id,
+            reviewed_digest=removal.semantic_digest,
+        )
+
+    assert repository.load_graph(owner_context).version == 2
+    assert decisionos.load_context(owner_context.principal, ORG_A) == owner_context
+
+
+def test_source_removal_serializes_against_concurrent_membership_change(
+    setup_repositories,
+) -> None:
+    repository, decisionos, owner_context = setup_repositories
+    member_context = _commit_and_bind(
+        repository,
+        decisionos,
+        owner_context,
+        uid="firebase-alice-01",
+    )
+    removal = repository.save_import_draft(
+        owner_context,
+        import_draft(
+            import_id=IMPORT_B,
+            digest=DIGEST_B,
+            base_version=2,
+            include_person=False,
+        ),
+    )
+
+    def remove_source():
+        return repository.commit_graph(
+            owner_context,
+            draft_id=removal.import_id,
+            reviewed_digest=removal.semantic_digest,
+        )
+
+    def change_role():
+        try:
+            return decisionos.update_member_role(
+                owner_context,
+                member_context.principal.uid,
+                DecisionOSRole.CONTRIBUTOR,
+            )
+        except MembershipUnavailable as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        removed, role_result = tuple(executor.map(lambda fn: fn(), (remove_source, change_role)))
+
+    assert removed.graph_version == 3
+    assert isinstance(role_result, MembershipUnavailable) or (
+        role_result.role is DecisionOSRole.CONTRIBUTOR
+    )
+    with pytest.raises(OrganizationUnavailable):
+        decisionos.load_context(member_context.principal, ORG_A)
+
+
+def test_commit_rejects_candidate_introduced_active_member_binding(
+    setup_repositories,
+) -> None:
+    repository, decisionos, owner_context = setup_repositories
+    member_context = make_member(
+        decisionos,
+        owner_context,
+        uid="firebase-alice-01",
+        role=DecisionOSRole.VIEWER,
+    )
+    forged_subject = import_draft().candidate.subjects[0].model_copy(
+        update={
+            "lifecycle": SubjectLifecycle.ACTIVE,
+            "member_uid": member_context.principal.uid,
+        }
+    )
+    forged = import_draft().model_copy(
+        update={
+            "candidate": import_draft().candidate.model_copy(
+                update={"subjects": (forged_subject,)}
+            )
+        }
+    )
+    saved = repository.save_import_draft(owner_context, forged)
+
+    with pytest.raises(ImportUnavailable):
+        repository.commit_graph(
+            owner_context,
+            draft_id=saved.import_id,
+            reviewed_digest=saved.semantic_digest,
+        )
+
+
+def test_commit_carries_only_a_fresh_active_trusted_binding(setup_repositories) -> None:
+    repository, decisionos, owner_context = setup_repositories
+    member_context = _commit_and_bind(
+        repository,
+        decisionos,
+        owner_context,
+        uid="firebase-alice-01",
+    )
+    next_draft = repository.save_import_draft(
+        owner_context,
+        import_draft(import_id=IMPORT_B, digest=DIGEST_B, base_version=2),
+    )
+
+    repository.commit_graph(
+        owner_context,
+        draft_id=next_draft.import_id,
+        reviewed_digest=next_draft.semantic_digest,
+    )
+
+    carried = repository.load_graph(owner_context).subjects[0]
+    assert carried.lifecycle is SubjectLifecycle.ACTIVE
+    assert carried.member_uid == member_context.principal.uid
+
+
+def test_commit_rejects_a_stale_carried_member_binding(setup_repositories) -> None:
+    repository, decisionos, owner_context = setup_repositories
+    member_context = _commit_and_bind(
+        repository,
+        decisionos,
+        owner_context,
+        uid="firebase-alice-01",
+    )
+    next_draft = repository.save_import_draft(
+        owner_context,
+        import_draft(import_id=IMPORT_B, digest=DIGEST_B, base_version=2),
+    )
+    decisionos.suspend_member(owner_context, member_context.principal.uid)
+
+    with pytest.raises(ImportUnavailable):
+        repository.commit_graph(
+            owner_context,
+            draft_id=next_draft.import_id,
+            reviewed_digest=next_draft.semantic_digest,
+        )
+    assert repository.load_graph(owner_context).version == 2
+
+
+def test_one_uid_cannot_bind_two_subjects_and_prior_graph_is_immutable(
+    setup_repositories,
+) -> None:
+    repository, decisionos, owner_context = setup_repositories
+    second = OrganizationSubject(
+        subject_id=SUBJECT_B,
+        organization_id=ORG_A,
+        kind=OrganizationSubjectKind.HUMAN,
+        lifecycle=SubjectLifecycle.DRAFT_IMPORTED,
+        display_name="Bob Example",
+        source_identity="directory/bob",
+    )
+    base = import_draft()
+    two_people = base.model_copy(
+        update={
+            "candidate": base.candidate.model_copy(
+                update={"subjects": (*base.candidate.subjects, second)}
+            )
+        }
+    )
+    saved = repository.save_import_draft(owner_context, two_people)
+    repository.commit_graph(
+        owner_context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    version_one = repository.load_graph(owner_context)
+    member_context = make_member(
+        decisionos,
+        owner_context,
+        uid="firebase-alice-01",
+        role=DecisionOSRole.VIEWER,
+    )
+    repository.bind_member(
+        owner_context,
+        subject_id=SUBJECT_A,
+        member_uid=member_context.principal.uid,
+    )
+
+    with pytest.raises(OrganizationUnavailable):
+        repository.bind_member(
+            owner_context,
+            subject_id=SUBJECT_B,
+            member_uid=member_context.principal.uid,
+        )
+    assert version_one.version == 1
+    assert all(subject.member_uid is None for subject in version_one.subjects)

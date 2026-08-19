@@ -207,6 +207,16 @@ class DecisionOSRepository(Protocol):
     ) -> DecisionOSContext:
         raise NotImplementedError
 
+    def apply_organization_graph_membership_change(
+        self,
+        context: DecisionOSContext,
+        *,
+        carried_member_uids: tuple[str, ...],
+        removed_member_uids: tuple[str, ...],
+        mutation: Callable[[Any], None],
+    ) -> None:
+        raise NotImplementedError
+
 
 @dataclass
 class _InvitationRecord:
@@ -449,6 +459,54 @@ class InMemoryDecisionOSRepository:
 
         with self._lock:
             return self._authorize(context, permission)
+
+    def apply_organization_graph_membership_change(
+        self,
+        context: DecisionOSContext,
+        *,
+        carried_member_uids: tuple[str, ...],
+        removed_member_uids: tuple[str, ...],
+        mutation: Callable[[Any], None],
+    ) -> None:
+        """Validate carried bindings and suspend removed members under one lock."""
+
+        with self._lock:
+            current = self._authorize(context, DecisionOSPermission.MANAGE_MEMBERS)
+            carried = tuple(dict.fromkeys(carried_member_uids))
+            removed = tuple(dict.fromkeys(removed_member_uids))
+            if set(carried) & set(removed):
+                raise MembershipUnavailable()
+            for uid in carried:
+                self._member_for_management(current, uid)
+            active_removed = tuple(
+                member
+                for uid in removed
+                if (member := self._memberships.get((current.organization_id, uid))) is not None
+                and member.status is MembershipStatus.ACTIVE
+            )
+            if current.membership.role is DecisionOSRole.ADMIN and any(
+                member.role is DecisionOSRole.OWNER for member in active_removed
+            ):
+                raise DecisionOSAuthorizationDenied()
+            removed_uids = {member.uid for member in active_removed}
+            if any(member.role is DecisionOSRole.OWNER for member in active_removed) and not any(
+                organization_id == current.organization_id
+                and uid not in removed_uids
+                and membership.status is MembershipStatus.ACTIVE
+                and membership.role is DecisionOSRole.OWNER
+                for (organization_id, uid), membership in self._memberships.items()
+            ):
+                raise LastOwnerRequired()
+            mutation(None)
+            for member in active_removed:
+                updated = member.model_copy(update={"status": MembershipStatus.SUSPENDED})
+                self._memberships[(current.organization_id, member.uid)] = updated
+                self._append_audit(
+                    current.organization_id,
+                    "member_suspended",
+                    current.principal.uid,
+                    target_uid=member.uid,
+                )
 
     def load_workspace(
         self,
@@ -930,6 +988,79 @@ class FirestoreDecisionOSRepository:
         current = self.load_context(context.principal, context.organization_id)
         require_permission(current, permission)
         return current
+
+    def apply_organization_graph_membership_change(
+        self,
+        context: DecisionOSContext,
+        *,
+        carried_member_uids: tuple[str, ...],
+        removed_member_uids: tuple[str, ...],
+        mutation: Callable[[Any], None],
+    ) -> None:
+        """Apply a membership-only graph change in one DecisionOS transaction."""
+
+        from google.cloud import firestore
+        from google.cloud.firestore_v1.base_query import FieldFilter
+
+        carried = tuple(dict.fromkeys(carried_member_uids))
+        removed = tuple(dict.fromkeys(removed_member_uids))
+
+        @firestore.transactional
+        def apply(transaction):
+            current = self._authorize_transaction(
+                transaction,
+                context,
+                DecisionOSPermission.MANAGE_MEMBERS,
+            )
+            if set(carried) & set(removed):
+                raise MembershipUnavailable()
+            for uid in carried:
+                self._member_transaction(transaction, current, uid)
+            active_removed = []
+            for uid in removed:
+                row = self._member_ref(current.organization_id, uid).get(
+                    transaction=transaction
+                )
+                member = _snapshot_model(OrganizationMembership, row)
+                if member is not None and member.status is MembershipStatus.ACTIVE:
+                    active_removed.append(member)
+            if current.membership.role is DecisionOSRole.ADMIN and any(
+                member.role is DecisionOSRole.OWNER for member in active_removed
+            ):
+                raise DecisionOSAuthorizationDenied()
+            removed_uids = {member.uid for member in active_removed}
+            if any(member.role is DecisionOSRole.OWNER for member in active_removed):
+                owner_rows = (
+                    self._organization_ref(current.organization_id)
+                    .collection("members")
+                    .where(filter=FieldFilter("role", "==", DecisionOSRole.OWNER.value))
+                    .stream(transaction=transaction)
+                )
+                if not any(
+                    row.id not in removed_uids
+                    and OrganizationMembership.model_validate(row.to_dict()).status
+                    is MembershipStatus.ACTIVE
+                    for row in owner_rows
+                ):
+                    raise LastOwnerRequired()
+            now = _aware(self._clock())
+            for member in active_removed:
+                updated = member.model_copy(update={"status": MembershipStatus.SUSPENDED})
+                transaction.set(
+                    self._member_ref(current.organization_id, member.uid),
+                    updated.model_dump(mode="python"),
+                )
+                self._append_audit_transaction(
+                    transaction,
+                    current.organization_id,
+                    "member_suspended",
+                    current.principal.uid,
+                    target_uid=member.uid,
+                    occurred_at=now,
+                )
+            mutation(transaction)
+
+        apply(self._client.transaction())
 
     def load_workspace(
         self,

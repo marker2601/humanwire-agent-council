@@ -1,28 +1,244 @@
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime
+from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
+from pydantic_core import to_json
 
-from humanwire.decisionos_models import DecisionOSPrincipal
-from humanwire.decisionos_store import FirestoreDecisionOSRepository
+from humanwire.decisionos_models import (
+    DecisionOrganization,
+    DecisionOSContext,
+    DecisionOSPrincipal,
+    DecisionOSRole,
+    MembershipStatus,
+    OrganizationMembership,
+)
+from humanwire.decisionos_store import (
+    FirestoreDecisionOSRepository,
+    LastOwnerRequired,
+    OrganizationUnavailable,
+)
 from humanwire.organization_models import (
     ImportDraft,
     OrganizationGraphCandidate,
     OrganizationSubject,
     OrganizationSubjectKind,
+    OrganizationUnit,
     SourceRecord,
     SourceSnapshot,
     SubjectLifecycle,
 )
-from humanwire.organization_store import FirestoreOrganizationGraphRepository
+from humanwire.organization_store import (
+    FirestoreOrganizationGraphRepository,
+    ImportUnavailable,
+)
 
 ORG = "org_01ARZ3NDEKTSV4RRFFQ69G5FAV"
 SUBJECT = "sub_01ARZ3NDEKTSV4RRFFQ69G5FAV"
 NOW = datetime(2026, 8, 18, 15, 0, tzinfo=UTC)
 DIGEST = "1" * 64
+PRIVATE = "private-provider-sentinel@example.invalid"
+COLLECTION = "test_organizations"
+AUDIT = "test_org_audit"
+OWNER = DecisionOSPrincipal(
+    uid="firebase-owner-01",
+    email_verified=True,
+    provider_ids=("google.com",),
+)
+
+
+class FakeSnapshot:
+    def __init__(self, reference, data):
+        self.reference = reference
+        self.id = reference.id
+        self._data = data
+        self.exists = data is not None
+
+    def to_dict(self):
+        return deepcopy(self._data)
+
+
+class FakeQuery:
+    def __init__(self, client, paths, filters=()):
+        self.client = client
+        self.paths = tuple(paths)
+        self.filters = tuple(filters)
+
+    def where(self, *, filter):
+        return FakeQuery(
+            self.client,
+            self.paths,
+            (*self.filters, (filter.field_path, filter.value)),
+        )
+
+    def order_by(self, _field):
+        return self
+
+    def stream(self, transaction=None):
+        del transaction
+        if self.client.failure is not None:
+            raise RuntimeError(self.client.failure)
+        rows = []
+        for path in sorted(self.paths):
+            data = self.client.data.get(path)
+            if data is None:
+                continue
+            if all(data.get(field) == value for field, value in self.filters):
+                rows.append(FakeSnapshot(FakeDocument(self.client, path), data))
+        return tuple(rows)
+
+
+class FakeCollection:
+    def __init__(self, client, path):
+        self.client = client
+        self.path = tuple(path)
+
+    def document(self, document_id):
+        return FakeDocument(self.client, (*self.path, document_id))
+
+    def _document_paths(self):
+        return (
+            path
+            for path in self.client.data
+            if len(path) == len(self.path) + 1 and path[:-1] == self.path
+        )
+
+    def stream(self, transaction=None):
+        return FakeQuery(self.client, self._document_paths()).stream(transaction=transaction)
+
+    def where(self, *, filter):
+        return FakeQuery(self.client, self._document_paths()).where(filter=filter)
+
+    def order_by(self, field):
+        return FakeQuery(self.client, self._document_paths()).order_by(field)
+
+
+class FakeDocument:
+    def __init__(self, client, path):
+        self.client = client
+        self.path = tuple(path)
+        self.id = self.path[-1]
+
+    def collection(self, name):
+        return FakeCollection(self.client, (*self.path, name))
+
+    def get(self, transaction=None):
+        del transaction
+        if self.client.failure is not None:
+            raise RuntimeError(self.client.failure)
+        return FakeSnapshot(self, self.client.data.get(self.path))
+
+
+class FakeTransaction:
+    def __init__(self, client):
+        self.client = client
+        self.write_count = 0
+
+    def _write(self, reference, data):
+        encoded_size = len(to_json(data))
+        if encoded_size > self.client.max_document_bytes:
+            raise AssertionError(f"document exceeds bound: {encoded_size}")
+        self.write_count += 1
+        if self.write_count > self.client.max_transaction_writes:
+            raise AssertionError(f"transaction exceeds write bound: {self.write_count}")
+        self.client.max_observed_document_bytes = max(
+            self.client.max_observed_document_bytes,
+            encoded_size,
+        )
+        self.client.data[reference.path] = deepcopy(data)
+
+    def create(self, reference, data):
+        if reference.path in self.client.data:
+            raise RuntimeError("document already exists")
+        self._write(reference, data)
+
+    def set(self, reference, data):
+        self._write(reference, data)
+
+    def update(self, reference, data):
+        current = deepcopy(self.client.data.get(reference.path, {}))
+        current.update(deepcopy(data))
+        self._write(reference, current)
+
+    def delete(self, reference):
+        self.write_count += 1
+        if self.write_count > self.client.max_transaction_writes:
+            raise AssertionError(f"transaction exceeds write bound: {self.write_count}")
+        self.client.data.pop(reference.path, None)
+
+
+class FakeClient:
+    def __init__(self, *, failure=None):
+        self.data = {}
+        self.failure = failure
+        self.max_document_bytes = 450_000
+        self.max_transaction_writes = 450
+        self.max_observed_document_bytes = 0
+        self.transactions = []
+
+    def collection(self, name):
+        if self.failure is not None:
+            raise RuntimeError(self.failure)
+        return FakeCollection(self, (name,))
+
+    def collection_group(self, name):
+        paths = (path for path in self.data if len(path) >= 2 and path[-2] == name)
+        return FakeQuery(self, paths)
+
+    def transaction(self):
+        transaction = FakeTransaction(self)
+        self.transactions.append(transaction)
+        return transaction
+
+
+@pytest.fixture
+def fake_firestore(monkeypatch):
+    from google.cloud import firestore
+
+    monkeypatch.setattr(firestore, "transactional", lambda function: function)
+    client = FakeClient()
+    client.data[(COLLECTION, ORG)] = DecisionOrganization(
+        organization_id=ORG,
+        name="Northstar Labs",
+        created_by_uid=OWNER.uid,
+    ).model_dump(mode="python")
+    membership = OrganizationMembership(
+        organization_id=ORG,
+        uid=OWNER.uid,
+        role=DecisionOSRole.OWNER,
+        status=MembershipStatus.ACTIVE,
+    )
+    client.data[(COLLECTION, ORG, "members", OWNER.uid)] = membership.model_dump(
+        mode="python"
+    )
+    context = DecisionOSContext(principal=OWNER, membership=membership)
+    repository = FirestoreOrganizationGraphRepository(
+        client,
+        clock=lambda: NOW,
+        organization_collection=COLLECTION,
+        audit_collection=AUDIT,
+    )
+    return client, repository, context
+
+
+def exception_graph_text(error: BaseException) -> str:
+    pending = [error]
+    seen = set()
+    rendered = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        rendered.extend((str(current), repr(current), repr(current.args)))
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return " ".join(rendered)
 
 
 class Identifiers:
@@ -79,6 +295,361 @@ def draft() -> ImportDraft:
     )
 
 
+@pytest.mark.parametrize(
+    ("operation", "expected_error"),
+    (
+        (lambda repository, context: repository.load_context(OWNER, ORG), OrganizationUnavailable),
+        (lambda repository, context: repository.save_import_draft(context, draft()), ImportUnavailable),
+        (
+            lambda repository, context: repository.load_import_draft(
+                context,
+                "imp_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            ),
+            ImportUnavailable,
+        ),
+        (lambda repository, context: repository.list_imports(context), ImportUnavailable),
+        (
+            lambda repository, context: repository.commit_graph(
+                context,
+                draft_id="imp_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                reviewed_digest=DIGEST,
+            ),
+            ImportUnavailable,
+        ),
+        (lambda repository, context: repository.load_graph(context), OrganizationUnavailable),
+        (
+            lambda repository, context: repository.bind_member(
+                context,
+                subject_id=SUBJECT,
+                member_uid=OWNER.uid,
+            ),
+            OrganizationUnavailable,
+        ),
+        (lambda repository, context: repository.list_audit(context), OrganizationUnavailable),
+    ),
+)
+def test_firestore_public_error_barrier_removes_provider_exception_graph(
+    monkeypatch,
+    operation,
+    expected_error,
+) -> None:
+    from google.cloud import firestore
+
+    monkeypatch.setattr(firestore, "transactional", lambda function: function)
+    repository = FirestoreOrganizationGraphRepository(
+        FakeClient(failure=PRIVATE),
+        clock=lambda: NOW,
+        organization_collection=COLLECTION,
+        audit_collection=AUDIT,
+    )
+    context = DecisionOSContext(
+        principal=OWNER,
+        membership=OrganizationMembership(
+            organization_id=ORG,
+            uid=OWNER.uid,
+            role=DecisionOSRole.OWNER,
+            status=MembershipStatus.ACTIVE,
+        ),
+    )
+
+    with pytest.raises(expected_error) as captured:
+        operation(repository, context)
+
+    assert PRIVATE not in exception_graph_text(captured.value)
+
+
+def test_firestore_commit_keeps_strict_decisionos_root_compatible(fake_firestore) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+
+    repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+
+    assert DecisionOrganization.model_validate(client.data[(COLLECTION, ORG)]).organization_id == ORG
+    decisionos = FirestoreDecisionOSRepository(
+        client,
+        clock=lambda: NOW,
+        organization_collection=COLLECTION,
+        invitation_index_collection="test_invites",
+    )
+    assert decisionos.load_context(OWNER, ORG) == context
+    assert decisionos.list_organizations(OWNER)[0].organization_id == ORG
+
+
+def _numeric_ulid(value: int) -> str:
+    return f"{value:026d}"
+
+
+def large_draft() -> ImportDraft:
+    records = tuple(
+        SourceRecord(
+            record_id=f"rec_{_numeric_ulid(index)}",
+            source_ordinal=index,
+            source_identity=f"directory/person-{index}",
+            fields=(("name", f"Person {index}"),),
+        )
+        for index in range(1, 5_001)
+    )
+    subjects = tuple(
+        OrganizationSubject(
+            subject_id=f"sub_{_numeric_ulid(index)}",
+            organization_id=ORG,
+            kind=OrganizationSubjectKind.HUMAN,
+            lifecycle=SubjectLifecycle.DRAFT_IMPORTED,
+            display_name=f"Person {index}",
+            source_identity=f"directory/person-{index}",
+        )
+        for index in range(1, 5_001)
+    )
+    snapshot = SourceSnapshot(
+        snapshot_id="snap_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        organization_id=ORG,
+        source_kind="csv",
+        captured_at=NOW,
+        records=records,
+        semantic_digest=DIGEST,
+    )
+    return ImportDraft(
+        import_id="imp_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        organization_id=ORG,
+        source_snapshot=snapshot,
+        candidate=OrganizationGraphCandidate(
+            organization_id=ORG,
+            source_snapshot_id=snapshot.snapshot_id,
+            subjects=subjects,
+        ),
+        base_graph_version=0,
+        semantic_digest=DIGEST,
+        created_at=NOW,
+    )
+
+
+def test_firestore_chunks_five_thousand_record_draft_and_graph_within_bounds(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, large_draft())
+
+    receipt = repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+
+    assert receipt.committed_subject_count == 5_000
+    assert repository.load_graph(context).version == 1
+    assert len(repository.load_graph(context).subjects) == 5_000
+    assert client.max_observed_document_bytes <= client.max_document_bytes
+    assert all(
+        transaction.write_count <= client.max_transaction_writes
+        for transaction in client.transactions
+    )
+
+
+def test_firestore_rejects_cross_bound_membership_document(fake_firestore) -> None:
+    client, repository, context = fake_firestore
+    client.data[(COLLECTION, ORG, "members", OWNER.uid)] = OrganizationMembership(
+        organization_id="org_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        uid=OWNER.uid,
+        role=DecisionOSRole.OWNER,
+        status=MembershipStatus.ACTIVE,
+    ).model_dump(mode="python")
+
+    with pytest.raises(OrganizationUnavailable):
+        repository.load_graph(context)
+
+
+def test_firestore_rejects_unknown_draft_storage_metadata(fake_firestore) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    import_path = (COLLECTION, ORG, "imports", saved.import_id)
+    client.data[import_path]["unexpected_private_metadata"] = PRIVATE
+
+    with pytest.raises(ImportUnavailable) as captured:
+        repository.load_import_draft(context, saved.import_id)
+
+    assert PRIVATE not in exception_graph_text(captured.value)
+
+
+def test_firestore_rejects_cross_bound_chunk_and_wrong_member_uid(fake_firestore) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    chunk_path = (
+        COLLECTION,
+        ORG,
+        "imports",
+        saved.import_id,
+        "chunks",
+        "source_records_00000",
+    )
+    client.data[chunk_path]["organization_id"] = "org_01ARZ3NDEKTSV4RRFFQ69G5FAW"
+
+    with pytest.raises(ImportUnavailable):
+        repository.load_import_draft(context, saved.import_id)
+
+    client.data[(COLLECTION, ORG, "members", OWNER.uid)] = OrganizationMembership(
+        organization_id=ORG,
+        uid="firebase-other-owner",
+        role=DecisionOSRole.OWNER,
+        status=MembershipStatus.ACTIVE,
+    ).model_dump(mode="python")
+    with pytest.raises(OrganizationUnavailable):
+        repository.load_graph(context)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("organization_id", "org_01ARZ3NDEKTSV4RRFFQ69G5FAW"),
+        ("import_id", "imp_01ARZ3NDEKTSV4RRFFQ69G5FAW"),
+        ("source_snapshot_digest", "2" * 64),
+        ("receipt_id", "rcp_01ARZ3NDEKTSV4RRFFQ69G5FAW"),
+    ),
+)
+def test_firestore_rejects_committed_receipt_not_bound_to_draft(
+    fake_firestore,
+    field,
+    value,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    client.data[(COLLECTION, ORG, "imports", saved.import_id)]["receipt"][field] = value
+
+    with pytest.raises(ImportUnavailable):
+        repository.commit_graph(
+            context,
+            draft_id=saved.import_id,
+            reviewed_digest=saved.semantic_digest,
+        )
+
+
+def _removal_draft(saved: ImportDraft, *, base_version: int) -> ImportDraft:
+    snapshot = saved.source_snapshot.model_copy(
+        update={"records": (), "semantic_digest": "2" * 64}
+    )
+    return saved.model_copy(
+        update={
+            "import_id": "imp_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            "source_snapshot": snapshot,
+            "candidate": OrganizationGraphCandidate(
+                organization_id=ORG,
+                source_snapshot_id=snapshot.snapshot_id,
+            ),
+            "base_graph_version": base_version,
+            "semantic_digest": "2" * 64,
+        }
+    )
+
+
+def test_firestore_source_removal_suspends_non_owner_membership_atomically(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    member_uid = "firebase-alice-01"
+    client.data[(COLLECTION, ORG, "members", member_uid)] = OrganizationMembership(
+        organization_id=ORG,
+        uid=member_uid,
+        role=DecisionOSRole.VIEWER,
+        status=MembershipStatus.ACTIVE,
+    ).model_dump(mode="python")
+    saved = repository.save_import_draft(context, draft())
+    repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    repository.bind_member(context, subject_id=SUBJECT, member_uid=member_uid)
+    removal = repository.save_import_draft(context, _removal_draft(saved, base_version=2))
+
+    receipt = repository.commit_graph(
+        context,
+        draft_id=removal.import_id,
+        reviewed_digest=removal.semantic_digest,
+    )
+
+    assert receipt.graph_version == 3
+    assert client.data[(COLLECTION, ORG, "members", member_uid)]["status"] == "suspended"
+    assert repository.load_graph(context).subjects[0].lifecycle is SubjectLifecycle.SUSPENDED
+
+
+def test_firestore_source_removal_preserves_last_owner_and_graph_version(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    repository.bind_member(context, subject_id=SUBJECT, member_uid=OWNER.uid)
+    removal = repository.save_import_draft(context, _removal_draft(saved, base_version=2))
+
+    with pytest.raises(LastOwnerRequired):
+        repository.commit_graph(
+            context,
+            draft_id=removal.import_id,
+            reviewed_digest=removal.semantic_digest,
+        )
+
+    assert client.data[(COLLECTION, ORG, "members", OWNER.uid)]["status"] == "active"
+    assert repository.load_graph(context).version == 2
+
+
+def test_firestore_current_chunk_cleanup_and_duplicate_retry_are_deterministic(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    original = draft()
+    unit = OrganizationUnit(
+        unit_id="unit_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        organization_id=ORG,
+        name="Operations",
+    )
+    with_unit = original.model_copy(
+        update={
+            "candidate": original.candidate.model_copy(update={"units": (unit,)})
+        }
+    )
+    saved = repository.save_import_draft(context, with_unit)
+    first = repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    assert repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    ) == first
+    second = original.model_copy(
+        update={
+            "import_id": "imp_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            "base_graph_version": 1,
+            "semantic_digest": "2" * 64,
+            "source_snapshot": original.source_snapshot.model_copy(
+                update={"semantic_digest": "2" * 64}
+            ),
+        }
+    )
+    saved_second = repository.save_import_draft(context, second)
+    repository.commit_graph(
+        context,
+        draft_id=saved_second.import_id,
+        reviewed_digest=saved_second.semantic_digest,
+    )
+
+    assert (COLLECTION, ORG, "org_units", "chunk_00000") not in client.data
+
+
 @pytest.mark.skipif(
     not os.environ.get("FIRESTORE_EMULATOR_HOST"),
     reason="requires explicit Firestore emulator",
@@ -120,6 +691,8 @@ def test_firestore_emulator_commits_one_tenant_bound_version_transactionally() -
     )
 
     assert receipt.graph_version == 1
+    assert decisionos.list_organizations(owner) == (organization,)
+    assert decisionos.load_context(owner, organization.organization_id) == context
     assert repository.load_graph(context).subjects[0].lifecycle is SubjectLifecycle.DIRECTORY_ONLY
     assert repository.commit_graph(
         context,
@@ -127,3 +700,23 @@ def test_firestore_emulator_commits_one_tenant_bound_version_transactionally() -
         reviewed_digest=saved.semantic_digest,
     ) == receipt
     assert repository.list_audit(context)[0].receipt == receipt
+    invitee = DecisionOSPrincipal(
+        uid="firebase-alice-01",
+        email_verified=True,
+        provider_ids=("google.com",),
+    )
+    invitation = decisionos.create_invitation(
+        context,
+        role=DecisionOSRole.VIEWER,
+        expires_in=timedelta(days=1),
+    )
+    decisionos.accept_invitation(invitee, invitation.token.get_secret_value())
+    repository.bind_member(context, subject_id=SUBJECT, member_uid=invitee.uid)
+    removal = repository.save_import_draft(context, _removal_draft(saved, base_version=2))
+    repository.commit_graph(
+        context,
+        draft_id=removal.import_id,
+        reviewed_digest=removal.semantic_digest,
+    )
+    with pytest.raises(OrganizationUnavailable):
+        decisionos.load_context(invitee, ORG)
