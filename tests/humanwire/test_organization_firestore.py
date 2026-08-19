@@ -355,6 +355,38 @@ def draft() -> ImportDraft:
     )
 
 
+def next_draft(
+    original: ImportDraft,
+    *,
+    import_id: str = "imp_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+    digest: str = "2" * 64,
+    created_at: datetime = NOW,
+    supersedes_import_id: str | None = None,
+) -> ImportDraft:
+    return original.model_copy(
+        update={
+            "import_id": import_id,
+            "semantic_digest": digest,
+            "created_at": created_at,
+            "supersedes_import_id": supersedes_import_id,
+            "source_snapshot": original.source_snapshot.model_copy(
+                update={"semantic_digest": digest}
+            ),
+        }
+    )
+
+
+def downgrade_to_legacy_v1(client: FakeClient, import_id: str) -> None:
+    import_path = (COLLECTION, ORG, "imports", import_id)
+    payload = client.data[import_path]
+    payload.pop("supersedes_import_id")
+    payload["schema_version"] = 1
+    payload["payload_digest"] = independent_digest(
+        {key: payload[key] for key in payload if key != "payload_digest"}
+    )
+    client.data.pop((COLLECTION, ORG, "organization_import_lineage", "csv"), None)
+
+
 @pytest.mark.parametrize(
     ("operation", "expected_error"),
     (
@@ -461,6 +493,141 @@ def test_firestore_latest_import_lineage_rejects_superseded_commit(fake_firestor
             draft_id=first.import_id,
             reviewed_digest=first.semantic_digest,
         )
+
+
+def test_firestore_current_draft_schema_is_v2(fake_firestore) -> None:
+    client, repository, context = fake_firestore
+
+    saved = repository.save_import_draft(context, draft())
+
+    payload = client.data[(COLLECTION, ORG, "imports", saved.import_id)]
+    assert payload["schema_version"] == 2
+    assert "supersedes_import_id" in payload
+
+
+def test_firestore_reads_and_lists_exact_legacy_v1_draft(fake_firestore) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    downgrade_to_legacy_v1(client, saved.import_id)
+
+    assert repository.load_import_draft(context, saved.import_id) == saved
+    assert repository.list_imports(context) == (saved,)
+
+
+def test_firestore_new_source_supersedes_legacy_without_lineage(fake_firestore) -> None:
+    client, repository, context = fake_firestore
+    first = repository.save_import_draft(context, draft())
+    downgrade_to_legacy_v1(client, first.import_id)
+    second = next_draft(first, created_at=NOW + timedelta(seconds=1))
+
+    repository.save_import_draft(context, second)
+
+    lineage_path = (COLLECTION, ORG, "organization_import_lineage", "csv")
+    assert client.data[lineage_path]["latest_import_id"] == second.import_id
+    with pytest.raises(ImportUnavailable, match="^import_lineage_conflict$"):
+        repository.commit_graph(
+            context,
+            draft_id=first.import_id,
+            reviewed_digest=first.semantic_digest,
+        )
+
+
+def test_firestore_legacy_correction_uses_newest_import_id_tiebreak(fake_firestore) -> None:
+    client, repository, context = fake_firestore
+    first = repository.save_import_draft(context, draft())
+    second = repository.save_import_draft(context, next_draft(first))
+    downgrade_to_legacy_v1(client, first.import_id)
+    downgrade_to_legacy_v1(client, second.import_id)
+    correction = next_draft(
+        second,
+        import_id="imp_01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        digest="3" * 64,
+        supersedes_import_id=second.import_id,
+    )
+
+    saved = repository.save_import_draft(context, correction)
+
+    assert saved.supersedes_import_id == second.import_id
+    lineage_path = (COLLECTION, ORG, "organization_import_lineage", "csv")
+    assert client.data[lineage_path]["latest_import_id"] == correction.import_id
+
+
+def test_firestore_legacy_commit_initializes_missing_lineage_atomically(
+    fake_firestore,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    downgrade_to_legacy_v1(client, saved.import_id)
+
+    receipt = repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+
+    lineage_path = (COLLECTION, ORG, "organization_import_lineage", "csv")
+    assert receipt.import_id == saved.import_id
+    assert client.data[lineage_path]["latest_import_id"] == saved.import_id
+
+
+def test_firestore_aborted_legacy_commit_does_not_orphan_lineage(fake_firestore) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    downgrade_to_legacy_v1(client, saved.import_id)
+    before = deepcopy(client.data)
+    client.abort_next_transaction = True
+
+    with pytest.raises(ImportUnavailable, match="^import_unavailable$"):
+        repository.commit_graph(
+            context,
+            draft_id=saved.import_id,
+            reviewed_digest=saved.semantic_digest,
+        )
+
+    assert client.data == before
+    assert (COLLECTION, ORG, "organization_import_lineage", "csv") not in client.data
+
+
+def test_firestore_exact_legacy_receipt_retry_needs_no_lineage(fake_firestore) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    receipt = repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    )
+    downgrade_to_legacy_v1(client, saved.import_id)
+
+    assert repository.commit_graph(
+        context,
+        draft_id=saved.import_id,
+        reviewed_digest=saved.semantic_digest,
+    ) == receipt
+    assert (COLLECTION, ORG, "organization_import_lineage", "csv") not in client.data
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "remove_supersedes"),
+    ((1, False), (2, True)),
+)
+def test_firestore_rejects_mixed_draft_schema_shapes(
+    fake_firestore,
+    schema_version,
+    remove_supersedes,
+) -> None:
+    client, repository, context = fake_firestore
+    saved = repository.save_import_draft(context, draft())
+    import_path = (COLLECTION, ORG, "imports", saved.import_id)
+    payload = client.data[import_path]
+    payload["schema_version"] = schema_version
+    if remove_supersedes:
+        payload.pop("supersedes_import_id")
+    payload["payload_digest"] = independent_digest(
+        {key: payload[key] for key in payload if key != "payload_digest"}
+    )
+
+    with pytest.raises(ImportUnavailable, match="^import_unavailable$"):
+        repository.load_import_draft(context, saved.import_id)
 
 
 def test_firestore_exact_committed_retry_precedes_newer_lineage(fake_firestore) -> None:

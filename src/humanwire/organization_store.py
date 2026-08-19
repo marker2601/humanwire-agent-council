@@ -62,7 +62,7 @@ _CHUNK_KINDS = (
     "edges",
     "authority_assignments",
 )
-_DRAFT_STORAGE_FIELDS = frozenset(
+_DRAFT_V2_STORAGE_FIELDS = frozenset(
     {
         "schema_version",
         "import_id",
@@ -79,6 +79,7 @@ _DRAFT_STORAGE_FIELDS = frozenset(
         "payload_digest",
     }
 )
+_DRAFT_V1_STORAGE_FIELDS = _DRAFT_V2_STORAGE_FIELDS - {"supersedes_import_id"}
 _GRAPH_STORAGE_FIELDS = frozenset(
     {
         "schema_version",
@@ -953,7 +954,7 @@ def _chunked_draft(draft: ImportDraft) -> tuple[dict[str, Any], dict[str, dict[s
             {f"{kind}_{chunk['index']:05d}": chunk for chunk in kind_chunks}
         )
     storage = {
-        "schema_version": 1,
+        "schema_version": 2,
         **payload,
         "status": "draft",
         "receipt": None,
@@ -991,6 +992,18 @@ def _chunked_graph(graph: OrganizationGraph) -> tuple[dict[str, Any], dict[str, 
         {key: storage[key] for key in storage if key != "payload_digest"}
     )
     return storage, chunks
+
+
+def _lineage_payload(draft: ImportDraft) -> dict[str, Any]:
+    payload = {
+        "schema_version": 1,
+        "organization_id": draft.organization_id,
+        "source_kind": draft.source_snapshot.source_kind,
+        "latest_import_id": draft.import_id,
+        "updated_at": draft.created_at,
+    }
+    payload["payload_digest"] = _payload_digest(payload)
+    return payload
 
 
 def _require_write_bound(write_count: int) -> None:
@@ -1098,14 +1111,7 @@ class FirestoreOrganizationGraphRepository:
             context.organization_id,
             draft.source_snapshot.source_kind,
         )
-        lineage_payload = {
-            "schema_version": 1,
-            "organization_id": draft.organization_id,
-            "source_kind": draft.source_snapshot.source_kind,
-            "latest_import_id": draft.import_id,
-            "updated_at": draft.created_at,
-        }
-        lineage_payload["payload_digest"] = _payload_digest(lineage_payload)
+        lineage_payload = _lineage_payload(draft)
         _require_document_bound(draft_ref, payload)
         _require_document_bound(lineage_ref, lineage_payload)
         for chunk_id, chunk in chunks.items():
@@ -1125,7 +1131,8 @@ class FirestoreOrganizationGraphRepository:
             if draft.organization_id != current.organization_id:
                 raise ImportUnavailable()
             lineage_row = lineage_ref.get(transaction=transaction)
-            latest_import_id = self._lineage_from_row(
+            latest_import_id, _legacy_lineage = self._lineage_or_legacy_latest(
+                transaction,
                 current.organization_id,
                 draft.source_snapshot.source_kind,
                 lineage_row,
@@ -1186,48 +1193,64 @@ class FirestoreOrganizationGraphRepository:
         context: DecisionOSContext,
         draft_id: str,
     ) -> None:
-        current = self._authorize(context, DecisionOSPermission.MANAGE_MEMBERS)
-        draft_ref = self._import_ref(current.organization_id, draft_id)
-        row = draft_ref.get()
-        if not row.exists:
-            raise ImportUnavailable()
-        draft = self._draft_from_row(
-            row,
-            draft_ref,
-            organization_id=current.organization_id,
-        )
-        payload = row.to_dict()
-        if payload.get("status") == "committed":
-            receipt = None
-            try:
-                receipt = ImportReceipt.model_validate_json(to_json(payload["receipt"]))
-            except (
-                KeyError,
-                PydanticSerializationError,
-                TypeError,
-                ValueError,
-                ValidationError,
-            ):
-                pass
-            if receipt is None or not self._receipt_matches_draft(
-                receipt,
-                draft,
-                acknowledged_codes=receipt.acknowledged_codes,
-            ):
+        from google.cloud import firestore
+
+        draft_ref = self._import_ref(context.organization_id, draft_id)
+
+        @firestore.transactional
+        def require_latest(transaction):
+            current = self._authorize_transaction(
+                transaction,
+                context,
+                DecisionOSPermission.MANAGE_MEMBERS,
+            )
+            row = draft_ref.get(transaction=transaction)
+            if not row.exists:
                 raise ImportUnavailable()
-            return
-        if payload.get("status") != "draft":
-            raise ImportUnavailable()
-        lineage_row = self._lineage_ref(
-            current.organization_id,
-            draft.source_snapshot.source_kind,
-        ).get()
-        if self._lineage_from_row(
-            current.organization_id,
-            draft.source_snapshot.source_kind,
-            lineage_row,
-        ) != draft.import_id:
-            raise ImportLineageConflict()
+            draft = self._draft_from_row(
+                row,
+                draft_ref,
+                organization_id=current.organization_id,
+                transaction=transaction,
+            )
+            payload = row.to_dict()
+            if payload.get("status") == "committed":
+                receipt = None
+                try:
+                    receipt = ImportReceipt.model_validate_json(to_json(payload["receipt"]))
+                except (
+                    KeyError,
+                    PydanticSerializationError,
+                    TypeError,
+                    ValueError,
+                    ValidationError,
+                ):
+                    pass
+                if receipt is None or not self._receipt_matches_draft(
+                    receipt,
+                    draft,
+                    acknowledged_codes=receipt.acknowledged_codes,
+                ):
+                    raise ImportUnavailable()
+                return
+            if payload.get("status") != "draft":
+                raise ImportUnavailable()
+            lineage_ref = self._lineage_ref(
+                current.organization_id,
+                draft.source_snapshot.source_kind,
+            )
+            latest_import_id, legacy_lineage = self._lineage_or_legacy_latest(
+                transaction,
+                current.organization_id,
+                draft.source_snapshot.source_kind,
+                lineage_ref.get(transaction=transaction),
+            )
+            if latest_import_id != draft.import_id:
+                raise ImportLineageConflict()
+            if legacy_lineage is not None:
+                transaction.set(lineage_ref, legacy_lineage)
+
+        require_latest(self._client.transaction())
 
     @_firestore_error_barrier(ImportUnavailable)
     def reconcile_import(
@@ -1296,15 +1319,17 @@ class FirestoreOrganizationGraphRepository:
                 return receipt
             if payload.get("status") != "draft":
                 raise ImportUnavailable()
-            lineage_row = self._lineage_ref(
+            lineage_ref = self._lineage_ref(
                 current.organization_id,
                 draft.source_snapshot.source_kind,
-            ).get(transaction=transaction)
-            if self._lineage_from_row(
+            )
+            latest_import_id, legacy_lineage = self._lineage_or_legacy_latest(
+                transaction,
                 current.organization_id,
                 draft.source_snapshot.source_kind,
-                lineage_row,
-            ) != draft.import_id:
+                lineage_ref.get(transaction=transaction),
+            )
+            if latest_import_id != draft.import_id:
                 raise ImportLineageConflict()
             state_row = state_ref.get(transaction=transaction)
             current_version, _state = self._state_from_row(
@@ -1399,7 +1424,10 @@ class FirestoreOrganizationGraphRepository:
                 + (2 * len(graph_chunks))
                 + extra_current_deletes
                 + (2 * len(active_removed))
+                + (1 if legacy_lineage is not None else 0)
             )
+            if legacy_lineage is not None:
+                transaction.set(lineage_ref, legacy_lineage)
             transaction.create(
                 version_ref,
                 graph_storage,
@@ -1677,6 +1705,69 @@ class FirestoreOrganizationGraphRepository:
             raise ImportUnavailable()
         return payload["latest_import_id"]
 
+    def _lineage_or_legacy_latest(
+        self,
+        transaction,
+        organization_id: str,
+        source_kind: str,
+        lineage_row,
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        latest_import_id = self._lineage_from_row(
+            organization_id,
+            source_kind,
+            lineage_row,
+        )
+        if latest_import_id is not None:
+            return latest_import_id, None
+        candidates: list[ImportDraft] = []
+        rows = (
+            self._organization_ref(organization_id)
+            .collection("imports")
+            .stream(transaction=transaction)
+        )
+        for row in rows:
+            payload = row.to_dict()
+            snapshot_payload = payload.get("source_snapshot")
+            if (
+                not isinstance(snapshot_payload, dict)
+                or snapshot_payload.get("source_kind") != source_kind
+            ):
+                continue
+            if payload.get("schema_version") != 1:
+                raise ImportUnavailable()
+            draft = self._draft_from_row(
+                row,
+                self._import_ref(organization_id, row.id),
+                organization_id=organization_id,
+                transaction=transaction,
+            )
+            if payload.get("status") == "draft":
+                candidates.append(draft)
+            elif payload.get("status") == "committed":
+                receipt = None
+                try:
+                    receipt = ImportReceipt.model_validate_json(to_json(payload["receipt"]))
+                except (
+                    KeyError,
+                    PydanticSerializationError,
+                    TypeError,
+                    ValueError,
+                    ValidationError,
+                ):
+                    pass
+                if receipt is None or not self._receipt_matches_draft(
+                    receipt,
+                    draft,
+                    acknowledged_codes=receipt.acknowledged_codes,
+                ):
+                    raise ImportUnavailable()
+            else:
+                raise ImportUnavailable()
+        if not candidates:
+            return None, None
+        latest = max(candidates, key=lambda item: (item.created_at, item.import_id))
+        return latest.import_id, _lineage_payload(latest)
+
     def _draft_from_payload(
         self,
         payload: dict[str, Any],
@@ -1685,7 +1776,15 @@ class FirestoreOrganizationGraphRepository:
     ) -> ImportDraft:
         draft = None
         try:
-            if set(payload) != _DRAFT_STORAGE_FIELDS or not self._storage_digest_valid(payload):
+            expected_fields = {
+                1: _DRAFT_V1_STORAGE_FIELDS,
+                2: _DRAFT_V2_STORAGE_FIELDS,
+            }.get(payload.get("schema_version"))
+            if (
+                expected_fields is None
+                or set(payload) != expected_fields
+                or not self._storage_digest_valid(payload)
+            ):
                 raise ValueError("invalid draft storage metadata")
             draft_payload = {
                 key: value for key, value in payload.items() if key in ImportDraft.model_fields

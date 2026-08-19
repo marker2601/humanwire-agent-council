@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
+import json
+import math
 import multiprocessing
-import pickle
 import re
 import secrets
 import unicodedata
@@ -51,6 +53,10 @@ _IMPORT_ID = rf"^imp_{_ULID}$"
 _RECORD_ID = rf"^rec_{_ULID}$"
 _SHA256 = r"^[0-9a-f]{64}$"
 _ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+_FACTORY_MODULE = r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$"
+_FACTORY_NAME = r"^[A-Za-z_]\w*$"
+_MAX_MAPPER_CONFIG_BYTES = 16_384
+_MAX_MAPPER_PACKET_BYTES = 8_000_000
 _CORRECTION_FIELDS = frozenset(
     {
         "authority_function",
@@ -154,6 +160,69 @@ class OrganizationMapper(Protocol):
     ) -> OrganizationGraphCandidate: ...
 
 
+def _worker_config_is_safe(value: object, *, depth: int = 0) -> bool:
+    if depth > 8:
+        return False
+    if value is None or type(value) in {bool, str}:
+        return type(value) is not str or len(value) <= 1_000
+    if type(value) is int:
+        return -(2**63) <= value <= (2**63) - 1
+    if type(value) is float:
+        return math.isfinite(value)
+    if type(value) is list:
+        return len(value) <= 100 and all(
+            _worker_config_is_safe(item, depth=depth + 1) for item in value
+        )
+    if type(value) is dict:
+        return len(value) <= 100 and all(
+            type(key) is str
+            and re.fullmatch(r"^[a-z][a-z0-9_]{0,63}$", key) is not None
+            and _worker_config_is_safe(item, depth=depth + 1)
+            for key, item in value.items()
+        )
+    return False
+
+
+def _reject_json_constant(_value: str) -> None:
+    raise ValueError("mapper config is invalid")
+
+
+class OrganizationMapperWorkerSpec(BaseModel):
+    """Strict primitive instructions for constructing a mapper inside a child."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    factory_module: str = Field(min_length=1, max_length=255, pattern=_FACTORY_MODULE)
+    factory_qualname: str = Field(min_length=1, max_length=120, pattern=_FACTORY_NAME)
+    config_json: str = Field(min_length=2, max_length=_MAX_MAPPER_CONFIG_BYTES)
+
+    @field_validator("config_json")
+    @classmethod
+    def config_is_canonical_safe_json(cls, value: str) -> str:
+        try:
+            config = json.loads(
+                value,
+                parse_constant=_reject_json_constant,
+            )
+            canonical = json.dumps(
+                config,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        except (TypeError, ValueError):
+            raise ValueError("mapper config is invalid") from None
+        if (
+            len(value.encode("utf-8")) > _MAX_MAPPER_CONFIG_BYTES
+            or type(config) is not dict
+            or not _worker_config_is_safe(config)
+            or canonical != value
+        ):
+            raise ValueError("mapper config is invalid")
+        return value
+
+
 def _deterministic_ulid(*parts: str) -> str:
     value = int.from_bytes(
         hashlib.sha256("\0".join(parts).encode("utf-8")).digest()[:16],
@@ -179,6 +248,7 @@ class _ControlDiagnostics:
     blocking_codes: tuple[str, ...]
     conflicting_parent_units: frozenset[str]
     multiple_leader_units: frozenset[str]
+    structurally_ambiguous_units: frozenset[str]
 
 
 def _control_diagnostics(records: tuple[SourceRecord, ...]) -> _ControlDiagnostics:
@@ -187,6 +257,7 @@ def _control_diagnostics(records: tuple[SourceRecord, ...]) -> _ControlDiagnosti
     records_by_unit: dict[str, list[SourceRecord]] = {}
     parents_by_unit: dict[str, set[str]] = {}
     leaders_by_unit: dict[str, list[SourceRecord]] = {}
+    malformed_unit_controls: set[str] = set()
     for record in records:
         fields = _fields(record)
         unit_name = fields.get("unit_name")
@@ -195,6 +266,10 @@ def _control_diagnostics(records: tuple[SourceRecord, ...]) -> _ControlDiagnosti
             parent_name = fields.get("unit_parent_name")
             if parent_name is not None:
                 parents_by_unit.setdefault(unit_name, set()).add(parent_name)
+                if parent_name == unit_name:
+                    ambiguous.add(record.record_id)
+                    codes.add("invalid_control_value")
+                    malformed_unit_controls.add(unit_name)
         elif "unit_parent_name" in fields:
             ambiguous.add(record.record_id)
             codes.add("invalid_control_value")
@@ -202,6 +277,11 @@ def _control_diagnostics(records: tuple[SourceRecord, ...]) -> _ControlDiagnosti
             if boolean_field in fields and fields[boolean_field] not in {"false", "true"}:
                 ambiguous.add(record.record_id)
                 codes.add("invalid_control_value")
+                if boolean_field == "unit_leader" and unit_name is not None:
+                    malformed_unit_controls.add(unit_name)
+        if "unit_leader" in fields and unit_name is None:
+            ambiguous.add(record.record_id)
+            codes.add("invalid_control_value")
         if unit_name is not None and fields.get("unit_leader") == "true":
             leaders_by_unit.setdefault(unit_name, []).append(record)
         has_function = "authority_function" in fields
@@ -230,13 +310,17 @@ def _control_diagnostics(records: tuple[SourceRecord, ...]) -> _ControlDiagnosti
         codes.add("conflicting_unit_parent")
     if multiple_leader_units:
         codes.add("multiple_unit_leaders")
-    for unit_name in conflicting_parent_units | multiple_leader_units:
+    structurally_ambiguous_units = (
+        conflicting_parent_units | multiple_leader_units | malformed_unit_controls
+    )
+    for unit_name in structurally_ambiguous_units:
         ambiguous.update(record.record_id for record in records_by_unit[unit_name])
     return _ControlDiagnostics(
         ambiguous_record_ids=frozenset(ambiguous),
         blocking_codes=tuple(sorted(codes)),
         conflicting_parent_units=conflicting_parent_units,
         multiple_leader_units=multiple_leader_units,
+        structurally_ambiguous_units=frozenset(structurally_ambiguous_units),
     )
 
 
@@ -266,7 +350,7 @@ class RuleOrganizationMapper:
         parent_by_unit = {
             unit_name: next(iter(parent_names))
             for unit_name, parent_names in declared_parents.items()
-            if unit_name not in diagnostics.conflicting_parent_units
+            if unit_name not in diagnostics.structurally_ambiguous_units
         }
         unit_ids = {
             name: f"unit_{_deterministic_ulid(snapshot.organization_id, 'unit', name)}"
@@ -308,7 +392,7 @@ class RuleOrganizationMapper:
                 leader_subject_id=(
                     min(leaders[name])
                     if leaders.get(name)
-                    and name not in diagnostics.multiple_leader_units
+                    and name not in diagnostics.structurally_ambiguous_units
                     else None
                 ),
             )
@@ -424,13 +508,19 @@ class RuleOrganizationMapper:
 
 
 def _mapper_worker(
-    mapper: OrganizationMapper,
+    spec_json: str,
     snapshot_json: str,
     graph_json: str,
     sender,
 ) -> None:
     payload = b""
     try:
+        spec = OrganizationMapperWorkerSpec.model_validate_json(spec_json)
+        module = importlib.import_module(spec.factory_module)
+        factory = vars(module).get(spec.factory_qualname)
+        if not callable(factory):
+            raise TypeError("mapper factory is unavailable")
+        mapper = factory(json.loads(spec.config_json))
         snapshot = SourceSnapshot.model_validate_json(snapshot_json)
         graph = OrganizationGraph.model_validate_json(graph_json)
         candidate = mapper.map(snapshot, graph)
@@ -443,22 +533,51 @@ def _mapper_worker(
     sender.close()
 
 
+def _mapper_worker_spec(mapper: OrganizationMapper) -> OrganizationMapperWorkerSpec | None:
+    try:
+        state = object.__getattribute__(mapper, "__dict__")
+    except Exception:  # noqa: BLE001 - hostile mapper access is sealed
+        return None
+    if type(state) is not dict:
+        return None
+    spec = state.get("_humanwire_mapper_spec")
+    if type(spec) is not OrganizationMapperWorkerSpec:
+        return None
+    try:
+        spec_state = object.__getattribute__(spec, "__dict__")
+    except Exception:  # noqa: BLE001 - hostile spec access is sealed
+        return None
+    if type(spec_state) is not dict or len(spec_state) != 3:
+        return None
+    factory_module = spec_state.get("factory_module")
+    factory_qualname = spec_state.get("factory_qualname")
+    config_json = spec_state.get("config_json")
+    if any(type(item) is not str for item in (factory_module, factory_qualname, config_json)):
+        return None
+    try:
+        return OrganizationMapperWorkerSpec.model_validate(
+            {
+                "factory_module": factory_module,
+                "factory_qualname": factory_qualname,
+                "config_json": config_json,
+            }
+        )
+    except (TypeError, ValueError, ValidationError):
+        return None
+
+
 def _run_mapper_with_deadline(
-    mapper: OrganizationMapper,
+    spec: OrganizationMapperWorkerSpec,
     snapshot: SourceSnapshot,
     current: OrganizationGraph,
     timeout_seconds: float,
 ) -> object:
-    try:
-        pickle.dumps(mapper)
-    except Exception:  # noqa: BLE001 - configuration details are sealed
-        return None
     process_context = multiprocessing.get_context("spawn")
     receiver, sender = process_context.Pipe(duplex=False)
     process = process_context.Process(
         target=_mapper_worker,
         args=(
-            mapper,
+            spec.model_dump_json(),
             snapshot.model_dump_json(),
             current.model_dump_json(),
             sender,
@@ -474,7 +593,7 @@ def _run_mapper_with_deadline(
         sender.close()
         remaining = max(0.0, deadline - monotonic())
         if receiver.poll(remaining):
-            payload = receiver.recv_bytes()
+            payload = receiver.recv_bytes(maxlength=_MAX_MAPPER_PACKET_BYTES)
             process.join(max(0.0, deadline - monotonic()))
     except Exception:  # noqa: BLE001 - spawn/pickle/provider details are sealed
         payload = None
@@ -493,8 +612,11 @@ def _run_mapper_with_deadline(
     if not payload:
         return None
     try:
+        primitive = json.loads(payload)
+        if type(primitive) is not dict:
+            return None
         return OrganizationGraphCandidate.model_validate_json(payload)
-    except Exception:  # noqa: BLE001 - hostile mapper output is sealed
+    except Exception:  # noqa: BLE001 - hostile packet/output is sealed
         return None
 
 
@@ -639,11 +761,16 @@ class OrganizationImportService:
         if type(self._mapper) is RuleOrganizationMapper:
             candidate: object = self._mapper.map(snapshot, current)
         else:
-            candidate = _run_mapper_with_deadline(
-                self._mapper,
-                snapshot,
-                current,
-                self._mapper_timeout_seconds,
+            spec = _mapper_worker_spec(self._mapper)
+            candidate = (
+                None
+                if spec is None
+                else _run_mapper_with_deadline(
+                    spec,
+                    snapshot,
+                    current,
+                    self._mapper_timeout_seconds,
+                )
             )
         failed = candidate is None
         if not failed:

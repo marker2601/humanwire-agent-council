@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
+from humanwire import organization_import
 from humanwire.decisionos_models import DecisionOSPrincipal, DecisionOSRole
 from humanwire.decisionos_store import DecisionOSAuthorizationDenied, InMemoryDecisionOSRepository
 from humanwire.organization_import import (
@@ -575,6 +576,77 @@ def test_control_ambiguity_is_byte_identical_when_inputs_are_shuffled() -> None:
     assert first[1].model_dump_json() == second[1].model_dump_json()
 
 
+def malformed_unit_control_snapshot(*, reorder: bool = False) -> SourceSnapshot:
+    records = (
+        source_record(
+            1,
+            "row/one",
+            (
+                ("display_name", "Ada One"),
+                ("kind", "human"),
+                ("unit_leader", "true"),
+                ("unit_name", "Platform"),
+                ("unit_parent_name", "Engineering"),
+            ),
+        ),
+        source_record(
+            2,
+            "row/two",
+            (
+                ("display_name", "Ada Two"),
+                ("kind", "human"),
+                ("unit_leader", "sometimes"),
+                ("unit_name", "Platform"),
+                ("unit_parent_name", "Engineering"),
+            ),
+        ),
+    )
+    if reorder:
+        records = tuple(
+            record.model_copy(update={"fields": tuple(reversed(record.fields))})
+            for record in reversed(records)
+        )
+    return SourceSnapshot(
+        snapshot_id="snap_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        organization_id=ORG_A,
+        source_kind="csv",
+        captured_at=NOW,
+        records=records,
+        semantic_digest="7" * 64,
+    )
+
+
+def test_malformed_unit_control_marks_whole_unit_and_selects_no_leader() -> None:
+    def build(snapshot):
+        decisionos = InMemoryDecisionOSRepository(
+            identifiers=SequenceIdentifiers(), clock=lambda: NOW
+        )
+        owner = principal("firebase-owner-01")
+        organization = decisionos.create_organization(owner, "Northstar Labs")
+        context = decisionos.load_context(owner, organization.organization_id)
+        service = OrganizationImportService(
+            repository=InMemoryOrganizationGraphRepository(
+                decisionos=decisionos, clock=lambda: NOW
+            ),
+            clock=lambda: NOW,
+        )
+        draft = service.create_draft(context, snapshot)
+        return draft, service.reconcile(context, draft.import_id)
+
+    first = build(malformed_unit_control_snapshot())
+    shuffled = build(malformed_unit_control_snapshot(reorder=True))
+    platform = next(unit for unit in first[0].candidate.units if unit.name == "Platform")
+
+    assert first[1].blocking_codes == ("invalid_control_value", "needs_review")
+    assert all(
+        subject.lifecycle is SubjectLifecycle.NEEDS_REVIEW
+        for subject in first[0].candidate.subjects
+    )
+    assert platform.leader_subject_id is None
+    assert first[0].model_dump_json() == shuffled[0].model_dump_json()
+    assert first[1].model_dump_json() == shuffled[1].model_dump_json()
+
+
 def test_stale_source_and_stale_graph_fail_closed(service_setup) -> None:
     service, _repository, _decisionos, context = service_setup
     stale_source = service.create_draft(context, complete_snapshot(digest="1" * 64))
@@ -706,6 +778,94 @@ class NonPicklableMapper:
         return RuleOrganizationMapper().map(snapshot, current_graph)
 
 
+class SlowGetStateMapper:
+    getstate_calls = 0
+
+    def __getstate__(self):
+        type(self).getstate_calls += 1
+        time.sleep(3)
+        return {}
+
+    def map(self, snapshot, current_graph):
+        raise AssertionError("arbitrary mapper ran in the parent")
+
+
+class PoisonedSpecState:
+    calls = 0
+
+    @classmethod
+    def model_dump_json(cls):
+        cls.calls += 1
+        time.sleep(3)
+        return "{}"
+
+
+class WorkerSpecMapper:
+    def __init__(self, spec) -> None:
+        self._humanwire_mapper_spec = spec
+        self.provider_client = NonPicklableProviderClient()
+
+    def map(self, snapshot, current_graph):
+        raise AssertionError("spec mapper ran in the parent")
+
+
+class NonPicklableProviderClient:
+    def __getstate__(self):
+        raise AssertionError("provider client crossed the process boundary")
+
+
+class HugeSerializedCandidate(OrganizationGraphCandidate):
+    def model_dump_json(self, *args, **kwargs):
+        return "x" * 10_000_000
+
+
+class TruncatedSerializedCandidate(OrganizationGraphCandidate):
+    def model_dump_json(self, *args, **kwargs):
+        return '{"organization_id":'
+
+
+class WorkerProbeMapper:
+    def __init__(self, mode: str) -> None:
+        self.mode = mode
+
+    def map(self, snapshot, current_graph):
+        if self.mode == "sleep":
+            time.sleep(30)
+        candidate = RuleOrganizationMapper().map(snapshot, current_graph)
+        if self.mode == "huge":
+            return HugeSerializedCandidate.model_construct(**candidate.__dict__)
+        if self.mode == "truncated":
+            return TruncatedSerializedCandidate.model_construct(**candidate.__dict__)
+        first = candidate.subjects[0].model_copy(update={"display_name": "Worker Output"})
+        return candidate.model_copy(update={"subjects": (first, *candidate.subjects[1:])})
+
+
+def build_worker_probe_mapper(config):
+    return WorkerProbeMapper(config["mode"])
+
+
+def worker_spec_mapper(mode: str) -> WorkerSpecMapper:
+    spec = organization_import.OrganizationMapperWorkerSpec(
+        factory_module=__name__,
+        factory_qualname="build_worker_probe_mapper",
+        config_json=f'{{"mode":"{mode}"}}',
+    )
+    return WorkerSpecMapper(spec)
+
+
+@pytest.mark.parametrize(
+    "config_json",
+    ('{"z":1,"a":2}', '{"value":NaN}', "[]"),
+)
+def test_mapper_worker_spec_requires_canonical_safe_object_json(config_json) -> None:
+    with pytest.raises(ValidationError):
+        organization_import.OrganizationMapperWorkerSpec(
+            factory_module=__name__,
+            factory_qualname="build_worker_probe_mapper",
+            config_json=config_json,
+        )
+
+
 class EmptyMapper:
     def map(self, snapshot, current_graph):
         candidate = RuleOrganizationMapper().map(snapshot, current_graph)
@@ -816,6 +976,104 @@ def test_non_picklable_mapper_configuration_falls_back_fixed_safe(service_setup)
     draft = service.create_draft(context, complete_snapshot())
 
     assert len(draft.candidate.subjects) == 4
+
+
+def test_mapper_without_sealed_spec_never_invokes_slow_getstate(service_setup) -> None:
+    _service, repository, _decisionos, context = service_setup
+    SlowGetStateMapper.getstate_calls = 0
+    service = OrganizationImportService(
+        repository=repository,
+        mapper=SlowGetStateMapper(),
+        mapper_timeout_seconds=0.2,
+        clock=lambda: NOW,
+    )
+
+    started = time.perf_counter()
+    draft = service.create_draft(context, complete_snapshot())
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 1
+    assert SlowGetStateMapper.getstate_calls == 0
+    assert len(draft.candidate.subjects) == 4
+
+
+def test_mapper_spec_extraction_ignores_poisoned_instance_methods(service_setup) -> None:
+    _service, repository, _decisionos, context = service_setup
+    mapper = worker_spec_mapper("valid")
+    PoisonedSpecState.calls = 0
+    mapper._humanwire_mapper_spec.__dict__["model_dump_json"] = (
+        PoisonedSpecState.model_dump_json
+    )
+    service = OrganizationImportService(
+        repository=repository,
+        mapper=mapper,
+        mapper_timeout_seconds=2,
+        clock=lambda: NOW,
+    )
+
+    started = time.perf_counter()
+    draft = service.create_draft(context, complete_snapshot())
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 1
+    assert PoisonedSpecState.calls == 0
+    assert "Worker Output" not in {
+        subject.display_name for subject in draft.candidate.subjects
+    }
+
+
+def test_spec_built_mapper_deadline_leaves_no_child_or_thread(service_setup) -> None:
+    _service, repository, _decisionos, context = service_setup
+    before_processes = {process.pid for process in multiprocessing.active_children()}
+    before_threads = {thread.ident for thread in threading.enumerate()}
+    service = OrganizationImportService(
+        repository=repository,
+        mapper=worker_spec_mapper("sleep"),
+        mapper_timeout_seconds=0.2,
+        clock=lambda: NOW,
+    )
+
+    started = time.perf_counter()
+    draft = service.create_draft(context, complete_snapshot())
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 2
+    assert len(draft.candidate.subjects) == 4
+    assert {process.pid for process in multiprocessing.active_children()} <= before_processes
+    assert {thread.ident for thread in threading.enumerate()} <= before_threads
+
+
+def test_spec_built_mapper_returns_valid_child_candidate(service_setup) -> None:
+    _service, repository, _decisionos, context = service_setup
+    service = OrganizationImportService(
+        repository=repository,
+        mapper=worker_spec_mapper("valid"),
+        mapper_timeout_seconds=2,
+        clock=lambda: NOW,
+    )
+
+    draft = service.create_draft(context, complete_snapshot())
+
+    assert "Worker Output" in {
+        subject.display_name for subject in draft.candidate.subjects
+    }
+
+
+@pytest.mark.parametrize("mode", ["huge", "truncated"])
+def test_mapper_worker_rejects_bounded_or_truncated_packet(service_setup, mode) -> None:
+    _service, repository, _decisionos, context = service_setup
+    service = OrganizationImportService(
+        repository=repository,
+        mapper=worker_spec_mapper(mode),
+        mapper_timeout_seconds=2,
+        clock=lambda: NOW,
+    )
+
+    draft = service.create_draft(context, complete_snapshot())
+
+    assert "Worker Output" not in {
+        subject.display_name for subject in draft.candidate.subjects
+    }
 
 
 @pytest.mark.parametrize("mapper", [EmptyMapper(), PartialMapper()])
