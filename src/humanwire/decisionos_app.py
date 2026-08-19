@@ -14,7 +14,7 @@ from types import MappingProxyType
 from typing import Protocol
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
@@ -436,7 +436,7 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
     @app.api_route("/workspace", methods=["GET", "HEAD"])
     def protected_app(request: Request) -> Response:
         if _principal(request, dependencies.authenticator) is None:
-            return _fixed_error(401, "authentication_required")
+            return RedirectResponse(url="/signin", status_code=303)
         return templates.TemplateResponse(
             request=request,
             name="decisionos_shell.html",

@@ -168,11 +168,17 @@ def _raw_asgi_post(
     return start["status"], json.loads(payload or b"{}")
 
 
-def test_protected_app_requires_verified_session(client) -> None:
-    response = client.get("/workspace")
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+@pytest.mark.parametrize("path", ["/workspace", "/app"])
+def test_protected_browser_routes_send_unsigned_users_to_signin(
+    client,
+    method,
+    path,
+) -> None:
+    response = client.request(method, path, follow_redirects=False)
 
-    assert response.status_code == 401
-    assert response.json() == {"error": "authentication_required"}
+    assert response.status_code == 303
+    assert response.headers["location"] == "/signin"
 
 
 def test_signin_and_authenticated_shell_use_local_product_assets(client) -> None:
