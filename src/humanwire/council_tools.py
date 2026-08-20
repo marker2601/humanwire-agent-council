@@ -340,17 +340,26 @@ def build_council_tools(context: CouncilToolContext) -> tuple[FunctionTool, ...]
     """Bind the active context privately and expose only read-only ADK functions."""
 
     def bound_list_evidence() -> EvidenceCatalog:
-        return list_evidence(context)
+        try:
+            return list_evidence(context)
+        except CouncilToolDenied:
+            return {"error": "evidence_unavailable"}  # type: ignore[return-value]
 
     def bound_read_evidence_excerpt(
         evidence_id: str,
         start: int,
         length: int,
     ) -> EvidenceExcerpt:
-        return read_evidence_excerpt(context, evidence_id, start, length)
+        try:
+            return read_evidence_excerpt(context, evidence_id, start, length)
+        except CouncilToolDenied:
+            return {"error": "evidence_unavailable"}  # type: ignore[return-value]
 
     def bound_read_prior_decision(decision_id: str) -> PriorDecisionExcerpt:
-        return read_prior_decision(context, decision_id)
+        try:
+            return read_prior_decision(context, decision_id)
+        except CouncilToolDenied:
+            return {"error": "decision_unavailable"}  # type: ignore[return-value]
 
     bound_list_evidence.__name__ = "list_evidence"
     bound_read_evidence_excerpt.__name__ = "read_evidence_excerpt"

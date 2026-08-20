@@ -268,3 +268,19 @@ def test_build_tools_exposes_only_three_readonly_functions(
         "read_prior_decision",
     )
     assert all("registry" not in repr(tool) for tool in tools)
+
+
+def test_bound_tools_return_fixed_errors_for_model_generated_invalid_calls(
+    tool_context: CouncilToolContext,
+    registry: FakeRegistry,
+) -> None:
+    tools = {tool.name: tool for tool in build_council_tools(tool_context)}
+
+    assert tools["read_evidence_excerpt"].func(
+        evidence_id="evidence_market_01", start=0, length=1_000
+    ) == {"error": "evidence_unavailable"}
+    assert tools["read_prior_decision"].func(decision_id="not-a-decision") == {
+        "error": "decision_unavailable"
+    }
+    registry.failure = RuntimeError("PRIVATE-provider-message")
+    assert tools["list_evidence"].func() == {"error": "evidence_unavailable"}
