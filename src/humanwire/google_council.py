@@ -177,7 +177,9 @@ def _instruction(definition: CouncilSpecialist) -> str:
     if definition.specialist_id in _RESEARCH_IDS:
         identity = (
             f" Set candidate_id exactly to candidate_{definition.specialist_id}_01 and "
-            f"specialist_id exactly to {definition.specialist_id}."
+            f"specialist_id exactly to {definition.specialist_id}. Set the first claim_id "
+            f"exactly to claim_{definition.specialist_id}_01; every additional claim_id "
+            "must also start with the literal claim_."
         )
     if definition.specialist_id == "decision_synthesis":
         prior = (
@@ -206,19 +208,61 @@ def _instruction(definition: CouncilSpecialist) -> str:
         "Use only the provided read-only evidence tools. Never claim to approve, "
         "message people, mutate records, or exercise human authority. Every sourced "
         "claim must cite an evidence ID returned by a tool. Classify unsupported "
-        "reasoning as model_inference or human_assumption. Return only the strict "
-        f"typed output for policy {definition.policy_version}.{identity}{prior}"
+        "reasoning as model_inference or human_assumption. "
+        f"{_output_contract(definition)}{identity}{prior}"
     )
 
 
-def _output_schema(definition: CouncilSpecialist) -> type[BaseModel]:
+def _output_contract(definition: CouncilSpecialist) -> str:
+    claim = (
+        '{"claim_id":"claim_lowercase_id","statement":"concise claim",'
+        '"classification":"confirmed_fact|source_assertion|model_inference|'
+        'human_assumption|unresolved_conflict","evidence_ids":[],'
+        '"confidence":0.0}'
+    )
     if definition.output_schema == "CouncilCandidate":
-        return CouncilCandidate
-    if definition.output_schema == "CouncilChallenge":
-        return CouncilChallenge
-    if definition.output_schema == "CouncilRecommendation":
-        return CouncilRecommendation
-    raise ValueError("council_registry_invalid")
+        payload = (
+            '{"candidate_id":"candidate_specialist_01",'
+            '"specialist_id":"specialist_id","summary":"concise analysis",'
+            f'"claims":[{claim}],"questions":["open question"],'
+            '"recommended_action":"next human action",'
+            f'"policy_version":"{definition.policy_version}"}}'
+        )
+        rules = (
+            " Include at least one claim. If there is no cited evidence, use only "
+            "model_inference or human_assumption with an empty evidence_ids array."
+        )
+    elif definition.output_schema == "CouncilChallenge":
+        payload = (
+            '{"challenge_id":"challenge_red_01","challenger_id":"red_team",'
+            '"target_candidate_id":"candidate_exact_id",'
+            '"challenged_claim_ids":["claim_exact_id"],'
+            '"severity":"advisory|material|blocking",'
+            '"issue":"concise challenge","required_action":"required human action",'
+            f'"policy_version":"{definition.policy_version}"}}'
+        )
+        rules = " Reference only exact candidate and claim IDs from session state."
+    elif definition.output_schema == "CouncilRecommendation":
+        payload = (
+            '{"recommendation_id":"recommendation_stage_01",'
+            '"summary":"concise recommendation",'
+            f'"claims":[{claim}],"challenges":[],'
+            '"recommended_action":"next human action",'
+            '"required_human_action":"decision reserved for an authorized person",'
+            '"source_candidate_ids":["candidate_exact_id"],'
+            f'"policy_version":"{definition.policy_version}"}}'
+        )
+        rules = (
+            " Include at least one claim. Preserve exact source candidate IDs. In final "
+            "synthesis, copy the complete red-team challenge into challenges and include "
+            "every challenged claim ID in claims."
+        )
+    else:
+        raise ValueError("council_registry_invalid")
+    return (
+        "Return only one compact JSON object with no markdown or code fence, matching "
+        f"this exact field shape: {payload}{rules}"
+    )
 
 
 def _safe_prompt(request: CouncilRunRequest) -> str:
@@ -406,7 +450,6 @@ class GoogleCouncilRunner:
                 model=self.model_identifier,
                 instruction=_instruction(definition),
                 tools=selected_tools,
-                output_schema=_output_schema(definition),
                 output_key=definition.specialist_id,
                 include_contents="none",
                 disallow_transfer_to_parent=True,

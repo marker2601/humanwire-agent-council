@@ -12,8 +12,6 @@ from google.genai import types
 from humanwire.council_models import (
     ChallengeSeverity,
     ClaimClassification,
-    CouncilCandidate,
-    CouncilChallenge,
     CouncilRecommendation,
     CouncilRunRequest,
 )
@@ -333,7 +331,7 @@ def test_council_has_no_authoritative_repository_capability() -> None:
     assert repository.authoritative_mutation_count == 0
 
 
-def test_leaf_agents_use_strict_schemas_budgets_and_readonly_tools() -> None:
+def test_leaf_agents_use_vertex_compatible_json_contracts_budgets_and_tools() -> None:
     runner = GoogleCouncilRunner(
         model_identifier="gemini-3.6-flash",
         tool_context=_tool_context(),
@@ -352,9 +350,19 @@ def test_leaf_agents_use_strict_schemas_budgets_and_readonly_tools() -> None:
         assert agent.retry_config.max_attempts == definition.maximum_attempts
         assert agent.generate_content_config.max_output_tokens == definition.token_budget
         assert {tool.name for tool in agent.tools} <= definition.tool_allowlist
+        # ADK's output_schema adapter becomes a set_model_response function
+        # declaration that Gemini 3.5 Flash rejects on Vertex.  Keep the model
+        # call provider-compatible and validate the returned JSON ourselves.
+        assert agent.output_schema is None
+        assert "Return only one compact JSON object" in agent.instruction
+        assert '"policy_version"' in agent.instruction
         if agent.name in RESEARCH_IDS:
-            assert agent.output_schema is CouncilCandidate
+            assert '"candidate_id"' in agent.instruction
+            assert '"claims"' in agent.instruction
+            assert f"claim_{agent.name}_01" in agent.instruction
         elif agent.name == "red_team":
-            assert agent.output_schema is CouncilChallenge
+            assert '"challenge_id"' in agent.instruction
+            assert '"challenged_claim_ids"' in agent.instruction
         else:
-            assert agent.output_schema is CouncilRecommendation
+            assert '"recommendation_id"' in agent.instruction
+            assert '"source_candidate_ids"' in agent.instruction
