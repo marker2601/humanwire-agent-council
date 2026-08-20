@@ -9,6 +9,7 @@ from google.adk.agents import Agent, ParallelAgent, SequentialAgent
 from google.adk.models import LlmResponse
 from google.genai import types
 
+import humanwire.google_council as google_council_module
 from humanwire.council_models import (
     ChallengeSeverity,
     ClaimClassification,
@@ -262,7 +263,14 @@ def test_model_output_cannot_invent_a_citation() -> None:
     assert captured.value.__context__ is None
 
 
-def test_provider_exception_has_fixed_private_boundary() -> None:
+def test_provider_exception_has_fixed_private_boundary(monkeypatch) -> None:
+    warnings: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        google_council_module._LOGGER,
+        "warning",
+        lambda *args, **kwargs: warnings.append((*args, kwargs)),
+    )
+
     def failing_callback(*, callback_context, llm_request):
         del callback_context, llm_request
         raise RuntimeError("PRIVATE-GEMINI-PAYLOAD C:\\private\\credentials.json")
@@ -286,6 +294,14 @@ def test_provider_exception_has_fixed_private_boundary() -> None:
     assert captured.value.__context__ is None
     assert "PRIVATE" not in repr(captured.value)
     assert "credentials" not in repr(captured.value)
+    assert warnings == [
+        (
+            "council_provider_failed category=%s code=%s",
+            "runtime",
+            "none",
+            {},
+        )
+    ]
 
 
 @pytest.mark.parametrize("cancelled", [False, True])

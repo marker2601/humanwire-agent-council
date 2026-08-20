@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import secrets
 import threading
 import time
@@ -14,6 +15,7 @@ from typing import Any, Literal
 from google.adk.agents import Agent, ParallelAgent, SequentialAgent
 from google.adk.runners import InMemoryRunner
 from google.adk.workflow import RetryConfig
+from google.genai import errors as genai_errors
 from google.genai import types
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -25,7 +27,11 @@ from humanwire.council_models import (
     CouncilSpecialist,
 )
 from humanwire.council_registry import specialist_registry
-from humanwire.council_tools import CouncilToolContext, build_council_tools
+from humanwire.council_tools import (
+    CouncilToolContext,
+    CouncilToolDenied,
+    build_council_tools,
+)
 
 _RESEARCH_IDS = (
     "market_intelligence",
@@ -36,9 +42,23 @@ _RESEARCH_IDS = (
 _SEQUENTIAL_IDS = ("decision_synthesis", "red_team", "final_synthesis")
 _ALL_AGENT_IDS = _RESEARCH_IDS + _SEQUENTIAL_IDS
 _APP_NAME = "humanwire_decision_council"
+_LOGGER = logging.getLogger("uvicorn.error")
 
 BeforeModelCallback = Callable[..., Any]
 ExecutionCallback = Callable[["CouncilExecutionEvent"], None]
+
+
+def _provider_failure_signal(error: Exception) -> tuple[str, str]:
+    if isinstance(error, genai_errors.APIError):
+        code = object.__getattribute__(error, "code")
+        safe_code = str(code) if type(code) is int and 100 <= code <= 599 else "none"
+        category = "client" if isinstance(error, genai_errors.ClientError) else "server"
+        return category, safe_code
+    if isinstance(error, CouncilToolDenied):
+        return "tool", "none"
+    if isinstance(error, (ValidationError, ValueError)):
+        return "validation", "none"
+    return "runtime", "none"
 
 
 class CouncilExecutionStatus(StrEnum):
@@ -509,7 +529,11 @@ class GoogleCouncilRunner:
             )
         except _RunTimedOut:
             failure = "timeout"
-        except Exception:  # noqa: BLE001 - provider details are discarded here
+        except Exception as error:  # noqa: BLE001 - details stay private
+            category, code = _provider_failure_signal(error)
+            _LOGGER.warning(
+                "council_provider_failed category=%s code=%s", category, code
+            )
             failure = "provider_unavailable"
         finally:
             if runner is not None:
