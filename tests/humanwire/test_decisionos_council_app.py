@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from humanwire.council_gateway import CouncilGatewayResult
 from humanwire.council_projection import build_council_projection
-from humanwire.council_runtime import CouncilRunOutput
+from humanwire.council_runtime import CouncilEvidenceSummary, CouncilRunOutput
 from humanwire.decisionos_app import DecisionOSDependencies, create_decisionos_app
 from humanwire.decisionos_auth import (
     AppCheckUnavailable,
@@ -63,6 +63,30 @@ class FakeAppCheck:
 class FakeCouncilRuntime:
     def __init__(self) -> None:
         self.latest = None
+        self.demo_seeded = None
+        self.poison_summary = None
+
+    def seed_demo_evidence(self, context, workspace):
+        assert context.organization_id == workspace.organization_id
+        self.demo_seeded = (context.organization_id, workspace.workspace_id)
+        return (
+            CouncilEvidenceSummary(
+                evidence_id="evidence_demo_market_validation",
+                title="Synthetic demo · Market validation",
+                provenance="synthetic_demo",
+            ),
+            CouncilEvidenceSummary(
+                evidence_id="evidence_demo_financial_runway",
+                title="Synthetic demo · Financial runway",
+                provenance="synthetic_demo",
+            ),
+        )
+
+    def list_evidence(self, context, workspace):
+        assert context.organization_id == workspace.organization_id
+        if self.poison_summary is not None:
+            return (self.poison_summary,)
+        return self.seed_demo_evidence(context, workspace)
 
     def run(
         self,
@@ -188,3 +212,70 @@ def test_latest_projection_is_tenant_bound_and_reloadable() -> None:
 
     assert response.status_code == 200
     assert response.json()["projection"]["run_id"] == "council_run_01"
+
+
+def test_demo_evidence_route_persists_explicit_synthetic_workspace_records() -> None:
+    client, runtime = _client()
+    organization, workspace, headers = _setup(client)
+
+    response = client.post(
+        f"/api/organizations/{organization}/workspaces/{workspace}/demo-evidence",
+        headers=headers,
+        json={"confirm": "synthetic_demo"},
+    )
+
+    assert response.status_code == 201
+    assert response.json() == {
+        "provenance": "synthetic_demo",
+        "evidence": [
+            {
+                "evidence_id": "evidence_demo_market_validation",
+                "title": "Synthetic demo · Market validation",
+                "status": "ready",
+                "provenance": "synthetic_demo",
+            },
+            {
+                "evidence_id": "evidence_demo_financial_runway",
+                "title": "Synthetic demo · Financial runway",
+                "status": "ready",
+                "provenance": "synthetic_demo",
+            },
+        ],
+    }
+    assert runtime.demo_seeded == (organization, workspace)
+
+
+def test_evidence_route_lists_safe_summaries_without_model_visible_text() -> None:
+    client, _runtime = _client()
+    organization, workspace, _headers = _setup(client)
+
+    response = client.get(
+        f"/api/organizations/{organization}/workspaces/{workspace}/evidence"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["evidence"][0]["provenance"] == "synthetic_demo"
+    assert "sanitized_text" not in response.text
+
+
+def test_evidence_route_rejects_attacker_dispatched_serialization_hooks() -> None:
+    client, runtime = _client()
+    organization, workspace, _headers = _setup(client)
+    calls = []
+
+    class PoisonSummary:
+        def model_dump(self, *, mode: str):
+            calls.append(mode)
+            return {"private": "PRIVATE-RUNTIME-SENTINEL"}
+
+    runtime.poison_summary = PoisonSummary()
+
+    response = client.get(
+        f"/api/organizations/{organization}/workspaces/{workspace}/evidence"
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {"error": "evidence_unavailable"}
+    assert calls == []
+    assert "PRIVATE-RUNTIME-SENTINEL" not in response.text

@@ -108,9 +108,16 @@
                   <textarea id="council-objective" name="objective" rows="3" minlength="10" maxlength="2000" required>Assess whether HumanWire is ready for a limited launch, identify the strongest evidence, surface material risks, and recommend the exact next human decision.</textarea>
                   <div>
                     <span>Uses tenant-scoped evidence only. Agents cannot approve or send messages.</span>
-                    <button class="decisionos-primary-button" type="submit" data-run-council>Run Agent Council</button>
+                    <div class="decisionos-council__actions">
+                      <button class="decisionos-secondary-button" type="button" data-demo-evidence>Load demo company</button>
+                      <button class="decisionos-primary-button" type="submit" data-run-council>Run Agent Council</button>
+                    </div>
                   </div>
                 </form>
+                <div class="decisionos-demo-disclosure" data-demo-disclosure hidden>
+                  <strong>Synthetic demo evidence</strong>
+                  <span>Fictional company records for this demonstration—not real HumanWire facts.</span>
+                </div>
                 <ol class="decisionos-council__flow" data-council-flow>
                   <li data-specialist="market_intelligence"><span>1</span><strong>Market Intelligence</strong><small>Waiting</small></li>
                   <li data-specialist="financial_analysis"><span>2</span><strong>Financial Analysis</strong><small>Waiting</small></li>
@@ -144,7 +151,7 @@
               <section class="decisionos-evidence-preview" aria-labelledby="evidence-title">
                 <h2 id="evidence-title">Evidence that changes the decision</h2>
                 <p>Source-backed inputs appear here as the team adds them.</p>
-                <ul>
+                <ul data-evidence-preview-list>
                   <li><strong>Market validation</strong><span>No evidence added</span></li>
                   <li><strong>Financial runway</strong><span>No evidence added</span></li>
                   <li><strong>Customer proof</strong><span>No evidence added</span></li>
@@ -174,15 +181,84 @@
           <h1>Decisions</h1>
           <p>Decisions created in this workspace will appear here with evidence and approval status.</p>
           <button class="decisionos-primary-button" type="button" data-new-decision>New decision</button>
+          <article class="decisionos-latest-decision" data-latest-decision hidden>
+            <div>
+              <p class="decisionos-eyebrow">Latest saved council decision</p>
+              <span class="decisionos-decision-state" data-latest-decision-state></span>
+            </div>
+            <h2 data-latest-decision-objective></h2>
+            <p data-latest-decision-summary></p>
+            <code data-latest-decision-run></code>
+          </article>
         </section>
 
         <section data-panel="evidence" hidden>
-          <h1>Evidence</h1>
-          <p>Source material remains organization-scoped and connected to the decisions it supports.</p>
+          <div class="decisionos-panel-heading">
+            <div>
+              <h1>Evidence</h1>
+              <p>Source material remains organization-scoped and connected to the decisions it supports.</p>
+            </div>
+            <button class="decisionos-secondary-button" type="button" data-demo-evidence>Load demo company</button>
+          </div>
+          <div class="decisionos-demo-disclosure" data-demo-disclosure hidden>
+            <strong>Synthetic demo evidence</strong>
+            <span>Fictional company records for this demonstration—not real HumanWire facts.</span>
+          </div>
+          <ul class="decisionos-evidence-list" data-evidence-list>
+            <li data-evidence-empty>No evidence records are ready yet.</li>
+          </ul>
         </section>
 
         <section data-panel="team" hidden>
           <h1>Team</h1>
+          <p>AI specialists prepare the decision package; invited people retain approval authority.</p>
+          <section class="decisionos-agent-team" aria-labelledby="agent-team-title">
+            <div class="decisionos-agent-team__heading">
+              <div>
+                <p class="decisionos-eyebrow">Google ADK · Gemini</p>
+                <h2 id="agent-team-title">AI operating team</h2>
+              </div>
+              <span>7 active specialists</span>
+            </div>
+            <div class="decisionos-agent-grid">
+              <article data-agent-profile="market_intelligence">
+                <div><strong>Market Intelligence AI</strong><span data-agent-live-status>Ready</span></div>
+                <p>Tests customer and market claims against cited workspace evidence.</p>
+                <dl><div><dt>Model</dt><dd>Gemini</dd></div><div><dt>Tools</dt><dd>Read-only evidence</dd></div><div><dt>Current task</dt><dd data-agent-current-task>Ready for assignment</dd></div></dl>
+              </article>
+              <article data-agent-profile="financial_analysis">
+                <div><strong>Financial Analysis AI</strong><span data-agent-live-status>Ready</span></div>
+                <p>Checks runway, financial coherence, and bounded operating assumptions.</p>
+                <dl><div><dt>Model</dt><dd>Gemini</dd></div><div><dt>Tools</dt><dd>Read-only evidence</dd></div><div><dt>Current task</dt><dd data-agent-current-task>Ready for assignment</dd></div></dl>
+              </article>
+              <article data-agent-profile="product_technical">
+                <div><strong>Product &amp; Technical AI</strong><span data-agent-live-status>Ready</span></div>
+                <p>Evaluates readiness, differentiation, and technical execution risk.</p>
+                <dl><div><dt>Model</dt><dd>Gemini</dd></div><div><dt>Tools</dt><dd>Read-only evidence</dd></div><div><dt>Current task</dt><dd data-agent-current-task>Ready for assignment</dd></div></dl>
+              </article>
+              <article data-agent-profile="risk_compliance">
+                <div><strong>Risk &amp; Compliance AI</strong><span data-agent-live-status>Ready</span></div>
+                <p>Surfaces operational, legal, security, and policy gaps.</p>
+                <dl><div><dt>Model</dt><dd>Gemini</dd></div><div><dt>Tools</dt><dd>Read-only evidence</dd></div><div><dt>Current task</dt><dd data-agent-current-task>Ready for assignment</dd></div></dl>
+              </article>
+              <article data-agent-profile="decision_synthesis">
+                <div><strong>Decision Synthesis AI</strong><span data-agent-live-status>Ready</span></div>
+                <p>Combines specialist handoffs into one evidence-bound recommendation.</p>
+                <dl><div><dt>Model</dt><dd>Gemini</dd></div><div><dt>Inputs</dt><dd>Four specialist handoffs</dd></div><div><dt>Current task</dt><dd data-agent-current-task>Ready for assignment</dd></div></dl>
+              </article>
+              <article data-agent-profile="red_team">
+                <div><strong>Red Team AI</strong><span data-agent-live-status>Ready</span></div>
+                <p>Challenges unsupported claims, contradictions, and unsafe conclusions.</p>
+                <dl><div><dt>Model</dt><dd>Gemini</dd></div><div><dt>Inputs</dt><dd>Draft recommendation</dd></div><div><dt>Current task</dt><dd data-agent-current-task>Ready for assignment</dd></div></dl>
+              </article>
+              <article data-agent-profile="final_synthesis">
+                <div><strong>Final Synthesis AI</strong><span data-agent-live-status>Ready</span></div>
+                <p>Resolves the challenge and prepares the exact human-review digest.</p>
+                <dl><div><dt>Model</dt><dd>Gemini</dd></div><div><dt>Inputs</dt><dd>Draft plus challenge</dd></div><div><dt>Current task</dt><dd data-agent-current-task>Ready for assignment</dd></div></dl>
+              </article>
+            </div>
+          </section>
+          <h2 class="decisionos-human-team-title">Human access</h2>
           <p>Invite contributors, approvers, and viewers without transferring owner authority.</p>
           <form class="decisionos-invite-form" data-invite-member>
             <label for="invitation-role">Invitation role</label>

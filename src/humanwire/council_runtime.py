@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Protocol
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict
 
@@ -17,8 +18,10 @@ from humanwire.council_models import CouncilRunRequest
 from humanwire.council_projection import CouncilProjection, build_council_projection
 from humanwire.council_tools import (
     CouncilEvidenceRecord,
+    CouncilEvidenceStatus,
     CouncilPriorDecision,
     CouncilToolContext,
+    _canonical_record,
     list_evidence,
 )
 from humanwire.decisionos_models import DecisionOSContext, DecisionWorkspace
@@ -43,6 +46,75 @@ class CouncilRunOutput(_RuntimeModel):
     run_id: str
     projection: CouncilProjection
     gateway: CouncilGatewayResult
+
+
+class CouncilEvidenceSummary(_RuntimeModel):
+    evidence_id: str
+    title: str
+    status: Literal["ready"] = "ready"
+    provenance: Literal["workspace", "synthetic_demo"]
+
+
+_DEMO_EVIDENCE = (
+    (
+        "evidence_demo_market_validation",
+        "Synthetic demo · Market validation",
+        "Synthetic demo evidence. Twelve fictional customer interviews identified a recurring need for auditable multi-team decisions, and eight fictional design partners agreed to a limited pilot.",
+    ),
+    (
+        "evidence_demo_customer_signal",
+        "Synthetic demo · Customer signal",
+        "Synthetic demo evidence. Eight fictional design partners completed onboarding, five reached a saved decision, and three requested a paid pilot; these figures exist only for this product demonstration.",
+    ),
+    (
+        "evidence_demo_financial_runway",
+        "Synthetic demo · Financial runway",
+        "Synthetic demo evidence. A fictional operating model assumes 500000 USD cash, 35000 USD monthly burn, and approximately fourteen months of runway for a bounded launch.",
+    ),
+    (
+        "evidence_demo_product_readiness",
+        "Synthetic demo · Product readiness",
+        "Synthetic demo evidence. A fictional release candidate passed 94 percent of 120 acceptance scenarios; audit export and approval controls passed, while enterprise directory sync remains a monitored rollout item.",
+    ),
+    (
+        "evidence_demo_risk_register",
+        "Synthetic demo · Risk and compliance",
+        "Synthetic demo evidence. A fictional risk review marks privacy notice, access logging, and incident response ready for a limited pilot; third-party penetration testing remains required before a broad launch.",
+    ),
+)
+
+
+def build_demo_evidence_records(
+    organization_id: str,
+    workspace_id: str,
+) -> tuple[CouncilEvidenceRecord, ...]:
+    """Build a deterministic, explicitly fictional evidence package for product demos."""
+
+    return tuple(
+        CouncilEvidenceRecord(
+            organization_id=organization_id,
+            workspace_id=workspace_id,
+            evidence_id=evidence_id,
+            title=title,
+            sanitized_text=text,
+            source_digest=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            extraction_version="extract-v1",
+            status=CouncilEvidenceStatus.READY,
+        )
+        for evidence_id, title, text in _DEMO_EVIDENCE
+    )
+
+
+def _summary(record: CouncilEvidenceRecord) -> CouncilEvidenceSummary:
+    return CouncilEvidenceSummary(
+        evidence_id=record.evidence_id,
+        title=record.title,
+        provenance=(
+            "synthetic_demo"
+            if record.evidence_id.startswith("evidence_demo_")
+            else "workspace"
+        ),
+    )
 
 
 class CouncilRunStore(Protocol):
@@ -420,6 +492,17 @@ class FirestoreCouncilEvidenceRegistry:
         )
         return CouncilPriorDecision.model_validate(row.to_dict()) if row.exists else None
 
+    def seed_demo_evidence(
+        self,
+        organization_id: str,
+        workspace_id: str,
+    ) -> tuple[CouncilEvidenceRecord, ...]:
+        records = build_demo_evidence_records(organization_id, workspace_id)
+        collection = self._collection(organization_id, workspace_id)
+        for record in records:
+            collection.document(record.evidence_id).set(record.model_dump(mode="json"))
+        return records
+
 
 RunnerFactory = Callable[[CouncilToolContext], GoogleCouncilRunner]
 
@@ -543,6 +626,75 @@ class DecisionOSCouncilRuntime:
             self._clock(),
         )
         return output
+
+    def seed_demo_evidence(
+        self,
+        context: DecisionOSContext,
+        workspace: DecisionWorkspace,
+    ) -> tuple[CouncilEvidenceSummary, ...]:
+        canonical_context = DecisionOSContext.model_validate(context)
+        canonical_workspace = DecisionWorkspace.model_validate(workspace)
+        require_permission(canonical_context, DecisionOSPermission.CONTRIBUTE)
+        if canonical_workspace.organization_id != canonical_context.organization_id:
+            raise CouncilRuntimeUnavailable()
+        writer = getattr(self._evidence_registry, "seed_demo_evidence", None)
+        if not callable(writer):
+            raise CouncilRuntimeUnavailable()
+        failed = False
+        raw_records: object = None
+        try:
+            raw_records = writer(
+                canonical_context.organization_id,
+                canonical_workspace.workspace_id,
+            )
+        except Exception:  # noqa: BLE001 - provider details remain private
+            failed = True
+        if failed or type(raw_records) is not tuple or len(raw_records) != len(
+            _DEMO_EVIDENCE
+        ):
+            raise CouncilRuntimeUnavailable() from None
+        records: list[CouncilEvidenceRecord] = []
+        for raw in raw_records:
+            record = _canonical_record(raw, CouncilEvidenceRecord)
+            if (
+                record is None
+                or record.organization_id != canonical_context.organization_id
+                or record.workspace_id != canonical_workspace.workspace_id
+                or not record.evidence_id.startswith("evidence_demo_")
+                or record.status is not CouncilEvidenceStatus.READY
+            ):
+                raise CouncilRuntimeUnavailable() from None
+            records.append(record)
+        return tuple(_summary(record) for record in records)
+
+    def list_evidence(
+        self,
+        context: DecisionOSContext,
+        workspace: DecisionWorkspace,
+    ) -> tuple[CouncilEvidenceSummary, ...]:
+        canonical_context = DecisionOSContext.model_validate(context)
+        canonical_workspace = DecisionWorkspace.model_validate(workspace)
+        require_permission(canonical_context, DecisionOSPermission.READ_WORKSPACE)
+        if canonical_workspace.organization_id != canonical_context.organization_id:
+            raise CouncilRuntimeUnavailable()
+        tool_context = CouncilToolContext(
+            context=canonical_context,
+            workspace_id=canonical_workspace.workspace_id,
+            registry=self._evidence_registry,
+        )
+        catalog = list_evidence(tool_context)
+        return tuple(
+            CouncilEvidenceSummary(
+                evidence_id=item.evidence_id,
+                title=item.title,
+                provenance=(
+                    "synthetic_demo"
+                    if item.evidence_id.startswith("evidence_demo_")
+                    else "workspace"
+                ),
+            )
+            for item in catalog.items
+        )
 
     def load_latest(
         self,

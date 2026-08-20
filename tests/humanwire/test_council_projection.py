@@ -9,7 +9,11 @@ from humanwire.council_models import (
     EvidenceClaim,
 )
 from humanwire.council_projection import build_council_projection
-from humanwire.council_runtime import FirestoreCouncilRunStore
+from humanwire.council_runtime import (
+    FirestoreCouncilEvidenceRegistry,
+    FirestoreCouncilRunStore,
+    build_demo_evidence_records,
+)
 from humanwire.decisionos_models import (
     DecisionOSContext,
     DecisionOSPrincipal,
@@ -255,3 +259,58 @@ def test_firestore_latest_restores_strict_projection_from_json_arrays() -> None:
     restored = FirestoreCouncilRunStore(Client()).load_latest(context, workspace_id)
 
     assert restored == projection
+
+
+def test_demo_evidence_records_are_stable_explicit_and_safe() -> None:
+    organization_id = "org_01HQ7XK9WPH4Y8ZQK3R2N1M6AA"
+    workspace_id = "wrk_01HQ7XK9WPH4Y8ZQK3R2N1M6AA"
+
+    first = build_demo_evidence_records(organization_id, workspace_id)
+    second = build_demo_evidence_records(organization_id, workspace_id)
+
+    assert first == second
+    assert len(first) == 5
+    assert all(item.evidence_id.startswith("evidence_demo_") for item in first)
+    assert all(item.title.startswith("Synthetic demo · ") for item in first)
+    assert all(item.sanitized_text.startswith("Synthetic demo evidence. ") for item in first)
+    assert all("@" not in item.sanitized_text for item in first)
+
+
+def test_firestore_demo_evidence_is_persisted_as_real_workspace_records() -> None:
+    organization_id = "org_01HQ7XK9WPH4Y8ZQK3R2N1M6AA"
+    workspace_id = "wrk_01HQ7XK9WPH4Y8ZQK3R2N1M6AA"
+
+    class Reference:
+        def __init__(self, client, path):
+            self._client = client
+            self._path = path
+
+        def collection(self, name):
+            return Collection(self._client, (*self._path, name))
+
+        def set(self, payload):
+            self._client.rows[self._path] = payload
+
+    class Collection:
+        def __init__(self, client, path):
+            self._client = client
+            self._path = path
+
+        def document(self, identifier):
+            return Reference(self._client, (*self._path, identifier))
+
+    class Client:
+        def __init__(self):
+            self.rows = {}
+
+        def collection(self, name):
+            return Collection(self, (name,))
+
+    client = Client()
+    registry = FirestoreCouncilEvidenceRegistry(client)
+    records = registry.seed_demo_evidence(organization_id, workspace_id)
+
+    assert len(records) == 5
+    assert len(client.rows) == 5
+    assert all(row["status"] == "ready" for row in client.rows.values())
+    assert all(row["organization_id"] == organization_id for row in client.rows.values())

@@ -710,6 +710,30 @@ a:focus-visible {
   font-size: 14px;
 }
 
+.decisionos-council__actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 10px;
+}
+
+.decisionos-demo-disclosure {
+  display: flex;
+  margin: 0 0 20px;
+  padding: 12px 14px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  border: 1px solid #d6a74a;
+  border-radius: 8px;
+  color: #5d481b;
+  background: #fff9e9;
+  font-size: 14px;
+}
+
+.decisionos-demo-disclosure[hidden] {
+  display: none;
+}
+
 .decisionos-council__flow {
   display: grid;
   margin: 0;
@@ -1042,6 +1066,161 @@ a:focus-visible {
   font-size: 14px;
 }
 
+.decisionos-panel-heading,
+.decisionos-agent-team__heading,
+.decisionos-latest-decision > div {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.decisionos-panel-heading {
+  margin-bottom: 24px;
+}
+
+.decisionos-panel-heading h1,
+.decisionos-panel-heading p,
+.decisionos-agent-team__heading h2,
+.decisionos-agent-team__heading p {
+  margin-top: 0;
+}
+
+.decisionos-evidence-list {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  gap: 10px;
+  list-style: none;
+}
+
+.decisionos-evidence-list li,
+.decisionos-latest-decision,
+.decisionos-agent-grid article {
+  border: 1px solid var(--decisionos-line);
+  border-radius: 10px;
+  background: var(--decisionos-white);
+}
+
+.decisionos-evidence-list li {
+  display: flex;
+  min-height: 64px;
+  padding: 14px 16px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  font-size: 14px;
+}
+
+.decisionos-evidence-list li span {
+  color: var(--decisionos-muted);
+}
+
+.decisionos-latest-decision {
+  max-width: 900px;
+  margin-top: 24px;
+  padding: 22px;
+  box-shadow: 0 12px 28px rgb(6 21 47 / 7%);
+}
+
+.decisionos-latest-decision h2 {
+  margin: 18px 0 8px;
+  font-size: 20px;
+}
+
+.decisionos-latest-decision code {
+  display: inline-block;
+  margin-top: 12px;
+  color: var(--decisionos-muted);
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.decisionos-decision-state,
+.decisionos-agent-team__heading > span,
+.decisionos-agent-grid article > div > span {
+  display: inline-flex;
+  min-height: 32px;
+  padding: 0 10px;
+  align-items: center;
+  border: 1px solid #b8dff4;
+  border-radius: 999px;
+  color: #075c91;
+  background: #eef9ff;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.decisionos-agent-team {
+  margin-top: 28px;
+  padding: 22px;
+  border: 1px solid #b8dff4;
+  border-radius: 12px;
+  background: #f7fcff;
+}
+
+.decisionos-agent-grid {
+  display: grid;
+  margin-top: 18px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 14px;
+}
+
+.decisionos-agent-grid article {
+  padding: 16px;
+}
+
+.decisionos-agent-grid article > div {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.decisionos-agent-grid article > p {
+  min-height: 48px;
+  color: var(--decisionos-muted);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.decisionos-agent-grid dl {
+  display: grid;
+  margin: 14px 0 0;
+  gap: 8px;
+}
+
+.decisionos-agent-grid dl > div {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr);
+  gap: 10px;
+  font-size: 14px;
+}
+
+.decisionos-agent-grid dt {
+  color: var(--decisionos-muted);
+  font-weight: 700;
+}
+
+.decisionos-agent-grid dd {
+  margin: 0;
+}
+
+.decisionos-agent-grid article[data-status="running"] {
+  border-color: var(--decisionos-cyan);
+  box-shadow: 0 0 0 3px rgb(6 185 237 / 12%);
+}
+
+.decisionos-agent-grid article[data-status="complete"] > div > span {
+  border-color: #9fd8bc;
+  color: #12643f;
+  background: #eefaf4;
+}
+
+.decisionos-human-team-title {
+  margin-top: 34px;
+}
+
 @media (max-width: 1180px) {
   .decisionos-login {
     grid-template-columns: minmax(0, 1.3fr) minmax(380px, 0.8fr);
@@ -1152,6 +1331,23 @@ a:focus-visible {
 }
 
 @media (max-width: 759px) {
+  .decisionos-council__actions,
+  .decisionos-panel-heading,
+  .decisionos-agent-team__heading,
+  .decisionos-latest-decision > div {
+    width: 100%;
+    flex-direction: column;
+  }
+
+  .decisionos-agent-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .decisionos-evidence-list li {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
   .decisionos-brandbar {
     padding: 0 18px;
   }

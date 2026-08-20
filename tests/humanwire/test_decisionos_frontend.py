@@ -78,6 +78,16 @@ def test_workspace_shell_has_real_navigation_and_authority_regions() -> None:
         "Evidence that changes the decision",
         "Decision authority",
         "Human approval required",
+        "Load demo company",
+        "Synthetic demo evidence",
+        "AI operating team",
+        "Market Intelligence AI",
+        "Financial Analysis AI",
+        "Product & Technical AI",
+        "Risk & Compliance AI",
+        "Decision Synthesis AI",
+        "Red Team AI",
+        "Final Synthesis AI",
     ):
         assert label in visible
     assert "data-organization-list" in source
@@ -86,6 +96,10 @@ def test_workspace_shell_has_real_navigation_and_authority_regions() -> None:
     assert "data-create-workspace" in source
     assert "data-invite-member" in source
     assert "data-sign-out" in source
+    assert source.count("data-agent-profile=") == 7
+    assert "data-demo-evidence" in source
+    assert "data-evidence-list" in source
+    assert "data-latest-decision" in source
 
 
 def test_css_matches_the_locked_decisionos_design_system() -> None:
@@ -188,3 +202,16 @@ def test_google_popup_returns_into_the_server_session_boundary() -> None:
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout == "decisionos frontend harness: PASS\n"
+
+
+def test_council_frontend_paces_activity_and_synchronizes_team_and_decision() -> None:
+    completed = subprocess.run(
+        ["node", "tests/humanwire/decisionos_council_demo_harness.js"],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "decisionos council demo harness: PASS\n"

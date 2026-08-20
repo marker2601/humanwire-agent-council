@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from fastapi import FastAPI, Request
 from fastapi.responses import (
@@ -89,8 +89,9 @@ _MUTATION_PATHS = (
     re.compile(rf"^/api/organizations/{_ORGANIZATION_ID}/invitations$"),
     re.compile(rf"^/api/organizations/{_ORGANIZATION_ID}/workspaces$"),
 )
-_COUNCIL_RUN_PATH = re.compile(
-    rf"^/api/organizations/{_ORGANIZATION_ID}/workspaces/{_WORKSPACE_ID}/council-runs$"
+_COUNCIL_MUTATION_PATH = re.compile(
+    rf"^/api/organizations/{_ORGANIZATION_ID}/workspaces/{_WORKSPACE_ID}/"
+    r"(?:council-runs|demo-evidence)$"
 )
 _ORGANIZATION_ROUTE_PROFILES = (
     (
@@ -199,6 +200,10 @@ class DecisionOSCouncilRuntime(Protocol):
     ) -> CouncilRunOutput: ...
 
     def load_latest(self, context, workspace_id: str) -> CouncilProjection | None: ...
+
+    def seed_demo_evidence(self, context, workspace) -> tuple[object, ...]: ...
+
+    def list_evidence(self, context, workspace) -> tuple[object, ...]: ...
 
 
 @dataclass(frozen=True)
@@ -313,6 +318,45 @@ class _CouncilRunBody(_BodyModel):
     objective: str = Field(min_length=10, max_length=2_000)
 
 
+class _DemoEvidenceBody(_BodyModel):
+    confirm: Literal["synthetic_demo"]
+
+
+def _council_evidence_payload(value: object) -> list[dict[str, str]]:
+    from humanwire.council_runtime import CouncilEvidenceSummary
+
+    if type(value) is not tuple or len(value) > 100:
+        raise ValueError("evidence summary boundary is invalid")
+    rows: list[dict[str, str]] = []
+    expected = {"evidence_id", "title", "status", "provenance"}
+    for item in value:
+        if type(item) is not CouncilEvidenceSummary:
+            raise ValueError("evidence summary boundary is invalid")
+        values = object.__getattribute__(item, "__dict__")
+        extra = object.__getattribute__(item, "__pydantic_extra__")
+        private = object.__getattribute__(item, "__pydantic_private__")
+        if (
+            type(values) is not dict
+            or set(dict.__iter__(values)) != expected
+            or extra is not None
+            and (type(extra) is not dict or dict.__len__(extra) != 0)
+            or private is not None
+            and (type(private) is not dict or dict.__len__(private) != 0)
+        ):
+            raise ValueError("evidence summary boundary is invalid")
+        payload = {name: dict.__getitem__(values, name) for name in expected}
+        canonical = CouncilEvidenceSummary.model_validate(payload, strict=True)
+        rows.append(
+            {
+                "evidence_id": canonical.evidence_id,
+                "title": canonical.title,
+                "status": canonical.status,
+                "provenance": canonical.provenance,
+            }
+        )
+    return rows
+
+
 def _fixed_error(status_code: int, code: str) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"error": code})
 
@@ -383,7 +427,7 @@ def _is_exact_mutation(request: Request, *, council_enabled: bool = False) -> bo
         and (
             any(pattern.fullmatch(path) for pattern in _MUTATION_PATHS)
             or council_enabled
-            and _COUNCIL_RUN_PATH.fullmatch(path) is not None
+            and _COUNCIL_MUTATION_PATH.fullmatch(path) is not None
         )
     )
 
@@ -493,7 +537,7 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
             council_mutation = (
                 dependencies.council_features_enabled
                 and request.method == "POST"
-                and _COUNCIL_RUN_PATH.fullmatch(request.url.path) is not None
+                and _COUNCIL_MUTATION_PATH.fullmatch(request.url.path) is not None
             )
             hosts = _raw_headers(request, b"host")
             host = _ascii_header(hosts)
@@ -820,6 +864,66 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
 
     if dependencies.council_features_enabled:
         assert dependencies.council_runtime is not None
+
+        @app.api_route(
+            "/api/organizations/{organization_id}/workspaces/{workspace_id}/evidence",
+            methods=["GET", "HEAD"],
+        )
+        def list_council_evidence(
+            organization_id: str,
+            workspace_id: str,
+            request: Request,
+        ) -> Response:
+            principal = _principal(request, dependencies.authenticator)
+            if principal is None:
+                return _fixed_error(401, "authentication_required")
+            try:
+                context = dependencies.repository.load_context(principal, organization_id)
+                workspace = dependencies.repository.load_workspace(context, workspace_id)
+                evidence = dependencies.council_runtime.list_evidence(context, workspace)
+                evidence_payload = _council_evidence_payload(evidence)
+            except OrganizationUnavailable:
+                return _fixed_error(404, "organization_not_found")
+            except WorkspaceUnavailable:
+                return _fixed_error(404, "workspace_not_found")
+            except Exception:  # noqa: BLE001 - durable details stay private
+                return _fixed_error(500, "evidence_unavailable")
+            return JSONResponse(content={"evidence": evidence_payload})
+
+        @app.post(
+            "/api/organizations/{organization_id}/workspaces/{workspace_id}/demo-evidence"
+        )
+        async def seed_council_demo_evidence(
+            organization_id: str,
+            workspace_id: str,
+            request: Request,
+        ) -> Response:
+            body = await _body(request, _DemoEvidenceBody)
+            principal = _principal(request, dependencies.authenticator)
+            if not isinstance(body, _DemoEvidenceBody) or principal is None:
+                return _fixed_error(400, "invalid_request")
+            try:
+                context = dependencies.repository.load_context(principal, organization_id)
+                workspace = dependencies.repository.load_workspace(context, workspace_id)
+                evidence = dependencies.council_runtime.seed_demo_evidence(
+                    context, workspace
+                )
+                evidence_payload = _council_evidence_payload(evidence)
+            except OrganizationUnavailable:
+                return _fixed_error(404, "organization_not_found")
+            except WorkspaceUnavailable:
+                return _fixed_error(404, "workspace_not_found")
+            except DecisionOSAuthorizationDenied:
+                return _fixed_error(403, "authorization_denied")
+            except Exception:  # noqa: BLE001 - durable details stay private
+                return _fixed_error(500, "evidence_unavailable")
+            return JSONResponse(
+                status_code=201,
+                content={
+                    "provenance": "synthetic_demo",
+                    "evidence": evidence_payload,
+                },
+            )
 
         @app.api_route(
             "/api/organizations/{organization_id}/workspaces/{workspace_id}/council-runs/latest",

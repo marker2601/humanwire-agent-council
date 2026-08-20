@@ -1,12 +1,14 @@
 (function decisionOSWorkspace(global) {
   "use strict";
 
+  const COUNCIL_ACTIVITY_DELAY_MS = 1400;
   const state = {
     organizations: [],
     workspaces: [],
     activeOrganizationId: "",
     activeWorkspaceId: "",
     councilRunning: false,
+    evidence: [],
   };
 
   function element(selector) {
@@ -194,6 +196,23 @@
                 ? "Blocked"
                 : "Waiting";
     }
+    const profile = element(`[data-agent-profile="${specialistId}"]`);
+    if (!profile) return;
+    profile.dataset.status = status;
+    const profileStatus = profile.querySelector("[data-agent-live-status]");
+    const task = profile.querySelector("[data-agent-current-task]");
+    const copy =
+      status === "complete"
+        ? ["Complete", "Handoff saved"]
+        : status === "running"
+          ? ["Working", "Reviewing workspace evidence"]
+          : status === "failed"
+            ? ["Stopped", "Last safe state retained"]
+            : status === "blocked"
+              ? ["Blocked", "Waiting for human resolution"]
+              : ["Ready", "Ready for assignment"];
+    if (profileStatus) profileStatus.textContent = copy[0];
+    if (task) task.textContent = copy[1];
   }
 
   function resetCouncilView() {
@@ -219,10 +238,72 @@
     const name = global.document.createElement("strong");
     const detail = global.document.createElement("span");
     name.textContent = event.display_name;
-    detail.textContent = event.status === "completed" ? "Completed" : "Started";
+    const handoffs = {
+      market_intelligence: "Decision Synthesis",
+      financial_analysis: "Decision Synthesis",
+      product_technical: "Decision Synthesis",
+      risk_compliance: "Decision Synthesis",
+      decision_synthesis: "Red Team",
+      red_team: "Final Synthesis",
+      final_synthesis: "Human review",
+    };
+    detail.textContent =
+      event.status === "completed"
+        ? `Completed · handoff to ${handoffs[event.specialist_id] || "next stage"}`
+        : "Started · reviewing assigned inputs";
     row.append(name, detail);
     activity.append(row);
     row.scrollIntoView?.({block: "nearest", behavior: "auto"});
+  }
+
+  function renderLatestDecision(projection) {
+    const card = element("[data-latest-decision]");
+    if (!card || !projection?.recommendation_summary) return;
+    const status = element("[data-latest-decision-state]");
+    const objective = element("[data-latest-decision-objective]");
+    const summary = element("[data-latest-decision-summary]");
+    const run = element("[data-latest-decision-run]");
+    if (status) {
+      const value = projection.state.replaceAll("_", " ");
+      status.textContent = value.charAt(0).toUpperCase() + value.slice(1);
+    }
+    if (objective) objective.textContent = projection.objective;
+    if (summary) summary.textContent = projection.recommendation_summary;
+    if (run) run.textContent = projection.run_id;
+    card.hidden = false;
+  }
+
+  function renderEvidence(evidence) {
+    state.evidence = Array.isArray(evidence) ? evidence : [];
+    const hasDemo = state.evidence.some(
+      (item) => item?.provenance === "synthetic_demo",
+    );
+    for (const disclosure of elements("[data-demo-disclosure]")) {
+      disclosure.hidden = !hasDemo;
+    }
+    for (const selector of ["[data-evidence-preview-list]", "[data-evidence-list]"]) {
+      const list = element(selector);
+      if (!list) continue;
+      list.replaceChildren();
+      for (const item of state.evidence) {
+        if (!item || typeof item.title !== "string") continue;
+        const row = global.document.createElement("li");
+        const title = global.document.createElement("strong");
+        const detail = global.document.createElement("span");
+        title.textContent = item.title;
+        detail.textContent =
+          item.provenance === "synthetic_demo"
+            ? "Ready · synthetic demo record"
+            : "Ready · workspace evidence";
+        row.append(title, detail);
+        list.append(row);
+      }
+      if (!list.children.length) {
+        const row = global.document.createElement("li");
+        row.textContent = "No evidence records are ready yet.";
+        list.append(row);
+      }
+    }
   }
 
   function renderClaimList(selector, claims, emptyLabel) {
@@ -260,6 +341,7 @@
     if (stateLabel) {
       stateLabel.textContent = projection.state.replaceAll("_", " ");
     }
+    renderLatestDecision(projection);
     if (!projection.recommendation_summary) return;
     const summary = element("[data-recommendation-summary]");
     const action = element("[data-recommended-action]");
@@ -304,6 +386,39 @@
     }
   }
 
+  async function loadEvidence() {
+    if (!state.activeOrganizationId || !state.activeWorkspaceId) return;
+    const result = await getJSON(
+      `/api/organizations/${state.activeOrganizationId}/workspaces/${state.activeWorkspaceId}/evidence`,
+    );
+    renderEvidence(result.evidence || []);
+  }
+
+  async function loadDemoEvidence() {
+    if (!state.activeOrganizationId || !state.activeWorkspaceId) return;
+    const buttons = elements("[data-demo-evidence]");
+    for (const button of buttons) button.disabled = true;
+    setStatus("Creating a clearly labeled synthetic demo company…");
+    try {
+      const result = await postJSON(
+        `/api/organizations/${state.activeOrganizationId}/workspaces/${state.activeWorkspaceId}/demo-evidence`,
+        {confirm: "synthetic_demo"},
+      );
+      renderEvidence(result.evidence || []);
+      setStatus("Synthetic demo evidence is ready. Run the Agent Council to watch the team work.");
+    } catch (_error) {
+      setStatus("The demo company could not be created. Try again.", "error");
+    } finally {
+      for (const button of buttons) button.disabled = false;
+    }
+  }
+
+  function waitForCouncilActivity() {
+    return new Promise((resolve) => {
+      global.setTimeout(resolve, COUNCIL_ACTIVITY_DELAY_MS);
+    });
+  }
+
   async function consumeCouncilStream(reader) {
     const decoder = new TextDecoder();
     let buffer = "";
@@ -321,6 +436,7 @@
           if (stateLabel) stateLabel.textContent = "Running";
         } else if (envelope.type === "activity") {
           appendCouncilActivity(envelope.event);
+          await waitForCouncilActivity();
         } else if (envelope.type === "complete") {
           terminal = true;
           renderCouncilProjection(envelope.projection);
@@ -375,6 +491,7 @@
     state.activeWorkspaceId = state.workspaces[0]?.workspace_id || "";
     renderWorkspace();
     await loadLatestCouncil();
+    await loadEvidence().catch(() => renderEvidence([]));
   }
 
   async function loadOrganizations() {
@@ -518,6 +635,9 @@
     for (const target of elements("[data-open-invite]")) {
       target.addEventListener("click", () => setPanel("team"));
     }
+    for (const target of elements("[data-demo-evidence]")) {
+      target.addEventListener("click", loadDemoEvidence);
+    }
     for (const target of elements("[data-playbook]")) {
       target.addEventListener("click", choosePlaybook);
     }
@@ -544,7 +664,10 @@
 
   global.HumanWireDecisionOSApp = Object.freeze({
     loadOrganizations,
+    consumeCouncilStream,
+    loadDemoEvidence,
     postJSON,
+    renderEvidence,
     runCouncil,
     renderCouncilProjection,
     setPanel,
