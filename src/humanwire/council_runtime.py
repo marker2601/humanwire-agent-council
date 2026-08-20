@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import secrets
 import threading
 import time
@@ -366,7 +367,14 @@ class FirestoreCouncilRunStore:
         if type(projection) is not dict:
             return None
         try:
-            return CouncilProjection.model_validate(projection)
+            payload = json.dumps(
+                projection,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            return CouncilProjection.model_validate_json(payload)
         except Exception:  # noqa: BLE001 - corrupt private state fails closed
             raise CouncilRuntimeUnavailable() from None
 

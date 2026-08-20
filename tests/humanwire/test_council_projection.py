@@ -9,6 +9,14 @@ from humanwire.council_models import (
     EvidenceClaim,
 )
 from humanwire.council_projection import build_council_projection
+from humanwire.council_runtime import FirestoreCouncilRunStore
+from humanwire.decisionos_models import (
+    DecisionOSContext,
+    DecisionOSPrincipal,
+    DecisionOSRole,
+    MembershipStatus,
+    OrganizationMembership,
+)
 from humanwire.google_council import (
     CouncilExecutionEvent,
     CouncilExecutionResult,
@@ -165,3 +173,85 @@ def test_running_projection_keeps_waiting_running_and_complete_distinct() -> Non
     assert statuses["market_intelligence"] == "complete"
     assert statuses["financial_analysis"] == "running"
     assert statuses["red_team"] == "waiting"
+
+
+def test_firestore_latest_restores_strict_projection_from_json_arrays() -> None:
+    organization_id = "org_01HQ7XK9WPH4Y8ZQK3R2N1M6AA"
+    workspace_id = "wrk_01HQ7XK9WPH4Y8ZQK3R2N1M6AA"
+    run_id = "council_run_01"
+    projection = build_council_projection(
+        run_id=run_id,
+        objective="Decide whether the product is ready for a limited launch.",
+        result=_result(),
+    )
+    latest_path = (
+        "decisionos_organizations",
+        organization_id,
+        "workspaces",
+        workspace_id,
+        "council_state",
+        "latest",
+    )
+    run_path = (
+        "decisionos_organizations",
+        organization_id,
+        "workspaces",
+        workspace_id,
+        "council_runs",
+        run_id,
+    )
+
+    class Snapshot:
+        def __init__(self, payload):
+            self.exists = payload is not None
+            self._payload = payload
+
+        def to_dict(self):
+            return self._payload
+
+    class Reference:
+        def __init__(self, client, path):
+            self._client = client
+            self._path = path
+
+        def collection(self, name):
+            return Collection(self._client, (*self._path, name))
+
+        def get(self):
+            return Snapshot(self._client.rows.get(self._path))
+
+    class Collection:
+        def __init__(self, client, path):
+            self._client = client
+            self._path = path
+
+        def document(self, identifier):
+            return Reference(self._client, (*self._path, identifier))
+
+    class Client:
+        def __init__(self):
+            self.rows = {
+                latest_path: {"run_id": run_id},
+                run_path: {"projection": projection.model_dump(mode="json")},
+            }
+
+        def collection(self, name):
+            return Collection(self, (name,))
+
+    context = DecisionOSContext(
+        principal=DecisionOSPrincipal(
+            uid="owner-01",
+            email_verified=True,
+            provider_ids=("google.com",),
+        ),
+        membership=OrganizationMembership(
+            organization_id=organization_id,
+            uid="owner-01",
+            role=DecisionOSRole.OWNER,
+            status=MembershipStatus.ACTIVE,
+        ),
+    )
+
+    restored = FirestoreCouncilRunStore(Client()).load_latest(context, workspace_id)
+
+    assert restored == projection
