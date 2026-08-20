@@ -9,6 +9,7 @@ class FakeElement {
     this.children = [];
     this.dataset = {};
     this.hidden = false;
+    this.textHistory = [];
     this.textContent = "";
     this.attributes = {};
     this.queries = new Map();
@@ -19,6 +20,11 @@ class FakeElement {
   querySelector(selector) { return this.queries.get(selector) || null; }
   setAttribute(name, value) { this.attributes[name] = value; }
   scrollIntoView() {}
+  get textContent() { return this._textContent; }
+  set textContent(value) {
+    this._textContent = value;
+    this.textHistory?.push(value);
+  }
 }
 
 async function main() {
@@ -134,6 +140,12 @@ async function main() {
 
   assert.deepStrictEqual(delays, [1400, 1400, 1400, 1400]);
   assert.strictEqual(selectors.get("[data-council-activity]").children.length, 4);
+  const marketStatusHistory = teamNodes
+    .get("market_intelligence")
+    .querySelector("[data-agent-live-status]").textHistory;
+  const workingIndex = marketStatusHistory.indexOf("Working");
+  assert.notStrictEqual(workingIndex, -1);
+  assert.strictEqual(marketStatusHistory.slice(workingIndex).includes("Ready"), false);
   assert.strictEqual(
     teamNodes.get("market_intelligence").querySelector("[data-agent-live-status]").textContent,
     "Complete",

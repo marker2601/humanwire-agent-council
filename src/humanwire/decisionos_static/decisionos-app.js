@@ -229,7 +229,12 @@
 
   function appendCouncilActivity(event) {
     if (!event || typeof event.specialist_id !== "string") return;
-    const status = event.status === "started" ? "running" : event.status;
+    const status =
+      event.status === "started"
+        ? "running"
+        : event.status === "completed"
+          ? "complete"
+          : event.status;
     setCouncilNodeStatus(event.specialist_id, status);
     show("[data-council-live]", true);
     const activity = element("[data-council-activity]");
