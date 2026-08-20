@@ -297,11 +297,23 @@ def test_provider_exception_has_fixed_private_boundary(monkeypatch) -> None:
     assert warnings == [
         (
             "council_provider_failed category=%s code=%s",
-            "runtime",
+            "group_runtime",
             "none",
             {},
         )
     ]
+
+
+def test_provider_failure_signal_summarizes_exception_group_without_messages() -> None:
+    failure = ExceptionGroup(
+        "PRIVATE-group-message",
+        [KeyError("PRIVATE-key"), TypeError("PRIVATE-type")],
+    )
+
+    assert google_council_module._provider_failure_signal(failure) == (
+        "group_key_type",
+        "none",
+    )
 
 
 @pytest.mark.parametrize("cancelled", [False, True])

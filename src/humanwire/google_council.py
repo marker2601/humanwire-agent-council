@@ -49,6 +49,16 @@ ExecutionCallback = Callable[["CouncilExecutionEvent"], None]
 
 
 def _provider_failure_signal(error: Exception) -> tuple[str, str]:
+    if isinstance(error, BaseExceptionGroup):
+        child_signals = {
+            _provider_failure_signal(child)
+            for child in object.__getattribute__(error, "exceptions")
+            if isinstance(child, Exception)
+        }
+        categories = sorted({category for category, _ in child_signals})[:4]
+        codes = sorted({code for _, code in child_signals if code != "none"})
+        category = "group_" + "_".join(categories) if categories else "group"
+        return category, codes[0] if len(codes) == 1 else "none"
     if isinstance(error, genai_errors.APIError):
         code = object.__getattribute__(error, "code")
         safe_code = str(code) if type(code) is int and 100 <= code <= 599 else "none"
@@ -58,6 +68,12 @@ def _provider_failure_signal(error: Exception) -> tuple[str, str]:
         return "tool", "none"
     if isinstance(error, (ValidationError, ValueError)):
         return "validation", "none"
+    if type(error) is AttributeError:
+        return "attribute", "none"
+    if type(error) is KeyError:
+        return "key", "none"
+    if type(error) is TypeError:
+        return "type", "none"
     return "runtime", "none"
 
 
