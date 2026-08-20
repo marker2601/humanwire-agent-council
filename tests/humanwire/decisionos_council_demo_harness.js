@@ -65,6 +65,10 @@ async function main() {
     "[data-latest-decision-objective]",
     "[data-latest-decision-summary]",
     "[data-latest-decision-run]",
+    "[data-organization-list]",
+    "[data-workspace-list]",
+    "[data-run-council]",
+    "[data-app-status]",
   ]) selectors.set(selector, new FakeElement());
 
   const delays = [];
@@ -159,6 +163,30 @@ async function main() {
     selectors.get("[data-latest-decision-summary]").textContent,
     "Proceed with a human-reviewed limited launch.",
   );
+
+  const jsonResponse = (payload) => ({
+    ok: true,
+    status: 200,
+    async json() { return payload; },
+  });
+  context.fetch = async (path) => {
+    if (path === "/api/organizations") {
+      return jsonResponse({organizations: [{organization_id: "org_demo", name: "Demo", role: "owner"}]});
+    }
+    if (path === "/api/organizations/org_demo/workspaces") {
+      return jsonResponse({workspaces: [{workspace_id: "workspace_demo", name: "Launch", playbook: "launch"}]});
+    }
+    if (path.endsWith("/council-runs/latest")) return jsonResponse({projection: null});
+    if (path.endsWith("/evidence")) return jsonResponse({evidence: []});
+    throw new Error(`unexpected fetch: ${path}`);
+  };
+  await context.HumanWireDecisionOSApp.loadOrganizations();
+  context.fetch = () => new Promise(() => {});
+  void context.HumanWireDecisionOSApp.runCouncil({
+    preventDefault() {},
+    currentTarget: {elements: {objective: {value: "Assess launch readiness now"}}},
+  });
+  assert.strictEqual(selectors.get("[data-council-state]").textContent, "Running");
   process.stdout.write("decisionos council demo harness: PASS\n");
 }
 

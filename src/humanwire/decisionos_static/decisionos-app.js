@@ -465,6 +465,8 @@
     const button = element("[data-run-council]");
     if (button) button.disabled = true;
     resetCouncilView();
+    const stateLabel = element("[data-council-state]");
+    if (stateLabel) stateLabel.textContent = "Running";
     show("[data-council-live]", true);
     setStatus("The Agent Council is investigating this decision…");
     try {
