@@ -6,7 +6,9 @@ param(
     [ValidatePattern('^[A-Za-z0-9._-]{1,120}$')][string]$ImageTag = "decisionos-$([DateTimeOffset]::UtcNow.ToString('yyyyMMddHHmmss'))",
     [ValidatePattern('^[A-Za-z0-9_-]{1,255}$')][string]$FirebaseApiKeySecret = 'decisionos-firebase-api-key',
     [ValidatePattern('^[A-Za-z0-9_-]{1,255}$')][string]$FirebaseAppIdSecret = 'decisionos-firebase-app-id',
-    [ValidatePattern('^[A-Za-z0-9_-]{1,255}$')][string]$AppCheckSiteKeySecret = 'decisionos-app-check-site-key'
+    [ValidatePattern('^[A-Za-z0-9_-]{1,255}$')][string]$AppCheckSiteKeySecret = 'decisionos-app-check-site-key',
+    [ValidatePattern('^gemini-[0-9]+\.[0-9]+-[a-z0-9][a-z0-9.-]{0,127}$')][string]$ModelId = 'gemini-3.5-flash',
+    [ValidatePattern('^[a-z][a-z0-9-]{1,62}$')][string]$ModelLocation = 'global'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -24,7 +26,7 @@ function Invoke-Gcloud {
 }
 
 Invoke-Gcloud config set project $ProjectId
-Invoke-Gcloud services enable run.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com firestore.googleapis.com firebase.googleapis.com firebaseappcheck.googleapis.com firebaserules.googleapis.com firebasestorage.googleapis.com identitytoolkit.googleapis.com iam.googleapis.com logging.googleapis.com recaptchaenterprise.googleapis.com secretmanager.googleapis.com storage.googleapis.com
+Invoke-Gcloud services enable run.googleapis.com aiplatform.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com firestore.googleapis.com firebase.googleapis.com firebaseappcheck.googleapis.com firebaserules.googleapis.com firebasestorage.googleapis.com identitytoolkit.googleapis.com iam.googleapis.com logging.googleapis.com recaptchaenterprise.googleapis.com secretmanager.googleapis.com storage.googleapis.com
 
 & gcloud artifacts repositories describe $Repository --location=$Region --project=$ProjectId *> $null
 if ($LASTEXITCODE -ne 0) {
@@ -42,6 +44,7 @@ if ($LASTEXITCODE -ne 0) {
 Invoke-Gcloud projects add-iam-policy-binding $ProjectId --member="serviceAccount:$Account" --role=roles/datastore.user --condition=None
 Invoke-Gcloud projects add-iam-policy-binding $ProjectId --member="serviceAccount:$Account" --role=roles/firebaseauth.admin --condition=None
 Invoke-Gcloud projects add-iam-policy-binding $ProjectId --member="serviceAccount:$Account" --role=roles/logging.logWriter --condition=None
+Invoke-Gcloud projects add-iam-policy-binding $ProjectId --member="serviceAccount:$Account" --role=roles/aiplatform.user --condition=None
 foreach ($SecretName in @($FirebaseApiKeySecret, $FirebaseAppIdSecret, $AppCheckSiteKeySecret)) {
     Invoke-Gcloud secrets describe $SecretName --project=$ProjectId
     Invoke-Gcloud secrets add-iam-policy-binding $SecretName --project=$ProjectId --member="serviceAccount:$Account" --role=roles/secretmanager.secretAccessor --condition=None
@@ -54,9 +57,9 @@ Invoke-Gcloud builds submit --config=infra/google/cloudbuild.yaml --substitution
 $Digest = (& gcloud artifacts docker images describe $TaggedImage --format='value(image_summary.digest)').Trim()
 if ($LASTEXITCODE -ne 0 -or $Digest -notmatch '^sha256:[0-9a-f]{64}$') { throw 'decisionos_image_digest_invalid' }
 $PinnedImage = "$BaseImage@$Digest"
-$PublicEnvironment = "HUMANWIRE_SERVICE_ROLE=decisionos,HUMANWIRE_DECISIONOS_PROJECT_ID=$FirebaseProjectId,HUMANWIRE_DECISIONOS_FIRESTORE_DATABASE=(default),HUMANWIRE_DECISIONOS_ALLOWED_HOSTS=decisionos.invalid,HUMANWIRE_DECISIONOS_FIREBASE_AUTH_DOMAIN=$FirebaseProjectId.firebaseapp.com,HUMANWIRE_DECISIONOS_FIREBASE_STORAGE_BUCKET=$FirebaseProjectId.firebasestorage.app,HUMANWIRE_DECISIONOS_APP_CHECK_ENFORCED=false"
+$PublicEnvironment = "HUMANWIRE_SERVICE_ROLE=decisionos,HUMANWIRE_DECISIONOS_PROJECT_ID=$FirebaseProjectId,HUMANWIRE_DECISIONOS_FIRESTORE_DATABASE=(default),HUMANWIRE_DECISIONOS_ALLOWED_HOSTS=decisionos.invalid,HUMANWIRE_DECISIONOS_FIREBASE_AUTH_DOMAIN=$FirebaseProjectId.firebaseapp.com,HUMANWIRE_DECISIONOS_FIREBASE_STORAGE_BUCKET=$FirebaseProjectId.firebasestorage.app,HUMANWIRE_DECISIONOS_APP_CHECK_ENFORCED=false,HUMANWIRE_DECISIONOS_COUNCIL_FEATURES_ENABLED=true,HUMANWIRE_DECISIONOS_COUNCIL_MODEL_ID=$ModelId,HUMANWIRE_DECISIONOS_COUNCIL_GOOGLE_LOCATION=$ModelLocation,HUMANWIRE_DECISIONOS_COUNCIL_TIMEOUT_SECONDS=180"
 
-Invoke-Gcloud run deploy $Service --image=$PinnedImage --region=$Region --project=$ProjectId --service-account=$Account --allow-unauthenticated --min-instances=0 --max-instances=3 --concurrency=40 --timeout=60 --cpu=1 --memory=512Mi --set-env-vars=$PublicEnvironment --set-secrets=$SecretBindings
+Invoke-Gcloud run deploy $Service --image=$PinnedImage --region=$Region --project=$ProjectId --service-account=$Account --allow-unauthenticated --min-instances=0 --max-instances=3 --concurrency=4 --timeout=300 --cpu=1 --memory=1Gi --set-env-vars=$PublicEnvironment --set-secrets=$SecretBindings
 $DecisionOSUrl = (& gcloud run services describe $Service --region=$Region --project=$ProjectId --format='value(status.url)').Trim()
 $DecisionOSHost = ([Uri]$DecisionOSUrl).Host
 $AllowedHosts = "$DecisionOSHost;$FirebaseProjectId.firebaseapp.com;$FirebaseProjectId.web.app"

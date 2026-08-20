@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import queue
 import re
+import threading
+from asyncio import to_thread
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -14,7 +17,13 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
@@ -42,6 +51,8 @@ from humanwire.decisionos_store import (
 )
 
 if TYPE_CHECKING:
+    from humanwire.council_projection import CouncilProjection
+    from humanwire.council_runtime import CouncilRunOutput
     from humanwire.decisionos_organization_routes import (
         OrganizationProjectionBuilder,
         OrganizationSourceParser,
@@ -77,6 +88,9 @@ _MUTATION_PATHS = (
     re.compile(r"^/api/invitations/accept$"),
     re.compile(rf"^/api/organizations/{_ORGANIZATION_ID}/invitations$"),
     re.compile(rf"^/api/organizations/{_ORGANIZATION_ID}/workspaces$"),
+)
+_COUNCIL_RUN_PATH = re.compile(
+    rf"^/api/organizations/{_ORGANIZATION_ID}/workspaces/{_WORKSPACE_ID}/council-runs$"
 )
 _ORGANIZATION_ROUTE_PROFILES = (
     (
@@ -173,6 +187,20 @@ class AppCheckVerifier(Protocol):
         raise NotImplementedError
 
 
+class DecisionOSCouncilRuntime(Protocol):
+    def run(
+        self,
+        context,
+        workspace,
+        objective: str,
+        *,
+        cancellation: threading.Event,
+        on_event: Callable,
+    ) -> CouncilRunOutput: ...
+
+    def load_latest(self, context, workspace_id: str) -> CouncilProjection | None: ...
+
+
 @dataclass(frozen=True)
 class DecisionOSDependencies:
     authenticator: SessionAuthenticator
@@ -189,6 +217,8 @@ class DecisionOSDependencies:
     organization_graph_repository: OrganizationGraphRepository | None = None
     organization_projection_builder: OrganizationProjectionBuilder | None = None
     organization_activation_service: ActivationService | None = None
+    council_features_enabled: bool = False
+    council_runtime: DecisionOSCouncilRuntime | None = None
 
     def __post_init__(self) -> None:
         if not self.allowed_hosts:
@@ -213,6 +243,11 @@ class DecisionOSDependencies:
             and any(item is None for item in organization_dependencies)
         ):
             raise ValueError("DecisionOS organization dependencies are incomplete")
+        if (
+            type(self.council_features_enabled) is not bool
+            or self.council_features_enabled != (self.council_runtime is not None)
+        ):
+            raise ValueError("DecisionOS council dependencies are incomplete")
 
 
 def _public_value(value: object) -> bool:
@@ -274,6 +309,10 @@ class _WorkspaceBody(_BodyModel):
     playbook: WorkspacePlaybook = Field(strict=False)
 
 
+class _CouncilRunBody(_BodyModel):
+    objective: str = Field(min_length=10, max_length=2_000)
+
+
 def _fixed_error(status_code: int, code: str) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"error": code})
 
@@ -329,7 +368,7 @@ async def _body(request: Request, model_type: type[_BodyModel]) -> _BodyModel | 
         return None
 
 
-def _is_exact_mutation(request: Request) -> bool:
+def _is_exact_mutation(request: Request, *, council_enabled: bool = False) -> bool:
     path = request.scope.get("path")
     raw_path = request.scope.get("raw_path")
     if not isinstance(path, str) or not isinstance(raw_path, bytes):
@@ -341,7 +380,11 @@ def _is_exact_mutation(request: Request) -> bool:
     return (
         raw_path == exact_raw
         and not request.scope.get("query_string")
-        and any(pattern.fullmatch(path) for pattern in _MUTATION_PATHS)
+        and (
+            any(pattern.fullmatch(path) for pattern in _MUTATION_PATHS)
+            or council_enabled
+            and _COUNCIL_RUN_PATH.fullmatch(path) is not None
+        )
     )
 
 
@@ -447,6 +490,11 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
                 if dependencies.organization_features_enabled
                 else None
             )
+            council_mutation = (
+                dependencies.council_features_enabled
+                and request.method == "POST"
+                and _COUNCIL_RUN_PATH.fullmatch(request.url.path) is not None
+            )
             hosts = _raw_headers(request, b"host")
             host = _ascii_header(hosts)
             if host is None or host.casefold() not in dependencies.allowed_hosts:
@@ -458,7 +506,10 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
                 and request.method not in organization_profile[0]
             ) or request.method not in {"GET", "HEAD", "POST"} or (
                 request.method == "POST"
-                and not _is_exact_mutation(request)
+                and not _is_exact_mutation(
+                    request,
+                    council_enabled=dependencies.council_features_enabled,
+                )
                 and not isinstance(organization_profile, tuple)
             ):
                 response = _fixed_error(405, "method_not_allowed")
@@ -519,6 +570,7 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
                             if app_check_failed and (
                                 dependencies.app_check_enforced
                                 or isinstance(organization_profile, tuple)
+                                or council_mutation
                             ):
                                 response = _fixed_error(403, "app_check_failed")
                             else:
@@ -765,6 +817,126 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
         except WorkspaceUnavailable:
             return _fixed_error(404, "workspace_not_found")
         return JSONResponse(content=workspace.model_dump(mode="json"))
+
+    if dependencies.council_features_enabled:
+        assert dependencies.council_runtime is not None
+
+        @app.api_route(
+            "/api/organizations/{organization_id}/workspaces/{workspace_id}/council-runs/latest",
+            methods=["GET", "HEAD"],
+        )
+        def load_latest_council(
+            organization_id: str,
+            workspace_id: str,
+            request: Request,
+        ) -> Response:
+            principal = _principal(request, dependencies.authenticator)
+            if principal is None:
+                return _fixed_error(401, "authentication_required")
+            try:
+                context = dependencies.repository.load_context(principal, organization_id)
+                dependencies.repository.load_workspace(context, workspace_id)
+                projection = dependencies.council_runtime.load_latest(
+                    context, workspace_id
+                )
+            except OrganizationUnavailable:
+                return _fixed_error(404, "organization_not_found")
+            except WorkspaceUnavailable:
+                return _fixed_error(404, "workspace_not_found")
+            except Exception:  # noqa: BLE001 - durable details stay private
+                return _fixed_error(500, "council_unavailable")
+            return JSONResponse(
+                content={
+                    "projection": (
+                        None if projection is None else projection.model_dump(mode="json")
+                    )
+                }
+            )
+
+        @app.post(
+            "/api/organizations/{organization_id}/workspaces/{workspace_id}/council-runs"
+        )
+        async def run_council(
+            organization_id: str,
+            workspace_id: str,
+            request: Request,
+        ) -> Response:
+            body = await _body(request, _CouncilRunBody)
+            principal = _principal(request, dependencies.authenticator)
+            if not isinstance(body, _CouncilRunBody) or principal is None:
+                return _fixed_error(400, "invalid_request")
+            try:
+                context = dependencies.repository.load_context(principal, organization_id)
+                workspace = dependencies.repository.load_workspace(context, workspace_id)
+            except OrganizationUnavailable:
+                return _fixed_error(404, "organization_not_found")
+            except WorkspaceUnavailable:
+                return _fixed_error(404, "workspace_not_found")
+
+            async def stream():
+                channel: queue.Queue[dict[str, object] | None] = queue.Queue()
+                cancellation = threading.Event()
+
+                def on_event(event) -> None:
+                    channel.put(
+                        {
+                            "type": "activity",
+                            "event": event.model_dump(mode="json"),
+                        }
+                    )
+
+                def execute() -> None:
+                    output = None
+                    failed = False
+                    try:
+                        output = dependencies.council_runtime.run(
+                            context,
+                            workspace,
+                            body.objective,
+                            cancellation=cancellation,
+                            on_event=on_event,
+                        )
+                    except Exception:  # noqa: BLE001 - fixed streaming error only
+                        failed = True
+                    if failed or output is None:
+                        channel.put({"type": "failed", "error": "council_unavailable"})
+                    else:
+                        channel.put(
+                            {
+                                "type": "complete",
+                                "run_id": output.run_id,
+                                "projection": output.projection.model_dump(mode="json"),
+                                "gateway": output.gateway.model_dump(mode="json"),
+                            }
+                        )
+                    channel.put(None)
+
+                worker = threading.Thread(
+                    target=execute,
+                    name="humanwire-council-request",
+                    daemon=False,
+                )
+                worker.start()
+                try:
+                    yield b'{"type":"started"}\n'
+                    while True:
+                        item = await to_thread(channel.get)
+                        if item is None:
+                            break
+                        yield (
+                            json.dumps(
+                                item,
+                                ensure_ascii=True,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ).encode("ascii")
+                            + b"\n"
+                        )
+                finally:
+                    cancellation.set()
+                    await to_thread(worker.join, 10.0)
+
+            return StreamingResponse(stream(), media_type="application/x-ndjson")
 
     if dependencies.organization_features_enabled:
         from humanwire.decisionos_organization_routes import (

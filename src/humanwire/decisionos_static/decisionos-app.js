@@ -6,6 +6,7 @@
     workspaces: [],
     activeOrganizationId: "",
     activeWorkspaceId: "",
+    councilRunning: false,
   };
 
   function element(selector) {
@@ -71,6 +72,25 @@
     if (response.status === 401) global.location.assign("/signin");
     if (!response.ok) throw new Error(result.error || "request_failed");
     return result;
+  }
+
+  async function postStream(path, payload) {
+    const response = await global.fetch(path, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Firebase-AppCheck": await appCheckToken(),
+        "X-HumanWire-CSRF": cookie("__Host-humanwire-csrf"),
+      },
+      body: JSON.stringify(payload),
+    });
+    if (response.status === 401) global.location.assign("/signin");
+    if (!response.ok || !response.body) {
+      const result = await responseJSON(response);
+      throw new Error(result.error || "request_failed");
+    }
+    return response.body.getReader();
   }
 
   function setStatus(message, tone) {
@@ -153,6 +173,196 @@
     }
   }
 
+  function councilNode(specialistId) {
+    return element(`[data-specialist="${specialistId}"]`);
+  }
+
+  function setCouncilNodeStatus(specialistId, status) {
+    const node = councilNode(specialistId);
+    if (!node) return;
+    node.dataset.status = status;
+    const label = node.querySelector("small");
+    if (label) {
+      label.textContent =
+        status === "complete"
+          ? "Complete"
+          : status === "running"
+            ? "Working"
+            : status === "failed"
+              ? "Stopped"
+              : status === "blocked"
+                ? "Blocked"
+                : "Waiting";
+    }
+  }
+
+  function resetCouncilView() {
+    for (const node of elements("[data-council-flow] [data-specialist]")) {
+      setCouncilNodeStatus(node.dataset.specialist, "waiting");
+    }
+    const activity = element("[data-council-activity]");
+    if (activity) activity.replaceChildren();
+    show("[data-council-live]", false);
+    show("[data-council-result]", false);
+    const stateLabel = element("[data-council-state]");
+    if (stateLabel) stateLabel.textContent = "Ready to run";
+  }
+
+  function appendCouncilActivity(event) {
+    if (!event || typeof event.specialist_id !== "string") return;
+    const status = event.status === "started" ? "running" : event.status;
+    setCouncilNodeStatus(event.specialist_id, status);
+    show("[data-council-live]", true);
+    const activity = element("[data-council-activity]");
+    if (!activity) return;
+    const row = global.document.createElement("li");
+    const name = global.document.createElement("strong");
+    const detail = global.document.createElement("span");
+    name.textContent = event.display_name;
+    detail.textContent = event.status === "completed" ? "Completed" : "Started";
+    row.append(name, detail);
+    activity.append(row);
+    row.scrollIntoView?.({block: "nearest", behavior: "auto"});
+  }
+
+  function renderClaimList(selector, claims, emptyLabel) {
+    const list = element(selector);
+    if (!list) return;
+    list.replaceChildren();
+    for (const claim of claims || []) {
+      const row = global.document.createElement("li");
+      const statement = global.document.createElement("span");
+      const meta = global.document.createElement("small");
+      statement.textContent = claim.statement;
+      meta.textContent = claim.evidence_ids?.length
+        ? `${claim.classification.replaceAll("_", " ")} · ${claim.evidence_ids.join(", ")}`
+        : claim.classification.replaceAll("_", " ");
+      row.append(statement, meta);
+      list.append(row);
+    }
+    if (!list.children.length) {
+      const row = global.document.createElement("li");
+      row.textContent = emptyLabel;
+      list.append(row);
+    }
+  }
+
+  function renderCouncilProjection(projection) {
+    if (!projection || !Array.isArray(projection.nodes)) return;
+    for (const node of projection.nodes) {
+      setCouncilNodeStatus(node.specialist_id, node.status);
+    }
+    setCouncilNodeStatus(
+      "human_approval",
+      projection.state === "human_approval_required" ? "running" : projection.state,
+    );
+    const stateLabel = element("[data-council-state]");
+    if (stateLabel) {
+      stateLabel.textContent = projection.state.replaceAll("_", " ");
+    }
+    if (!projection.recommendation_summary) return;
+    const summary = element("[data-recommendation-summary]");
+    const action = element("[data-recommended-action]");
+    const authority = element("[data-required-human-action]");
+    const digest = element("[data-recommendation-digest]");
+    if (summary) summary.textContent = projection.recommendation_summary;
+    if (action) action.textContent = projection.recommended_action;
+    if (authority) authority.textContent = projection.required_human_action;
+    if (digest) digest.textContent = projection.recommendation_digest;
+    renderClaimList(
+      "[data-evidence-claims]",
+      projection.evidence_claims,
+      "No source-backed claim was accepted.",
+    );
+    renderClaimList(
+      "[data-inference-claims]",
+      projection.inference_claims,
+      "No uncited model inference remains.",
+    );
+    const challenges = element("[data-council-challenges]");
+    if (challenges) {
+      challenges.replaceChildren();
+      for (const challenge of projection.challenges || []) {
+        const row = global.document.createElement("li");
+        row.textContent = `${challenge.issue} Required: ${challenge.required_action}`;
+        challenges.append(row);
+      }
+    }
+    show("[data-council-result]", true);
+  }
+
+  async function loadLatestCouncil() {
+    if (!state.activeOrganizationId || !state.activeWorkspaceId) return;
+    try {
+      const result = await getJSON(
+        `/api/organizations/${state.activeOrganizationId}/workspaces/${state.activeWorkspaceId}/council-runs/latest`,
+      );
+      if (result.projection) renderCouncilProjection(result.projection);
+      else resetCouncilView();
+    } catch (_error) {
+      resetCouncilView();
+    }
+  }
+
+  async function consumeCouncilStream(reader) {
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let terminal = false;
+    while (true) {
+      const chunk = await reader.read();
+      buffer += decoder.decode(chunk.value || new Uint8Array(), {stream: !chunk.done});
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        if (!line) continue;
+        const envelope = JSON.parse(line);
+        if (envelope.type === "started") {
+          const stateLabel = element("[data-council-state]");
+          if (stateLabel) stateLabel.textContent = "Running";
+        } else if (envelope.type === "activity") {
+          appendCouncilActivity(envelope.event);
+        } else if (envelope.type === "complete") {
+          terminal = true;
+          renderCouncilProjection(envelope.projection);
+        } else if (envelope.type === "failed") {
+          terminal = true;
+          throw new Error("council_unavailable");
+        }
+      }
+      if (chunk.done) break;
+    }
+    if (!terminal) throw new Error("council_stream_ended");
+  }
+
+  async function runCouncil(event) {
+    event.preventDefault();
+    if (state.councilRunning || !state.activeWorkspaceId) return;
+    const form = event.currentTarget;
+    const objective = form.elements.objective.value.trim();
+    if (objective.length < 10) return;
+    state.councilRunning = true;
+    const button = element("[data-run-council]");
+    if (button) button.disabled = true;
+    resetCouncilView();
+    show("[data-council-live]", true);
+    setStatus("The Agent Council is investigating this decision…");
+    try {
+      const reader = await postStream(
+        `/api/organizations/${state.activeOrganizationId}/workspaces/${state.activeWorkspaceId}/council-runs`,
+        {objective},
+      );
+      await consumeCouncilStream(reader);
+      setStatus("Agent Council complete. Human approval is required.");
+    } catch (_error) {
+      const stateLabel = element("[data-council-state]");
+      if (stateLabel) stateLabel.textContent = "Stopped safely";
+      setStatus("The Agent Council stopped. The last saved activity remains available.", "error");
+    } finally {
+      state.councilRunning = false;
+      if (button) button.disabled = false;
+    }
+  }
+
   async function loadWorkspaces(organizationId) {
     state.activeOrganizationId = organizationId;
     const result = await getJSON(`/api/organizations/${organizationId}/workspaces`);
@@ -164,6 +374,7 @@
     }
     state.activeWorkspaceId = state.workspaces[0]?.workspace_id || "";
     renderWorkspace();
+    await loadLatestCouncil();
   }
 
   async function loadOrganizations() {
@@ -231,9 +442,16 @@
       element("#organization-name")?.focus();
       return;
     }
-    show("[data-empty-workspaces]", true);
-    element("#workspace-name")?.focus();
-    setStatus("Name the decision workspace and choose its playbook.");
+    if (!state.activeWorkspaceId) {
+      show("[data-empty-workspaces]", true);
+      element("#workspace-name")?.focus();
+      setStatus("Name the decision workspace and choose its playbook.");
+      return;
+    }
+    setPanel("home");
+    element("#council-objective")?.focus();
+    element("[data-council-form]")?.scrollIntoView?.({block: "center"});
+    setStatus("Set the objective, then run the evidence-bound Agent Council.");
   }
 
   function choosePlaybook(event) {
@@ -307,6 +525,7 @@
     element("[data-create-workspace]")?.addEventListener("submit", createWorkspace);
     element("[data-invite-member]")?.addEventListener("submit", createInvitation);
     element("[data-accept-invitation]")?.addEventListener("submit", acceptInvitation);
+    element("[data-council-form]")?.addEventListener("submit", runCouncil);
     element("[data-sign-out]")?.addEventListener("click", signOut);
     element("[data-organization-list]")?.addEventListener("change", (event) => {
       loadWorkspaces(event.currentTarget.value).catch(() => {
@@ -316,6 +535,7 @@
     element("[data-workspace-list]")?.addEventListener("change", (event) => {
       state.activeWorkspaceId = event.currentTarget.value;
       renderWorkspace();
+      loadLatestCouncil().catch(() => resetCouncilView());
     });
     loadOrganizations().catch(() => {
       setStatus("The workspace could not be loaded. Sign in again.", "error");
@@ -325,6 +545,8 @@
   global.HumanWireDecisionOSApp = Object.freeze({
     loadOrganizations,
     postJSON,
+    runCouncil,
+    renderCouncilProjection,
     setPanel,
   });
 

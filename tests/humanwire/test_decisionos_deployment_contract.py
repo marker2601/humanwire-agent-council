@@ -111,6 +111,8 @@ def test_production_settings_bind_only_explicit_decisionos_environment(monkeypat
     )
     assert settings.app_check_enforced is False
     assert settings.organization_features_enabled is False
+    assert settings.council_features_enabled is False
+    assert settings.council_model_id == "gemini-3.5-flash"
     assert settings.firebase_public_config == {
         "firebase": {
             "apiKey": "public-web-key",
@@ -141,6 +143,28 @@ def test_organization_feature_setting_is_explicit_and_disabled_by_default(monkey
 
     assert disabled.organization_features_enabled is False
     assert enabled.organization_features_enabled is True
+
+
+def test_council_feature_setting_is_explicit_and_disabled_by_default(monkeypatch) -> None:
+    values = {
+        "PROJECT_ID": "humanwire-startup",
+        "ALLOWED_HOSTS": "decisionos.example.com",
+        "FIREBASE_API_KEY": "public-web-key",
+        "FIREBASE_APP_ID": "1:123:web:abc",
+        "FIREBASE_AUTH_DOMAIN": "humanwire-startup.firebaseapp.com",
+        "APP_CHECK_SITE_KEY": "recaptcha-site-key",
+    }
+    for suffix, value in values.items():
+        monkeypatch.setenv(f"HUMANWIRE_DECISIONOS_{suffix}", value)
+
+    disabled = decisionos_web.DecisionOSSettings()
+    monkeypatch.setenv("HUMANWIRE_DECISIONOS_COUNCIL_FEATURES_ENABLED", "true")
+    enabled = decisionos_web.DecisionOSSettings()
+
+    assert disabled.council_features_enabled is False
+    assert enabled.council_features_enabled is True
+    assert enabled.council_model_id == "gemini-3.5-flash"
+    assert enabled.council_google_location == "global"
 
 
 def test_container_keeps_existing_roles_and_installs_decisionos_runtime() -> None:
@@ -203,12 +227,17 @@ def test_decisionos_deployments_are_separate_secret_bound_and_monitor_first() ->
         assert "roles/datastore.user" in source
         assert "roles/firebaseauth.admin" in source
         assert "roles/logging.logWriter" in source
+        assert "roles/aiplatform.user" in source
         assert "roles/secretmanager.secretAccessor" in source
         assert "firebasestorage.googleapis.com" in source
         assert "recaptchaenterprise.googleapis.com" in source
         assert "--allow-unauthenticated" in source
         assert "--min-instances=0" in source
-        assert "gemini" not in folded
+        assert "gemini-3.5-flash" in folded
+        assert "HUMANWIRE_DECISIONOS_COUNCIL_FEATURES_ENABLED=true" in source
+        assert "HUMANWIRE_DECISIONOS_COUNCIL_MODEL_ID" in source
+        assert "HUMANWIRE_DECISIONOS_COUNCIL_GOOGLE_LOCATION" in source
+        assert "aiplatform.googleapis.com" in source
         assert "featherless" not in folded
         assert "caspi" not in folded
         assert "AIza" not in source
@@ -236,6 +265,8 @@ def test_firebase_config_deploys_rules_and_indexes() -> None:
             },
         }
     ]
+
+
 
 
 def test_deployment_documentation_preserves_the_submitted_services() -> None:

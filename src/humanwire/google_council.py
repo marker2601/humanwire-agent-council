@@ -173,18 +173,31 @@ def workflow_shape(workflow: SequentialAgent) -> dict[str, list[str]]:
 
 def _instruction(definition: CouncilSpecialist) -> str:
     prior = ""
+    identity = ""
+    if definition.specialist_id in _RESEARCH_IDS:
+        identity = (
+            f" Set candidate_id exactly to candidate_{definition.specialist_id}_01 and "
+            f"specialist_id exactly to {definition.specialist_id}."
+        )
     if definition.specialist_id == "decision_synthesis":
         prior = (
             " Use the four typed research candidates in session state: "
             "{market_intelligence}; {financial_analysis}; {product_technical}; "
-            "{risk_compliance}."
+            "{risk_compliance}. Set source_candidate_ids exactly to "
+            "candidate_market_intelligence_01, candidate_financial_analysis_01, "
+            "candidate_product_technical_01, and candidate_risk_compliance_01."
         )
     elif definition.specialist_id == "red_team":
-        prior = " Challenge the typed draft in session state: {decision_synthesis}."
+        prior = (
+            " Challenge the typed draft in session state: {decision_synthesis}. Set "
+            "challenger_id to red_team, target_candidate_id to one exact source "
+            "candidate ID, and challenged_claim_ids only to claim IDs in that candidate."
+        )
     elif definition.specialist_id == "final_synthesis":
         prior = (
             " Resolve the draft and challenge in session state: "
-            "{decision_synthesis}; {red_team}."
+            "{decision_synthesis}; {red_team}. Preserve the exact four source candidate "
+            "IDs and include the red-team challenge in challenges."
         )
     return (
         f"You are the HumanWire {definition.display_name} specialist. "
@@ -194,7 +207,7 @@ def _instruction(definition: CouncilSpecialist) -> str:
         "message people, mutate records, or exercise human authority. Every sourced "
         "claim must cite an evidence ID returned by a tool. Classify unsupported "
         "reasoning as model_inference or human_assumption. Return only the strict "
-        f"typed output for policy {definition.policy_version}.{prior}"
+        f"typed output for policy {definition.policy_version}.{identity}{prior}"
     )
 
 

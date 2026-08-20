@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import secrets
 from functools import lru_cache
 from typing import Any
@@ -50,6 +51,10 @@ class DecisionOSSettings(BaseSettings):
     app_check_site_key: SecretStr
     app_check_enforced: bool = False
     organization_features_enabled: bool = False
+    council_features_enabled: bool = False
+    council_model_id: str = "gemini-3.5-flash"
+    council_google_location: str = "global"
+    council_timeout_seconds: float = Field(default=180.0, ge=10.0, le=300.0)
 
     @field_validator(
         "firestore_database",
@@ -58,6 +63,8 @@ class DecisionOSSettings(BaseSettings):
         "firebase_auth_domain",
         "firebase_storage_bucket",
         "firebase_messaging_sender_id",
+        "council_model_id",
+        "council_google_location",
     )
     @classmethod
     def has_safe_text(cls, value: str | None) -> str | None:
@@ -208,6 +215,26 @@ def build_dependencies(
             "organization_graph_repository": organization_repository,
             "organization_projection_builder": build_organization_projection,
         }
+    council_dependencies: dict[str, object] = {}
+    if settings.council_features_enabled:
+        from humanwire.council_runtime import (
+            DecisionOSCouncilRuntime,
+            FirestoreCouncilEvidenceRegistry,
+            FirestoreCouncilRunStore,
+        )
+
+        os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
+        os.environ["GOOGLE_CLOUD_PROJECT"] = settings.project_id
+        os.environ["GOOGLE_CLOUD_LOCATION"] = settings.council_google_location
+        council_dependencies = {
+            "council_features_enabled": True,
+            "council_runtime": DecisionOSCouncilRuntime(
+                store=FirestoreCouncilRunStore(firestore_client),
+                evidence_registry=FirestoreCouncilEvidenceRegistry(firestore_client),
+                model_identifier=settings.council_model_id,
+                timeout_seconds=settings.council_timeout_seconds,
+            ),
+        }
     return DecisionOSDependencies(
         authenticator=FirebaseSessionAuthenticator(_FirebaseAuthAdapter(firebase_app)),
         app_check=FirebaseAppCheckVerifier(_FirebaseAppCheckAdapter(firebase_app)),
@@ -219,6 +246,7 @@ def build_dependencies(
         app_check_observer=_observe_app_check,
         organization_features_enabled=settings.organization_features_enabled,
         **organization_dependencies,
+        **council_dependencies,
     )
 
 

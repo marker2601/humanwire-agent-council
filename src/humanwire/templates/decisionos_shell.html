@@ -95,15 +95,50 @@
 
             <div class="decisionos-workspace__canvas">
               <section class="decisionos-council" aria-labelledby="council-title">
-                <h2 id="council-title">Readiness council</h2>
-                <p>Functional AI specialists prepare traceable work in sequence. Your team owns the decision.</p>
-                <ol class="decisionos-council__flow">
-                  <li aria-current="step"><span>1</span><strong>Market analyst</strong><small>Ready</small></li>
-                  <li><span>2</span><strong>Evidence analyst</strong><small>Reviewing evidence</small></li>
-                  <li><span>3</span><strong>Risk reviewer</strong><small>Ready</small></li>
-                  <li><span>4</span><strong>Investment memo editor</strong><small>Ready</small></li>
-                  <li class="decisionos-council__human"><span>5</span><strong>Founder approval</strong><small>Human approval required</small></li>
+                <div class="decisionos-council__heading">
+                  <div>
+                    <p class="decisionos-eyebrow">Google ADK · Gemini</p>
+                    <h2 id="council-title">Agent Council</h2>
+                  </div>
+                  <span class="decisionos-council__state" data-council-state>Ready to run</span>
+                </div>
+                <p>Four specialists investigate in parallel. Synthesis, red-team challenge, and final synthesis follow. Every result remains advisory until human approval.</p>
+                <form class="decisionos-council__composer" data-council-form>
+                  <label for="council-objective">Decision objective</label>
+                  <textarea id="council-objective" name="objective" rows="3" minlength="10" maxlength="2000" required>Assess whether HumanWire is ready for a limited launch, identify the strongest evidence, surface material risks, and recommend the exact next human decision.</textarea>
+                  <div>
+                    <span>Uses tenant-scoped evidence only. Agents cannot approve or send messages.</span>
+                    <button class="decisionos-primary-button" type="submit" data-run-council>Run Agent Council</button>
+                  </div>
+                </form>
+                <ol class="decisionos-council__flow" data-council-flow>
+                  <li data-specialist="market_intelligence"><span>1</span><strong>Market Intelligence</strong><small>Waiting</small></li>
+                  <li data-specialist="financial_analysis"><span>2</span><strong>Financial Analysis</strong><small>Waiting</small></li>
+                  <li data-specialist="product_technical"><span>3</span><strong>Product &amp; Technical</strong><small>Waiting</small></li>
+                  <li data-specialist="risk_compliance"><span>4</span><strong>Risk &amp; Compliance</strong><small>Waiting</small></li>
+                  <li data-specialist="decision_synthesis"><span>5</span><strong>Decision Synthesis</strong><small>Waiting for research</small></li>
+                  <li data-specialist="red_team"><span>6</span><strong>Red Team</strong><small>Waiting for draft</small></li>
+                  <li data-specialist="final_synthesis"><span>7</span><strong>Final Synthesis</strong><small>Waiting for challenge</small></li>
+                  <li class="decisionos-council__human" data-specialist="human_approval"><span>8</span><strong>Human approval</strong><small>Required after synthesis</small></li>
                 </ol>
+                <div class="decisionos-council__live" data-council-live hidden>
+                  <h3>Live activity</h3>
+                  <ol data-council-activity aria-live="polite"></ol>
+                </div>
+                <section class="decisionos-council__result" data-council-result hidden aria-labelledby="council-result-title">
+                  <p class="decisionos-eyebrow">Evidence-bound recommendation</p>
+                  <h3 id="council-result-title" data-recommendation-summary></h3>
+                  <dl>
+                    <div><dt>Recommended action</dt><dd data-recommended-action></dd></div>
+                    <div><dt>Authority</dt><dd data-required-human-action></dd></div>
+                    <div><dt>Digest</dt><dd><code data-recommendation-digest></code></dd></div>
+                  </dl>
+                  <div class="decisionos-council__claims">
+                    <div><h4>Evidence-backed claims</h4><ul data-evidence-claims></ul></div>
+                    <div><h4>Model inferences</h4><ul data-inference-claims></ul></div>
+                    <div><h4>Red-team challenges</h4><ul data-council-challenges></ul></div>
+                  </div>
+                </section>
               </section>
 
               <section class="decisionos-evidence-preview" aria-labelledby="evidence-title">
