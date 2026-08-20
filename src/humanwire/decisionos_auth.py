@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import logging
 import re
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
@@ -15,6 +16,7 @@ from humanwire.decisionos_models import DecisionOSPrincipal
 _OPAQUE_LIMIT = 8192
 _CSRF_LIMIT = 512
 _APP_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_LOGGER = logging.getLogger(__name__)
 
 
 class AuthenticationUnavailable(RuntimeError):
@@ -161,11 +163,26 @@ class FirebaseSessionAuthenticator:
         failed = False
         try:
             claims = self._client.verify_id_token(id_token, check_revoked=True)
-            _require_recent_authentication(claims, self._clock())
-            principal = _principal_from_claims(claims)
         except Exception:  # noqa: BLE001 - provider details must not cross the boundary
             failed = True
         if failed:
+            _LOGGER.warning(
+                "decisionos_authentication_failed stage=verify_id_token",
+                extra={"stage": "verify_id_token"},
+            )
+            raise AuthenticationUnavailable() from None
+
+        failed = False
+        try:
+            _require_recent_authentication(claims, self._clock())
+            principal = _principal_from_claims(claims)
+        except Exception:  # noqa: BLE001 - claim details must not cross the boundary
+            failed = True
+        if failed:
+            _LOGGER.warning(
+                "decisionos_authentication_failed stage=validate_claims",
+                extra={"stage": "validate_claims"},
+            )
             raise AuthenticationUnavailable() from None
 
         failed = False
@@ -178,6 +195,10 @@ class FirebaseSessionAuthenticator:
         except Exception:  # noqa: BLE001 - provider details must not cross the boundary
             failed = True
         if failed:
+            _LOGGER.warning(
+                "decisionos_authentication_failed stage=create_session_cookie",
+                extra={"stage": "create_session_cookie"},
+            )
             raise AuthenticationUnavailable() from None
         return AuthenticatedSession(principal=principal, cookie=cookie)
 

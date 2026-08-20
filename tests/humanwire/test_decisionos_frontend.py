@@ -156,6 +156,7 @@ def test_frontend_build_is_pinned_and_produces_a_local_firebase_adapter() -> Non
 def test_login_defers_app_check_enforcement_to_the_server_boundary() -> None:
     build = _source(ROOT / "scripts" / "build_decisionos_frontend.mjs")
 
+    assert "result.user.getIdToken(true)" in build
     assert "async function optionalAppCheckToken()" in build
     assert "return (await getToken(state.appCheck, false)).token;" in build
     assert 'return "";' in build
@@ -171,7 +172,7 @@ def test_templates_load_only_local_scripts_and_styles() -> None:
         assert all(item.startswith("/decisionos-static/") for item in facts.resources)
 
 
-def test_google_redirect_returns_into_the_server_session_boundary() -> None:
+def test_google_popup_returns_into_the_server_session_boundary() -> None:
     completed = subprocess.run(
         ["node", "tests/humanwire/decisionos_frontend_harness.js"],
         cwd=ROOT,

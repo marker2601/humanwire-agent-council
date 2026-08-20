@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -218,6 +219,27 @@ def test_provider_exception_graph_does_not_retain_private_details() -> None:
     assert "account.json" not in serialized_graph
     assert captured.value.__cause__ is None
     assert captured.value.__context__ is None
+
+
+def test_id_token_failure_logs_only_the_safe_boundary_stage(caplog) -> None:
+    client = FakeFirebaseAuth()
+    client.failure = RuntimeError("PRIVATE-ID-TOKEN C:/private/account.json")
+
+    with (
+        caplog.at_level(logging.WARNING, logger="humanwire.decisionos_auth"),
+        pytest.raises(AuthenticationUnavailable),
+    ):
+        _auth(client).exchange_id_token("opaque-id-token")
+
+    assert len(caplog.records) == 1
+    record = caplog.records[0]
+    assert record.getMessage() == (
+        "decisionos_authentication_failed stage=verify_id_token"
+    )
+    assert record.stage == "verify_id_token"
+    serialized = " ".join((record.getMessage(), repr(record.__dict__)))
+    assert "PRIVATE-ID-TOKEN" not in serialized
+    assert "account.json" not in serialized
 
 
 @pytest.mark.parametrize(

@@ -9,7 +9,7 @@ import {
   isSignInWithEmailLink,
   sendSignInLinkToEmail,
   signInWithEmailLink,
-  signInWithRedirect,
+  signInWithPopup,
   signOut,
 } from "firebase/auth";
 import {
@@ -43,7 +43,7 @@ async function optionalAppCheckToken() {
 }
 
 async function credential(result) {
-  const idToken = await result.user.getIdToken();
+  const idToken = await result.user.getIdToken(true);
   return {idToken, appCheckToken: await optionalAppCheckToken()};
 }
 
@@ -51,7 +51,7 @@ globalThis.HumanWireFirebase = Object.freeze({
   configure,
   async beginGoogleSignIn(config) {
     const current = configure(config);
-    await signInWithRedirect(current.auth, current.provider);
+    return credential(await signInWithPopup(current.auth, current.provider));
   },
   async completeGoogleSignIn(config) {
     const current = configure(config);

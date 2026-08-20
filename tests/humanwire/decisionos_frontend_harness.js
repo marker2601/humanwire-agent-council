@@ -33,10 +33,13 @@ async function main() {
       return {ok: true, status: 204, json: async () => ({organizations: []})};
     },
     HumanWireFirebase: {
-      async beginGoogleSignIn() { googleRedirectStarts += 1; },
+      async beginGoogleSignIn() {
+        googleRedirectStarts += 1;
+        return credentials;
+      },
       async completeGoogleSignIn() {
         googleRedirectCompletions += 1;
-        return credentials;
+        return null;
       },
       async appCheckToken() { return "app-check"; },
       async signOut() {},
@@ -51,16 +54,16 @@ async function main() {
   load("src/humanwire/decisionos_static/decisionos-auth.js", context);
   await context.HumanWireDecisionOSAuth.signInGoogle();
   assert.strictEqual(googleRedirectStarts, 1);
-  assert.strictEqual(requests.length, 0);
-
-  await context.HumanWireDecisionOSAuth.completeGoogleSignIn();
-  assert.strictEqual(googleRedirectCompletions, 1);
   assert.strictEqual(requests.length, 1);
   assert.strictEqual(requests[0].url, "/api/session/login");
   assert.strictEqual(JSON.parse(requests[0].options.body).id_token, "private-id-token");
   assert.strictEqual(requests[0].options.headers["X-Firebase-AppCheck"], "app-check");
   assert.strictEqual(credentials.idToken, "");
   assert.deepStrictEqual(redirects, ["/workspace"]);
+
+  await context.HumanWireDecisionOSAuth.completeGoogleSignIn();
+  assert.strictEqual(googleRedirectCompletions, 1);
+  assert.strictEqual(requests.length, 1);
 
   context.HumanWireFirebase.completeGoogleSignIn = async () => {
     throw {code: "appCheck/recaptcha-error"};

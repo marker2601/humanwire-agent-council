@@ -61,9 +61,10 @@
   }
 
   async function signInGoogle() {
-    setStatus("Redirecting to secure Google sign in…");
+    setStatus("Opening secure Google sign in…");
     try {
-      await adapter.beginGoogleSignIn(readConfig());
+      const credentials = await adapter.beginGoogleSignIn(readConfig());
+      if (credentials) await exchangeCredential(credentials);
     } catch (error) {
       setStatus("Sign in could not be completed. Try again.", "error", safeAuthReason(error));
     }
