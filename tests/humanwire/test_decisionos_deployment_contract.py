@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from humanwire import decisionos_web
@@ -112,6 +113,7 @@ def test_production_settings_bind_only_explicit_decisionos_environment(monkeypat
     assert settings.app_check_enforced is False
     assert settings.organization_features_enabled is False
     assert settings.council_features_enabled is False
+    assert settings.mission_features_enabled is False
     assert settings.council_model_id == "gemini-3.5-flash"
     assert settings.firebase_public_config == {
         "firebase": {
@@ -165,6 +167,29 @@ def test_council_feature_setting_is_explicit_and_disabled_by_default(monkeypatch
     assert enabled.council_features_enabled is True
     assert enabled.council_model_id == "gemini-3.5-flash"
     assert enabled.council_google_location == "global"
+
+
+def test_mission_feature_requires_the_council_and_is_disabled_by_default(
+    monkeypatch,
+) -> None:
+    values = {
+        "PROJECT_ID": "humanwire-startup",
+        "ALLOWED_HOSTS": "decisionos.example.com",
+        "FIREBASE_API_KEY": "public-web-key",
+        "FIREBASE_APP_ID": "1:123:web:abc",
+        "FIREBASE_AUTH_DOMAIN": "humanwire-startup.firebaseapp.com",
+        "APP_CHECK_SITE_KEY": "recaptcha-site-key",
+    }
+    for suffix, value in values.items():
+        monkeypatch.setenv(f"HUMANWIRE_DECISIONOS_{suffix}", value)
+
+    assert decisionos_web.DecisionOSSettings().mission_features_enabled is False
+    monkeypatch.setenv("HUMANWIRE_DECISIONOS_MISSION_FEATURES_ENABLED", "true")
+    with pytest.raises(ValueError, match="mission feature requires the council"):
+        decisionos_web.DecisionOSSettings()
+    monkeypatch.setenv("HUMANWIRE_DECISIONOS_COUNCIL_FEATURES_ENABLED", "true")
+    enabled = decisionos_web.DecisionOSSettings()
+    assert enabled.mission_features_enabled is True
 
 
 def test_container_keeps_existing_roles_and_installs_decisionos_runtime() -> None:
@@ -235,6 +260,7 @@ def test_decisionos_deployments_are_separate_secret_bound_and_monitor_first() ->
         assert "--min-instances=0" in source
         assert "gemini-3.5-flash" in folded
         assert "HUMANWIRE_DECISIONOS_COUNCIL_FEATURES_ENABLED=true" in source
+        assert "HUMANWIRE_DECISIONOS_MISSION_FEATURES_ENABLED=true" in source
         assert "HUMANWIRE_DECISIONOS_COUNCIL_MODEL_ID" in source
         assert "HUMANWIRE_DECISIONOS_COUNCIL_GOOGLE_LOCATION" in source
         assert "aiplatform.googleapis.com" in source

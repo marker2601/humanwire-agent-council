@@ -7,9 +7,9 @@ import logging
 import os
 import secrets
 from functools import lru_cache
-from typing import Any
+from typing import Any, Self
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from humanwire.decisionos_app import DecisionOSDependencies, create_decisionos_app
@@ -52,9 +52,16 @@ class DecisionOSSettings(BaseSettings):
     app_check_enforced: bool = False
     organization_features_enabled: bool = False
     council_features_enabled: bool = False
+    mission_features_enabled: bool = False
     council_model_id: str = "gemini-3.5-flash"
     council_google_location: str = "global"
     council_timeout_seconds: float = Field(default=180.0, ge=10.0, le=300.0)
+
+    @model_validator(mode="after")
+    def mission_requires_council(self) -> Self:
+        if self.mission_features_enabled and not self.council_features_enabled:
+            raise ValueError("mission feature requires the council")
+        return self
 
     @field_validator(
         "firestore_database",
@@ -200,6 +207,7 @@ def build_dependencies(
     )
     decisionos_repository = FirestoreDecisionOSRepository(firestore_client)
     organization_dependencies: dict[str, object] = {}
+    organization_repository = None
     if settings.organization_features_enabled:
         from humanwire.organization_import import OrganizationImportService
         from humanwire.organization_projection import build_organization_projection
@@ -216,6 +224,7 @@ def build_dependencies(
             "organization_projection_builder": build_organization_projection,
         }
     council_dependencies: dict[str, object] = {}
+    council_runtime = None
     if settings.council_features_enabled:
         from humanwire.council_runtime import (
             DecisionOSCouncilRuntime,
@@ -226,13 +235,44 @@ def build_dependencies(
         os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
         os.environ["GOOGLE_CLOUD_PROJECT"] = settings.project_id
         os.environ["GOOGLE_CLOUD_LOCATION"] = settings.council_google_location
+        council_runtime = DecisionOSCouncilRuntime(
+            store=FirestoreCouncilRunStore(firestore_client),
+            evidence_registry=FirestoreCouncilEvidenceRegistry(firestore_client),
+            model_identifier=settings.council_model_id,
+            timeout_seconds=settings.council_timeout_seconds,
+        )
         council_dependencies = {
             "council_features_enabled": True,
-            "council_runtime": DecisionOSCouncilRuntime(
-                store=FirestoreCouncilRunStore(firestore_client),
-                evidence_registry=FirestoreCouncilEvidenceRegistry(firestore_client),
-                model_identifier=settings.council_model_id,
-                timeout_seconds=settings.council_timeout_seconds,
+            "council_runtime": council_runtime,
+        }
+    mission_dependencies: dict[str, object] = {}
+    if settings.mission_features_enabled:
+        from humanwire.mission_participants import MissionParticipantResolver
+        from humanwire.mission_service import MissionService
+        from humanwire.mission_store import FirestoreMissionRepository
+        from humanwire.mission_transport import (
+            ConnectedMissionDispatcher,
+            NoConfiguredMissionRoutes,
+        )
+        from humanwire.organization_store import FirestoreOrganizationGraphRepository
+
+        if council_runtime is None:
+            raise ValueError("DecisionOS mission council is unavailable")
+        mission_graph_repository = organization_repository or (
+            FirestoreOrganizationGraphRepository(firestore_client)
+        )
+        mission_dependencies = {
+            "mission_features_enabled": True,
+            "mission_service": MissionService(
+                repository=FirestoreMissionRepository(firestore_client),
+                resolver=MissionParticipantResolver(
+                    graph_repository=mission_graph_repository,
+                ),
+                council=council_runtime,
+                dispatcher=ConnectedMissionDispatcher(
+                    routes=NoConfiguredMissionRoutes(),
+                    transport=None,
+                ),
             ),
         }
     return DecisionOSDependencies(
@@ -247,6 +287,7 @@ def build_dependencies(
         organization_features_enabled=settings.organization_features_enabled,
         **organization_dependencies,
         **council_dependencies,
+        **mission_dependencies,
     )
 
 

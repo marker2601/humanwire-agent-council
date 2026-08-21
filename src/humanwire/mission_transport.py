@@ -146,6 +146,17 @@ class MissionTransport(Protocol):
     def deliver(self, outreach: PreparedMissionOutreach) -> MissionDeliveryReceipt: ...
 
 
+class NoConfiguredMissionRoutes:
+    """Explicit deployment state for Demo-only installations."""
+
+    def consented_routes(
+        self,
+        _context: DecisionOSContext,
+        _subject_id: str,
+    ) -> tuple[MissionRoute, ...]:
+        return ()
+
+
 class MissionTransportUnavailable(RuntimeError):
     def __init__(self) -> None:
         super().__init__("mission_transport_unavailable")
@@ -481,5 +492,6 @@ __all__ = [
     "MissionRouteRegistry",
     "MissionTransport",
     "MissionTransportUnavailable",
+    "NoConfiguredMissionRoutes",
     "PreparedMissionOutreach",
 ]
