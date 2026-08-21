@@ -65,7 +65,7 @@ def _safe_display(value: str) -> str:
     if (
         not normalized
         or any(ord(character) < 32 or ord(character) == 127 for character in normalized)
-        or any(character in "<>&\"'" for character in normalized)
+        or any(character in "<>" for character in normalized)
     ):
         raise ValueError("display text is invalid")
     return normalized
