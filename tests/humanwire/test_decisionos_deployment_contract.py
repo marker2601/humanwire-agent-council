@@ -260,6 +260,7 @@ def test_decisionos_deployments_are_separate_secret_bound_and_monitor_first() ->
         assert "--min-instances=0" in source
         assert "gemini-3.5-flash" in folded
         assert "HUMANWIRE_DECISIONOS_COUNCIL_FEATURES_ENABLED=true" in source
+        assert "HUMANWIRE_DECISIONOS_ORGANIZATION_FEATURES_ENABLED=true" in source
         assert "HUMANWIRE_DECISIONOS_MISSION_FEATURES_ENABLED=true" in source
         assert "HUMANWIRE_DECISIONOS_COUNCIL_MODEL_ID" in source
         assert "HUMANWIRE_DECISIONOS_COUNCIL_GOOGLE_LOCATION" in source
