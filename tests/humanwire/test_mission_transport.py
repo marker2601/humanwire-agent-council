@@ -176,6 +176,25 @@ def test_connected_dispatch_requires_configured_provider() -> None:
     assert outcome.code == "provider_not_configured"
 
 
+def test_readiness_check_never_sends_and_returns_exact_blocker() -> None:
+    person = participant(MissionActorType.HUMAN_MEMBER)
+    transport = RecordingTransport()
+    dispatcher = ConnectedMissionDispatcher(
+        routes=FixedRoutes((route(consented=False),)),
+        transport=transport,
+        clock=lambda: NOW,
+    )
+
+    blocker = dispatcher.check_readiness(
+        context(),
+        snapshot(MissionMode.CONNECTED_ORGANIZATION, person),
+        person,
+    )
+
+    assert blocker == "no_consented_route"
+    assert transport.calls == []
+
+
 def test_connected_dispatch_records_exact_adapter_result() -> None:
     transport = RecordingTransport()
     person = participant(MissionActorType.HUMAN_MEMBER)

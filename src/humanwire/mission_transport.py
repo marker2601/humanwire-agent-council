@@ -314,6 +314,55 @@ class ConnectedMissionDispatcher:
         self._transport = transport
         self._clock = clock
 
+    def check_readiness(
+        self,
+        context: DecisionOSContext,
+        snapshot: MissionSnapshot,
+        participant: MissionParticipant,
+    ) -> str | None:
+        if (
+            type(context) is not DecisionOSContext
+            or type(snapshot) is not MissionSnapshot
+            or type(participant) is not MissionParticipant
+            or snapshot.mode is not MissionMode.CONNECTED_ORGANIZATION
+            or snapshot.organization_id != context.organization_id
+            or participant.actor_type is not MissionActorType.HUMAN_MEMBER
+            or participant.subject_id is None
+            or participant not in snapshot.participants
+        ):
+            return "no_eligible_participant"
+        failed = False
+        raw_routes = None
+        try:
+            raw_routes = self._routes.consented_routes(context, participant.subject_id)
+        except Exception:  # noqa: BLE001 - directory details stay private
+            failed = True
+        if failed or type(raw_routes) is not tuple:
+            raw_routes = ()
+        eligible = tuple(
+            item
+            for item in raw_routes
+            if type(item) is MissionRoute
+            and item.organization_id == context.organization_id
+            and item.subject_id == participant.subject_id
+            and item.consented
+            and item.active
+        )
+        if not eligible:
+            return "no_consented_route"
+        transport = self._transport
+        if transport is None:
+            return "provider_not_configured"
+        try:
+            provider_route_id = object.__getattribute__(transport, "route_id")
+        except Exception:  # noqa: BLE001 - provider descriptor details stay private
+            provider_route_id = None
+        if type(provider_route_id) is not str or not any(
+            item.provider_route_id == provider_route_id for item in eligible
+        ):
+            return "provider_not_configured"
+        return None
+
     def dispatch(
         self,
         context: DecisionOSContext,
