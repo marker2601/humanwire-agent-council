@@ -247,3 +247,35 @@ def test_mission_frontend_keeps_mode_stream_and_reset_truthful() -> None:
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout == "decisionos mission harness: PASS\n"
+
+
+def test_mission_frontend_shows_truthful_live_progress_without_a_blank_wait() -> None:
+    template = _source(TEMPLATES / "decisionos_shell.html")
+    styles = _source(STATIC / "decisionos.css")
+    controller = _source(STATIC / "decisionos-app.js")
+
+    for selector in (
+        "data-mission-progress",
+        "data-mission-progress-meter",
+        "data-mission-progress-summary",
+        "data-mission-elapsed",
+        "data-mission-pulse",
+    ):
+        assert selector in template
+    for stage in ("outreach", "analysis", "synthesis", "evidence", "decision"):
+        assert f'data-mission-step="{stage}"' in template
+    assert "aria-live=\"polite\"" in template
+    assert "aria-busy" in controller
+    assert "Still working" in controller
+    assert "prefers-reduced-motion: reduce" in styles
+
+    completed = subprocess.run(
+        ["node", "tests/humanwire/decisionos_mission_experience_harness.js"],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "decisionos mission experience harness: PASS\n"

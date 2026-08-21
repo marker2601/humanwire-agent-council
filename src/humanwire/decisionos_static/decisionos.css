@@ -836,6 +836,124 @@ a:focus-visible {
   font-size: 15px;
 }
 
+.decisionos-mission__progress {
+  display: grid;
+  margin-top: 18px;
+  padding: 16px;
+  gap: 12px;
+  border: 1px solid #b8dff4;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #f4fbff 0%, #ffffff 76%);
+}
+
+.decisionos-mission__progress > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.decisionos-mission__progress > div strong,
+.decisionos-mission__progress > div span,
+.decisionos-mission__progress > p {
+  overflow-wrap: anywhere;
+  font-size: 14px;
+}
+
+.decisionos-mission__progress > div span,
+.decisionos-mission__progress > p {
+  color: var(--decisionos-muted);
+}
+
+.decisionos-mission__progress progress {
+  width: 100%;
+  height: 8px;
+  border: 0;
+  border-radius: 999px;
+  overflow: hidden;
+  accent-color: var(--decisionos-cyan);
+}
+
+.decisionos-mission__progress ol {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  list-style: none;
+}
+
+.decisionos-mission__progress li {
+  display: grid;
+  min-width: 0;
+  min-height: 64px;
+  align-content: center;
+  padding: 9px;
+  gap: 4px;
+  border: 1px solid var(--decisionos-soft-line);
+  border-radius: 8px;
+  color: var(--decisionos-muted);
+  background: var(--decisionos-white);
+  transition: border-color 180ms ease, background 180ms ease, color 180ms ease;
+}
+
+.decisionos-mission__progress li span,
+.decisionos-mission__progress li strong {
+  overflow-wrap: anywhere;
+  font-size: 14px;
+}
+
+.decisionos-mission__progress li[data-state="complete"] {
+  border-color: #97d8c2;
+  color: #126348;
+  background: #effaf6;
+}
+
+.decisionos-mission__progress li[data-state="current"] {
+  border-color: var(--decisionos-cyan);
+  color: #064c82;
+  background: #eaf8ff;
+  box-shadow: 0 8px 24px rgb(6 185 237 / 12%);
+  animation: decisionos-mission-breathe 1.8s ease-in-out infinite;
+}
+
+.decisionos-mission__progress > p {
+  min-height: 22px;
+  margin: 0;
+  font-weight: 650;
+}
+
+.decisionos-mission__progress > p[data-tone="error"] {
+  color: #8a3b19;
+}
+
+.decisionos-mission__timeline li {
+  animation: decisionos-mission-event-in 220ms ease-out both;
+}
+
+@keyframes decisionos-mission-event-in {
+  from {
+    opacity: 0;
+    transform: translateY(7px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes decisionos-mission-breathe {
+  0%,
+  100% {
+    box-shadow: 0 8px 24px rgb(6 185 237 / 8%);
+  }
+
+  50% {
+    box-shadow: 0 8px 28px rgb(6 185 237 / 22%);
+  }
+}
+
 .decisionos-mission__grid {
   display: grid;
   min-width: 0;
@@ -1671,6 +1789,16 @@ a:focus-visible {
   .decisionos-mission__modes,
   .decisionos-mission__grid {
     grid-template-columns: 1fr;
+  }
+
+  .decisionos-mission__progress ol {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .decisionos-mission__progress > div {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
   }
 
   .decisionos-mission__composer,
