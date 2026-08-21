@@ -332,6 +332,7 @@ async function main() {
   assert.strictEqual(selectors.get("[data-council-state]").textContent, "Decision brief ready");
   assert.strictEqual(selectors.get("[data-mission-progress-summary]").textContent, "Decision brief ready");
   assert.strictEqual(selectors.get("[data-mission-progress-meter]").value, 5);
+  assert.strictEqual(selectors.get("[data-mission-progress-meter]").textContent, "5 of 5 stages complete");
   assert.strictEqual(selectors.get("[data-mission-timeline]").children.length, events.length);
   assert.strictEqual(selectors.get("[data-mission-timeline]").replaceCount, 2);
   assert.match(selectors.get("[data-mission-elapsed]").textContent, /^Completed in /);

@@ -631,7 +631,14 @@
           : "upcoming";
     }
     const meter = element("[data-mission-progress-meter]");
-    if (meter) meter.value = complete ? MISSION_STAGES.length : currentIndex + 1;
+    if (meter) {
+      const meterValue = complete ? MISSION_STAGES.length : currentIndex + 1;
+      meter.value = meterValue;
+      meter.setAttribute("value", String(meterValue));
+      meter.textContent = complete
+        ? `${MISSION_STAGES.length} of ${MISSION_STAGES.length} stages complete`
+        : `Stage ${meterValue} of ${MISSION_STAGES.length} in progress`;
+    }
     const summary = element("[data-mission-progress-summary]");
     if (summary) summary.textContent = complete
       ? "Decision brief ready"
