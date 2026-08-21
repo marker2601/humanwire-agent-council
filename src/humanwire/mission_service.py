@@ -122,7 +122,7 @@ class MissionService:
         ):
             raise MissionServiceUnavailable()
         try:
-            snapshot = self._repository.load(context, mission_id)
+            snapshot = self._repository.load_bound(context, workspace, mission_id)
         except Exception:  # noqa: BLE001 - repository details stay private
             raise MissionServiceUnavailable() from None
         if (

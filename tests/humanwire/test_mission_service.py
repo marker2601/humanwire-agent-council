@@ -218,6 +218,27 @@ def service_fixture(
     )
 
 
+def test_service_load_uses_exact_workspace_bound_repository_lookup() -> None:
+    class WorkspaceBoundRepository(InMemoryMissionRepository):
+        def load(self, _context, _mission_id):
+            raise AssertionError("unscoped mission lookup must not run")
+
+    store = WorkspaceBoundRepository(
+        clock=lambda: NOW,
+        identifiers=FixedIdentifiers(),
+    )
+    service = MissionService(
+        repository=store,
+        resolver=FixedResolver((participant(MissionActorType.AI_SPECIALIST),)),
+        council=RecordingCouncil(),
+        dispatcher=RecordingDispatcher(),
+        clock=lambda: NOW,
+    )
+    created = service.create(context(), workspace(), request(MissionMode.DEMO_RUN))
+
+    assert service.load(context(), workspace(), created.mission_id) == created
+
+
 def test_demo_run_executes_council_and_never_dispatches_provider() -> None:
     service, council, dispatcher = service_fixture(MissionMode.DEMO_RUN)
     created = service.create(context(), workspace(), request(MissionMode.DEMO_RUN))

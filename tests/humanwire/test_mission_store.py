@@ -111,6 +111,18 @@ def test_repository_never_returns_cross_tenant_snapshot() -> None:
         store.load(context(ORG_B), saved.mission_id)
 
 
+def test_workspace_bound_load_rejects_a_different_workspace() -> None:
+    store = repository()
+    saved = store.create(context(), workspace(), request())
+    foreign_workspace = workspace().model_copy(
+        update={"workspace_id": "wrk_01HQ7XK9WPH4Y8ZQK3R2N1M6AB"}
+    )
+
+    assert store.load_bound(context(), workspace(), saved.mission_id) == saved
+    with pytest.raises(MissionUnavailable, match="mission_unavailable"):
+        store.load_bound(context(), foreign_workspace, saved.mission_id)
+
+
 def test_repository_rejects_cross_workspace_creation() -> None:
     foreign_workspace = workspace().model_copy(update={"organization_id": ORG_B})
     with pytest.raises(MissionUnavailable, match="mission_unavailable"):
@@ -149,4 +161,3 @@ def test_loaded_snapshot_is_detached_from_hostile_subclass() -> None:
 
     with pytest.raises(MissionUnavailable, match="mission_unavailable"):
         store.load(context(), MISSION_A)
-

@@ -69,6 +69,13 @@ class MissionRepository(Protocol):
         mission_id: str,
     ) -> MissionSnapshot: ...
 
+    def load_bound(
+        self,
+        context: DecisionOSContext,
+        workspace: DecisionWorkspace,
+        mission_id: str,
+    ) -> MissionSnapshot: ...
+
     def update(
         self,
         context: DecisionOSContext,
@@ -257,6 +264,31 @@ class InMemoryMissionRepository:
         if canonical.organization_id != canonical_context.organization_id:
             raise MissionUnavailable()
         return canonical
+
+    def load_bound(
+        self,
+        context: DecisionOSContext,
+        workspace: DecisionWorkspace,
+        mission_id: str,
+    ) -> MissionSnapshot:
+        canonical_context = _canonical(context, DecisionOSContext)
+        canonical_workspace = _canonical(workspace, DecisionWorkspace)
+        if canonical_workspace.organization_id != canonical_context.organization_id:
+            raise MissionUnavailable()
+        require_permission(canonical_context, DecisionOSPermission.READ_WORKSPACE)
+        if not mission_id_is_valid(mission_id):
+            raise MissionUnavailable()
+        with self._lock:
+            stored = self._records.get(
+                (canonical_context.organization_id, mission_id)
+            )
+        snapshot = _canonical(stored, MissionSnapshot)
+        if (
+            snapshot.organization_id != canonical_context.organization_id
+            or snapshot.workspace_id != canonical_workspace.workspace_id
+        ):
+            raise MissionUnavailable()
+        return snapshot
 
     def update(
         self,
@@ -527,6 +559,44 @@ class FirestoreMissionRepository:
         value = rows[0].to_dict()
         snapshot = _snapshot_from_row(value)
         if snapshot.organization_id != canonical_context.organization_id:
+            raise MissionUnavailable()
+        return snapshot
+
+    def load_bound(
+        self,
+        context: DecisionOSContext,
+        workspace: DecisionWorkspace,
+        mission_id: str,
+    ) -> MissionSnapshot:
+        canonical_context = _canonical(context, DecisionOSContext)
+        canonical_workspace = _canonical(workspace, DecisionWorkspace)
+        require_permission(canonical_context, DecisionOSPermission.READ_WORKSPACE)
+        if (
+            canonical_workspace.organization_id != canonical_context.organization_id
+            or not mission_id_is_valid(mission_id)
+        ):
+            raise MissionUnavailable()
+        reference = self._mission_ref(
+            canonical_context.organization_id,
+            canonical_workspace.workspace_id,
+            mission_id,
+        )
+        failed = False
+        row = None
+        try:
+            document = reference.get()
+            if document.exists:
+                row = document.to_dict()
+        except Exception:  # noqa: BLE001 - provider details stay private
+            failed = True
+        if failed or row is None:
+            raise MissionUnavailable()
+        snapshot = _snapshot_from_row(row)
+        if (
+            snapshot.organization_id != canonical_context.organization_id
+            or snapshot.workspace_id != canonical_workspace.workspace_id
+            or snapshot.mission_id != mission_id
+        ):
             raise MissionUnavailable()
         return snapshot
 
