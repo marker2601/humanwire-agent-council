@@ -94,29 +94,84 @@
             </aside>
 
             <div class="decisionos-workspace__canvas">
+              <section class="decisionos-mission" aria-labelledby="mission-title">
+                <div class="decisionos-mission__heading">
+                  <div>
+                    <p class="decisionos-eyebrow">HumanWire mission control</p>
+                    <h2 id="mission-title">Coordinate a decision</h2>
+                  </div>
+                  <span class="decisionos-mission__state" data-mission-state>Ready</span>
+                </div>
+                <p>Send one agenda to the right AI specialists and stakeholders, collect what matters, and return a decision brief instead of another long meeting.</p>
+                <form class="decisionos-mission__composer" data-mission-form>
+                  <fieldset class="decisionos-mission__modes">
+                    <legend>How should HumanWire run this mission?</legend>
+                    <label>
+                      <input type="radio" name="mode" value="demo_run" data-mission-mode="demo_run" checked>
+                      <span><strong>Demo run</strong><small>AI team and AI stakeholders · no external messages</small></span>
+                    </label>
+                    <label>
+                      <input type="radio" name="mode" value="connected_organization" data-mission-mode="connected_organization">
+                      <span><strong>Connected organization</strong><small>AI team and activated members · consented delivery only</small></span>
+                    </label>
+                  </fieldset>
+                  <label for="mission-objective">Decision or agenda</label>
+                  <textarea id="mission-objective" name="objective" rows="4" minlength="12" maxlength="1000" required>Assess whether HumanWire is ready for a limited launch, collect the strongest evidence and constraints, resolve material disagreement, and prepare the exact next decision.</textarea>
+                  <div class="decisionos-mission__options">
+                    <label>Urgency
+                      <select name="urgency">
+                        <option value="standard">Standard</option>
+                        <option value="urgent">Urgent</option>
+                      </select>
+                    </label>
+                    <label class="decisionos-mission__check"><input type="checkbox" name="include_conflict" checked> Resolve disagreement before the brief</label>
+                  </div>
+                  <div class="decisionos-mission__actions">
+                    <p data-mission-readiness>Demo run is ready. AI actors stay clearly labeled and no provider is contacted.</p>
+                    <div>
+                      <button class="decisionos-secondary-button" type="button" data-new-mission hidden>New mission</button>
+                      <button class="decisionos-primary-button" type="submit" data-start-mission>Start mission</button>
+                    </div>
+                  </div>
+                </form>
+                <section class="decisionos-mission__workspace" data-mission-workspace hidden aria-labelledby="mission-workspace-title">
+                  <div class="decisionos-mission__workspace-heading">
+                    <div>
+                      <p class="decisionos-eyebrow" data-mission-mode-label>Demo run</p>
+                      <h3 id="mission-workspace-title" data-mission-objective></h3>
+                    </div>
+                    <span data-mission-stage>Request</span>
+                  </div>
+                  <div class="decisionos-mission__grid">
+                    <section aria-labelledby="mission-participants-title">
+                      <h4 id="mission-participants-title">People and agents</h4>
+                      <ul class="decisionos-mission__participants" data-mission-participants></ul>
+                    </section>
+                    <section aria-labelledby="mission-timeline-title">
+                      <h4 id="mission-timeline-title">Live coordination</h4>
+                      <ol class="decisionos-mission__timeline" data-mission-timeline aria-live="polite"></ol>
+                    </section>
+                  </div>
+                  <aside class="decisionos-mission__result" data-mission-result>
+                    <div><span>Next action</span><strong data-mission-next-action></strong></div>
+                    <p data-mission-recommendation></p>
+                    <p data-mission-blocked hidden></p>
+                  </aside>
+                </section>
+              </section>
+
               <section class="decisionos-council" aria-labelledby="council-title">
                 <div class="decisionos-council__heading">
                   <div>
                     <p class="decisionos-eyebrow">Google ADK · Gemini</p>
                     <h2 id="council-title">Agent Council</h2>
                   </div>
-                  <span class="decisionos-council__state" data-council-state>Ready to run</span>
+                  <span class="decisionos-council__state" data-council-state>Agent team ready</span>
                 </div>
-                <p>Four specialists investigate in parallel. Synthesis, red-team challenge, and final synthesis follow. Every result remains advisory until human approval.</p>
-                <form class="decisionos-council__composer" data-council-form>
-                  <label for="council-objective">Decision objective</label>
-                  <textarea id="council-objective" name="objective" rows="3" minlength="10" maxlength="2000" required>Assess whether HumanWire is ready for a limited launch, identify the strongest evidence, surface material risks, and recommend the exact next human decision.</textarea>
-                  <div>
-                    <span>Uses tenant-scoped evidence only. Agents cannot approve or send messages.</span>
-                    <div class="decisionos-council__actions">
-                      <button class="decisionos-secondary-button" type="button" data-demo-evidence>Load demo company</button>
-                      <button class="decisionos-primary-button" type="submit" data-run-council>Run Agent Council</button>
-                    </div>
-                  </div>
-                </form>
+                <p>The Agent Council investigates in parallel, challenges unsupported conclusions, and synthesizes the mission evidence. Human authority remains explicit.</p>
                 <div class="decisionos-demo-disclosure" data-demo-disclosure hidden>
-                  <strong>Synthetic demo evidence</strong>
-                  <span>Fictional company records for this demonstration—not real HumanWire facts.</span>
+                  <strong>Demo run</strong>
+                  <span>AI stakeholders and sample company records stay inside this run. No external messages are sent.</span>
                 </div>
                 <ol class="decisionos-council__flow" data-council-flow>
                   <li data-specialist="market_intelligence"><span>1</span><strong>Market Intelligence</strong><small>Waiting</small></li>
@@ -201,8 +256,8 @@
             <button class="decisionos-secondary-button" type="button" data-demo-evidence>Load demo company</button>
           </div>
           <div class="decisionos-demo-disclosure" data-demo-disclosure hidden>
-            <strong>Synthetic demo evidence</strong>
-            <span>Fictional company records for this demonstration—not real HumanWire facts.</span>
+            <strong>Demo run</strong>
+            <span>AI stakeholders and sample company records stay inside this run. No external messages are sent.</span>
           </div>
           <ul class="decisionos-evidence-list" data-evidence-list>
             <li data-evidence-empty>No evidence records are ready yet.</li>

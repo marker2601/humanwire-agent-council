@@ -601,6 +601,7 @@ a:focus-visible {
 }
 
 .decisionos-playbooks h2,
+.decisionos-mission h2,
 .decisionos-council h2,
 .decisionos-evidence-preview h2,
 .decisionos-authority h2 {
@@ -629,6 +630,330 @@ a:focus-visible {
 .decisionos-workspace__canvas {
   padding-right: 28px;
   padding-left: 28px;
+}
+
+.decisionos-mission {
+  min-width: 0;
+  margin-bottom: 32px;
+  padding-bottom: 30px;
+  border-bottom: 1px solid var(--decisionos-line);
+}
+
+.decisionos-mission__heading,
+.decisionos-mission__workspace-heading,
+.decisionos-mission__actions,
+.decisionos-mission__actions > div {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.decisionos-mission > p {
+  max-width: 760px;
+  margin: 4px 0 20px;
+  color: var(--decisionos-muted);
+  font-size: 14px;
+}
+
+.decisionos-mission__state,
+.decisionos-mission__workspace-heading > span {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  padding: 0 12px;
+  border: 1px solid #b8dff4;
+  border-radius: 999px;
+  color: #075c91;
+  background: #eef9ff;
+  font-size: 14px;
+  font-weight: 750;
+}
+
+.decisionos-mission__composer {
+  display: grid;
+  padding: 20px;
+  gap: 14px;
+  border: 1px solid #b8dff4;
+  border-radius: 14px;
+  background: linear-gradient(135deg, #f2fbff 0%, #ffffff 68%);
+  box-shadow: 0 18px 48px rgb(6 21 47 / 7%);
+}
+
+.decisionos-mission__composer > label,
+.decisionos-mission__modes legend,
+.decisionos-mission__options > label {
+  color: var(--decisionos-ink);
+  font-size: 14px;
+  font-weight: 750;
+}
+
+.decisionos-mission__composer textarea,
+.decisionos-mission__composer select {
+  width: 100%;
+  border: 1px solid #98b7ca;
+  border-radius: 8px;
+  color: var(--decisionos-ink);
+  background: var(--decisionos-white);
+  font: inherit;
+}
+
+.decisionos-mission__composer textarea {
+  min-height: 112px;
+  resize: vertical;
+  padding: 12px 14px;
+  line-height: 1.5;
+}
+
+.decisionos-mission__composer select {
+  min-width: 150px;
+  padding: 0 12px;
+}
+
+.decisionos-mission__modes {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  border: 0;
+}
+
+.decisionos-mission__modes legend {
+  margin-bottom: 8px;
+  grid-column: 1 / -1;
+}
+
+.decisionos-mission__modes label {
+  display: flex;
+  min-width: 0;
+  min-height: 76px;
+  align-items: flex-start;
+  padding: 14px;
+  gap: 10px;
+  border: 1px solid var(--decisionos-line);
+  border-radius: 10px;
+  background: var(--decisionos-white);
+  cursor: pointer;
+}
+
+.decisionos-mission__modes label:has(input:checked) {
+  border-color: var(--decisionos-cyan);
+  box-shadow: inset 0 0 0 1px var(--decisionos-cyan);
+  background: #f3fbff;
+}
+
+.decisionos-mission__modes label:has(input:focus-visible) {
+  outline: 3px solid color-mix(in srgb, var(--decisionos-cyan) 55%, transparent);
+  outline-offset: 3px;
+}
+
+.decisionos-mission__modes input {
+  width: 20px;
+  min-width: 20px;
+  height: 20px;
+  margin: 2px 0 0;
+  accent-color: var(--decisionos-blue);
+}
+
+.decisionos-mission__modes span {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.decisionos-mission__modes strong,
+.decisionos-mission__modes small {
+  overflow-wrap: anywhere;
+}
+
+.decisionos-mission__modes strong {
+  font-size: 15px;
+}
+
+.decisionos-mission__modes small {
+  color: var(--decisionos-muted);
+  font-size: 14px;
+  line-height: 1.35;
+}
+
+.decisionos-mission__options {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+}
+
+.decisionos-mission__options > label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.decisionos-mission__check {
+  min-height: 44px;
+}
+
+.decisionos-mission__check input {
+  width: 20px;
+  height: 20px;
+  accent-color: var(--decisionos-blue);
+}
+
+.decisionos-mission__actions {
+  align-items: center;
+  padding-top: 4px;
+}
+
+.decisionos-mission__actions > p {
+  max-width: 520px;
+  margin: 0;
+  color: var(--decisionos-muted);
+  font-size: 14px;
+}
+
+.decisionos-mission__workspace {
+  margin-top: 18px;
+  padding: 20px;
+  border: 1px solid var(--decisionos-line);
+  border-radius: 14px;
+  background: var(--decisionos-white);
+}
+
+.decisionos-mission__workspace h3,
+.decisionos-mission__workspace h4 {
+  margin: 0;
+  color: var(--decisionos-ink);
+}
+
+.decisionos-mission__workspace h3 {
+  max-width: 760px;
+  font-size: 20px;
+  line-height: 1.35;
+}
+
+.decisionos-mission__workspace h4 {
+  margin-bottom: 10px;
+  font-size: 15px;
+}
+
+.decisionos-mission__grid {
+  display: grid;
+  min-width: 0;
+  margin-top: 20px;
+  grid-template-columns: minmax(200px, 0.8fr) minmax(260px, 1.2fr);
+  gap: 22px;
+}
+
+.decisionos-mission__participants,
+.decisionos-mission__timeline {
+  display: grid;
+  min-width: 0;
+  max-height: 430px;
+  margin: 0;
+  padding: 0;
+  gap: 8px;
+  overflow: auto;
+  list-style: none;
+}
+
+.decisionos-mission__participants li {
+  display: grid;
+  min-width: 0;
+  padding: 10px 12px;
+  gap: 2px;
+  border: 1px solid var(--decisionos-soft-line);
+  border-radius: 8px;
+}
+
+.decisionos-mission__participants strong,
+.decisionos-mission__participants span,
+.decisionos-mission__participants small {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+}
+
+.decisionos-mission__participants span,
+.decisionos-mission__participants small {
+  color: var(--decisionos-muted);
+}
+
+.decisionos-mission__participants li[data-actor^="ai-"] {
+  border-color: #b8dff4;
+  background: #f6fcff;
+}
+
+.decisionos-mission__timeline li {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 36px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+}
+
+.decisionos-mission__timeline li > span {
+  display: inline-flex;
+  width: 34px;
+  height: 34px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  color: #075c91;
+  background: #eaf8ff;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.decisionos-mission__timeline li > div {
+  min-width: 0;
+  padding: 6px 0 12px;
+  border-bottom: 1px solid var(--decisionos-soft-line);
+}
+
+.decisionos-mission__timeline strong,
+.decisionos-mission__timeline small {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+}
+
+.decisionos-mission__timeline small {
+  margin-top: 2px;
+  color: var(--decisionos-muted);
+}
+
+.decisionos-mission__result {
+  display: grid;
+  margin-top: 18px;
+  padding: 16px;
+  gap: 8px;
+  border: 1px solid #b8dff4;
+  border-radius: 10px;
+  background: #f5fbff;
+}
+
+.decisionos-mission__result > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.decisionos-mission__result span,
+.decisionos-mission__result strong,
+.decisionos-mission__result p {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+}
+
+.decisionos-mission__result span {
+  color: var(--decisionos-muted);
+}
+
+.decisionos-mission__result [data-mission-blocked] {
+  color: #8a3b19;
+  font-weight: 700;
 }
 
 .decisionos-council > p,
@@ -1331,12 +1656,48 @@ a:focus-visible {
 }
 
 @media (max-width: 759px) {
+  .decisionos-mission__heading,
+  .decisionos-mission__workspace-heading,
+  .decisionos-mission__actions,
+  .decisionos-mission__actions > div,
   .decisionos-council__actions,
   .decisionos-panel-heading,
   .decisionos-agent-team__heading,
   .decisionos-latest-decision > div {
     width: 100%;
     flex-direction: column;
+  }
+
+  .decisionos-mission__modes,
+  .decisionos-mission__grid {
+    grid-template-columns: 1fr;
+  }
+
+  .decisionos-mission__composer,
+  .decisionos-mission__workspace {
+    padding: 16px;
+  }
+
+  .decisionos-mission__options {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .decisionos-mission__options > label {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .decisionos-mission__composer select,
+  .decisionos-mission__actions button {
+    width: 100%;
+  }
+
+  .decisionos-mission__result > div {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
   }
 
   .decisionos-agent-grid {
@@ -1395,7 +1756,7 @@ a:focus-visible {
   }
 
   .decisionos-method strong {
-    font-size: 13px;
+    font-size: 14px;
     overflow-wrap: anywhere;
   }
 
@@ -1410,7 +1771,7 @@ a:focus-visible {
     bottom: -20px;
     left: -16px;
     width: 100px;
-    font-size: 12px;
+    font-size: 14px;
   }
 
   .decisionos-playbook-links {

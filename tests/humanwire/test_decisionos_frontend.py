@@ -74,12 +74,13 @@ def test_workspace_shell_has_real_navigation_and_authority_regions() -> None:
         "Financial Analysis",
         "Decision Synthesis",
         "Red Team",
-        "Run Agent Council",
+        "Start mission",
         "Evidence that changes the decision",
         "Decision authority",
         "Human approval required",
         "Load demo company",
-        "Synthetic demo evidence",
+        "Demo run",
+        "Connected organization",
         "AI operating team",
         "Market Intelligence AI",
         "Financial Analysis AI",
@@ -100,6 +101,14 @@ def test_workspace_shell_has_real_navigation_and_authority_regions() -> None:
     assert "data-demo-evidence" in source
     assert "data-evidence-list" in source
     assert "data-latest-decision" in source
+    assert 'data-mission-mode="demo_run"' in source
+    assert 'data-mission-mode="connected_organization"' in source
+    assert "data-mission-form" in source
+    assert "data-mission-workspace" in source
+    assert "data-mission-participants" in source
+    assert "data-mission-timeline" in source
+    assert "Synthetic demo evidence" not in visible
+    assert "fabricated" not in visible.casefold()
 
 
 def test_css_matches_the_locked_decisionos_design_system() -> None:
@@ -157,6 +166,16 @@ def test_app_controller_targets_only_real_protected_routes() -> None:
     assert "X-HumanWire-CSRF" in source
     assert "X-Firebase-AppCheck" in source
     assert "aria-selected" in source
+    for name in (
+        "createMission",
+        "runMission",
+        "consumeMissionStream",
+        "renderMission",
+        "resetMission",
+    ):
+        assert f"function {name}" in source
+    assert "recipient" not in source
+    assert "mission_stream_ended" in source
 
 
 def test_frontend_build_is_pinned_and_produces_a_local_firebase_adapter() -> None:
@@ -215,3 +234,16 @@ def test_council_frontend_paces_activity_and_synchronizes_team_and_decision() ->
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout == "decisionos council demo harness: PASS\n"
+
+
+def test_mission_frontend_keeps_mode_stream_and_reset_truthful() -> None:
+    completed = subprocess.run(
+        ["node", "tests/humanwire/decisionos_mission_harness.js"],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "decisionos mission harness: PASS\n"

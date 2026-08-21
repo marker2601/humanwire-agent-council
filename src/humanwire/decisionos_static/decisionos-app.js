@@ -8,6 +8,9 @@
     activeOrganizationId: "",
     activeWorkspaceId: "",
     councilRunning: false,
+    missionRunning: false,
+    missionReader: null,
+    mission: null,
     evidence: [],
   };
 
@@ -298,7 +301,7 @@
         title.textContent = item.title;
         detail.textContent =
           item.provenance === "synthetic_demo"
-            ? "Ready · synthetic demo record"
+            ? "Ready · Demo run sample"
             : "Ready · workspace evidence";
         row.append(title, detail);
         list.append(row);
@@ -403,14 +406,14 @@
     if (!state.activeOrganizationId || !state.activeWorkspaceId) return;
     const buttons = elements("[data-demo-evidence]");
     for (const button of buttons) button.disabled = true;
-    setStatus("Creating a clearly labeled synthetic demo company…");
+    setStatus("Preparing the Demo run company…");
     try {
       const result = await postJSON(
         `/api/organizations/${state.activeOrganizationId}/workspaces/${state.activeWorkspaceId}/demo-evidence`,
         {confirm: "synthetic_demo"},
       );
       renderEvidence(result.evidence || []);
-      setStatus("Synthetic demo evidence is ready. Run the Agent Council to watch the team work.");
+      setStatus("Demo run evidence is ready. Start a mission to watch the team work.");
     } catch (_error) {
       setStatus("The demo company could not be created. Try again.", "error");
     } finally {
@@ -486,6 +489,234 @@
     }
   }
 
+  function missionPath(missionId) {
+    const base = `/api/organizations/${state.activeOrganizationId}/workspaces/${state.activeWorkspaceId}/missions`;
+    return missionId ? `${base}/${missionId}` : base;
+  }
+
+  function missionStateLabel(value) {
+    return String(value || "ready")
+      .replaceAll("_", " ")
+      .replace(/^./, (character) => character.toUpperCase());
+  }
+
+  function updateMissionReadiness() {
+    const selected = element('[data-mission-mode]:checked');
+    const target = element("[data-mission-readiness]");
+    if (!target) return;
+    target.textContent = selected?.value === "connected_organization"
+      ? "Connected organization uses activated members and exact consented routes. Missing configuration stops safely."
+      : "Demo run is ready. AI actors stay clearly labeled and no provider is contacted.";
+  }
+
+  function renderMissionParticipants(participants) {
+    const target = element("[data-mission-participants]");
+    if (!target) return;
+    target.replaceChildren();
+    for (const participant of participants || []) {
+      const item = global.document.createElement("li");
+      const identity = global.document.createElement("strong");
+      const role = global.document.createElement("span");
+      const actor = global.document.createElement("small");
+      identity.textContent = participant.display_name || "Mission participant";
+      role.textContent = participant.role || "Decision participant";
+      actor.textContent = participant.actor_label || "Participant";
+      item.dataset.actor = String(participant.actor_label || "participant")
+        .toLowerCase()
+        .replaceAll(" ", "-");
+      item.append(identity, role, actor);
+      target.append(item);
+    }
+  }
+
+  function appendMissionEvent(event) {
+    if (!event || !Number.isInteger(event.ordinal)) return;
+    const target = element("[data-mission-timeline]");
+    if (target && !target.querySelector?.(`[data-event-ordinal="${event.ordinal}"]`)) {
+      const item = global.document.createElement("li");
+      const marker = global.document.createElement("span");
+      const copy = global.document.createElement("div");
+      const summary = global.document.createElement("strong");
+      const stage = global.document.createElement("small");
+      item.dataset.eventOrdinal = String(event.ordinal);
+      marker.textContent = String(event.ordinal).padStart(2, "0");
+      summary.textContent = event.summary || "Mission activity saved.";
+      stage.textContent = missionStateLabel(event.stage);
+      copy.append(summary, stage);
+      item.append(marker, copy);
+      target.append(item);
+      item.scrollIntoView?.({block: "nearest"});
+    }
+    const stageLabel = element("[data-mission-stage]");
+    if (stageLabel) stageLabel.textContent = missionStateLabel(event.stage);
+    const participantId = String(event.participant_id || "");
+    if (participantId.startsWith("ai-")) {
+      const specialistId = participantId.slice(3).replaceAll("-", "_");
+      if (event.kind === "council.specialist_started") {
+        setCouncilNodeStatus(specialistId, "started");
+      } else if (event.kind === "council.specialist_completed") {
+        setCouncilNodeStatus(specialistId, "completed");
+      } else if (event.kind === "council.specialist_failed") {
+        setCouncilNodeStatus(specialistId, "failed");
+      }
+    }
+  }
+
+  function renderMission(projection) {
+    if (!projection || !Array.isArray(projection.participants) || !Array.isArray(projection.events)) {
+      throw new Error("mission_unavailable");
+    }
+    state.mission = projection;
+    show("[data-mission-workspace]", true);
+    show("[data-new-mission]", true);
+    const start = element("[data-start-mission]");
+    if (start) start.hidden = true;
+    const stateLabel = element("[data-mission-state]");
+    const objective = element("[data-mission-objective]");
+    const mode = element("[data-mission-mode-label]");
+    const stage = element("[data-mission-stage]");
+    const next = element("[data-mission-next-action]");
+    const recommendation = element("[data-mission-recommendation]");
+    const blocked = element("[data-mission-blocked]");
+    if (stateLabel) stateLabel.textContent = missionStateLabel(projection.state);
+    if (objective) objective.textContent = projection.objective || "HumanWire mission";
+    if (mode) mode.textContent = projection.mode_label || "Mission";
+    if (stage) stage.textContent = missionStateLabel(projection.stage);
+    if (next) next.textContent = projection.next_action || "Review the saved mission.";
+    if (recommendation) {
+      recommendation.textContent = projection.recommendation_summary
+        || "HumanWire is collecting the evidence needed for this decision.";
+    }
+    const blockedCopy = {
+      no_eligible_participant: "No activated organization member is eligible for this mission.",
+      no_consented_route: "The selected member has no active consented communication route.",
+      provider_not_configured: "Connected delivery is not configured for this organization.",
+      delivery_failed: "The provider did not confirm delivery. No response was invented.",
+      delivery_state_unknown: "Delivery could not be confirmed. HumanWire will not retry blindly.",
+      organization_not_ready: "Finish organization onboarding before using Connected organization.",
+    };
+    if (blocked) {
+      blocked.textContent = blockedCopy[projection.blocked_reason] || "";
+      blocked.hidden = !projection.blocked_reason;
+    }
+    renderMissionParticipants(projection.participants);
+    const timeline = element("[data-mission-timeline]");
+    if (timeline) timeline.replaceChildren();
+    resetCouncilView();
+    for (const event of projection.events) appendMissionEvent(event);
+    show("[data-demo-disclosure]", projection.mode === "demo_run");
+    if (global.history?.replaceState && projection.mission_id) {
+      global.history.replaceState(null, "", `/workspace#mission=${projection.mission_id}`);
+    }
+  }
+
+  async function createMission(payload) {
+    const result = await postJSON(missionPath(), payload);
+    if (!result.mission) throw new Error("mission_unavailable");
+    renderMission(result.mission);
+    return result.mission;
+  }
+
+  async function runMission(missionId) {
+    return postStream(`${missionPath(missionId)}/run`, {});
+  }
+
+  async function consumeMissionStream(reader) {
+    state.missionReader = reader;
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let terminal = false;
+    while (true) {
+      const chunk = await reader.read();
+      if (reader !== state.missionReader) return;
+      buffer += decoder.decode(chunk.value || new Uint8Array(), {stream: !chunk.done});
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        if (!line) continue;
+        const envelope = JSON.parse(line);
+        if (envelope.type === "started") {
+          const stateLabel = element("[data-mission-state]");
+          if (stateLabel) stateLabel.textContent = "Running";
+        } else if (envelope.type === "activity") {
+          appendMissionEvent(envelope.event);
+        } else if (["complete", "awaiting_response", "blocked"].includes(envelope.type)) {
+          terminal = true;
+          renderMission(envelope.mission);
+        } else if (envelope.type === "failed") {
+          terminal = true;
+          throw new Error("mission_unavailable");
+        }
+      }
+      if (chunk.done) break;
+    }
+    if (!terminal) throw new Error("mission_stream_ended");
+  }
+
+  function resetMission() {
+    const previous = state.missionReader;
+    state.missionReader = null;
+    state.mission = null;
+    if (previous?.cancel) previous.cancel().catch?.(() => {});
+    show("[data-mission-workspace]", false);
+    show("[data-new-mission]", false);
+    const start = element("[data-start-mission]");
+    const stateLabel = element("[data-mission-state]");
+    const timeline = element("[data-mission-timeline]");
+    if (start) {
+      start.hidden = false;
+      start.disabled = false;
+    }
+    if (stateLabel) stateLabel.textContent = "Ready";
+    if (timeline) timeline.replaceChildren();
+    if (global.history?.replaceState) global.history.replaceState(null, "", "/workspace");
+    resetCouncilView();
+    updateMissionReadiness();
+  }
+
+  async function startMission(event) {
+    event.preventDefault();
+    if (state.missionRunning || !state.activeWorkspaceId) return;
+    const form = event.currentTarget;
+    const payload = {
+      mode: form.elements.mode.value,
+      objective: form.elements.objective.value.trim(),
+      urgency: form.elements.urgency.value,
+      include_conflict: Boolean(form.elements.include_conflict.checked),
+    };
+    if (payload.objective.length < 12) return;
+    state.missionRunning = true;
+    const button = element("[data-start-mission]");
+    if (button) button.disabled = true;
+    setStatus("HumanWire is assembling the right people and agents…");
+    try {
+      const mission = await createMission(payload);
+      const reader = await runMission(mission.mission_id);
+      await consumeMissionStream(reader);
+      const message = state.mission?.state === "awaiting_response"
+        ? "Outreach is delivered. HumanWire is waiting for the organization response."
+        : state.mission?.state === "blocked"
+          ? "Connected organization stopped safely. Review the readiness requirement."
+          : "Decision brief ready. Review the evidence and next action.";
+      setStatus(message, state.mission?.state === "blocked" ? "error" : undefined);
+    } catch (_error) {
+      const stateLabel = element("[data-mission-state]");
+      if (stateLabel) stateLabel.textContent = "Stopped safely";
+      setStatus("The mission stopped. The last saved activity remains available.", "error");
+    } finally {
+      state.missionRunning = false;
+      if (button && !state.mission) button.disabled = false;
+    }
+  }
+
+  async function loadMissionFromHash() {
+    const hash = String(global.location.hash || "");
+    const matched = /^#mission=(mis_[0-9A-HJKMNP-TV-Z]{26})$/.exec(hash);
+    if (!matched || !state.activeWorkspaceId) return;
+    const result = await getJSON(missionPath(matched[1]));
+    if (result.mission) renderMission(result.mission);
+  }
+
   async function loadWorkspaces(organizationId) {
     state.activeOrganizationId = organizationId;
     const result = await getJSON(`/api/organizations/${organizationId}/workspaces`);
@@ -499,6 +730,7 @@
     renderWorkspace();
     await loadLatestCouncil();
     await loadEvidence().catch(() => renderEvidence([]));
+    await loadMissionFromHash().catch(() => resetMission());
   }
 
   async function loadOrganizations() {
@@ -573,9 +805,9 @@
       return;
     }
     setPanel("home");
-    element("#council-objective")?.focus();
-    element("[data-council-form]")?.scrollIntoView?.({block: "center"});
-    setStatus("Set the objective, then run the evidence-bound Agent Council.");
+    element("#mission-objective")?.focus();
+    element("[data-mission-form]")?.scrollIntoView?.({block: "center"});
+    setStatus("Choose a mode, set the agenda, and start the mission.");
   }
 
   function choosePlaybook(event) {
@@ -653,6 +885,11 @@
     element("[data-invite-member]")?.addEventListener("submit", createInvitation);
     element("[data-accept-invitation]")?.addEventListener("submit", acceptInvitation);
     element("[data-council-form]")?.addEventListener("submit", runCouncil);
+    element("[data-mission-form]")?.addEventListener("submit", startMission);
+    element("[data-new-mission]")?.addEventListener("click", resetMission);
+    for (const target of elements("[data-mission-mode]")) {
+      target.addEventListener("change", updateMissionReadiness);
+    }
     element("[data-sign-out]")?.addEventListener("click", signOut);
     element("[data-organization-list]")?.addEventListener("change", (event) => {
       loadWorkspaces(event.currentTarget.value).catch(() => {
@@ -660,6 +897,7 @@
       });
     });
     element("[data-workspace-list]")?.addEventListener("change", (event) => {
+      resetMission();
       state.activeWorkspaceId = event.currentTarget.value;
       renderWorkspace();
       loadLatestCouncil().catch(() => resetCouncilView());
@@ -667,14 +905,20 @@
     loadOrganizations().catch(() => {
       setStatus("The workspace could not be loaded. Sign in again.", "error");
     });
+    updateMissionReadiness();
   }
 
   global.HumanWireDecisionOSApp = Object.freeze({
     loadOrganizations,
+    consumeMissionStream,
     consumeCouncilStream,
+    createMission,
     loadDemoEvidence,
     postJSON,
     renderEvidence,
+    renderMission,
+    resetMission,
+    runMission,
     runCouncil,
     renderCouncilProjection,
     setPanel,
