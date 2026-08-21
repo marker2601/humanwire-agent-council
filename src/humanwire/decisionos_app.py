@@ -57,6 +57,7 @@ if TYPE_CHECKING:
         OrganizationProjectionBuilder,
         OrganizationSourceParser,
     )
+    from humanwire.mission_service import MissionService
     from humanwire.organization_activation import ActivationService
     from humanwire.organization_import import OrganizationImportService
     from humanwire.organization_store import OrganizationGraphRepository
@@ -69,6 +70,7 @@ _CSRF_COOKIE = "__Host-humanwire-csrf"
 _HOST = re.compile(r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?(?::([0-9]{1,5}))?$")
 _ORGANIZATION_ID = r"org_[0-9A-HJKMNP-TV-Z]{26}"
 _WORKSPACE_ID = r"wrk_[0-9A-HJKMNP-TV-Z]{26}"
+_MISSION_ID = r"mis_[0-9A-HJKMNP-TV-Z]{26}"
 _PUBLIC_CONFIG_KEYS = frozenset({"firebase", "appCheckSiteKey"})
 _FIREBASE_PUBLIC_KEYS = frozenset(
     {
@@ -92,6 +94,33 @@ _MUTATION_PATHS = (
 _COUNCIL_MUTATION_PATH = re.compile(
     rf"^/api/organizations/{_ORGANIZATION_ID}/workspaces/{_WORKSPACE_ID}/"
     r"(?:council-runs|demo-evidence)$"
+)
+_MISSION_ROUTE_PROFILES = (
+    (
+        re.compile(
+            rf"^/api/organizations/{_ORGANIZATION_ID}/workspaces/{_WORKSPACE_ID}/"
+            r"missions$"
+        ),
+        frozenset({"POST"}),
+    ),
+    (
+        re.compile(
+            rf"^/api/organizations/{_ORGANIZATION_ID}/workspaces/{_WORKSPACE_ID}/"
+            rf"missions/{_MISSION_ID}$"
+        ),
+        frozenset({"GET", "HEAD"}),
+    ),
+    (
+        re.compile(
+            rf"^/api/organizations/{_ORGANIZATION_ID}/workspaces/{_WORKSPACE_ID}/"
+            rf"missions/{_MISSION_ID}/run$"
+        ),
+        frozenset({"POST"}),
+    ),
+)
+_MISSION_ROUTE_FAMILY = re.compile(
+    r"^/api/organizations/[^/]+/workspaces/[^/]+/missions"
+    r"(?:/[^/]+(?:/run)?)?/?$"
 )
 _ORGANIZATION_ROUTE_PROFILES = (
     (
@@ -224,6 +253,8 @@ class DecisionOSDependencies:
     organization_activation_service: ActivationService | None = None
     council_features_enabled: bool = False
     council_runtime: DecisionOSCouncilRuntime | None = None
+    mission_features_enabled: bool = False
+    mission_service: MissionService | None = None
 
     def __post_init__(self) -> None:
         if not self.allowed_hosts:
@@ -253,6 +284,11 @@ class DecisionOSDependencies:
             or self.council_features_enabled != (self.council_runtime is not None)
         ):
             raise ValueError("DecisionOS council dependencies are incomplete")
+        if (
+            type(self.mission_features_enabled) is not bool
+            or self.mission_features_enabled != (self.mission_service is not None)
+        ):
+            raise ValueError("DecisionOS mission dependencies are incomplete")
 
 
 def _public_value(value: object) -> bool:
@@ -320,6 +356,17 @@ class _CouncilRunBody(_BodyModel):
 
 class _DemoEvidenceBody(_BodyModel):
     confirm: Literal["synthetic_demo"]
+
+
+class _MissionBody(_BodyModel):
+    mode: Literal["demo_run", "connected_organization"]
+    objective: str = Field(min_length=12, max_length=1_000)
+    urgency: Literal["standard", "urgent"] = "standard"
+    include_conflict: bool = True
+
+
+class _MissionRunBody(_BodyModel):
+    pass
 
 
 def _council_evidence_payload(value: object) -> list[dict[str, str]]:
@@ -454,6 +501,28 @@ def _organization_route_profile(
     return None
 
 
+def _mission_route_profile(
+    request: Request,
+) -> tuple[frozenset[str], str] | str | None:
+    path = request.scope.get("path")
+    raw_path = request.scope.get("raw_path")
+    if not isinstance(path, str) or not isinstance(raw_path, bytes):
+        return None
+    for pattern, methods in _MISSION_ROUTE_PROFILES:
+        if pattern.fullmatch(path) is None:
+            continue
+        try:
+            exact_raw = path.encode("ascii")
+        except UnicodeEncodeError:
+            return "invalid"
+        if raw_path != exact_raw or request.scope.get("query_string"):
+            return "invalid"
+        return methods, "json" if "POST" in methods else "read"
+    if _MISSION_ROUTE_FAMILY.fullmatch(path) is not None:
+        return "invalid"
+    return None
+
+
 def _session_cookie(request: Request) -> str | None:
     if len(_raw_headers(request, b"cookie")) != 1:
         return None
@@ -534,10 +603,19 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
                 if dependencies.organization_features_enabled
                 else None
             )
+            mission_profile = (
+                _mission_route_profile(request)
+                if dependencies.mission_features_enabled
+                else None
+            )
             council_mutation = (
                 dependencies.council_features_enabled
                 and request.method == "POST"
                 and _COUNCIL_MUTATION_PATH.fullmatch(request.url.path) is not None
+            )
+            mission_mutation = (
+                isinstance(mission_profile, tuple)
+                and request.method == "POST"
             )
             hosts = _raw_headers(request, b"host")
             host = _ascii_header(hosts)
@@ -545,9 +623,12 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
                 response = _fixed_error(400, "invalid_host")
             elif len(_raw_headers(request, b"cookie")) > 1:
                 response = _fixed_error(400, "invalid_request")
-            elif organization_profile == "invalid" or (
+            elif organization_profile == "invalid" or mission_profile == "invalid" or (
                 isinstance(organization_profile, tuple)
                 and request.method not in organization_profile[0]
+            ) or (
+                isinstance(mission_profile, tuple)
+                and request.method not in mission_profile[0]
             ) or request.method not in {"GET", "HEAD", "POST"} or (
                 request.method == "POST"
                 and not _is_exact_mutation(
@@ -555,6 +636,7 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
                     council_enabled=dependencies.council_features_enabled,
                 )
                 and not isinstance(organization_profile, tuple)
+                and not isinstance(mission_profile, tuple)
             ):
                 response = _fixed_error(405, "method_not_allowed")
             elif request.method == "POST":
@@ -615,6 +697,7 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
                                 dependencies.app_check_enforced
                                 or isinstance(organization_profile, tuple)
                                 or council_mutation
+                                or mission_mutation
                             ):
                                 response = _fixed_error(403, "app_check_failed")
                             else:
@@ -1027,6 +1110,208 @@ def create_decisionos_app(dependencies: DecisionOSDependencies) -> FastAPI:
                         item = await to_thread(channel.get)
                         if item is None:
                             break
+                        yield (
+                            json.dumps(
+                                item,
+                                ensure_ascii=True,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ).encode("ascii")
+                            + b"\n"
+                        )
+                finally:
+                    cancellation.set()
+                    await to_thread(worker.join, 10.0)
+
+            return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+    if dependencies.mission_features_enabled:
+        from humanwire.mission_models import MissionRequest, MissionState
+        from humanwire.mission_projection import build_mission_projection
+
+        assert dependencies.mission_service is not None
+
+        @app.post(
+            "/api/organizations/{organization_id}/workspaces/{workspace_id}/missions"
+        )
+        async def create_mission(
+            organization_id: str,
+            workspace_id: str,
+            request: Request,
+        ) -> Response:
+            body = await _body(request, _MissionBody)
+            principal = _principal(request, dependencies.authenticator)
+            if not isinstance(body, _MissionBody) or principal is None:
+                return _fixed_error(400, "invalid_request")
+            try:
+                context = dependencies.repository.load_context(principal, organization_id)
+                workspace = dependencies.repository.load_workspace(context, workspace_id)
+                mission_request = MissionRequest(
+                    mode=body.mode,
+                    objective=body.objective,
+                    urgency=body.urgency,
+                    include_conflict=body.include_conflict,
+                )
+                snapshot = dependencies.mission_service.create(
+                    context,
+                    workspace,
+                    mission_request,
+                )
+                projection = build_mission_projection(snapshot)
+            except OrganizationUnavailable:
+                return _fixed_error(404, "organization_not_found")
+            except WorkspaceUnavailable:
+                return _fixed_error(404, "workspace_not_found")
+            except DecisionOSAuthorizationDenied:
+                return _fixed_error(403, "authorization_denied")
+            except (TypeError, ValueError, ValidationError):
+                return _fixed_error(400, "invalid_request")
+            except Exception:  # noqa: BLE001 - mission details stay private
+                return _fixed_error(500, "mission_unavailable")
+            return JSONResponse(
+                status_code=201,
+                content={"mission": projection.model_dump(mode="json")},
+            )
+
+        @app.api_route(
+            "/api/organizations/{organization_id}/workspaces/{workspace_id}/missions/"
+            "{mission_id}",
+            methods=["GET", "HEAD"],
+        )
+        def load_mission(
+            organization_id: str,
+            workspace_id: str,
+            mission_id: str,
+            request: Request,
+        ) -> Response:
+            principal = _principal(request, dependencies.authenticator)
+            if principal is None:
+                return _fixed_error(401, "authentication_required")
+            try:
+                context = dependencies.repository.load_context(principal, organization_id)
+                workspace = dependencies.repository.load_workspace(context, workspace_id)
+                snapshot = dependencies.mission_service.load(
+                    context,
+                    workspace,
+                    mission_id,
+                )
+                projection = build_mission_projection(snapshot)
+            except OrganizationUnavailable:
+                return _fixed_error(404, "organization_not_found")
+            except WorkspaceUnavailable:
+                return _fixed_error(404, "workspace_not_found")
+            except DecisionOSAuthorizationDenied:
+                return _fixed_error(403, "authorization_denied")
+            except Exception:  # noqa: BLE001 - mission details stay private
+                return _fixed_error(404, "mission_not_found")
+            return JSONResponse(content={"mission": projection.model_dump(mode="json")})
+
+        @app.post(
+            "/api/organizations/{organization_id}/workspaces/{workspace_id}/missions/"
+            "{mission_id}/run"
+        )
+        async def run_mission(
+            organization_id: str,
+            workspace_id: str,
+            mission_id: str,
+            request: Request,
+        ) -> Response:
+            body = await _body(request, _MissionRunBody)
+            principal = _principal(request, dependencies.authenticator)
+            if not isinstance(body, _MissionRunBody) or principal is None:
+                return _fixed_error(400, "invalid_request")
+            try:
+                context = dependencies.repository.load_context(principal, organization_id)
+                workspace = dependencies.repository.load_workspace(context, workspace_id)
+                dependencies.mission_service.load(context, workspace, mission_id)
+            except OrganizationUnavailable:
+                return _fixed_error(404, "organization_not_found")
+            except WorkspaceUnavailable:
+                return _fixed_error(404, "workspace_not_found")
+            except DecisionOSAuthorizationDenied:
+                return _fixed_error(403, "authorization_denied")
+            except Exception:  # noqa: BLE001 - mission details stay private
+                return _fixed_error(404, "mission_not_found")
+
+            async def stream():
+                channel: queue.Queue[dict[str, object] | None] = queue.Queue()
+                cancellation = threading.Event()
+
+                def on_event(_event) -> None:
+                    try:
+                        live = dependencies.mission_service.load(
+                            context,
+                            workspace,
+                            mission_id,
+                        )
+                        projected = build_mission_projection(live)
+                        safe_event = projected.events[-1]
+                        payload = BaseModel.model_dump(safe_event, mode="json")
+                    except Exception:  # noqa: BLE001 - fixed stream failure only
+                        return
+                    channel.put({"type": "activity", "event": payload})
+
+                def execute() -> None:
+                    snapshot = None
+                    try:
+                        snapshot = dependencies.mission_service.run(
+                            context,
+                            workspace,
+                            mission_id,
+                            cancellation=cancellation,
+                            on_event=on_event,
+                        )
+                        projection = build_mission_projection(snapshot)
+                    except Exception:  # noqa: BLE001 - fixed streaming error only
+                        projection = None
+                    if snapshot is None or projection is None:
+                        channel.put(
+                            {"type": "failed", "error": "mission_unavailable"}
+                        )
+                    else:
+                        terminal_type = {
+                            MissionState.COMPLETE: "complete",
+                            MissionState.AWAITING_RESPONSE: "awaiting_response",
+                            MissionState.BLOCKED: "blocked",
+                            MissionState.FAILED: "failed",
+                        }.get(snapshot.state, "failed")
+                        if terminal_type == "failed":
+                            channel.put(
+                                {"type": "failed", "error": "mission_unavailable"}
+                            )
+                        else:
+                            channel.put(
+                                {
+                                    "type": terminal_type,
+                                    "mission": projection.model_dump(mode="json"),
+                                }
+                            )
+                    channel.put(None)
+
+                worker = threading.Thread(
+                    target=execute,
+                    name="humanwire-mission-request",
+                    daemon=False,
+                )
+                worker.start()
+                try:
+                    yield b'{"type":"started"}\n'
+                    while True:
+                        item = await to_thread(channel.get)
+                        if item is None:
+                            break
+                        if item.get("type") in {
+                            "complete",
+                            "awaiting_response",
+                            "blocked",
+                            "failed",
+                        }:
+                            await to_thread(worker.join, 10.0)
+                            if worker.is_alive():
+                                item = {
+                                    "type": "failed",
+                                    "error": "mission_unavailable",
+                                }
                         yield (
                             json.dumps(
                                 item,
