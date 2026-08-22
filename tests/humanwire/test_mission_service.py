@@ -263,6 +263,12 @@ def test_demo_run_executes_council_and_never_dispatches_provider() -> None:
         "stakeholder.response_recorded",
         "decision_brief.ready",
     ]
+    contribution = completed.events[-2]
+    assert contribution.summary == (
+        "Sofia Alvarez · Decision owner AI reserved approval until the evidence "
+        "and risk gates are satisfied."
+    )
+    assert contribution.summary != "AI stakeholder evidence recorded."
     assert observed[-1].kind == "decision_brief.ready"
 
 

@@ -184,6 +184,7 @@ async function main() {
   };
 
   const createGate = deferred();
+  let latestCouncilLoads = 0;
   const pendingReads = [];
   const reader = {
     read() {
@@ -241,7 +242,34 @@ async function main() {
       if (path.endsWith("/workspaces")) {
         return response({workspaces: [{workspace_id: "wrk_01HQ7XK9WPH4Y8ZQK3R2N1M6AA", name: "Launch", playbook: "launch_decision"}]});
       }
-      if (path.endsWith("/council-runs/latest")) return response({projection: null});
+      if (path.endsWith("/council-runs/latest")) {
+        latestCouncilLoads += 1;
+        return response({
+          projection: latestCouncilLoads > 1 ? {
+            state: "human_approval_required",
+            recommendation_summary: "Launch with a bounded pilot.",
+            recommended_action: "Approve a limited launch.",
+            required_human_action: "Confirm the decision owner.",
+            recommendation_digest: "a".repeat(64),
+            nodes: [{specialist_id: "market_intelligence", status: "complete"}],
+            evidence_claims: [{
+              statement: "Pilot demand is supported by saved evidence.",
+              classification: "source_backed",
+              evidence_ids: ["evidence-01"],
+            }],
+            inference_claims: [{
+              statement: "A limited launch can contain execution risk.",
+              classification: "model_inference",
+              evidence_ids: [],
+            }],
+            challenges: [{
+              issue: "Independent testing remains required.",
+              required_action: "Complete the test before broad launch.",
+            }],
+            events: [],
+          } : null,
+        });
+      }
       if (path.endsWith("/evidence")) return response({evidence: []});
       if (path.endsWith("/missions")) return createGate.promise;
       if (path.endsWith("/run")) return response({}, 200, {getReader() { return reader; }});
@@ -329,7 +357,7 @@ async function main() {
   assert.strictEqual(form.getAttribute("aria-busy"), "false");
   assert.strictEqual(selectors.get('[data-specialist="market_intelligence"]').dataset.status, "complete");
   assert.strictEqual(selectors.get('[data-specialist="human_approval"]').dataset.status, "required");
-  assert.strictEqual(selectors.get("[data-council-state]").textContent, "Decision brief ready");
+  assert.strictEqual(selectors.get("[data-council-state]").textContent, "human approval required");
   assert.strictEqual(selectors.get("[data-mission-progress-summary]").textContent, "Decision brief ready");
   assert.strictEqual(selectors.get("[data-mission-progress-meter]").value, 5);
   assert.strictEqual(selectors.get("[data-mission-progress-meter]").textContent, "5 of 5 stages complete");
@@ -337,6 +365,8 @@ async function main() {
   assert.strictEqual(selectors.get("[data-mission-timeline]").replaceCount, 2);
   assert.match(selectors.get("[data-mission-elapsed]").textContent, /^Completed in /);
   assert.match(selectors.get("[data-mission-pulse]").textContent, /decision brief is ready/i);
+  assert.strictEqual(latestCouncilLoads, 2);
+  assert.strictEqual(selectors.get("[data-council-result]").hidden, false);
 
   context.HumanWireDecisionOSApp.resetMission();
   assert.strictEqual(startButton.textContent, "Start mission");

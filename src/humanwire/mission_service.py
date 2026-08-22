@@ -39,6 +39,28 @@ class MissionServiceUnavailable(RuntimeError):
         super().__init__("mission_unavailable")
 
 
+_DEMO_CONTRIBUTIONS = (
+    ("executive sponsor", "confirmed executive sponsorship and the accountable decision owner"),
+    ("communications", "confirmed the communication constraint and stakeholder narrative"),
+    ("product", "defined the scope, success criteria, and product dependency"),
+    ("engineering", "confirmed engineering ownership, rollback, and operational dependencies"),
+    ("risk", "recorded the risk gate that must close before approval"),
+    ("approval", "reserved approval until the evidence and risk gates are satisfied"),
+    ("operations", "confirmed operational readiness and post-approval availability"),
+    ("business", "confirmed the business priority and measurable outcome"),
+    ("decision owner", "reserved approval until the evidence and risk gates are satisfied"),
+)
+
+
+def _demo_contribution(participant: MissionParticipant) -> str:
+    role = participant.role.casefold()
+    detail = next(
+        (copy for marker, copy in _DEMO_CONTRIBUTIONS if marker in role),
+        "provided the requested decision input",
+    )
+    return f"{participant.display_name} · {participant.role} {detail}."
+
+
 class MissionResolver(Protocol):
     def resolve(
         self,
@@ -354,7 +376,7 @@ class MissionService:
                         current,
                         kind="stakeholder.response_recorded",
                         stage="evidence",
-                        summary="AI stakeholder evidence recorded.",
+                        summary=_demo_contribution(item),
                         participant_id=item.participant_id,
                         on_event=on_event,
                     )

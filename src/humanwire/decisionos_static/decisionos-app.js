@@ -389,7 +389,7 @@
     }
     setCouncilNodeStatus(
       "human_approval",
-      projection.state === "human_approval_required" ? "running" : projection.state,
+      projection.state === "human_approval_required" ? "required" : projection.state,
     );
     const stateLabel = element("[data-council-state]");
     if (stateLabel) {
@@ -962,6 +962,7 @@
       const mission = await createMission(payload);
       const reader = await runMission(mission.mission_id);
       await consumeMissionStream(reader);
+      if (state.mission?.state === "complete") await loadLatestCouncil();
       const message = state.mission?.state === "awaiting_response"
         ? "Outreach is delivered. HumanWire is waiting for the organization response."
         : state.mission?.state === "blocked"
