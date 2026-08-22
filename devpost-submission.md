@@ -114,7 +114,7 @@ The 1:52 film is 75.4% chronological footage from the authenticated deployed pro
 - The live app and direct Cloud Run URL were verified against revision `humanwire-decisionos-00040-g92`.
 - The final video is 112.000 seconds, 1920×1080, H.264/yuv420p at 30 fps with AAC stereo 48 kHz, burned English captions, faststart, and a full 3,360-frame decode.
 - Final master SHA-256: `330CC378E57F3E2DF6B524A9C27DE28A7842E1E8F43D766EC40536F20BF1AF64`.
-- The public video is published and passed signed-out title/readback verification; the final Devpost write is the remaining release action.
+- The public video and Devpost entry were both verified live on August 22, 2026. Devpost submission ID: `1146825`.
 
 ## Known Limitations
 

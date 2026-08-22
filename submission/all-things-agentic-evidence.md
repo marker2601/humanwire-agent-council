@@ -60,6 +60,15 @@ Only checked items may become final Devpost claims.
 - New-project boundary: the repository began on 08-11-26, inside the official 08-03-26 through 08-31-26 submission period. The Google adaptation reused earlier-in-period HumanWire gateway, workflow, repository, product UI, Standard agents, and adapters at commit `b549b514a9abff0c4fd35150b6cc158b61f973c1`.
 - Submission-period work from 08-16-26: Gemini/Google ADK mode, cloud repository/dispatch/progress/web/worker adapters, durable browser mode, cloud E2E and hardening, deployment package, diagram, and All Things Agentic submission materials.
 
+## Devpost submission receipt
+
+- Hackathon: `All Things Agentic Hackathon`.
+- Category: `Taskmaster`.
+- Submission ID: `1146825`.
+- Submitted at: `2026-08-22T16:45:48.116-04:00`.
+- Public project: `https://devpost.com/software/humanwire-agent-council`.
+- Live Devpost readback returned project state `published`, the exact public YouTube URL, the hosted workspace URL, and a non-null hackathon `submitted_at` value.
+
 ## Live Google proof
 
 - Project: `humanwire-agentic-2026`; billing enabled with a bounded budget alert policy.
