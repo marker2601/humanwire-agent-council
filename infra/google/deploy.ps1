@@ -4,7 +4,8 @@ param(
     [ValidatePattern('^[a-z][a-z0-9-]{1,62}$')][string]$Region = 'us-central1',
     [ValidatePattern('^[a-z][a-z0-9-]{1,62}$')][string]$Repository = 'humanwire',
     [ValidatePattern('^[A-Za-z0-9._-]{1,120}$')][string]$ImageTag = "build-$([DateTimeOffset]::UtcNow.ToString('yyyyMMddHHmmss'))",
-    [ValidatePattern('^gemini-[0-9]+\.[0-9]+-[a-z0-9][a-z0-9.-]{0,127}$')][string]$ModelId = 'gemini-3.6-flash'
+    [ValidatePattern('^gemini-[0-9]+\.[0-9]+-[a-z0-9][a-z0-9.-]{0,127}$')][string]$ModelId = 'gemini-3.5-flash',
+    [ValidatePattern('^[a-z][a-z0-9-]{1,62}$')][string]$ModelLocation = 'global'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -57,7 +58,7 @@ $PinnedImage = "$BaseImage@$Digest"
 & gcloud pubsub topics describe $Topic --project=$ProjectId *> $null
 if ($LASTEXITCODE -ne 0) { Invoke-Gcloud pubsub topics create $Topic --project=$ProjectId }
 
-Invoke-Gcloud run deploy $WorkerService --image=$PinnedImage --region=$Region --project=$ProjectId --service-account=$WorkerAccount --no-allow-unauthenticated --min-instances=0 --max-instances=1 --concurrency=1 --timeout=600 --cpu=1 --memory=1Gi --set-env-vars="HUMANWIRE_SERVICE_ROLE=worker,GOOGLE_CLOUD_PROJECT=$ProjectId,HUMANWIRE_FIRESTORE_DATABASE=(default),HUMANWIRE_WORKER_HOST=worker.invalid,HUMANWIRE_MODEL_ID=$ModelId,HUMANWIRE_GOOGLE_LOCATION=$Region"
+Invoke-Gcloud run deploy $WorkerService --image=$PinnedImage --region=$Region --project=$ProjectId --service-account=$WorkerAccount --no-allow-unauthenticated --min-instances=0 --max-instances=1 --concurrency=1 --timeout=600 --cpu=1 --memory=1Gi --set-env-vars="HUMANWIRE_SERVICE_ROLE=worker,GOOGLE_CLOUD_PROJECT=$ProjectId,HUMANWIRE_FIRESTORE_DATABASE=(default),HUMANWIRE_WORKER_HOST=worker.invalid,HUMANWIRE_MODEL_ID=$ModelId,HUMANWIRE_GOOGLE_LOCATION=$ModelLocation"
 $WorkerUrl = (& gcloud run services describe $WorkerService --region=$Region --project=$ProjectId --format='value(status.url)').Trim()
 $WorkerHost = ([Uri]$WorkerUrl).Host
 Invoke-Gcloud run services update $WorkerService --region=$Region --project=$ProjectId --image=$PinnedImage --update-env-vars="HUMANWIRE_WORKER_HOST=$WorkerHost"

@@ -6,7 +6,11 @@ from humanwire.config import Settings
 
 def test_listener_credentials_are_required_only_when_listening() -> None:
     with pytest.raises(ValueError, match="CASPIAN_API_KEY"):
-        Settings().require_listener_credentials()
+        Settings(
+            _env_file=None,
+            caspian_api_key=None,
+            telegram_bot_token=None,
+        ).require_listener_credentials()
 
 
 def test_listener_credentials_return_plain_values() -> None:
@@ -18,7 +22,7 @@ def test_listener_credentials_return_plain_values() -> None:
 
 
 def test_analytics_read_token_is_secret_and_optional() -> None:
-    assert Settings(_env_file=None).analytics_read_token is None
+    assert Settings(_env_file=None, analytics_read_token=None).analytics_read_token is None
     configured = Settings(_env_file=None, analytics_read_token="fictional-read-token")
 
     assert configured.analytics_read_token is not None
@@ -32,7 +36,11 @@ def test_blank_analytics_read_token_is_disabled(raw: str) -> None:
 
 
 def test_engagement_preview_defaults_and_environment_parsing(monkeypatch) -> None:
-    defaults = Settings(_env_file=None)
+    defaults = Settings(
+        _env_file=None,
+        engagement_preview_seconds=15,
+        engagement_require_go=False,
+    )
 
     assert defaults.engagement_preview_seconds == 15
     assert defaults.engagement_require_go is False

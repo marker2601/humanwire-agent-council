@@ -24,8 +24,9 @@ from humanwire.persona_runtime import (
     PersonaDecision,
     PersonaProfile,
     StrictPersonaModel,
+    persona_decision_output_schema,
     persona_prompt_payload,
-    validate_persona_decision,
+    validate_persona_stage_decision,
 )
 
 BeforeModelCallback = Callable[..., Any]
@@ -80,8 +81,7 @@ class GoogleAdkPersonaDecisionEngine:
                 description=specialist.description,
                 model=self.model_identifier,
                 instruction=f"{system} {specialist.instruction}",
-                output_schema=PersonaDecision,
-                mode="task",
+                output_schema=persona_decision_output_schema(profile, context),
                 include_contents="none",
                 disallow_transfer_to_parent=True,
                 disallow_transfer_to_peers=True,
@@ -89,6 +89,7 @@ class GoogleAdkPersonaDecisionEngine:
                 generate_content_config=types.GenerateContentConfig(
                     temperature=0,
                     max_output_tokens=self._max_output_tokens,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
                 ),
                 before_model_callback=self._before_model_callback,
             )
@@ -155,7 +156,7 @@ class GoogleAdkPersonaDecisionEngine:
             raise ModelFailure("invalid_schema")
         if cancellation.is_set() or deadline <= time.monotonic():
             raise ModelFailure("timeout")
-        return validate_persona_decision(profile, decision)
+        return validate_persona_stage_decision(profile, context, decision)
 
 
 class GoogleAdkPersonaDecisionEngineFactory(StrictPersonaModel):

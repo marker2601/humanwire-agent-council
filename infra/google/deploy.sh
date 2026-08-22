@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_ID="${1:?usage: deploy.sh PROJECT_ID [REGION] [IMAGE_TAG]}"
+PROJECT_ID="${1:?usage: deploy.sh PROJECT_ID [REGION] [IMAGE_TAG] [MODEL_LOCATION]}"
 REGION="${2:-us-central1}"
 IMAGE_TAG="${3:-build-$(date -u +%Y%m%d%H%M%S)}"
 REPOSITORY="humanwire"
-MODEL_ID="gemini-3.6-flash"
+MODEL_ID="gemini-3.5-flash"
+MODEL_LOCATION="${4:-global}"
 WEB_SERVICE="humanwire-web"
 WORKER_SERVICE="humanwire-worker"
 TOPIC="humanwire-runs"
@@ -38,7 +39,7 @@ DIGEST="$(gcloud artifacts docker images describe "${TAGGED_IMAGE}" --format='va
 PINNED_IMAGE="${BASE_IMAGE}@${DIGEST}"
 
 gcloud pubsub topics describe "${TOPIC}" --project="${PROJECT_ID}" >/dev/null 2>&1 || gcloud pubsub topics create "${TOPIC}" --project="${PROJECT_ID}"
-gcloud run deploy "${WORKER_SERVICE}" --image="${PINNED_IMAGE}" --region="${REGION}" --project="${PROJECT_ID}" --service-account="${WORKER_ACCOUNT}" --no-allow-unauthenticated --min-instances=0 --max-instances=1 --concurrency=1 --timeout=600 --cpu=1 --memory=1Gi --set-env-vars="HUMANWIRE_SERVICE_ROLE=worker,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},HUMANWIRE_FIRESTORE_DATABASE=(default),HUMANWIRE_WORKER_HOST=worker.invalid,HUMANWIRE_MODEL_ID=${MODEL_ID},HUMANWIRE_GOOGLE_LOCATION=${REGION}"
+gcloud run deploy "${WORKER_SERVICE}" --image="${PINNED_IMAGE}" --region="${REGION}" --project="${PROJECT_ID}" --service-account="${WORKER_ACCOUNT}" --no-allow-unauthenticated --min-instances=0 --max-instances=1 --concurrency=1 --timeout=600 --cpu=1 --memory=1Gi --set-env-vars="HUMANWIRE_SERVICE_ROLE=worker,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},HUMANWIRE_FIRESTORE_DATABASE=(default),HUMANWIRE_WORKER_HOST=worker.invalid,HUMANWIRE_MODEL_ID=${MODEL_ID},HUMANWIRE_GOOGLE_LOCATION=${MODEL_LOCATION}"
 WORKER_URL="$(gcloud run services describe "${WORKER_SERVICE}" --region="${REGION}" --project="${PROJECT_ID}" --format='value(status.url)')"
 WORKER_HOST="${WORKER_URL#https://}"
 gcloud run services update "${WORKER_SERVICE}" --region="${REGION}" --project="${PROJECT_ID}" --image="${PINNED_IMAGE}" --update-env-vars="HUMANWIRE_WORKER_HOST=${WORKER_HOST}"

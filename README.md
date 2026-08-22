@@ -2,9 +2,62 @@
 
 **The AI chief of staff that selects the minimum necessary engagement for every person a decision touches.**
 
+## All Things Agentic: HumanWire Agent Council
+
+HumanWire turns one executive agenda into durable, reviewable decision work. Seven bounded Gemini specialists analyze the request, challenge unsupported claims, and synthesize a recommendation. Eight named AI stakeholders then contribute role-specific evidence and authority constraints. The result is a saved decision brief that keeps facts, inferences, red-team challenges, and the final human approval gate separate.
+
+- **Live product:** [humanwire-agentic-2026.firebaseapp.com/workspace](https://humanwire-agentic-2026.firebaseapp.com/workspace)
+- **Direct Cloud Run proof:** [humanwire-decisionos-wjjhjrgnyq-uc.a.run.app](https://humanwire-decisionos-wjjhjrgnyq-uc.a.run.app)
+- **Architecture:** [submission/all-things-agentic-architecture.png](submission/all-things-agentic-architecture.png)
+- **60-product benchmark:** [docs/hackathon-build/ai-product-benchmark.md](docs/hackathon-build/ai-product-benchmark.md)
+
+### Judge walkthrough
+
+1. Open the live product and sign in with Google.
+2. Keep **Demo run** selected. The page states that AI stakeholders and sample company records stay inside the run and that no external messages are sent.
+3. Start the prepared launch-readiness mission.
+4. Watch seven specialist roles progress through market, finance, product and technical, risk and compliance, decision synthesis, red team, and final synthesis.
+5. Watch eight named stakeholder contributions arrive with distinct roles, evidence, constraints, and approval boundaries.
+6. Open the completed **Council**, **Decisions**, and **Evidence** views. The recommendation, source records, digest, required authority, and **human approval required** state remain visible after refresh.
+
+### Qualifying Google stack
+
+- **Gemini 3.5 Flash on Vertex AI** produces bounded specialist analysis.
+- **Google ADK 2.7** orchestrates the Agent Council.
+- **Firebase Hosting and Authentication** protect the signed-in product edge. App Check is configured in monitored rollout, while exact host, origin, CSRF, and request-shape defenses enforce mutations.
+- **Cloud Run** hosts the DecisionOS service; production revision `humanwire-decisionos-00040-g92` serves 100% of traffic.
+- **Firestore** preserves organization, mission, evidence, Council, decision, and audit state.
+- **Veo 3.1 Fast** and **Lyria 3 Pro** are used only for the clearly labeled submission-film opening and score; they do not replace product proof.
+
+Models can propose and challenge. They cannot silently approve a decision, impersonate a human authority, change evidence provenance, or send an external message from the public demo.
+
+### Reproduce and test
+
+Requirements: Python 3.12+, Node.js 20+, and Git.
+
+```powershell
+git clone https://github.com/marker2601/humanwire-agent-council.git
+Set-Location humanwire-agent-council
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -e ".[dev,google,decisionos]"
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m ruff check src tests scripts
+node --check src\humanwire\decisionos_static\decisionos-app.js
+node tests\humanwire\decisionos_mission_harness.js
+```
+
+The test suite defaults to fake or in-memory adapters and does not require Google credentials. Firestore emulator tests run only when `FIRESTORE_EMULATOR_HOST` is explicitly configured. For an actual cloud deployment, create the three Firebase public-configuration secrets named in [infra/google/README.md](infra/google/README.md), authenticate `gcloud`, and run:
+
+```powershell
+.\infra\google\deploy-decisionos.ps1 -ProjectId YOUR_PROJECT_ID -Region us-central1
+```
+
+The deployment script builds a digest-pinned image, deploys Firebase rules/hosting and the Cloud Run service, applies least-privilege IAM, and prints the exact revision, URL, and digest. Never commit Firebase configuration secrets, provider credentials, contact routes, private evidence, or local `.env` files.
+
 HumanWire turns one authenticated manager mandate into a bounded, cross-channel coordination plan. It informs people who only need context, asks for acknowledgement where receipt matters, collects quick or structured input where evidence is required, routes explicit approval to the right authority, and prepares a meeting only when asynchronous coordination cannot resolve a verified conflict.
 
-## Start the local coordination studio
+## Earlier coordination foundation: local studio
 
 The primary local product opens on **Start a coordination**. It lets you submit the launch-decision request, watch the saved Request -> HumanWire -> Caspian Gateway path progress through conflict resolution, approval, availability, and a meeting package, then replay or download the immutable result.
 
@@ -16,48 +69,25 @@ Open `http://127.0.0.1:8766/`. The command creates the workspace parent when nee
 
 **Standard agent reasoning** is the credential-free default. **AI-assisted reasoning** uses the bounded PydanticAI stakeholder adapter only when `FEATHERLESS_API_KEY` is configured. In both modes, HumanWire's workflow and repository retain authority, and non-silent responses cross one CaspianGateway handler. The local status **Workspace channels** means the coordination used the local channel boundary; it does not claim external provider delivery.
 
-Verification of external Caspian, email, and Telegram delivery remains a separate private operator checklist. A live model run is likewise pending until separately retained evidence exists. The `humanwire synthetic` CLI remains available as internal deterministic evidence, but it is not the primary product screen.
+Verification of external Caspian, email, Telegram, and Featherless delivery remains a separate private operator checklist. The Google adaptation below has its own retained live Gemini/ADK evidence. The `humanwire synthetic` CLI remains available as internal deterministic evidence, but it is not the primary product screen.
 
-## Live product
+## Earlier public coordination surface
 
 The public product is deployed at [secondsignal.vercel.app](https://secondsignal.vercel.app). A submitted coordination opens one bounded same-origin event stream and renders the real workflow as it progresses from the request through outreach, conflict resolution, approval, availability, and a meeting-ready package. The public build uses credential-free Standard agents and loads no private organization directory, provider credentials, model credentials, contact destinations, or private responses.
 
 The private local studio uses the same product UI with polling and isolated file-backed run roots. External Caspian/email/Telegram delivery and live Featherless evidence remain separate operator-configured modes; the public URL does not claim those external connections.
 
-## All Things Agentic Google Cloud adaptation
+## Current production architecture and deployment
 
-The `codex/humanwire` branch adds an explicit qualifying Google runtime for the All Things Agentic Taskmaster entry. Google ADK coordinates Gemini 3.6 Flash specialists; HumanWire still owns identity, evidence confirmation, engagement contracts, approval, availability, scheduling, and repository mutation.
+The competition build is the authenticated DecisionOS service described at the top of this README. It uses one digest-pinned Cloud Run service behind Firebase Hosting and Authentication, with App Check in monitored rollout and exact same-origin mutation guards; Firestore provides durable state; Google ADK orchestrates Gemini 3.5 Flash on Vertex AI. The exact IAM, secret names, local checks, deployment steps, live inspection commands, and history-preserving rollback are documented in [infra/google/README.md](infra/google/README.md). Retained safe proof is recorded in [submission/all-things-agentic-evidence.md](submission/all-things-agentic-evidence.md).
 
-```mermaid
-flowchart LR
-    Owner["Decision owner"] --> Web["Cloud Run · public web"]
-    Web -->|"queued run"| Firestore[("Firestore")]
-    Web -->|"alias + idempotency"| PubSub["Pub/Sub"]
-    PubSub -->|"OIDC push"| Worker["Cloud Run · private worker"]
-    Worker --> ADK["Google ADK specialists"]
-    ADK --> Gemini["Gemini 3.6 Flash · Vertex AI"]
-    Gemini -->|"typed candidate"| Authority["HumanWire authority gateway"]
-    Authority -->|"validated event"| Firestore
-    Firestore -->|"cold polling + exports"| Web
-```
+The earlier two-service Pub/Sub coordination runtime remains in the repository as reusable HumanWire foundation code, but it is not the architecture claimed for the current Agent Council deployment or video.
 
-The cloud uses one digest-pinned image with explicit service roles and dedicated identities. The web identity has only Firestore and Pub/Sub publish access. The worker alone has Vertex AI, Firestore, and logging access. A dedicated Pub/Sub identity alone receives Cloud Run Invoker on the worker. Cloud authentication uses Application Default Credentials; the image and deployment files contain no Gemini API key.
+### Unified HumanWire missions
 
-Install the qualifying dependencies and run the deterministic cloud proof:
+The signed-in DecisionOS product now starts one durable mission in either **Demo run** or **Connected organization** mode. Both modes keep the Gemini Agent Council visible and active, save a shared participant/timeline/decision projection, and preserve human approval authority. Demo run uses clearly labeled AI stakeholders and performs zero provider calls. Connected organization resolves activated organization members and fails closed unless the exact participant, consented route, and server transport are ready; the browser never supplies contact destinations.
 
-```powershell
-.\.venv\Scripts\python.exe -m pip install -e ".[dev,google]"
-.\.venv\Scripts\python.exe -m pytest tests\humanwire\test_google_e2e.py tests\humanwire\test_studio_e2e.py -q
-```
-
-Build the shared container and deploy it after selecting a billing-enabled Google project:
-
-```powershell
-docker build --pull --tag humanwire-google:local .
-.\infra\google\deploy.ps1 -ProjectId YOUR_PROJECT_ID -Region us-central1
-```
-
-The exact IAM, local role checks, Cloud Run/Pub/Sub/Firestore inspection steps, live acceptance, and history-preserving rollback are documented in [infra/google/README.md](infra/google/README.md). The current repository does **not** claim a live Google deployment or Gemini invocation until those recorded checks pass. The existing Vercel URL remains the separate credential-free Standard-agent product.
+The production deployment enables the submission-safe Demo run. Real Caspian email or Telegram delivery is supported by the mission adapter but is not claimed for the public deployment until a private route registry and listener are configured and verified. Setup, readiness codes, privacy boundaries, and focused tests are documented in [HumanWire mission modes](docs/humanwire-mission-modes.md).
 
 ## The coordination problem
 

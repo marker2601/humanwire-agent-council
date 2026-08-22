@@ -44,7 +44,7 @@
 - Chose ETag/saved-ordinal polling so refresh and instance replacement do not lose progress.
 - Defined IAM, secret, prompt/output, idempotency, export, observability, testing, deployment, and rollback boundaries.
 - Mapped every PRD epic to implementation components and verification.
-- Active shaping moment: participant answered “approved” to Gemini 3.6 Flash, ADK 2.x, two Cloud Run services, Firestore, Pub/Sub, and adapter-preserved local behavior.
+- Active shaping moment: participant approved a qualifying Gemini 3.5+ model, ADK 2.x, two Cloud Run services, Firestore, Pub/Sub, and adapter-preserved local behavior. Live deployment later corrected the provisional model name to Google's published `gemini-3.5-flash` global endpoint.
 - Deepening rounds: 0. Explicit approval and the speed-first preference made another optional architecture interview unnecessary.
 
 ## Build checklist draft — 2026-08-16
@@ -135,7 +135,7 @@
 - RED: cloud-page and controller contracts failed because the durable app still rendered local-poll copy and did not send or consume the saved-ordinal protocol.
 - Added a distinct cloud delivery mode that submits only `google_adk`, hydrates any non-stream workspace URL immediately, polls with both ETag and saved ordinal, and uses immutable terminal JSON plus evidence CSV export routes.
 - Preserved stream and local-poll behavior while extending the hostile controller harness across cloud start, cold refresh, alias-free active conflict, unchanged snapshots, terminal hydration, replay queues, failed state, mobile tabs, and full reset.
-- The rendered cloud surface now identifies Google ADK, Gemini 3.6 Flash, HumanWire authority gates, and the no-external-message boundary without exposing Standard/model mode controls.
+- The rendered cloud surface now identifies Google ADK, Gemini 3.5 Flash, HumanWire authority gates, and the no-external-message boundary without exposing Standard/model mode controls.
 - In-app Browser verification passed at exact 1680x950, 1280x720, 600x900, and 390x844 viewports: 17 nodes and 57 edges, no graph collisions or page overflow, no visible control below 44x44, no meaningful text below 14px, and no console warnings or errors.
 - A completed 55-event durable run survived reload at Event 55, replay moved 55 to 54, and both JSON and CSV downloads fired without navigating away. The mobile composer and completed workspace retained all required controls and truthful runtime copy.
 - Automated frontend/cloud-page gates, Node syntax, Ruff, privacy scan, and diff checks passed. Browser QA used only the local in-memory repository and deterministic worker; no Gemini or live Google Cloud call occurred.
@@ -173,3 +173,37 @@
 - The official Cloud SDK 580.0.0 is installed locally and recognizes every deployment command used by the scripts. Current Google state remains deliberately empty: no authenticated account, selected project, ADC, or live provider call.
 - Focused deployment and adjacent cloud boundary tests pass; PowerShell and Bash parse checks pass. The pinned Docker image builds successfully, and both web and worker roles boot independently as the `humanwire` user and return their exact health response using local emulator endpoints.
 - Item 10 remains unchecked because the external deployment and cloud inspection steps cannot truthfully run until a billing-enabled project and Google authentication are available. No cloud resource or spend was created.
+
+## Build items 10–11 - live Google deployment and acceptance - 2026-08-17
+
+- Activated billing on `humanwire-agentic-2026`, created a bounded $30 alert budget, and deployed the same digest-pinned image to public web and IAM-private worker services with max-one scaling.
+- Live revisions `humanwire-web-00024-gvl` and `humanwire-worker-00024-fcv` both serve digest `sha256:beeb4c38559c3fedf771c10efaf621ef100f5015f942c90ecf6aeb5ea995ae7f`; the worker permits only the dedicated Pub/Sub push identity and returns HTTP 403 anonymously.
+- Several live diagnostic runs exposed stage-contract, lease-heartbeat, and model-controlled virtual-time defects. Each defect received a failing regression before repair; diagnostic runs were excluded from submission evidence.
+- Final live run `coordination-3dc459c1f701cb15` completed 55/55 saved events and `meeting_ready` with zero rejected model responses. The strict repository verifier confirmed request → outreach → conflict → targeted interview → confirmed evidence → proposal → revision → approval → availability → meeting ordering and canonical snapshot/JSON/CSV parity.
+- Browser acceptance on the deployed completed run passed desktop and true 390×844 mobile checks: one selected replay edge, synchronized selected data, JSON/CSV downloads, no navigation, no horizontal overflow, no sub-44px visible controls, and no console warning/error.
+
+## Build item 12 - judge-facing submission film - 2026-08-17
+
+- Captured one chronological 186-second run from the public Cloud Run product at 1920×1080; the film keeps that recorded product visible for 82.7% of its 3:45 duration.
+- Used one bounded Vertex generation from Veo 3.1 Fast for the labeled eight-second visual guide and one bounded Lyria 3 Pro generation for the original instrumental score. Estimated generation cost was $0.88; neither generated asset is presented as product evidence.
+- Kept the exact deployed revisions, shared image digest, private-worker IAM boundary, 55-event result, and no-external-stakeholder-message boundary visible in the edit. Google Chirp 3 HD narration remains subject to human audible approval before final release.
+- The full repository suite passes in a credential-sanitized test process; the local private `.env` remains ignored by both Git and Docker, and no credential pattern appears in the tracked production diff.
+
+## DecisionOS Agent Council release - 2026-08-22
+
+- Promoted the current submission architecture to Firebase Hosting and Google sign-in,
+  one digest-pinned Cloud Run `humanwire-decisionos` service, Firestore durable state,
+  Google ADK 2.7, and Gemini 3.5 Flash on Vertex AI.
+- Deployed revision `humanwire-decisionos-00040-g92` at 100% traffic and verified one
+  authenticated 26-event mission with seven bounded specialists, eight named AI
+  stakeholder contributions, a saved evidence-bound brief, refresh recovery, and an
+  explicit human-approval gate.
+- Kept the public run truthful: App Check is monitored while exact authenticated
+  mutation guards remain enforced; Demo run sends no external messages; optional
+  organization transports require private consented configuration.
+- Benchmarked 60 official AI products and retained the governed decision-control-plane
+  architecture while strengthening live progress, named role handoffs, facts versus
+  inference, authority visibility, and the durable judge-facing decision brief.
+- Produced a 112-second English-captioned film with 75.4% chronological product
+  footage, explicit Cloud Run/Firestore/Vertex proof, a labeled Veo 3.1 visual guide,
+  and an original Lyria 3 Pro score. Publication remains gated on final human audition.

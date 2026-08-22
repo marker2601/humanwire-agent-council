@@ -21,8 +21,8 @@ def _configuration(environment: Mapping[str, str]) -> tuple[str, str, str, Googl
         project = environment.get("GOOGLE_CLOUD_PROJECT", "").strip()
         database = environment.get("HUMANWIRE_FIRESTORE_DATABASE", "(default)").strip()
         host = environment.get("HUMANWIRE_WORKER_HOST", "").strip().casefold()
-        model = environment.get("HUMANWIRE_MODEL_ID", "").strip()
-        location = environment.get("HUMANWIRE_GOOGLE_LOCATION", "us-central1").strip()
+        model = environment.get("HUMANWIRE_MODEL_ID", "gemini-3.5-flash").strip()
+        location = environment.get("HUMANWIRE_GOOGLE_LOCATION", "global").strip()
         if (
             _PROJECT.fullmatch(project) is None
             or _DATABASE.fullmatch(database) is None

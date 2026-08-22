@@ -8,7 +8,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from humanwire.model_client import ModelFailure
-from humanwire.persona_runtime import PersonaDecision, SyntheticIntent
+from humanwire.persona_runtime import (
+    PersonaDecision,
+    PersonaVisibility,
+    SyntheticIntent,
+    persona_response_contract,
+)
 
 
 class _LegacyEngine:
@@ -80,6 +85,36 @@ class _FixtureEngine:
                 time_offset_seconds=1,
                 intent=SyntheticIntent.ACKNOWLEDGE,
                 content=self._value,
+            )
+        if self._mode == "stage_contract":
+            contract = persona_response_contract(profile, context)
+            intent = SyntheticIntent(contract["required_intent"])
+            visibility = PersonaVisibility(contract["required_visibility"])
+            content_by_intent = {
+                SyntheticIntent.SILENCE: "No response sent.",
+                SyntheticIntent.ACKNOWLEDGE: "Acknowledged.",
+                SyntheticIntent.ANSWER: "Launch date is recorded.",
+                SyntheticIntent.INTERVIEW_RESPONSE: (
+                    "Internal risk note."
+                    if visibility is PersonaVisibility.PRIVATE
+                    else "Engineering must own the rollback checkpoint before approval."
+                ),
+                SyntheticIntent.CONFIRM_EVIDENCE: "Confirmed.",
+                SyntheticIntent.ACCEPT_PROPOSAL: "Accepted.",
+                SyntheticIntent.CHANGE_PROPOSAL: (
+                    "Assign Engineering as the rollback checkpoint owner before approval."
+                ),
+                SyntheticIntent.APPROVE: "Approved.",
+                SyntheticIntent.CHANGE: "Record the reviewed change.",
+                SyntheticIntent.AVAILABILITY: contract["required_content"],
+            }
+            content = content_by_intent[intent]
+            assert isinstance(content, str)
+            return PersonaDecision(
+                time_offset_seconds=1,
+                intent=intent,
+                content=content,
+                visibility=visibility,
             )
 
         observed_concurrency = 0

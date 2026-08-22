@@ -1,71 +1,66 @@
-# HumanWire — All Things Agentic four-minute demo
+# HumanWire — All Things Agentic release script
 
-This is a production script, not proof by itself. Record the final demo only after the live Google deployment passes acceptance. Keep the product portion one continuous take; use cuts only between the architecture introduction, the live take, and the cloud-console proof.
+Release contract: 1:52, 1920×1080, 30 fps, H.264/yuv420p, AAC stereo 48 kHz, faststart. The real deployed product occupies 84.4 seconds (75.4%). The six-second Google Veo 3.1 Fast opening is visibly labeled as a visual guide. The authenticated mission recording is chronological and uses no artificial speed-up. Gemini 3.5 Flash specialists are orchestrated through Google ADK 2.7. The instrumental score was generated once with Lyria 3 Pro on Vertex AI. The visible truth boundary is **Live Google run · no external stakeholder messages**. Narration uses the human-approved Google Cloud Chirp 3 HD Aoede voice.
 
-## 0:00–0:22 — The problem
+## 0:00–0:06 — Stakes
 
-**Visual:** HumanWire title, then the launch-decision composer.
+**Visual:** Labeled Veo visual guide.
 
-**Narration:**
+**Narration:** “Big decisions need more than AI: evidence, voices, and explicit human authority.”
 
-“Decisions do not stall because teams need more generated text. They stall because the wrong people are asked for the wrong contribution, objections arrive late, evidence is mistaken for assertion, and approval is treated as implied. HumanWire turns one objective into an evidence-backed, authority-approved, meeting-ready decision.”
+## 0:06–0:12 — Architecture
 
-## 0:22–0:48 — Architecture and trust boundary
+**Visual:** Firebase Authentication, monitored App Check, enforced same-origin guards, Cloud Run, Firestore, Google ADK, Gemini on Vertex AI, and the human approval gate.
 
-**Visual:** `all-things-agentic-architecture.png`; highlight web, Firestore/Pub/Sub, private worker, ADK/Gemini, then the green authority boundary.
+**Narration:** “Google ADK and Gemini 3.5 Flash turn an agenda into durable work.”
 
-**Narration:**
+## 0:12–0:25 — Start the real run
 
-“A public Cloud Run service creates a durable Firestore run before publishing an opaque Pub/Sub message. An authenticated push invokes a private worker. Google ADK coordinates Gemini 3.6 Flash specialists, but their typed decisions are only candidates. HumanWire alone validates identity, evidence, approval, scheduling, and persistence.”
+**Visual:** The authenticated deployed workspace and the user action that starts a demo mission.
 
-## 0:48–2:48 — One continuous live Taskmaster run
+**Narration:** “This is the live deployed product. I start a demo mission; no external message is sent. HumanWire assembles seven specialist agents and eight labeled AI stakeholders.”
 
-**Visual:** Start from the deployed Cloud Run URL. Submit the fixed Launch decision template. Do not speed up or edit the workflow portion.
+## 0:25–0:45 — Specialist council in motion
 
-**Narration checkpoints:**
+**Visual:** Seven bounded specialist agents work in parallel with saved progress and handoffs.
 
-- “One click starts the asynchronous workflow; the browser is not running the agent.”
-- At outreach: “Each stakeholder receives only the engagement their role requires.”
-- At conflict: “Anika rejects an unsupported assumption, so HumanWire opens a targeted interview instead of forcing agreement.”
-- At evidence: “The answer becomes usable only after the evidence gate confirms it.”
-- At proposal revision: “The proposal changes because the saved evidence changed—not because the UI advanced an animation.”
-- At approval: “Sofia acts only after evidence and revision. Her explicit approval is distinct from acknowledgement.”
-- At availability: “Daniel is contacted only after approval.”
-- At completion: “The meeting package is ready because every authoritative prerequisite is satisfied.”
+**Narration:** “Each specialist receives a bounded role across market, finance, product, technical, risk, synthesis, and red team. They work in parallel, save handoffs, challenge weak claims, and never inherit approval authority. The progress rail and timeline come from saved Firestore state.”
 
-Keep the selected event synchronized across the graph, Conversation, Data, and lifecycle panes. Show exactly one highlighted graph path.
+## 0:45–1:03 — Named stakeholder contributions
 
-## 2:48–3:20 — Durability and replay
+**Visual:** Eight named stakeholders contribute role-specific evidence and authority constraints.
 
-**Visual:** Refresh the completed workspace. Use Previous to select the conflict event, switch Conversation/Data tabs, then Follow Live. Trigger JSON and CSV downloads without navigating.
+**Narration:** “HumanWire collects role-specific contributions from the executive sponsor, communications, product, engineering, risk, approval, operations, and business owners. The risk lead holds the gate; the approval owner waits for evidence. Nobody is flattened into a generic AI response.”
 
-**Narration:**
+## 1:03–1:18 — Evidence-bound recommendation
 
-“A refresh reconstructs the same immutable prefix from Firestore. Replay selects the same event across every pane. JSON and CSV are regenerated from that timeline and bound to the final transcript and semantic trace, so another instance can serve the same evidence.”
+**Visual:** Confirmed facts, inferences, red-team challenges, and explicit human authority remain separate.
 
-## 3:20–3:48 — Visible Google Cloud proof
+**Narration:** “The final synthesis becomes an evidence-bound recommendation. Confirmed facts, model inferences, and red-team challenges stay separate. The Council cannot approve its own proposal; the final node remains human approval required.”
 
-**Visual:** Cloud Run services/revisions, image digest, private worker IAM, Pub/Sub authenticated subscription, safe Firestore run structure, and fixed Cloud Logging events. Do not show account email, billing details, credentials, tokens, prompts, private model responses, project secrets, or raw logs.
+## 1:18–1:36.4 — Decision brief and audit trail
 
-**Narration:**
+**Visual:** The recommendation, authority, digest, evidence, decisions, and sources remain available after refresh.
 
-“Both Cloud Run services use the same digest-pinned image and dedicated service identities. Pub/Sub alone can invoke the private worker. Firestore owns the lease and immutable timeline. Vertex AI is available only to the worker through Application Default Credentials. The web identity cannot call the model.”
+**Narration:** “The decision, evidence digest, recommended action, required authority, and source records remain available after refresh. That is the product: fewer coordination meetings, a review-ready brief, and an audit trail a team can defend.”
 
-## 3:48–4:00 — Close
+## 1:36.4–1:45.4 — Google Cloud proof
 
-**Visual:** Meeting package ready, repository URL, Taskmaster label.
+**Visual:** Firebase Authentication, monitored App Check, exact Cloud Run revision, Firestore durable state, Google ADK, and Vertex AI.
 
-**Narration:**
+**Narration:** “Firebase guards access. Cloud Run and Firestore host DecisionOS. Google ADK runs Gemini 3.5 Flash.”
 
-“HumanWire is not another chatbot. It is a durable Taskmaster that does the coordination work while preserving the authority that makes a decision real. The complete code and reproduction steps are public.”
+## 1:45.4–1:52 — Close
 
-## Recording gate
+**Visual:** HumanWire · Taskmaster and the direct Cloud Run URL.
 
-- Runtime no longer than 4:00.
-- Product workflow shown as one continuous, unedited live take.
-- Visible qualifying `.run.app` URL and Google Cloud evidence.
-- No secret, account email, project credential, private evidence, contact route, token, prompt, or raw provider output.
-- Architecture matches the deployed services and IAM.
-- Captions are accurate, max two lines, and do not cover product controls.
-- Audio is intelligible at normal speed; no unreviewed synthetic narration.
-- Repository and video links are public in a signed-out browser.
+**Narration:** “Less meeting time. More evidence. Human authority stays visible. HumanWire.”
+
+## Release gates
+
+- The final release mix is audibly approved by a human before publication.
+- Every narration clip decodes, fits its chapter, and contains no unplanned silence longer than 1.2 seconds.
+- Captions reconstruct the locked narration, stay within two authored lines and 42 characters per line, and do not cover active product controls.
+- Every cut boundary, chapter midpoint, product action, caption midpoint, and closing frame passes original-resolution review.
+- Full 3,360-frame decode, random-seek parity, standard codecs, exact duration, and faststart pass.
+- The video URL, deployed URL, and repository URL pass signed-out readback before final Devpost submission.

@@ -17,6 +17,7 @@ from humanwire.persona_runtime import (
     PersonaContext,
     PersonaDecision,
     PersonaProfile,
+    PersonaTranscriptEntry,
     SyntheticIntent,
     persona_prompt_payload,
 )
@@ -67,6 +68,167 @@ def _context() -> PersonaContext:
     )
 
 
+@pytest.mark.parametrize(
+    ("engagement_contract", "allowed_intents", "message", "required_intent"),
+    [
+        (EngagementType.INFORM, (SyntheticIntent.SILENCE,), "HUMANWIRE UPDATE", "silence"),
+        (
+            EngagementType.ACKNOWLEDGE,
+            (SyntheticIntent.ACKNOWLEDGE, SyntheticIntent.ACCEPT_PROPOSAL),
+            "HUMANWIRE ACKNOWLEDGEMENT · [MANDATE] Reply ACK [MANDATE].",
+            "acknowledge",
+        ),
+        (
+            EngagementType.QUICK_RESPONSE,
+            (SyntheticIntent.ACKNOWLEDGE, SyntheticIntent.ANSWER),
+            "Question 1 of 1: Is the launch ready?",
+            "answer",
+        ),
+        (
+            EngagementType.STRUCTURED_INTERVIEW,
+            (SyntheticIntent.ACKNOWLEDGE, SyntheticIntent.INTERVIEW_RESPONSE),
+            "Question 1 of 3: What risk must be resolved?",
+            "interview_response",
+        ),
+        (
+            EngagementType.QUICK_RESPONSE,
+            (SyntheticIntent.CONFIRM_EVIDENCE,),
+            "HUMANWIRE EVIDENCE CONFIRMATION",
+            "confirm_evidence",
+        ),
+        (
+            EngagementType.STRUCTURED_INTERVIEW,
+            (SyntheticIntent.CHANGE_PROPOSAL,),
+            "HUMANWIRE DRAFT PROPOSAL",
+            "change_proposal",
+        ),
+        (
+            EngagementType.ACKNOWLEDGE,
+            (SyntheticIntent.ACCEPT_PROPOSAL,),
+            "HUMANWIRE DRAFT PROPOSAL",
+            "accept_proposal",
+        ),
+        (
+            EngagementType.AVAILABILITY,
+            (SyntheticIntent.AVAILABILITY,),
+            "HUMANWIRE AVAILABILITY REQUEST",
+            "availability",
+        ),
+    ],
+)
+def test_shared_prompt_binds_the_model_to_the_current_protocol_stage(
+    engagement_contract: EngagementType,
+    allowed_intents: tuple[SyntheticIntent, ...],
+    message: str,
+    required_intent: str,
+) -> None:
+    profile = PersonaProfile(
+        role="Stakeholder",
+        private_facts=(),
+        allowed_intents=allowed_intents,
+        engagement_contract=engagement_contract,
+    )
+    context = PersonaContext(
+        delivered_message=message,
+        own_inbox=(message,),
+        own_transcript=(),
+        virtual_time=NOW,
+    )
+
+    _, user = persona_prompt_payload(profile, context)
+    contract = json.loads(user)["response_contract"]
+
+    assert contract["required_intent"] == required_intent
+    assert contract["required_time_offset_seconds"] == 1
+    expected_visibility = (
+        "private" if required_intent == "interview_response" else "shareable"
+    )
+    assert contract["required_visibility"] == expected_visibility
+    if required_intent == "availability":
+        assert contract["required_content"] == (
+            "2026-08-13T15:00:00+00:00/2026-08-13T16:00:00+00:00"
+        )
+
+
+def test_later_structured_answer_is_shareable_and_requests_rollback_ownership() -> None:
+    profile = PersonaProfile(
+        role="Risk lead",
+        private_facts=(),
+        allowed_intents=(SyntheticIntent.ACKNOWLEDGE, SyntheticIntent.INTERVIEW_RESPONSE),
+        engagement_contract=EngagementType.STRUCTURED_INTERVIEW,
+    )
+    context = PersonaContext(
+        delivered_message="Question 2 of 3: Who owns the mitigation?",
+        own_inbox=("Question 2 of 3: Who owns the mitigation?",),
+        own_transcript=(
+            PersonaTranscriptEntry(
+                timestamp=NOW,
+                local_sequence=1,
+                intent=SyntheticIntent.INTERVIEW_RESPONSE,
+                content="A private risk note was recorded.",
+            ),
+        ),
+        virtual_time=NOW,
+    )
+
+    _, user = persona_prompt_payload(profile, context)
+    contract = json.loads(user)["response_contract"]
+
+    assert contract["required_intent"] == "interview_response"
+    assert contract["required_visibility"] == "shareable"
+    assert "rollback" in contract["content_guidance"].casefold()
+
+
+@pytest.mark.parametrize(
+    ("message", "required_intent"),
+    [
+        (
+            "HUMANWIRE INTERVIEW · [MANDATE]\n\nReply ACK [MANDATE] to begin.",
+            "silence",
+        ),
+        (
+            (
+                "HUMANWIRE INTERVIEW · [MANDATE]\n\n"
+                "Please acknowledge this interview when ready: ACK [MANDATE]."
+            ),
+            "silence",
+        ),
+        (
+            (
+                "HUMANWIRE INTERVIEW · [MANDATE]\n\n"
+                "The prior registered route did not receive the required interview response.\n\n"
+                "Reply ACK [MANDATE] to continue."
+            ),
+            "acknowledge",
+        ),
+    ],
+)
+def test_structured_outreach_escalates_before_acknowledgement(
+    message: str,
+    required_intent: str,
+) -> None:
+    profile = PersonaProfile(
+        role="Risk lead",
+        private_facts=(),
+        allowed_intents=(
+            SyntheticIntent.ACKNOWLEDGE,
+            SyntheticIntent.INTERVIEW_RESPONSE,
+            SyntheticIntent.SILENCE,
+        ),
+        engagement_contract=EngagementType.STRUCTURED_INTERVIEW,
+    )
+    context = PersonaContext(
+        delivered_message=message,
+        own_inbox=(message,),
+        own_transcript=(),
+        virtual_time=NOW,
+    )
+
+    _, user = persona_prompt_payload(profile, context)
+
+    assert json.loads(user)["response_contract"]["required_intent"] == required_intent
+
+
 def _decide(
     engine: FeatherlessPersonaDecisionEngine,
     profile: PersonaProfile | None = None,
@@ -84,7 +246,7 @@ def test_model_engine_receives_only_the_approved_persona_context() -> None:
     """Break caught: the adapter leaks routing or workflow authority into its prompt."""
     client = CapturingClient(
         {
-            "time_offset_seconds": 2,
+            "time_offset_seconds": 1,
             "intent": "acknowledge",
             "content": "ACK",
             "visibility": "shareable",
@@ -95,7 +257,12 @@ def test_model_engine_receives_only_the_approved_persona_context() -> None:
     decision = _decide(engine)
 
     payload = json.loads(client.calls[0][1])
-    assert set(payload) == {"profile", "context", "output_schema"}
+    assert set(payload) == {
+        "profile",
+        "context",
+        "response_contract",
+        "output_schema",
+    }
     assert set(payload["profile"]) == {
         "role",
         "private_facts",
@@ -124,7 +291,7 @@ def test_direct_adapter_extends_the_shared_persona_prompt() -> None:
     """Break caught: the direct and typed adapters drift to different persona context."""
     client = CapturingClient(
         {
-            "time_offset_seconds": 2,
+            "time_offset_seconds": 1,
             "intent": "acknowledge",
             "content": "ACK",
             "visibility": "shareable",
@@ -141,12 +308,27 @@ def test_direct_adapter_extends_the_shared_persona_prompt() -> None:
     assert json.loads(direct_user) == {
         **json.loads(shared_user),
         "output_schema": {
-            "time_offset_seconds": "integer 0..60",
+            "time_offset_seconds": [1],
             "intent": ["acknowledge"],
             "content": "non-empty string, maximum 600 characters",
-            "visibility": ["shareable", "anonymous", "private"],
+            "visibility": ["shareable"],
         },
     }
+
+
+def test_model_engine_rejects_noncanonical_virtual_time_offset() -> None:
+    client = CapturingClient(
+        {
+            "time_offset_seconds": 2,
+            "intent": "acknowledge",
+            "content": "Acknowledged.",
+            "visibility": "shareable",
+        }
+    )
+    engine = FeatherlessPersonaDecisionEngine(client, "fixture/model")
+
+    with pytest.raises(ValueError, match="current response stage"):
+        _decide(engine, _profile(), _context())
 
 
 @pytest.mark.parametrize(

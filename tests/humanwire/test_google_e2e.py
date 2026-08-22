@@ -87,7 +87,7 @@ def _fake_adk_runner(
 def _factory() -> GoogleAdkPersonaDecisionEngineFactory:
     return GoogleAdkPersonaDecisionEngineFactory(
         runtime=GoogleRuntimeConfig(
-            model_id="gemini-3.6-flash",
+            model_id="gemini-3.5-flash",
             auth_mode=GoogleAuthMode.VERTEX_AI_ADC,
             project_id="humanwire-demo",
             location="us-central1",

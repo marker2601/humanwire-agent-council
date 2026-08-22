@@ -1,139 +1,142 @@
-# Title
-
-HumanWire
+# HumanWire Agent Council
 
 ## One-line Summary
 
-HumanWire is a decision-coordination agent that reaches the minimum necessary people across email and Telegram through one Caspian message boundary, resolves disagreement with evidence, and schedules only after approval and availability are real.
+Gemini and Google ADK specialists turn one executive agenda into an evidence-backed decision brief while HumanWire keeps authority, provenance, and final approval explicitly human.
 
 ## Problem
 
-Important decisions often stall because coordination tools broadcast the same request to everyone and then mistake delivery, silence, or an unverified answer for progress. Teams lose time in unnecessary interviews, decision authority becomes unclear, and meeting invitations appear before the evidence, approval, or required attendees are actually ready.
+Important decisions are slowed by coordination, not a lack of text. The right people are difficult to reach at the right moment, stakeholder concerns arrive late, evidence is mixed with assertion, and a polished AI answer can look like approval even when no accountable person has approved anything. Traditional meetings solve this by consuming everyone’s time at once.
 
 ## Solution
 
-HumanWire behaves more like a careful chief of staff. A manager describes the objective, timing, and stakeholders. HumanWire selects the minimum engagement contract each person needs—inform, acknowledge, quick response, structured interview, approval, or availability—and preserves one correlated workflow across email and Telegram through a single Caspian handler.
+HumanWire turns one agenda into durable decision work. Seven bounded Gemini specialists analyze market, finance, product, technical, risk, synthesis, and red-team concerns. Eight named AI stakeholders contribute role-specific evidence and authority constraints inside a clearly labeled demo run. The final Council output is a review-ready decision brief with confirmed facts, model inferences, red-team challenges, source records, a digest, recommended action, required authority, and a visible **human approval required** state.
 
-The workflow keeps assertions separate from confirmed evidence, treats a requested change as a real blocker, limits proposal revision to two rounds, and creates a meeting package only after the required authority and attendees have produced a current overlap.
+The workflow is saved in Firestore and survives refresh. The public demo sends no external messages. A separate connected-organization mode is implemented for activated members and consented routes, but it fails closed unless the required directory, identity, route, and transport are configured.
 
 ## Why This Matters
 
-An agent that can contact people needs stronger truth boundaries than a chat assistant. HumanWire is designed around the distinction between sent, acknowledged, asserted, confirmed, approved, and scheduled. That makes its output explainable, replayable, and safe to use as a coordination record.
+HumanWire reduces the coordination work around a decision without erasing the people accountable for it. Teams can collect distinct viewpoints asynchronously, challenge weak claims before a meeting, and enter the final review with the evidence and unresolved risks already organized. The intended outcome is fewer coordination meetings, shorter final meetings, and a decision record that can be defended later.
 
 ## How We Used AI
 
-The public product uses deterministic Standard agents so every judge can run the complete workflow without credentials or external messages. Those agents model different stakeholder roles and can acknowledge, disagree, answer an interview, confirm evidence, revise a proposal, approve, and provide availability.
-
-The repository also includes an optional Pydantic AI / Featherless adapter. Model output is schema-constrained, privacy-scanned, deadline-bounded, and validated again at the central decision boundary. The model can suggest a bounded persona action; it cannot authenticate a sender, select a transport destination, confirm evidence, approve a decision, or schedule a meeting. The same deterministic policies remain the fallback.
+- **Gemini 3.5 Flash on Vertex AI** performs bounded specialist analysis and synthesis.
+- **Google ADK 2.7** orchestrates the multi-agent Council and its handoffs.
+- Every specialist has a named role, a bounded assignment, and a constrained output contract.
+- HumanWire—not the model—owns identity, evidence provenance, durable state, authorization, and the final human approval gate.
+- **Veo 3.1 Fast** produced the clearly labeled six-second visual guide in the demo film.
+- **Lyria 3 Pro** produced the original instrumental score used in the demo film.
+- Demo stakeholders and sample company records are labeled as AI/demo data and remain inside the run; no external message is claimed.
 
 ## How We Used Codex
 
-Codex helped turn the product specification into testable modules, write red tests before implementation, trace failures across the gateway/workflow/repository/viewer boundaries, perform independent review rounds, and run broad regression, privacy, replay, accessibility, responsive-layout, and media-quality gates. Codex also helped prepare the public repository, the 80-second demo, and this submission packet. Project documentation and executable tests remain the source of truth for every claim.
+Codex helped convert the product requirements into typed contracts, implement features test-first, run adversarial privacy and authority reviews, diagnose browser and deployment failures, compare the product against 60 official AI products, validate the deployed mission flow, prepare the architecture and submission film, and keep public claims bound to recorded evidence. The final implementation was repeatedly checked with focused tests, broad regression suites, static analysis, browser QA, cloud inspection, and media-quality gates.
 
 ## Key Features
 
-- One normalized Caspian `on_message` boundary for email and Telegram instead of duplicated per-channel agents.
-- Minimum-necessary engagement planning across six explicit contracts.
-- Exact sender, route, conversation, assignment, mandate, and replay correlation.
-- Multi-person role behavior with conflict, targeted interview, evidence confirmation, proposal revision, approval, availability, and meeting preparation.
-- Durable outbox, leases, retry/failover fences, restart-safe replay, and inert duplicate inbound handling.
-- Live Decision Room graph plus synchronized Reach and Data panes.
-- Previous, Next, Play, Pause, and Follow-live inspection of the saved path.
-- Redacted JSON/CSV exports bound to the final saved run.
-- Responsive 390 px through desktop product UI with keyboard-visible, 44 px controls.
-- Credential-free public Standard-agent mode that makes no external calls.
+- One agenda starts a durable mission instead of a chat session.
+- Seven Gemini specialists work in parallel with visible progress and saved handoffs.
+- Eight named stakeholder roles contribute different evidence, constraints, and authority conditions.
+- The decision brief separates facts, inferences, and red-team challenges.
+- Models cannot approve their own recommendation or silently send external messages.
+- Firebase Google sign-in protects the workspace; App Check is configured in monitored rollout; exact host, origin, CSRF, and request-shape controls enforce mutations.
+- Firestore preserves mission, evidence, Council, decision, and audit state across refresh.
+- The completed Council, Decisions, and Evidence views expose a readable recommendation, source records, digest, required authority, and human approval gate.
+- Connected-organization mode requires activated members and consented routes and fails closed when those prerequisites are absent.
 
 ## Architecture
 
-```text
-Manager request
-  -> one Caspian email/Telegram message handler
-  -> HumanWire planning and engagement policy
-  -> authenticated workflow transitions
-  -> SQLite event store + durable outbox + replay fences
-  -> evidence, proposal, approval, availability
-  -> meeting package
-  -> redacted Decision Room / Reach / Data / JSON / CSV
-```
+The browser is served by Firebase Hosting. Firebase Authentication provides Google sign-in; App Check is configured and monitored. Same-origin CSRF, host, origin, body, and schema checks protect mutation routes. A digest-pinned Cloud Run DecisionOS service owns the authenticated workspace and mission API. Firestore stores tenant, organization, mission, evidence, Council, decision, and audit state. Google ADK orchestrates Gemini 3.5 Flash specialists on Vertex AI. A sanitized decision brief is projected from saved state, and the final transition remains an explicit human approval gate.
 
-Authority stays in the directory, contracts, state machines, transaction fences, and exact message correlation. Caspian is the cross-channel transport boundary. The product projection is rebuilt from saved truth and excludes routes, addresses, raw provider payloads, credentials, private facts, internal identifiers, and operational UUIDs.
+Architecture diagram: `submission/all-things-agentic-architecture.png`
+
+Current production revision: `humanwire-decisionos-00040-g92`
 
 ## Testing Instructions
 
-Requirements: Python 3.12.
+### Hosted judge flow
+
+1. Open https://humanwire-agentic-2026.firebaseapp.com/workspace.
+2. Sign in with Google.
+3. Keep **Demo run** selected and start the prepared mission.
+4. Observe seven specialist agents and eight named AI stakeholder contributions.
+5. Wait for **Decision brief ready**.
+6. Review **Council**, **Decisions**, and **Evidence**.
+7. Refresh the mission URL and confirm the saved result returns with **human approval required**.
+
+### Local test flow
 
 ```powershell
-git clone https://github.com/marker2601/humanwire.git
-cd humanwire
+git clone https://github.com/marker2601/humanwire-agent-council.git
+Set-Location humanwire-agent-council
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -e ".[dev,google,decisionos]"
 .\.venv\Scripts\python.exe -m pytest -q
 .\.venv\Scripts\python.exe -m ruff check src tests scripts
-.\.venv\Scripts\python.exe scripts\smoke_humanwire.py
-.\.venv\Scripts\python.exe -m humanwire smoke
+node --check src\humanwire\decisionos_static\decisionos-app.js
+node tests\humanwire\decisionos_mission_harness.js
 ```
 
-To run the private local studio without provider credentials:
-
-```powershell
-.\.venv\Scripts\python.exe -m humanwire studio --host 127.0.0.1 --port 8766 --workspace-root .\work\studio
-```
-
-Then open `http://127.0.0.1:8766/`, submit the launch-decision template, and inspect the live graph, synchronized panes, replay controls, and final downloads.
+The default tests use fake or in-memory adapters and do not need Google credentials. Firestore emulator tests run only when `FIRESTORE_EMULATOR_HOST` is explicitly configured. Cloud deployment steps and required secret names are documented in `infra/google/README.md`.
 
 ## Public Demo Link
 
-https://secondsignal.vercel.app/
+https://humanwire-agentic-2026.firebaseapp.com/workspace
 
-The public site runs the interactive Standard-agent workflow and sends no external messages.
+Direct Cloud Run proof: https://humanwire-decisionos-wjjhjrgnyq-uc.a.run.app
 
 ## Public Repository Link
 
-https://github.com/marker2601/humanwire
+https://github.com/marker2601/humanwire-agent-council
 
 ## Demo Video
 
-https://youtu.be/OJS99qETl3M
+Final local master: `work/all-things-agentic-video/final/humanwire-agent-council-all-things-agentic-2026.mp4`
 
-The professionally reviewed master is 80.021 seconds, 1920×1080, H.264/AAC, and remains under the event's three-minute limit. It devotes 82.5% of its running time to the real deployed product and is publicly embedded on Devpost.
+Public YouTube URL: TODO after upload.
 
-The video deliberately distinguishes the working public Standard-agent product from the configured Caspian transport boundary. Live Telegram/email provider verification was not configured or recorded, and the video does not claim otherwise.
+The 1:52 film is 75.4% chronological footage from the authenticated deployed product. It names Gemini 3.5 Flash and Google ADK 2.7, shows the mission running, shows named stakeholder contributions and the saved decision brief, exposes the human-approval boundary, and shows the exact Cloud Run revision plus Firebase/Firestore/Vertex AI architecture. The Veo opening is labeled as a visual guide and does not replace real product proof.
 
 ## Screenshot Shot List
 
-1. Composer with the launch-decision request, seven stakeholders, five workflow stages, and the Standard-agent boundary.
-2. Decision Room showing the full HumanWire → Caspian Gateway → stakeholder → artifact graph.
-3. Conflict replay with the selected edge synchronized to Reach and Data.
-4. Meeting-ready state with saved approval, availability, and final package.
-5. Mobile Decision Room at 390×844 with replay/export controls visible.
+1. Signed-in mission composer with Demo run and no-external-message boundary.
+2. Seven-specialist live progress rail.
+3. Eight named stakeholder contributions with distinct roles.
+4. Evidence-bound recommendation with authority and digest.
+5. Decisions/Evidence view after refresh.
+6. Google Cloud architecture diagram and exact Cloud Run revision.
 
 ## Submission Readiness Notes
 
-- Devpost authentication: verified.
-- Caspian registration: verified live on Devpost.
-- Devpost project draft: https://devpost.com/software/humanwire
-- Caspian submission: verified live as submission 1140539 at 2026-08-16T11:13:49.137-04:00.
-- Project thumbnail: uploaded from the reviewed completed-workspace screenshot and processing on Devpost.
-- Official deliverables: public GitHub repository and public demo video.
-- Official custom submission questions: none.
-- Public repository: live and signed-out reachable.
-- Public product: live and signed-out reachable.
-- Demo master: complete, professionally reviewed, and public at https://youtu.be/OJS99qETl3M.
-- Latest repository-wide tests: exit 0.
-- Secret/privacy/tracked-media scans: clean.
+- Official category: **Taskmaster**.
+- Hosted product, public repository, README spin-up instructions, architecture diagram, and final video master exist.
+- The live app and direct Cloud Run URL were verified against revision `humanwire-decisionos-00040-g92`.
+- The final video is 112.000 seconds, 1920×1080, H.264/yuv420p at 30 fps with AAC stereo 48 kHz, burned English captions, faststart, and a full 3,360-frame decode.
+- Final master SHA-256: `330CC378E57F3E2DF6B524A9C27DE28A7842E1E8F43D766EC40536F20BF1AF64`.
+- Public video upload and final Devpost write remain pending.
 
 ## Known Limitations
 
-- The public product uses Standard agents and sends no external messages.
-- Live Telegram/email Caspian-provider verification was not configured or recorded; no provider-proof claim is made.
-- SQLite is the local transactional boundary; production needs a managed database with equivalent constraints and operational controls.
-- Telegram outreach requires an existing bot conversation.
-- Provider delivery is at least once; callbacks and replays are fenced, but exactly-once recipient delivery is not claimed.
-- HumanWire creates a read-only meeting package/ICS artifact and does not write to a calendar.
+- The public product requires Google sign-in.
+- App Check is currently in monitored rollout rather than full enforcement; authenticated mutation routes still enforce exact host, origin, CSRF, body, and schema boundaries.
+- Public Demo run uses labeled AI stakeholders and sample company records and sends no external messages.
+- Connected organization outreach requires private operator configuration, activated members, consented routes, and a ready transport; the public deployment does not claim provider delivery.
+- The Council prepares a recommendation but does not grant itself human approval.
+- Firestore emulator tests are skipped unless the emulator host is explicitly configured.
 
-## Official Form Fields
+## TODO Official Form Fields
 
-- Video URL: https://youtu.be/OJS99qETl3M
-- Devpost project URL: https://devpost.com/software/humanwire
-- Submission receipt: 1140539
-- No custom submission questions were returned by the official Caspian form.
+- Submitter Type: `Individuals`
+- Country of residence: `United States`
+- Category: `Taskmaster`
+- Organization name: `Not applicable — individual submission`
+- Project start date: `08-11-26`
+- Repository: `https://github.com/marker2601/humanwire-agent-council`
+- Reproducible testing instructions in README: `Yes`
+- Hosted project: `https://humanwire-agentic-2026.firebaseapp.com/workspace`
+- Google SDK: `Agent Development Kit (ADK)`
+- Google Cloud services: `Firebase Hosting, Firebase Authentication, Firebase App Check, Cloud Run, Firestore, Vertex AI`
+- Google models: `Gemini 3.5 Flash, Veo 3.1 Fast, Lyria 3 Pro`
+- Architecture upload: `submission/all-things-agentic-architecture.png`
+- Public video URL: TODO after upload.

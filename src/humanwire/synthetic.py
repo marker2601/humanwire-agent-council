@@ -150,7 +150,7 @@ class SyntheticRunSidecar(_StrictModel):
     schema_version: Literal["humanwire.synthetic-run/v1"]
     mode: Literal["model_assisted"]
     model_identifier: str = Field(min_length=1, max_length=200)
-    prompt_version: Literal["humanwire.persona-decision/v1"]
+    prompt_version: Literal["humanwire.persona-decision/v2"]
     identity_seed: int = Field(ge=0, le=2_147_483_647)
     transcript_sha256: str = Field(pattern=_DIGEST_PATTERN)
     provenance: SyntheticProvenance
@@ -1132,10 +1132,11 @@ def _evaluate_model_batch(
     engine_factory: PersonaDecisionEngineFactory,
     candidates: list[_DecisionCandidate],
     max_workers: int,
+    timeout_seconds: float,
 ) -> tuple[list[_PersonaDecision | Exception], float]:
     if not candidates:
         return [], time.monotonic()
-    deadline = time.monotonic() + MODEL_DECISION_TIMEOUT_SECONDS
+    deadline = time.monotonic() + timeout_seconds
     try:
         pickle.dumps((engine_factory, candidates), protocol=pickle.HIGHEST_PROTOCOL)
     except Exception:  # noqa: BLE001 - non-serializable factories fail closed pre-spawn
@@ -1254,7 +1255,7 @@ def _model_action_completes(
     profile: _PolicyProfile,
     intent: SyntheticIntent,
 ) -> bool:
-    if intent in {SyntheticIntent.SILENCE, SyntheticIntent.ERROR}:
+    if intent is SyntheticIntent.ERROR:
         return True
     terminal_by_contract = {
         EngagementType.ACKNOWLEDGE: {SyntheticIntent.ACKNOWLEDGE},
@@ -1354,6 +1355,8 @@ def _record_outbound_presentation(
 def _record_decision_presentation(
     observer: StudioPresentationObserver | None,
     action: SyntheticAction,
+    *,
+    fixed_safe_fallback: bool = False,
 ) -> None:
     """Publish accepted bounded decision content before orchestrator wire translation."""
     if observer is None or action.visibility is not PersonaVisibility.SHAREABLE:
@@ -1367,7 +1370,30 @@ def _record_decision_presentation(
             safe_content=action.content,
         )
     except Exception:  # noqa: BLE001 - presentation cannot affect generation authority
-        _mark_presentation_unavailable(observer)
+        fallback_by_intent = {
+            SyntheticIntent.ACKNOWLEDGE: "Acknowledged.",
+            SyntheticIntent.ANSWER: "Role-specific response recorded.",
+            SyntheticIntent.INTERVIEW_RESPONSE: "Interview response recorded.",
+            SyntheticIntent.CONFIRM_EVIDENCE: "Evidence confirmed.",
+            SyntheticIntent.APPROVE: "Approved.",
+            SyntheticIntent.CHANGE: "A requested change was recorded.",
+            SyntheticIntent.ACCEPT_PROPOSAL: "Accepted.",
+            SyntheticIntent.CHANGE_PROPOSAL: "A proposal revision was requested.",
+        }
+        fallback = fallback_by_intent.get(action.intent) if fixed_safe_fallback else None
+        if fallback is None:
+            _mark_presentation_unavailable(observer)
+            return
+        try:
+            observer.record_decision(
+                created_at=action.timestamp,
+                persona_id=action.persona_id,
+                channel=action.channel,
+                intent=action.intent,
+                safe_content=fallback,
+            )
+        except Exception:  # noqa: BLE001 - the fixed fallback also fails closed
+            _mark_presentation_unavailable(observer)
 
 
 def _persisted_event_count(repository: SqlAlchemyHumanWireRepository) -> int:
@@ -1668,6 +1694,7 @@ def generate_scenario(
     *,
     decision_engine: PersonaDecisionEngineFactory | None = None,
     max_decision_workers: int = 1,
+    model_decision_timeout_seconds: float | None = None,
     progress_observer: SyntheticProgressObserver | None = None,
     presentation_observer: StudioPresentationObserver | None = None,
     mandate_request: str | None = None,
@@ -1678,6 +1705,10 @@ def generate_scenario(
 ) -> SyntheticRunResult:
     """Generate an isolated run through the one offline gateway boundary."""
     scenario = SyntheticScenario.model_validate(scenario)
+    if model_decision_timeout_seconds is None:
+        model_decision_timeout_seconds = MODEL_DECISION_TIMEOUT_SECONDS
+    if not 0.01 <= model_decision_timeout_seconds <= 120.0:
+        raise ValueError("model decision timeout is invalid")
     mode = (
         SyntheticGenerationMode.MODEL_ASSISTED
         if decision_engine is not None
@@ -1842,6 +1873,7 @@ def generate_scenario(
                 decision_engine,
                 model_batch,
                 max_decision_workers,
+                model_decision_timeout_seconds,
             )
             for candidate, result in zip(model_batch, results, strict=True):
                 action = _model_action(candidate, result)
@@ -2090,7 +2122,11 @@ def generate_scenario(
         persona_id = action.persona_id
         clock[0] = action.timestamp
         actions.append(action)
-        _record_decision_presentation(presentation_observer, action)
+        _record_decision_presentation(
+            presentation_observer,
+            action,
+            fixed_safe_fallback=decision_engine is not None,
+        )
         if decision_engine is not None and _model_action_completes(
             profiles[persona_id],
             action.intent,

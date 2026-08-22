@@ -283,7 +283,11 @@ def test_pydantic_engine_returns_centrally_validated_typed_decision(monkeypatch)
     )
     assert decision.intent is SyntheticIntent.ANSWER
     assert len(calls) == 1
-    assert set(json.loads(calls[0].user)) == {"context", "profile"}
+    assert set(json.loads(calls[0].user)) == {
+        "context",
+        "profile",
+        "response_contract",
+    }
     assert "sender_address" not in calls[0].user
 
 

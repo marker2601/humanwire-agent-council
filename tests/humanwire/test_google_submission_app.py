@@ -261,7 +261,7 @@ def test_catalog_health_head_and_private_worker_separation() -> None:
 
     assert '<meta name="humanwire-delivery-mode" content="cloud">' in page.text
     assert "Google ADK agents" in page.text
-    assert "Gemini 3.6 Flash" in page.text
+    assert "Gemini 3.5 Flash" in page.text
     assert "HumanWire authority gates" in page.text
     assert "No external stakeholder messages" in page.text
     assert 'name="agent_mode" value="standard"' not in page.text
@@ -431,7 +431,7 @@ def test_inline_dispatch_can_finish_and_cold_exports_are_downloadable(tmp_path) 
     repository = InMemoryRunRepository()
 
     class DecisionFactory:
-        model_identifier = "gemini-3.6-flash"
+        model_identifier = "gemini-3.5-flash"
 
     def deterministic_runner(scenario, output_path, run_root, **kwargs):
         return generate_scenario(

@@ -30,7 +30,7 @@ OWNER = "worker-owner-000000000000001"
 
 
 class DecisionFactory:
-    model_identifier = "gemini-3.6-flash"
+    model_identifier = "gemini-3.5-flash"
 
 
 def request():
@@ -51,6 +51,7 @@ def deterministic_runner(roots: list[Path], factories: list[object]):
     def run(scenario, output_path, run_root, **kwargs):
         roots.append(Path(run_root))
         factories.append(kwargs["decision_engine"])
+        assert kwargs["model_decision_timeout_seconds"] == 60.0
         return generate_scenario(
             scenario,
             output_path,
@@ -75,7 +76,7 @@ def test_worker_claims_before_factory_runs_completes_and_cleans_up() -> None:
     factories: list[object] = []
     factory = GoogleAdkPersonaDecisionEngineFactory(
         runtime=GoogleRuntimeConfig(
-            model_id="gemini-3.6-flash",
+            model_id="gemini-3.5-flash",
             auth_mode=GoogleAuthMode.VERTEX_AI_ADC,
             project_id="humanwire-demo",
             location="us-central1",
@@ -208,6 +209,41 @@ def test_worker_heartbeats_and_joins_its_non_daemon_claim_thread() -> None:
     assert not any(
         thread.name == "humanwire-cloud-claim" for thread in threading.enumerate()
     )
+
+
+def test_transient_heartbeat_error_does_not_abandon_a_healthy_lease() -> None:
+    repository = queued_repository()
+    roots: list[Path] = []
+    factories: list[object] = []
+    original_renew = repository.renew_claim
+    renew_attempts = 0
+
+    def flaky_renew(*args, **kwargs):
+        nonlocal renew_attempts
+        renew_attempts += 1
+        if renew_attempts == 1:
+            raise RuntimeError("PRIVATE-FIRESTORE-CONTENTION")
+        return original_renew(*args, **kwargs)
+
+    repository.renew_claim = flaky_renew  # type: ignore[method-assign]
+    run = deterministic_runner(roots, factories)
+
+    def wait_then_complete(*args, **kwargs):
+        time.sleep(0.25)
+        return run(*args, **kwargs)
+
+    worker = CloudRunWorker(
+        repository,
+        decision_factory_builder=DecisionFactory,
+        runner=wait_then_complete,
+        claim_owner_factory=lambda: OWNER,
+        clock=lambda: NOW,
+        heartbeat_seconds=0.1,
+    )
+
+    assert worker.handle(message()) is WorkerDisposition.ACCEPTED
+    assert renew_attempts >= 2
+    assert repository.load_metadata(ALIAS).state is CloudRunState.COMPLETE
 
 
 def test_unexpected_worker_failure_is_retryable_and_private() -> None:

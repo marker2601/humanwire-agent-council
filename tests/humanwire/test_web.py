@@ -4031,7 +4031,15 @@ def test_health_separates_liveness_from_production_readiness(demo_app) -> None:
 def test_production_readiness_requires_configuration_and_channel_state(demo_app) -> None:
     repository = demo_app.state.repository
     client = TestClient(
-        create_app(repository, Settings(_env_file=None), clock=lambda: NOW)
+        create_app(
+            repository,
+            Settings(
+                _env_file=None,
+                caspian_api_key=None,
+                telegram_bot_token=None,
+            ),
+            clock=lambda: NOW,
+        )
     )
 
     response = client.get("/health/ready")

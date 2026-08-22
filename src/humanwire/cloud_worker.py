@@ -319,7 +319,6 @@ class CloudRunWorker:
 
         def renew_claim() -> None:
             while not heartbeat_stop.wait(self._heartbeat_seconds):
-                renewed = False
                 try:
                     renewed = self._repository.renew_claim(
                         dispatch.run_alias,
@@ -327,8 +326,10 @@ class CloudRunWorker:
                         now=self._clock(),
                         lease_seconds=self._lease_seconds,
                     )
-                except Exception:  # noqa: BLE001 - heartbeat failure is retry-only
-                    renewed = False
+                except Exception:  # noqa: BLE001,S112 - retry-only heartbeat probe
+                    # A transient storage collision does not disprove ownership; the
+                    # durable lease and all later owner-checked writes remain authoritative.
+                    continue
                 if not renewed:
                     claim_lost.set()
                     return
@@ -354,6 +355,7 @@ class CloudRunWorker:
                     run_root,
                     decision_engine=factory,
                     max_decision_workers=4,
+                    model_decision_timeout_seconds=60.0,
                     progress_observer=observer,
                     presentation_observer=observer,
                     mandate_request=metadata.request.objective,

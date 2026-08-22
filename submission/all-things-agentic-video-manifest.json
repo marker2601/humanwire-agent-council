@@ -1,0 +1,33 @@
+{
+  "width": 1920,
+  "height": 1080,
+  "fps": 30,
+  "duration_seconds": 112,
+  "product_footage_ratio": 0.754,
+  "narration_text": "Big decisions need more than AI: evidence, voices, and explicit human authority. Google ADK and Gemini 3.5 Flash turn an agenda into durable work. This is the live deployed product. I start a demo mission; no external message is sent. HumanWire assembles seven specialist agents and eight labeled AI stakeholders. Each specialist receives a bounded role across market, finance, product, technical, risk, synthesis, and red team. They work in parallel, save handoffs, challenge weak claims, and never inherit approval authority. The progress rail and timeline come from saved Firestore state. HumanWire collects role-specific contributions from the executive sponsor, communications, product, engineering, risk, approval, operations, and business owners. The risk lead holds the gate; the approval owner waits for evidence. Nobody is flattened into a generic AI response. The final synthesis becomes an evidence-bound recommendation. Confirmed facts, model inferences, and red-team challenges stay separate. The Council cannot approve its own proposal; the final node remains human approval required. The decision, evidence digest, recommended action, required authority, and source records remain available after refresh. That is the product: fewer coordination meetings, a review-ready brief, and an audit trail a team can defend. Firebase guards access. Cloud Run and Firestore host DecisionOS. Google ADK runs Gemini 3.5 Flash. Less meeting time. More evidence. Human authority stays visible. HumanWire.",
+  "segments": [
+    {"id": "hook", "start_frame": 0, "duration_frames": 180, "source_kind": "generated_visual", "model": "Veo 3.1 Fast"},
+    {"id": "architecture", "start_frame": 180, "duration_frames": 180, "source_kind": "architecture"},
+    {"id": "live_google_run", "start_frame": 360, "duration_frames": 2532, "source_kind": "live_google_product"},
+    {"id": "cloud_proof", "start_frame": 2892, "duration_frames": 270, "source_kind": "cloud_proof"},
+    {"id": "closing", "start_frame": 3162, "duration_frames": 198, "source_kind": "title_card"}
+  ],
+  "claims": {
+    "model": "Gemini 3.5 Flash",
+    "bonus_models": ["Veo 3.1 Fast", "Lyria 3 Pro"],
+    "framework": "Google ADK 2.7",
+    "cloud": ["Firebase Hosting", "Firebase Authentication", "App Check", "Cloud Run", "Firestore", "Vertex AI"],
+    "external_messages": false,
+    "category": "Taskmaster"
+  },
+  "release": {
+    "destination": "Devpost · All Things Agentic",
+    "max_duration_seconds": 240,
+    "voice": "en-US-Chirp3-HD-Aoede",
+    "voice_audition_approved": true,
+    "final_mix_approved": false,
+    "captions": "burned, max two authored lines, 42 characters per line",
+    "music": "Lyria 3 Pro instrumental score; generated on Vertex AI",
+    "spend_cap_usd": 10
+  }
+}

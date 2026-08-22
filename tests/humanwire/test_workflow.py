@@ -273,6 +273,7 @@ def _build_mixed_workflow(
         or Settings(
             _env_file=None,
             engagement_preview_seconds=15,
+            engagement_require_go=False,
             acknowledgement_seconds=60,
             reminder_seconds=30,
         ),
@@ -3924,7 +3925,11 @@ def test_file_go_and_due_release_race_has_one_complete_winner(
     repository, workflow = _file_mixed_race_workflow(
         tmp_path,
         f"go-due-{winner}-{iteration}",
-        Settings(_env_file=None, engagement_preview_seconds=15),
+        Settings(
+            _env_file=None,
+            engagement_preview_seconds=15,
+            engagement_require_go=False,
+        ),
     )
     message, mandate, _ = _mixed_preview(
         workflow,
@@ -4233,7 +4238,11 @@ def test_file_repeated_due_scan_race_releases_once(
     repository, workflow = _file_mixed_race_workflow(
         tmp_path,
         f"repeated-due-{iteration}",
-        Settings(_env_file=None, engagement_preview_seconds=0),
+        Settings(
+            _env_file=None,
+            engagement_preview_seconds=0,
+            engagement_require_go=False,
+        ),
     )
     _, mandate, _ = _mixed_preview(
         workflow,

@@ -26,7 +26,7 @@
         <span aria-hidden="true"></span>
         <div>
           <strong>{% if delivery_mode | default('poll') == 'cloud' %}Durable AI workspace{% elif delivery_mode | default('poll') == 'stream' %}Interactive workspace{% else %}Private workspace{% endif %}</strong>
-          {% if delivery_mode | default('poll') == 'cloud' %}<small>Google ADK · Gemini 3.6 Flash</small>{% elif delivery_mode | default('poll') == 'stream' %}<small>Standard agents · no external messages</small>{% endif %}
+          {% if delivery_mode | default('poll') == 'cloud' %}<small>Google ADK · Gemini 3.5 Flash</small>{% elif delivery_mode | default('poll') == 'stream' %}<small>Standard agents · no external messages</small>{% endif %}
         </div>
       </div>
     </header>
@@ -80,7 +80,7 @@
             {% if delivery_mode | default('poll') == 'cloud' %}
               <div class="coordination-studio-page__runtime-card" aria-label="Google agent runtime">
                 <strong>Google ADK agents</strong>
-                <span>Gemini 3.6 Flash proposes persona decisions.</span>
+                <span>Gemini 3.5 Flash proposes persona decisions.</span>
                 <small>HumanWire authority gates · No external stakeholder messages</small>
               </div>
             {% elif delivery_mode | default('poll') != 'stream' %}

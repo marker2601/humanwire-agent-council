@@ -18,7 +18,7 @@ from humanwire.persona_runtime import (
     PersonaProfile,
     StrictPersonaModel,
     persona_prompt_payload,
-    validate_persona_decision,
+    validate_persona_stage_decision,
 )
 
 
@@ -58,7 +58,7 @@ class PydanticAIPersonaDecisionEngine:
             raise ModelFailure("invalid_response") from error
         if cancellation.is_set() or time.monotonic() >= deadline:
             raise ModelFailure("timeout")
-        return validate_persona_decision(profile, result.output)
+        return validate_persona_stage_decision(profile, context, result.output)
 
 
 class PydanticAIPersonaDecisionEngineFactory(StrictPersonaModel):

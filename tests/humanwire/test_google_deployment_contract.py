@@ -35,6 +35,20 @@ def test_worker_entrypoint_uses_adc_and_only_worker_safe_environment() -> None:
     assert "PRIVATE" not in repr(app.state.__dict__)
 
 
+def test_worker_entrypoint_defaults_to_published_global_gemini_target() -> None:
+    app = build_google_worker_app(
+        {
+            "GOOGLE_CLOUD_PROJECT": "humanwire-demo",
+            "HUMANWIRE_WORKER_HOST": "humanwire-worker.example.test",
+        },
+        firestore_client_factory=lambda **_kwargs: object(),
+    )
+
+    runtime = app.state.worker._decision_factory_builder().runtime
+    assert runtime.model_id == "gemini-3.5-flash"
+    assert runtime.location == "global"
+
+
 @pytest.mark.parametrize(
     "environment",
     (

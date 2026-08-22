@@ -177,7 +177,7 @@ class CloudRunMetadata(_CloudModel):
     idempotency_key_hash: str = Field(pattern=_SHA256.pattern)
     request: CoordinationRequest
     agent_mode: Literal[StudioAgentMode.GOOGLE_ADK] = StudioAgentMode.GOOGLE_ADK
-    model_id: Literal["gemini-3.6-flash"] = "gemini-3.6-flash"
+    model_id: Literal["gemini-3.5-flash"] = "gemini-3.5-flash"
     target_date: date
     state: CloudRunState
     lifecycle_stage: StudioLifecycleStage

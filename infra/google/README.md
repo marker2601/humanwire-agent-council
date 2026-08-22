@@ -3,8 +3,9 @@
 ## HumanWire DecisionOS service
 
 DecisionOS deploys as the separate `humanwire-decisionos` Cloud Run service with
-its own `humanwire-decisionos` service account. This deployment does not update or
-route traffic to `humanwire-web`, `humanwire-worker`, or the submitted public demo.
+its own `humanwire-decisionos` service account. It is the backend for the current
+Firebase-hosted Agent Council submission. This deployment does not update or route
+traffic to `humanwire-web` or `humanwire-worker`, the earlier foundation services.
 It uses Firebase Authentication for identity, Firestore membership for tenant
 authority, and Secret Manager references for the Firebase web app ID, public API
 key, and App Check site key. No secret value is accepted on a command line.
@@ -39,7 +40,11 @@ one invitation, one workspace per organization, and cross-tenant denial. Roll ba
 only `humanwire-decisionos` traffic to its prior revision. Do not delete Firestore,
 Storage, Firebase identities, audit records, or the existing submission services.
 
-This stack deploys one immutable image as two Cloud Run services:
+## Earlier two-service coordination foundation
+
+The following stack remains in the repository for tested compatibility and replay
+evidence. It is not the architecture claimed for the current Agent Council
+submission or film. It deploys one immutable image as two Cloud Run services:
 
 - `humanwire-web` is public and can use only Firestore plus Pub/Sub publish.
 - `humanwire-worker` is private, accepts authenticated Pub/Sub push, and alone can use Vertex AI, Firestore, and Cloud Logging.
@@ -67,7 +72,8 @@ docker run --rm --name humanwire-worker-local -p 18081:8080 `
   -e HUMANWIRE_SERVICE_ROLE=worker `
   -e GOOGLE_CLOUD_PROJECT=humanwire-local `
   -e HUMANWIRE_WORKER_HOST=worker.local.test `
-  -e HUMANWIRE_MODEL_ID=gemini-3.6-flash `
+  -e HUMANWIRE_MODEL_ID=gemini-3.5-flash `
+  -e HUMANWIRE_GOOGLE_LOCATION=global `
   -e FIRESTORE_EMULATOR_HOST=host.docker.internal:18082 `
   humanwire-google:local
 ```

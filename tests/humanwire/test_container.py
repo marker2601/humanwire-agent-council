@@ -94,6 +94,11 @@ def make_settings(tmp_path, **overrides) -> Settings:
     write_organization(organization_path)
     values = {
         "_env_file": None,
+        "caspian_api_key": None,
+        "telegram_bot_token": None,
+        "featherless_api_key": None,
+        "analytics_read_token": None,
+        "engagement_require_go": False,
         "database_url": "sqlite://",
         "organization_path": organization_path,
     }
@@ -646,6 +651,7 @@ def test_installed_smoke_command_runs_outside_repository(tmp_path) -> None:
 
 def test_smoke_command_forwards_only_explicit_live_flags(monkeypatch) -> None:
     calls: list[list[str]] = []
+    monkeypatch.setattr(cli, "configure_logging", lambda: None)
     monkeypatch.setattr(
         cli,
         "run_smoke",

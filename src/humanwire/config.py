@@ -20,9 +20,9 @@ class Settings(BaseSettings):
     featherless_api_key: SecretStr | None = None
     gemini_api_key: SecretStr | None = None
     google_cloud_project: str | None = None
-    google_cloud_location: str = "us-central1"
+    google_cloud_location: str = "global"
     google_genai_use_vertexai: bool = True
-    humanwire_model_id: str = "gemini-3.6-flash"
+    humanwire_model_id: str = "gemini-3.5-flash"
     analytics_read_token: SecretStr | None = None
     featherless_base_url: str = "https://api.featherless.ai/v1"
     featherless_model: str = "Qwen/Qwen2.5-7B-Instruct"

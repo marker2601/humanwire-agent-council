@@ -1,5 +1,13 @@
 # HumanWire — All Things Agentic Technical Specification
 
+> **Historical foundation (superseded for the submitted release).** This 2026-08-16
+> specification documents the earlier two-service coordination architecture. The
+> submitted Agent Council release uses the Firebase Hosting/Auth → one digest-pinned
+> Cloud Run DecisionOS service → Firestore → Google ADK/Gemini architecture shown in
+> `submission/all-things-agentic-architecture.png` and described in the root README.
+> The older runtime remains tested foundation code, but it is not claimed as the
+> architecture in the current product, film, or Devpost entry.
+
 ## 1. Status And Intent
 
 - **Status:** Approved for implementation planning
@@ -34,7 +42,7 @@ flowchart LR
     W -->|"Alias + idempotency key"| P["Pub/Sub"]
     P -->|"OIDC push"| R["Cloud Run: humanwire-worker"]
     R --> A["Google ADK coordinator"]
-    A --> G["Gemini 3.6 Flash specialists"]
+    A --> G["Gemini 3.5 Flash specialists"]
     G --> V["HumanWire typed validation"]
     V --> H["Gateway + workflow + repository"]
     H --> O["Safe progress projection"]
@@ -105,7 +113,7 @@ Requirements:
 
 The coordinator receives only a bounded safe assignment context: contract, persona role, objective excerpt, public prior decisions, and allowed intents. It selects a specialist and returns one structured candidate decision. It does not own lifecycle or workflow state.
 
-Use Google ADK 2.x `Agent` plus a runner/app wrapper. Default model: `gemini-3.6-flash`, satisfying the event's Gemini 3.5+ requirement. Configuration may select another allowlisted qualifying model but cannot silently downgrade.
+Use Google ADK 2.x `Agent` plus a runner/app wrapper. Default model: `gemini-3.5-flash` on the global Agent Platform endpoint, satisfying the event's Gemini 3.5+ requirement. Configuration may select another allowlisted qualifying model but cannot silently downgrade.
 
 **PRD:** Epics 2, 3, 8.
 
@@ -237,7 +245,7 @@ Fields:
 
 - `schema_version`, `run_alias`, `idempotency_key_hash`
 - normalized public `request`
-- `agent_mode=google_adk`, `model_id=gemini-3.6-flash`
+- `agent_mode=google_adk`, `model_id=gemini-3.5-flash`
 - `state`, `lifecycle_stage`, `saved_ordinal`, `timeline_count`
 - `claim_owner`, `lease_expires_at`, `version`
 - fixed `outcome`
@@ -366,11 +374,11 @@ HUMANWIRE_RUNTIME=google_adk
 HUMANWIRE_PUBLIC_ORIGINS=https://<deployed-host>
 HUMANWIRE_FIRESTORE_DATABASE=(default)
 HUMANWIRE_PUBSUB_TOPIC=<topic>
-HUMANWIRE_MODEL_ID=gemini-3.6-flash
+HUMANWIRE_MODEL_ID=gemini-3.5-flash
 HUMANWIRE_GOOGLE_LOCATION=<region>
 HUMANWIRE_RUN_RETENTION_HOURS=<bounded integer>
 GOOGLE_CLOUD_PROJECT=<project-id>
-GOOGLE_CLOUD_LOCATION=<region>
+GOOGLE_CLOUD_LOCATION=global
 GOOGLE_GENAI_USE_VERTEXAI=true
 ```
 
@@ -595,7 +603,7 @@ Full regressions, privacy, clean reproduction, architecture, write-up, reused-wo
 
 ## 18. Definition Of Done
 
-- Deployed workflow uses Gemini 3.6 Flash through Google ADK.
+- Deployed workflow uses Gemini 3.5 Flash through Google ADK.
 - Both Cloud Run services, Pub/Sub, and Firestore are essential to the demo.
 - Strict default chronology completes.
 - Refresh restores the same prefix.
@@ -610,7 +618,7 @@ Full regressions, privacy, clean reproduction, architecture, write-up, reused-wo
 
 ## 19. Approved Defaults
 
-- `gemini-3.6-flash`, Google ADK 2.x, Pydantic/JSON schema.
+- `gemini-3.5-flash`, Google ADK 2.x, Pydantic/JSON schema.
 - Vertex AI ADC in cloud; optional AI Studio key locally.
 - One image; public web + private worker Cloud Run services.
 - Authenticated Pub/Sub push.

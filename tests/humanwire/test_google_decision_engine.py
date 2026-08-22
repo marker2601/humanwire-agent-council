@@ -54,10 +54,13 @@ def model_callback(
     decision: dict,
     calls: list[str],
     prompts: list[str] | None = None,
+    configs: list[types.GenerateContentConfig] | None = None,
 ):
     def callback(*, callback_context, llm_request):
         del callback_context
         calls.append(llm_request.model)
+        if configs is not None:
+            configs.append(llm_request.config)
         if prompts is not None:
             prompts.append(
                 "\n".join(
@@ -146,8 +149,9 @@ class _MockAdkSpawnContext:
 def test_real_adk_runner_returns_one_centrally_validated_decision() -> None:
     calls: list[str] = []
     prompts: list[str] = []
+    configs: list[types.GenerateContentConfig] = []
     expected = PersonaDecision(
-        time_offset_seconds=2,
+        time_offset_seconds=1,
         intent=SyntheticIntent.ANSWER,
         content="Proceed after rollback ownership is recorded.",
         visibility=PersonaVisibility.SHAREABLE,
@@ -155,7 +159,7 @@ def test_real_adk_runner_returns_one_centrally_validated_decision() -> None:
     engine = GoogleAdkPersonaDecisionEngine(
         model_identifier="gemini-3.6-flash",
         before_model_callback=model_callback(
-            expected.model_dump(mode="json"), calls, prompts
+            expected.model_dump(mode="json"), calls, prompts, configs
         ),
     )
 
@@ -171,6 +175,12 @@ def test_real_adk_runner_returns_one_centrally_validated_decision() -> None:
     assert len(prompts) == 1
     assert own_context().delivered_message in prompts[0]
     assert SyntheticIntent.ANSWER.value in prompts[0]
+    assert configs[0].thinking_config is not None
+    assert configs[0].thinking_config.thinking_budget == 0
+    assert configs[0].response_schema is not None
+    time_schema = configs[0].response_schema["properties"]["time_offset_seconds"]
+    assert time_schema["minimum"] == time_schema["maximum"] == 1
+    assert configs[0].response_mime_type == "application/json"
 
 
 @pytest.mark.parametrize(

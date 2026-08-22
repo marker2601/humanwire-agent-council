@@ -1,5 +1,11 @@
 # HumanWire All Things Agentic Build Checklist
 
+> **Historical implementation checklist.** Items below record the earlier
+> two-service coordination foundation. The submitted Agent Council release is the
+> later DecisionOS architecture documented in the root README, deployment guide,
+> release evidence, and architecture diagram. Completed historical items are kept
+> for provenance and are not current deployment claims.
+
 ## Checklist Status
 
 - **Status:** Approved and locked for autonomous execution
@@ -86,14 +92,14 @@ Submission story assets to capture during the build:
   Acceptance: No secret/private/provider/path/command/internal identifier reaches Firestore, public JSON/CSV, logs, DOM, or errors; Gemini cannot cross authority gates; missing config never falls back; failed stages remain non-complete; Standard transcript bytes/hashes and existing Vercel/local product behavior remain intact.
   Verify: `.venv\Scripts\python.exe -m pytest tests\humanwire -q`, `.venv\Scripts\python.exe -m pytest -q`, `.venv\Scripts\ruff.exe check .`, both Node syntax checks, smoke commands, `git diff --check`, and tracked-diff/public-artifact privacy scans.
 
-- [ ] **10. Package and deploy the two-service Google Cloud stack**
+- [x] **10. Package and deploy the two-service Google Cloud stack**
   Spec ref: `spec.md > 14. Deployment; 9. Configuration; 11. Dependencies And Official References`
   What to build: Add Dockerfile, `.dockerignore`, Cloud Build/deployment files, Firestore indexes, dedicated service-account/IAM instructions, authenticated push subscription, scale-to-zero/bounded runtime settings, rollback steps, and clean-environment reproduction. Deploy one image as public web and private worker.
   Acceptance: Worker rejects unauthenticated access; Pub/Sub identity alone can invoke it; web identity cannot invoke Vertex AI; cloud uses ADC, not browser/API-key transport; revision/image are pinned; exact public origin is configured; rollback does not delete history; no open-ended spend setting is introduced.
   Verify: `.venv\Scripts\python.exe -m pytest tests\humanwire\test_google_deployment_contract.py -q`, build the container locally, run both entry points, then execute documented `gcloud` inspection/smoke commands against deployed revisions.
-  Current evidence: local packaging, deployment-contract tests, pinned Docker build, and non-root web/worker startup checks are complete. Live deployment remains pending an authenticated Google account, a selected billing-enabled project, and the requested hackathon access/credits.
+  Current evidence: `humanwire-web-00024-gvl` and `humanwire-worker-00024-fcv` serve one digest-pinned image in `humanwire-agentic-2026`; public/private IAM, authenticated Pub/Sub, Firestore, ADC-only Vertex access, max-one scaling, and anonymous worker HTTP 403 were inspected live.
 
-- [ ] **11. Run live Gemini, durability, and judge-view browser acceptance**
+- [x] **11. Run live Gemini, durability, and judge-view browser acceptance**
   Spec ref: `spec.md > 12.5 Live Gemini proof; 12.6 Browser verification; 18. Definition Of Done`
   What to build: Execute one fresh live launch-decision run on the deployed stack, refresh during execution, replay a historical event, verify final exports/digests, inspect safe Google proof, and capture desktop/mobile evidence. Fix any Critical/Important issue test-first and rerun affected gates.
   Acceptance: ADK/Gemini invocation is real and visible through saved work; Cloud Run/Pub/Sub/Firestore are essential; strict chronology completes; refresh restores the same prefix; exactly one graph path and synchronized rows render; 1680×950/1280×720/600×900/390×844 pass accessibility/geometry/console checks; public proof reveals no secrets.

@@ -1,0 +1,45 @@
+---
+title: HumanWire DecisionOS — Google Cloud Agent Architecture
+---
+block-beta
+  columns 4
+  USER["Judge or team member"]
+  HOST["Firebase Hosting<br/>DecisionOS workspace"]
+  AUTH["Firebase Authentication<br/>Google sign-in"]
+  CHECK["Firebase App Check monitored<br/>CSRF and origin enforced"]
+
+  RUN["Cloud Run<br/>DecisionOS revision 00040"]
+  ADK["Google ADK 2.7<br/>bounded Agent Council"]
+  GEM["Gemini 3.5 Flash<br/>Vertex AI"]
+  STORE["Firestore durable state<br/>mission · evidence · council · audit"]
+
+  BRIEF["Sanitized decision brief<br/>facts · inferences · challenges"]
+  HUMAN["Explicit human approval required"]
+  DEMO["Demo run<br/>AI stakeholders only<br/>no external messages sent"]
+  DELIVERY["Optional consented adapters<br/>email · Slack · call<br/>not configured in this demo"]
+
+  USER --> HOST
+  HOST --> AUTH
+  AUTH --> CHECK
+  CHECK --> RUN
+  RUN --> ADK
+  ADK --> GEM
+  GEM --> ADK
+  RUN --> STORE
+  ADK --> STORE
+  STORE --> BRIEF
+  BRIEF --> HUMAN
+  RUN -.-> DEMO
+  RUN -.-> DELIVERY
+
+  classDef edge fill:#0b2740,stroke:#40d5ff,color:#ffffff,stroke-width:2px
+  classDef runtime fill:#13213f,stroke:#a78bfa,color:#ffffff,stroke-width:2px
+  classDef data fill:#0f2f2d,stroke:#53e889,color:#ffffff,stroke-width:2px
+  classDef authority fill:#382814,stroke:#fbbf24,color:#ffffff,stroke-width:3px
+  classDef boundary fill:#2c1d2b,stroke:#fb7185,color:#ffffff,stroke-width:2px,stroke-dasharray:5 5
+
+  class USER,HOST,AUTH,CHECK edge
+  class RUN,ADK,GEM runtime
+  class STORE,BRIEF data
+  class HUMAN authority
+  class DEMO,DELIVERY boundary

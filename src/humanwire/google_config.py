@@ -28,7 +28,7 @@ class GoogleRuntimeConfig(BaseModel):
     model_id: str = Field(min_length=1, max_length=160)
     auth_mode: GoogleAuthMode
     project_id: str | None = Field(default=None, pattern=_SAFE_PROJECT)
-    location: str = Field(default="us-central1", pattern=_SAFE_LOCATION)
+    location: str = Field(default="global", pattern=_SAFE_LOCATION)
 
     @model_validator(mode="after")
     def is_qualifying_and_internally_consistent(self) -> Self:

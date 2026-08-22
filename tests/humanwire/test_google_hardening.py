@@ -187,7 +187,7 @@ def test_lost_lease_never_binds_a_late_completed_worker() -> None:
     )
 
     class Factory:
-        model_identifier = "gemini-3.6-flash"
+        model_identifier = "gemini-3.5-flash"
 
     def late_runner(_scenario, _output_path, _run_root, **_kwargs):
         time.sleep(0.25)
