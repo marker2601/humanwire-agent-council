@@ -94,7 +94,7 @@ https://github.com/marker2601/humanwire-agent-council
 
 Final local master: `work/all-things-agentic-video/final/humanwire-agent-council-all-things-agentic-2026.mp4`
 
-Public YouTube URL: TODO after upload.
+Public YouTube URL: https://youtu.be/5LDMzQU8oMM
 
 The 1:52 film is 75.4% chronological footage from the authenticated deployed product. It names Gemini 3.5 Flash and Google ADK 2.7, shows the mission running, shows named stakeholder contributions and the saved decision brief, exposes the human-approval boundary, and shows the exact Cloud Run revision plus Firebase/Firestore/Vertex AI architecture. The Veo opening is labeled as a visual guide and does not replace real product proof.
 
@@ -114,7 +114,7 @@ The 1:52 film is 75.4% chronological footage from the authenticated deployed pro
 - The live app and direct Cloud Run URL were verified against revision `humanwire-decisionos-00040-g92`.
 - The final video is 112.000 seconds, 1920×1080, H.264/yuv420p at 30 fps with AAC stereo 48 kHz, burned English captions, faststart, and a full 3,360-frame decode.
 - Final master SHA-256: `330CC378E57F3E2DF6B524A9C27DE28A7842E1E8F43D766EC40536F20BF1AF64`.
-- Public video upload and final Devpost write remain pending.
+- The public video is published and passed signed-out title/readback verification; the final Devpost write is the remaining release action.
 
 ## Known Limitations
 
@@ -125,7 +125,7 @@ The 1:52 film is 75.4% chronological footage from the authenticated deployed pro
 - The Council prepares a recommendation but does not grant itself human approval.
 - Firestore emulator tests are skipped unless the emulator host is explicitly configured.
 
-## TODO Official Form Fields
+## Official Form Fields
 
 - Submitter Type: `Individuals`
 - Country of residence: `United States`
@@ -139,4 +139,4 @@ The 1:52 film is 75.4% chronological footage from the authenticated deployed pro
 - Google Cloud services: `Firebase Hosting, Firebase Authentication, Firebase App Check, Cloud Run, Firestore, Vertex AI`
 - Google models: `Gemini 3.5 Flash, Veo 3.1 Fast, Lyria 3 Pro`
 - Architecture upload: `submission/all-things-agentic-architecture.png`
-- Public video URL: TODO after upload.
+- Public video URL: `https://youtu.be/5LDMzQU8oMM`
