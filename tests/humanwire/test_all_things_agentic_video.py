@@ -30,7 +30,7 @@ def test_google_video_manifest_is_judge_ready() -> None:
     assert payload["claims"]["external_messages"] is False
     assert payload["release"]["voice"] == "en-US-Chirp3-HD-Aoede"
     assert payload["release"]["voice_audition_approved"] is True
-    assert payload["release"]["final_mix_approved"] is False
+    assert payload["release"]["final_mix_approved"] is True
 
 
 def test_google_video_component_preserves_truth_and_real_product_focus() -> None:

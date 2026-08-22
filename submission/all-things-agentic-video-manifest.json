@@ -25,7 +25,7 @@
     "max_duration_seconds": 240,
     "voice": "en-US-Chirp3-HD-Aoede",
     "voice_audition_approved": true,
-    "final_mix_approved": false,
+    "final_mix_approved": true,
     "captions": "burned, max two authored lines, 42 characters per line",
     "music": "Lyria 3 Pro instrumental score; generated on Vertex AI",
     "spend_cap_usd": 10
