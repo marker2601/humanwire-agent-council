@@ -87,6 +87,25 @@ function projection(state = "ready") {
   };
 }
 
+function councilProjection() {
+  return {
+    run_id: "council_run_01",
+    objective: "Approve the launch decision with current evidence.",
+    state: "human_approval_required",
+    nodes: [
+      {specialist_id: "market_intelligence", status: "complete"},
+      {specialist_id: "human_approval", status: "required"},
+    ],
+    recommendation_summary: "Launch with a bounded pilot.",
+    recommended_action: "Proceed with the limited pilot.",
+    required_human_action: "Review and approve the plan.",
+    recommendation_digest: "a".repeat(64),
+    evidence_claims: [],
+    inference_claims: [],
+    challenges: [],
+  };
+}
+
 async function main() {
   const selectors = new Map();
   const flowNodes = [];
@@ -148,7 +167,7 @@ async function main() {
       },
       createElement() { return new FakeElement(); },
     },
-    location: {hash: "", assign() {}},
+    location: {hash: "#mission=mis_01HQ7XK9WPH4Y8ZQK3R2N1M6AA", assign() {}},
     history: {replaceState(_state, _title, url) { context.location.hash = url.split("#")[1] ? `#${url.split("#")[1]}` : ""; }},
     HumanWireFirebase: {async appCheckToken() { return "app-check"; }},
     TextDecoder,
@@ -163,8 +182,11 @@ async function main() {
       if (path.endsWith("/workspaces")) {
         return response({workspaces: [{workspace_id: "wrk_01HQ7XK9WPH4Y8ZQK3R2N1M6AA", name: "Launch", playbook: "launch_decision"}]});
       }
-      if (path.endsWith("/council-runs/latest")) return response({projection: null});
+      if (path.endsWith("/council-runs/latest")) return response({projection: councilProjection()});
       if (path.endsWith("/evidence")) return response({evidence: []});
+      if (path.endsWith("/missions/mis_01HQ7XK9WPH4Y8ZQK3R2N1M6AA")) {
+        return response({mission: projection("complete")});
+      }
       if (path.endsWith("/missions")) return response({mission: projection()});
       throw new Error(`unexpected request: ${path}`);
     },
@@ -177,6 +199,7 @@ async function main() {
   );
 
   await context.HumanWireDecisionOSApp.loadOrganizations();
+  assert.strictEqual(selectors.get("[data-council-result]").hidden, false);
   const created = await context.HumanWireDecisionOSApp.createMission({
     mode: "demo_run",
     objective: "Approve the launch decision with current evidence.",

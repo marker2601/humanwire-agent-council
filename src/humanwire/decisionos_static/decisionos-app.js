@@ -1012,9 +1012,11 @@
     }
     state.activeWorkspaceId = state.workspaces[0]?.workspace_id || "";
     renderWorkspace();
-    await loadLatestCouncil();
     await loadEvidence().catch(() => renderEvidence([]));
     await loadMissionFromHash().catch(() => resetMission());
+    if (!state.mission || state.mission.state === "complete") {
+      await loadLatestCouncil();
+    }
   }
 
   async function loadOrganizations() {
